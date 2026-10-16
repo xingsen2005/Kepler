@@ -139,7 +139,9 @@ async function loadCode() {
     if (meta) {
       const s = r.summary || {};
       meta.textContent = `指纹 ${r.fingerprint} · 长度 ${liveCode.length} 字符 · `
-        + `密钥 ${s.credentials || 0} · 桶 ${s.buckets || 0} · WebDAV 账户 ${s.webdavAccounts || 0} · IP 规则 ${s.ipRules || 0}`;
+        + `密钥 ${s.credentials || 0} · 桶 ${s.buckets || 0} · WebDAV 账户 ${s.webdavAccounts || 0} · `
+        + `IP 规则 ${s.ipRules || 0} · 发信 ${s.smtpConfigured ? '已配置' : '未配置'} · `
+        + `站点名 ${s.siteName || '（默认）'}`;
     }
   } catch (e) {
     if (ta) ta.value = '';
@@ -172,7 +174,8 @@ function openExportDialog(mode) {
       <input id="bk-backup-pass2" class="sl-input bk-input" type="password" autocomplete="new-password"
         placeholder="重复输入"></div>
     <div class="sl-err" id="bk-err" hidden></div>
-    <div class="sl-note">导出码只含<b>备份范围内</b>的 8 项配置；用户列表、分享链接、订单与各类密钥文件
+    <div class="sl-note">导出码只含<b>备份范围内</b>的 10 项配置；用户列表、分享链接、订单、
+      <b>邀请码</b>（条数可能过多，故不备份）与各类密钥文件
       （<code>secret.key</code> / <code>enc.key</code> 等）一律不含，也无法备份。</div>`;
 
   const fail = (msg) => {
@@ -336,8 +339,9 @@ function openImportDialog() {
 /**
  * 供调试 / 测试读取当前实时码（不参与渲染逻辑）。
  *
- * ⚠️ 这里刻意**不**再导出一份「备份范围 8 项」的常量：清单由服务端 `GET /backup/status`
+ * ⚠️ 这里刻意**不**再导出一份「备份范围 10 项」的常量：清单由服务端 `GET /backup/status`
  * 下发（`server/backup.js` 的 `SCOPES` 是唯一实现点）。前端再抄一份，下次加一项必然只改
  * 服务端，界面上却还少一项 —— 而两边都「看起来写了」。
+ *（界面上出现的「共 10 项」是**文案**，不是判据 —— 它由 `audit38` 的护栏盯着与服务端对齐。）
  */
 export function currentLiveCode() { return liveCode; }

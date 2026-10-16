@@ -215,11 +215,14 @@ test('R38-01g · 新环境变量必须登记进文档（docs-sync 的口径）',
 /* R38-02 · 备份范围                                                      */
 /* ==================================================================== */
 
-test('R38-02a · 备份范围必须是需求列出的 8 项，且顺序一致', () => {
-  assertEqual(backup.SCOPES.length, 8, 'R38-02：用户可见的备份项恰好 8 项');
+test('R38-02a · 备份范围必须是需求列出的 10 项，且顺序一致', () => {
+  assertEqual(backup.SCOPES.length, 10,
+    'R38-02：用户可见的备份项恰好 10 项（R38 的 8 项 + R55 追加的「发信设置」「站点设置」）');
   assertEqual(backup.SCOPES.map((s) => s.label).join('|'),
-    ['API Key 管理', '负载均衡', '上传排除', '登陆验证', 'WebDAV 服务', '支付设置', '存储桶管理', 'IP 地址管理'].join('|'),
-    'R38-02：8 项的措辞与顺序必须与需求逐字一致（顺序即界面上的清单顺序）');
+    ['API Key 管理', '负载均衡', '上传排除', '登陆验证', 'WebDAV 服务', '支付设置', '存储桶管理', 'IP 地址管理',
+      '发信设置', '站点设置'].join('|'),
+    'R38-02：措辞与顺序必须与需求逐字一致（顺序即界面上的清单顺序）；'
+    + '⚠️ 新增项一律**追加在末尾** —— 插在中间会让「本轮到底动了哪几项」在界面上看不出来');
 });
 
 test('R38-02b · 「负载均衡」与「API Key 管理」必须是同一份数据，不是两份', () => {
@@ -227,8 +230,8 @@ test('R38-02b · 「负载均衡」与「API Key 管理」必须是同一份数�
   assertEqual(cred.join('+'), 'API Key 管理+负载均衡',
     'R38-02：负载均衡展示/编辑的就是各密钥的 quotaBytes，与 API Key 是 config.enc 里的**同一条记录**；'
     + '另存一份会让「同一个字段两个来源」，导入时谁覆盖谁全凭顺序');
-  assertEqual(backup.SECTIONS.length, 7,
-    'R38-02：8 个用户可见项落到 7 个实际分区（去重后）');
+  assertEqual(backup.SECTIONS.length, 9,
+    'R38-02：10 个用户可见项落到 9 个实际分区（去重后：负载均衡与 API Key 管理同指 credentials）');
 });
 
 test('R38-02c · 用户列表不得进入备份（含管理员）', () => {
@@ -240,11 +243,17 @@ test('R38-02c · 用户列表不得进入备份（含管理员）', () => {
     'R38-02：实时码里绝不能出现用户表或口令哈希（跨实例搬运等于把「谁能登录」一起搬走）');
 });
 
-test('R38-02d · 分享链接 / 订单 / 加密密钥文件不得进入备份', () => {
+test('R38-02d · 分享链接 / 订单 / 邀请码 / 加密密钥文件不得进入备份', () => {
   const keys = Object.keys(backup.collect()).join(',');
-  for (const banned of ['links', 'shareLinks', 'payments', 'orders', 'enc', 'encSettings', 'encMeta', 'secretKeyFile']) {
+  for (const banned of ['links', 'shareLinks', 'payments', 'orders', 'invites', 'inviteStore',
+    'enc', 'encSettings', 'encMeta', 'secretKeyFile']) {
     assertEqual(keys.includes(banned), false, `R38-02：分区里不得出现「${banned}」`);
   }
+  // 邀请码（R54③ 引入的 data/invites.json）**明确不备份**：条数按「管理员发出去多少枚」增长，
+  // 一次可批量生成 500 枚且核销不删记录 ⇒ 随备份走既会把备份撑到 2MB 上限，也会让
+  // 「备份」这个动作变成一次口令集的分发（用户原话：「邀请码部分不备份，因为邀请码条数可能过多」）。
+  assertEqual(Object.keys(backup.collect()).indexOf('invites'), -1,
+    'R38-02：邀请码不备份 —— 条数可能过多');
   // 「文件加密选项」也不含在内（需求点 2）
   assertEqual(keys.includes('encSettings'), false,
     'R38-02：备份里没有「文件加密选项」——还原了开关却没有 enc.key，只会让系统以为'
@@ -351,9 +360,18 @@ test('R38-02l · 准入判据「每一项都算数」：只配了任意一项，
     payment: { enabled: false, platforms: {}, siteUrl: '' },
     buckets: { buckets: [], activeBucketId: '' },
     ipguard: { rules: [] },
+    // R55：两段新分区刻意用**空对象**表示「全新」—— 它们的默认值是**非空**的
+    // （发信设置的 secure 缺省跟随端口 ⇒ `true`；站点名有默认名），
+    // 故「全新」只能靠「归一化后等于默认」来表达，不能靠「一个字段都没写」。
+    smtp: {},
+    site: {},
   });
   assertEqual(backup.isEmptyData(empty()), true,
     'R38-02：全新实例（备份范围内一项没配）必须**允许**导入 —— 这正是「首次启动并创建用户后」那个窗口');
+  // 自证：上面那两个空对象确实被判成「默认值」。若哪天默认端口或站点名的默认值改了，
+  // 这条会先红，而不是让下面那批「逐项打开」的用例变成一群假绿。
+  assertEqual(configStore.smtpIsDefault(empty().smtp), true, 'R38-02：发信设置的「全新」形态应判为默认值');
+  assertEqual(configStore.siteIsDefault(empty().site), true, 'R38-02：站点设置的「全新」形态应判为默认值');
 
   // 逐项打开：任何一项都不许被漏掉（漏掉的那一项在导入时会「覆盖了但没提醒」，反过来也会
   // 「明明配过了却仍然允许导入」）
@@ -371,6 +389,18 @@ test('R38-02l · 准入判据「每一项都算数」：只配了任意一项，
     ['支付站点地址', (d) => { d.payment.siteUrl = 'https://pay.example.com'; }],
     ['存储桶管理', (d) => { d.buckets.buckets.push({ id: 'b1', quotaBytes: 0, speedLimit: 0 }); }],
     ['IP 地址管理', (d) => { d.ipguard.rules.push({ id: 'r1', target: '203.0.113.0/24' }); }],
+    // R55：两段新分区逐字段枚举 —— 尤其是「端口」那一条：发信设置的 `secure` 缺省**跟随端口**，
+    // 照抄「有值就算配过」的写法会把它判反（详见 config-store.smtpIsDefault 的注释）。
+    ['发信设置（启用开关）', (d) => { d.smtp.enabled = true; }],
+    ['发信设置（服务器地址）', (d) => { d.smtp.host = 'smtp.example.com'; }],
+    ['发信设置（登录用户名）', (d) => { d.smtp.user = 'u@example.com'; }],
+    ['发信设置（口令）', (d) => { d.smtp.password = 'pw'; }],
+    ['发信设置（发件人）', (d) => { d.smtp.from = 'a@example.com'; }],
+    ['发信设置（发件人显示名）', (d) => { d.smtp.fromName = 'Kepler'; }],
+    ['发信设置（仅端口）', (d) => { d.smtp.port = 587; }],
+    ['站点设置（站点名称）', (d) => { d.site.siteName = '我的站点'; }],
+    ['站点设置（公开注册）', (d) => { d.site.registration = 'open'; }],
+    ['站点设置（新用户身份）', (d) => { d.site.defaultRole = 'admin'; }],
   ];
   for (const [label, mutate] of cases) {
     const d = empty();
@@ -378,6 +408,17 @@ test('R38-02l · 准入判据「每一项都算数」：只配了任意一项，
     assertEqual(backup.isEmptyData(d), false,
       `R38-02：只要「${label}」已经配过，导入就必须关闭 —— 此时导入会把线上配置整批覆盖掉`);
   }
+
+  // 「改回默认值」必须等于「从没改过」：站点名留空在归一化里就是默认名，
+  // 若这两者被判成两种状态，用户会看到「什么都没改，导入却关上了」，且无从解释。
+  const defaultSite = configStore.siteView({});
+  const namedDefault = empty();
+  namedDefault.site.siteName = defaultSite.siteName;
+  namedDefault.site.registration = defaultSite.registration;
+  namedDefault.site.defaultRole = defaultSite.defaultRole;
+  assertEqual(backup.isEmptyData(namedDefault), true,
+    'R38-02：把站点设置显式写成默认值，必须与「一个字段都没写」同判 —— 否则「留空恢复默认」'
+    + '这个动作会把导入窗口永久关上');
 
   // 用户列表**不**影响判据：需求要的正是「创建用户之后」这个时刻
   const withUser = empty();
@@ -575,3 +616,150 @@ test('R38-02x · 导入不得动用户表（万一被清空 = 零管理员 → �
   assertEqual(ids(configStore.load()), before,
     'R38-02：导入必须只覆盖备份范围内的顶层键 —— 用户表既不能被清空，也不能被载荷里的内容顶替');
 });
+
+/* ==================================================================== */
+/* R55 · 发信设置 / 站点设置纳入备份（本轮追加的两项）                    */
+/* ==================================================================== */
+
+test('R55-01 · 发信设置随备份完整往返（口令是明文、且刻意不重封）', () => {
+  configStore.saveSmtp({
+    enabled: true,
+    host: 'smtp.example.com',
+    port: 587,
+    secure: false,
+    user: 'smtp-user@example.com',
+    password: 'smtp-pass-1234',
+    from: 'noreply@example.com',
+    fromName: 'Kepler 通知',
+  });
+
+  const data = backup.decodeCode(backup.buildCode());
+  assertEqual(data.smtp.host, 'smtp.example.com', 'R55：发信服务器地址必须随备份走');
+  assertEqual(data.smtp.port, 587, 'R55：端口必须随备份走');
+  assertEqual(data.smtp.secure, false, 'R55：TLS 方式必须随备份走（否则导入后连不上）');
+  assertEqual(data.smtp.enabled, true, 'R55：启用开关必须随备份走');
+  assertEqual(data.smtp.user, 'smtp-user@example.com', 'R55：登录用户名必须随备份走');
+  assertEqual(data.smtp.from, 'noreply@example.com', 'R55：发件人必须随备份走');
+  assertEqual(data.smtp.fromName, 'Kepler 通知', 'R55：发件人显示名必须随备份走');
+  assertEqual(data.smtp.password, 'smtp-pass-1234',
+    'R55：发信口令必须是**明文** —— 它在 config.enc 里本就是明文字段（靠整文件加密保护），'
+    + '不是 WebDAV 那种绑定本实例主密钥的 passwordSealed，故换实例无需重封');
+  assertEqual(/passwordSealed/.test(JSON.stringify(data.smtp)), false, 'R55：发信分区里不得出现 passwordSealed');
+  assertEqual(Object.prototype.hasOwnProperty.call(data.smtp, 'updatedAt'), false,
+    'R55：载荷刻意不含 updatedAt —— payloadOf() 必须是「配置内容」的纯函数，'
+    + '带上时间戳会让实时码每存一次发信设置就自己变一次');
+
+  // 换一份完全不同的发信设置，再导入还原
+  configStore.saveSmtp({
+    enabled: false, host: 'other.example.net', port: 25, secure: false,
+    user: '', password: null, from: '', fromName: '',
+  });
+  assertEqual(configStore.getSmtp().host, 'other.example.net', '前置：发信设置已被改掉');
+  assertEqual(configStore.getSmtp().password, '', '前置：口令已被清掉');
+
+  backup.apply(data);
+  const after = configStore.getSmtp();
+  assertEqual(after.host, 'smtp.example.com', 'R55：导入后发信服务器地址应复原');
+  assertEqual(after.port, 587, 'R55：端口应复原');
+  assertEqual(after.secure, false, 'R55：TLS 方式应复原');
+  assertEqual(after.enabled, true, 'R55：启用开关应复原');
+  assertEqual(after.user, 'smtp-user@example.com', 'R55：登录用户名应复原');
+  assertEqual(after.password, 'smtp-pass-1234', 'R55：口令应复原 —— 且能在本实例直接使用（无需重封）');
+  assertEqual(after.from, 'noreply@example.com', 'R55：发件人应复原');
+  assertEqual(after.fromName, 'Kepler 通知', 'R55：发件人显示名应复原');
+  assertEqual(configStore.smtpConfigured(after), true,
+    'R55：导入后「能不能发信」的判据必须为真（复原若只回了一半字段，这里会红）');
+});
+
+test('R55-01b · 导入是覆盖语义：载荷里没有口令，目标实例的口令也必须被清掉', () => {
+  configStore.saveSmtp({ password: 'target-only-pass' });
+  assertEqual(configStore.getSmtp().password, 'target-only-pass', '前置：目标实例有一份自己的口令');
+  const snapshot = backup.decodeCode(backup.buildCode());
+  snapshot.smtp.password = ''; // 「备份里没有口令」的形态
+  backup.apply(snapshot);
+  assertEqual(configStore.getSmtp().password, '',
+    'R55：导入是**覆盖**而不是合并 —— 旧口令绝不能因为载荷里没写就被留下（那会让「导入即恢复」变成'
+    + '「导入后仍用着上一台的凭据」，且界面上完全看不出来）');
+});
+
+test('R55-02 · 站点设置随备份完整往返；载荷里留空则回到默认值', () => {
+  const defaultSite = configStore.siteView({});
+  configStore.saveSite({ siteName: '备份测试站点', registration: 'open', defaultRole: 'admin' });
+  const data = backup.decodeCode(backup.buildCode());
+  assertEqual(data.site.siteName, '备份测试站点', 'R55：站点名称必须随备份走');
+  assertEqual(data.site.registration, 'open', 'R55：注册模式必须随备份走');
+  assertEqual(data.site.defaultRole, 'admin', 'R55：新用户身份必须随备份走');
+
+  configStore.saveSite({ siteName: '别的名字', registration: 'closed', defaultRole: 'user' });
+  backup.apply(data);
+  const after = configStore.getSite();
+  assertEqual(after.siteName, '备份测试站点', 'R55：导入后站点名称应复原');
+  assertEqual(after.registration, 'open', 'R55：注册模式应复原（这一项直接决定「谁能注册进来」）');
+  assertEqual(after.defaultRole, 'admin', 'R55：新用户身份应复原');
+
+  // 载荷里站点设置整段缺失（老版本导出的备份）→ 导入后必须回到**默认**形态，而不是空串
+  const legacy = backup.decodeCode(backup.buildCode());
+  delete legacy.site;
+  backup.apply(legacy);
+  const restored = configStore.getSite();
+  assertEqual(restored.siteName, defaultSite.siteName,
+    'R55：载荷里没有站点设置时，导入后必须回到默认站点名（而不是空串 —— 空串会让浏览器标题栏空白）');
+  assertEqual(restored.registration, defaultSite.registration,
+    'R55：缺失时的注册模式必须是**默认**（closed）而不是「开放」—— 这是最保守的一档');
+  assertEqual(restored.defaultRole, defaultSite.defaultRole, 'R55：新用户身份同理');
+  assertEqual(backup.isEmptyData(backup.collect()), false, '前置：本实例此刻已配置');
+});
+
+test('R55-03 · 发信 / 站点设置的改动必须让实时码立刻变化（且同一份配置码不变）', () => {
+  const before = backup.buildCode();
+  configStore.saveSmtp({ host: 'smtp.changed.example.com' });
+  const mid = backup.buildCode();
+  assert(before !== mid,
+    'R55：改发信设置后实时码必须变 —— 否则用户会以为「这次改动不在备份范围内」而放弃备份');
+
+  configStore.saveSite({ siteName: '实时码变更测试' });
+  const after = backup.buildCode();
+  assert(mid !== after, 'R55：改站点设置后实时码必须变');
+
+  assertEqual(backup.buildCode(), after,
+    'R55：同一份配置必须得到**同一串**码 —— 这条用来钉住「载荷里不能带 updatedAt」：'
+    + '带上的话，两次相邻的 buildCode() 恰好只差一次 save 的时间戳，这条就会红');
+});
+
+test('R55-04 · /backup/status 下发的清单与分区必须含本轮追加的两项', async () => {
+  const me = configStore.load().users.find((u) => u.username === 'admin1');
+  assert(me, '前置：R38-02r 应已建出 admin1');
+  const s = await serveBackup({ id: me.id, username: 'admin1', role: 'admin' });
+  try {
+    const r = await request(s.port, 'GET', '/backup/status');
+    assertEqual(r.status, 200, 'R55：status 应可读');
+    assertEqual(r.json.scopes.includes('发信设置'), true,
+      'R55：界面清单由服务端下发（前端不再抄一份）—— 服务端漏了「发信设置」，界面上就少一项');
+    assertEqual(r.json.scopes.includes('站点设置'), true, 'R55：站点设置同理');
+    assertEqual(r.json.scopes.join('|'), backup.SCOPES.map((x) => x.label).join('|'),
+      'R55：下发的清单必须与 SCOPES 逐字同序（插到中间会让用户记忆里的那份对不上）');
+    assertEqual(r.json.sections.includes('smtp'), true, 'R55：实际落盘分区必须含 smtp');
+    assertEqual(r.json.sections.includes('site'), true, 'R55：实际落盘分区必须含 site');
+  } finally { await s.close(); }
+});
+
+test('R55-05 · 界面必须写明新增两项、「共 10 项」，以及「邀请码不备份」及其理由', () => {
+  const html = read(path.join(ROOT, 'public', 'index.html'));
+  assert(html.includes('备份范围（共 10 项）'),
+    'R55：备份范围的件数必须跟着 SCOPES 一起改（写死 8 项会让界面上少说两项）');
+  assert(html.includes('发信设置') && html.includes('站点设置'),
+    'R55：清单里必须点名本轮追加的两项');
+  // 用户原话：「邀请码部分不备份，因为邀请码条数可能过多。」
+  assert(html.includes('邀请码'),
+    'R55：备份说明里必须写明邀请码不在备份范围内 —— 否则用户会以为「恢复之后邀请码也回来了」');
+  assert(html.includes('条数可能过多'),
+    'R55：必须给出理由（邀请码条数可能过多），而不是只写一句「不含邀请码」');
+
+  // 导出对话框里那句「备份范围内 N 项」也必须同步
+  const front = read(path.join(ROOT, 'public', 'js', 'backupcfg.js'));
+  assert(front.includes('10 项'),
+    'R55：导出对话框的说明写死了件数 —— 不同步会出现「卡片说 10 项、对话框说 8 项」两个真相');
+  assert(front.includes('邀请码'),
+    'R55：导出对话框同样要写明邀请码不含在内（用户是在这里做「要不要备份」的决定）');
+});
+

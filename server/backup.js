@@ -3,28 +3,35 @@
  *
  * ## 一、备份范围（需求逐项对应，且**必须**与需求同序）
  *
- * 用户可见的是 8 项，真正落进 `data` 的是 7 处 —— 「负载均衡」不是独立的一份数据：
+ * 用户可见的是 10 项，真正落进 `data` 的是 9 处 —— 「负载均衡」不是独立的一份数据：
  * 它展示与编辑的是**每个 API Key 的空间上限**（`credentials[].quotaBytes`），
  * 与「API Key 管理」在 `config.enc` 里本就是**同一条记录**。刻意不另存一份，
  * 否则「同一条记录的同一个字段」会有两个来源，导入时谁覆盖谁全凭顺序。
+ *
+ * ⚠️ 新增条目**一律追加在末尾**（R55 追加的「发信设置」「站点设置」即在最后）：顺序
+ * 就是界面上那份清单的顺序，也是 `GET /backup/status` 下发的顺序 —— 插在中间会让
+ * 「本轮到底动了哪几项」在界面上看不出来。
  *
  * ## 二、刻意**不在**备份范围内的东西（每一项都有明确理由，别顺手加回来）
  *
  *  - **用户列表**（`cfg.users`）：需求明确「所有用户均不在备份范围内（包括管理员）」。
  *    另外它本身也不该被备份 —— 账户与其口令哈希属于**这台实例**的身份，跨实例搬运
  *    等于把「谁能登录」一起搬走；而「重装系统后恢复管理员」应该走安装流程重新建号。
- *  - **分享链接**（`data/links.json`）与**支付订单**（`data/payments.json`）：运行时数据，
- *    且体量不确定。全量备份要经 `PUT`/`POST` 的 JSON 请求体，而 `express.json` 默认
- *    上限是 **2MB** —— 链接与订单一旦多起来，备份请求会先被 413 拒掉，
+ *  - **分享链接**（`data/links.json`）、**支付订单**（`data/payments.json`）与**邀请码**
+ *    （`data/invites.json`，R54③ 引入）：运行时数据，且体量不确定。**邀请码尤其如此 ——
+ *    它按「管理员发出去多少枚」增长，条数可能过多**（一次可批量生成 500 枚、且核销不删
+ *    记录，见 `server/invite-store.js`），随备份走既会把备份撑大，也会让「备份」这个
+ *    动作变成一次口令集的分发。全量备份要经 `PUT`/`POST` 的 JSON 请求体，而
+ *    `express.json` 默认上限是 **2MB** —— 这几样一旦多起来，备份请求会先被 413 拒掉，
  *    表现为「备份莫名其妙失败」，比不备份更糟。
  *  - **加密密钥文件**（`data/secret.key` / `enc.key` / `enc-settings.json` / `enc-meta.json`）：
  *    **无法备份，也绝不能备份**。`secret.key` 是配置主密钥，把它随备份一起流传出去，
  *    等于把整份配置的密文一起交出去；`enc.key` + `enc-meta.json` 能解开云端**全部**
  *    已加密文件。它们必须靠离线介质单独保管。这也是为什么备份里**没有**「文件加密选项」——
  *    还原了加密开关却没有 `enc.key`，只会让系统以为文件是加密的、实际一份也解不开。
- *  - **自定义请求域名**（`cfg.domains`）：不在需求列出的 8 项之内，故不含
+ *  - **自定义请求域名**（`cfg.domains`）：不在需求列出的备份项之内，故不含
  *    （它是「分享链接优先用哪个域名」的展示偏好，与「本站叫什么」是两件事；
- *    后者看部署环境变量 `SITE_DOMAIN`，见 `server/security.js`）。
+ *    后者看站点设置的站点名称与部署环境变量 `SITE_DOMAIN`，见 `server/security.js`）。
  *
  * ## 三、两种码，两种用途
  *
@@ -34,9 +41,9 @@
  *    只有它能跨实例搬运 —— 因为实时码里的 WebDAV 账户口令是明文，
  *    且它不含完整性保护，谁都能改一个字节再让服务端吃进去。
  *
- * ⚠️ 实时码里含 API Key / 支付凭证 / WebDAV 口令**明文**（它们本就在 `config.enc`
- * 的明文里，只是被整文件加密）。因此：该页面只对管理员开放，实时码不得出现在日志、
- * 审计记录或任何下行给普通用户的响应里。
+ * ⚠️ 实时码里含 API Key / 支付凭证 / WebDAV 口令 / **发信口令**（SMTP 密码）**明文**
+ * （它们本就在 `config.enc` 的明文里，只是被整文件加密）。因此：该页面只对管理员开放，
+ * 实时码不得出现在日志、审计记录或任何下行给普通用户的响应里。
  */
 const crypto = require('crypto');
 const configStore = require('./config-store');
@@ -57,8 +64,11 @@ const PASSWORD_MIN = 8;
 const PASSWORD_MAX = 128;
 
 /**
- * 用户可见的 8 个备份项 → 它们真正的存储位置（7 处）。
+ * 用户可见的 10 个备份项 → 它们真正的存储位置（9 处）。
  * 「负载均衡」与「API Key 管理」同指 `credentials`（见文件头第一节）。
+ *
+ * ⚠️ 顺序即界面清单顺序，**新项一律追加在末尾**（R55 追加的发信设置 / 站点设置即在最后）：
+ * 插在中间会让 `GET /backup/status` 下发的清单与用户记忆里的那份对不上。
  */
 const SCOPES = [
   { label: 'API Key 管理', section: 'credentials' },
@@ -69,9 +79,12 @@ const SCOPES = [
   { label: '支付设置', section: 'payment' },
   { label: '存储桶管理', section: 'buckets' },
   { label: 'IP 地址管理', section: 'ipguard' },
+  // R55：发信设置（含**明文口令**）与站点设置 —— 两者都是「换了实例就得重填一遍」的配置
+  { label: '发信设置', section: 'smtp' },
+  { label: '站点设置', section: 'site' },
 ];
 
-/** 实际写进 `data` 的分区（去重后 7 条） */
+/** 实际写进 `data` 的分区（去重后 9 条） */
 const SECTIONS = [...new Set(SCOPES.map((s) => s.section))];
 
 const b64u = (buf) => Buffer.from(buf).toString('base64url');
@@ -132,6 +145,58 @@ function sanitizeBucket(b) {
 }
 
 function boolOf(v) { return v === true; }
+
+/**
+ * 取「发信设置」的归一化副本（R55）。
+ *
+ * ⚠️ **口令在这里是明文**，与 WebDAV 账户口令同一处理但**理由不同**：
+ *  - WebDAV 的 `passwordSealed` 是**字段级**密封（绑定本实例的 `data/secret.key`），
+ *    原样搬走只会得到一段解不开的密文，故必须取明文再按目标实例重封；
+ *  - SMTP 口令本就是 `config.enc` 里的**明文字段**（靠整文件加密保护），换实例、
+ *    换主密钥都不影响它 —— 原样搬运即可，**无需重封**。
+ *
+ * `port` / `secure` 只在**确实给了**的时候才带进结果：两者的缺省**互相牵连**
+ * （`secure` 缺省跟随端口：465 → true，其余 → false），交给 `config-store` 的
+ * `normalizeSmtpInto()` 去推即可，在这里重写一遍那份推导必然与它分叉。
+ *
+ * ⚠️ **刻意不含 `updatedAt`**：`payloadOf()` 必须是「配置内容」的纯函数（实时码
+ * 改设置才变、不改就不变），带上时间戳会让码每存一次发信设置就自己变一次。
+ */
+function sanitizeSmtp(s) {
+  const src = (s && typeof s === 'object') ? s : {};
+  const out = {
+    enabled: boolOf(src.enabled),
+    host: String(src.host || ''),
+    user: String(src.user || ''),
+    // 口令不 trim()：首尾空格可能是口令本身的一部分（与 config-store 同口径）
+    password: String(src.password == null ? '' : src.password),
+    from: String(src.from || ''),
+    fromName: String(src.fromName || ''),
+  };
+  if (Number.isFinite(Number(src.port))) out.port = Number(src.port);
+  if (typeof src.secure === 'boolean') out.secure = src.secure;
+  return out;
+}
+
+/**
+ * 取「站点设置」的归一化副本（R55）。
+ *
+ * 站点设置里**没有任何机密**（站点名称 / 公开注册 / 新用户身份），故整段照搬。
+ * 只挑**当前已知的三个字段**（同 `sanitizeCredential` 的理由：备份要跨版本搬运，
+ * 历史累积的废弃字段不该被带过去）；`updatedAt` 同样不带 —— 理由是实时码必须是
+ * 配置内容的纯函数，带上它会让码每次存站点设置都自己变一次。
+ *
+ * 缺省字段留空串：`saveSite()` / `siteView()` 最终都会过一遍
+ * `normalizeSiteInto()`，空串在那里统一被换成默认值，这里不重写那份兜底。
+ */
+function sanitizeSite(s) {
+  const src = (s && typeof s === 'object') ? s : {};
+  return {
+    siteName: String(src.siteName == null ? '' : src.siteName),
+    registration: String(src.registration == null ? '' : src.registration),
+    defaultRole: String(src.defaultRole == null ? '' : src.defaultRole),
+  };
+}
 
 /**
  * 取「两套验证码凭证」的归一化副本（R41）。
@@ -202,6 +267,10 @@ function collect() {
     ipguard: {
       rules: clone(ipGuard.listRules() || []), // listRules 已剥掉派生缓存 `_parsed`
     },
+    // R55：发信设置（走 getSmtp —— 含明文口令，见 sanitizeSmtp 的说明）
+    smtp: sanitizeSmtp(configStore.getSmtp()),
+    // R55：站点设置（站点名称 / 公开注册 / 新用户身份）
+    site: sanitizeSite(configStore.getSite()),
   };
 }
 
@@ -240,6 +309,12 @@ function isEmptyData(data) {
   if ((b.buckets || []).length) return false;
   if (String(b.activeBucketId || '')) return false;
   if (((data.ipguard || {}).rules || []).length) return false;
+  // R55：发信设置 / 站点设置 —— 判据是「这一段是否**仍是默认值**」，故交给 config-store：
+  // 这两段的默认值一个**互相牵连**（`secure` 跟随端口 ⇒ 全新实例的 `secure` 其实是 `true`）、
+  // 一个**非空**（站点名有默认名、注册模式默认 closed、身份默认 user）。照抄「有值就算配过」
+  // 会让任何一台机器都判成「已配置」，导入窗口一开就是关着的；而漏判则会在导入时静默覆盖。
+  if (!configStore.smtpIsDefault(data.smtp)) return false;
+  if (!configStore.siteIsDefault(data.site)) return false;
   return true;
 }
 
@@ -445,6 +520,22 @@ function apply(data) {
   // ⑦ IP 地址管理（整批替换，保留 id / enabled）
   ipGuard.replaceAllRules(((data.ipguard || {}).rules) || []);
 
+  // ⑧ 发信设置（R55）。口令随整份配置一起走 —— 它在 config.enc 里本就是**明文**
+  //（靠整文件加密保护），换实例无需像 WebDAV 账户那样重封。
+  // `password: null` 是 saveSmtp 的「显式清除」档：载荷里没有口令时导入后也不该留着
+  // 目标实例原有口令（导入是**覆盖**语义）—— 传空串会被 saveSmtp 读成「保持不变」。
+  const sm = sanitizeSmtp(data.smtp);
+  configStore.saveSmtp(Object.assign({}, sm, { password: sm.password === '' ? null : sm.password }));
+
+  // ⑨ 站点设置（R55）。saveSite 是严格 PATCH，三个字段全给即整段覆盖；
+  // 空串 / 缺省由 normalizeSiteInto 换成默认值（与「从没配过」逐字同形）。
+  const st = data.site || {};
+  configStore.saveSite({
+    siteName: String(st.siteName == null ? '' : st.siteName),
+    registration: String(st.registration == null ? '' : st.registration),
+    defaultRole: String(st.defaultRole == null ? '' : st.defaultRole),
+  });
+
   configStore.flush();
   return summarize(collect());
 }
@@ -459,6 +550,11 @@ function summarize(data) {
     buckets: ((d.buckets || {}).buckets || []).length,
     webdavAccounts: ((d.webdav || {}).accounts || []).length,
     ipRules: ((d.ipguard || {}).rules || []).length,
+    // R55：发信设置「配没配」直接复用 config-store 的判据（**不在这里重写** host/from
+    // 的规则 —— 判据分叉会表现成「界面上说能发、发信端却抛 503」）；
+    // 站点名称无机密，直接回（仅用于界面核对「它有没有跟着变」）。
+    smtpConfigured: configStore.smtpConfigured(d.smtp),
+    siteName: String((d.site || {}).siteName || ''),
   };
 }
 

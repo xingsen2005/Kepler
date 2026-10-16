@@ -1739,6 +1739,58 @@ function siteView(cfg) {
   };
 }
 
+/* ============================ 「是否仍是默认值」判据（R55） ============================ */
+
+/**
+ * 发信设置是否**仍处于默认状态**（备份「全新实例」判据用，R55）。
+ *
+ * ⚠️ 为什么判据不是「逐字段看有没有值」，而是「**归一化之后是否等于归一化一个空对象**」：
+ * 这两段的默认值**互相牵连** —— 发信设置的 `secure` 缺省**跟随端口**（默认端口 → `true`），
+ * 于是「全新实例」的 `secure` 其实是 `true`。若照抄「`secure === true` 就算配过」，
+ * 一台**从没碰过发信设置**的机器上 `collect()` 出来的载荷就会被判成「已配置」，
+ * 而 `canImport()` 随即永远为 `false` —— 那个窗口再也打不开，且没有任何报错。
+ * 用「空对象归一化后的形态」当基准，等于把默认值的定义权**唯一**留在
+ * `normalizeSmtpInto()` 里：哪天默认端口或 `secure` 的推导规则改了，这里自动跟上。
+ *
+ * @param {object|undefined} smtp 待判定的发信设置（可缺省）
+ * @returns {boolean} true = 一个字段都没被改过
+ */
+function smtpIsDefault(smtp) {
+  const a = { smtp };
+  normalizeSmtpInto(a);
+  const b = { smtp: {} };
+  normalizeSmtpInto(b);
+  const x = a.smtp;
+  const y = b.smtp;
+  return x.enabled === y.enabled && x.host === y.host && x.port === y.port
+    && x.secure === y.secure && x.user === y.user && x.password === y.password
+    && x.from === y.from && x.fromName === y.fromName;
+}
+
+/**
+ * 站点设置是否**仍处于默认状态**（备份「全新实例」判据用，R55）。
+ *
+ * ⚠️ 站点设置与其它分区**不同**：它的默认值是**非空**的（站点名有默认名、注册模式默认
+ * `closed`、身份默认 `user`）。因此不能像别的分区那样「有一个字段非空就算配过」——
+ * 那会让任何一台机器都判成「已配置」，导入窗口一开就是关着的。判据必须与
+ * `normalizeSiteInto()` **共用同一套默认值**，否则「把站点名改回默认名」与「从没改过」
+ * 会被判成两种状态，而这种差异在界面上完全看不出来。
+ *
+ * @param {object|undefined} site 待判定的站点设置（可缺省）
+ * @returns {boolean} true = 一个字段都没被改过
+ */
+function siteIsDefault(site) {
+  const a = { site };
+  normalizeSiteInto(a);
+  const b = { site: {} };
+  normalizeSiteInto(b);
+  const x = a.site;
+  const y = b.site;
+  return x.siteName === y.siteName
+    && x.registration === y.registration
+    && x.defaultRole === y.defaultRole;
+}
+
 /* ============================ 登录人机验证配置 ============================ */
 
 /**
@@ -2578,6 +2630,8 @@ module.exports = {
   getSmtp, saveSmtp, smtpView, smtpSendConfig, smtpConfigured,
   // R54：站点设置（站点名称 / 公开注册 / 新用户身份）—— 无机密，siteView 整段下发
   getSite, saveSite, siteView,
+  // R55：「是否仍是默认值」判据 —— 供配置备份的「全新实例」闸门（backup.isEmptyData）使用
+  smtpIsDefault, siteIsDefault,
   getCaptcha, saveCaptcha,
   // 支付平台凭证（仅基础配置与合法性校验）
   getPayment, savePayment, clearPayment, setPaymentEnabled, setChannelEnabled, setPaymentSiteUrl,

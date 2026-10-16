@@ -4458,8 +4458,16 @@ const CASES = [
       // **这台实例**的身份，跨实例搬运等于把「谁能登录」一起搬走。
       name: 'R38-02c · 备份把用户表一起带上（跨实例搬运把「谁能登录」也搬走）',
       file: 'server/backup.js',
-      anchor: '    ipguard: {\n      rules: clone(ipGuard.listRules() || []), // listRules 已剥掉派生缓存 `_parsed`\n    },\n  };',
-      replacement: '    ipguard: {\n      rules: clone(ipGuard.listRules() || []), // listRules 已剥掉派生缓存 `_parsed`\n    },\n    users: clone(cfg.users || []),\n  };',
+      /*
+       * R55 复核：原锚点取的是 `ipguard` 块**加上紧随的 `};`（collect 的收尾）** ——
+       * R55 在 ipguard 之后追加了 `smtp` / `site` 两段，那条 `};` 立刻不再紧跟其后，
+       * 锚点失效（`invariants` 报「未命中」）。改为只锚 `ipguard` 块本身：
+       * 变异要复现的是「把用户表塞进 collect 的返回值」，与它后面还有没有别的键无关。
+       * 实测 `fail=3`：`R38-02c` + `R38-02e` / `R38-02g`（多出来的 `users` 分区同时打坏
+       * 「分区集合必须与 SECTIONS 一致」这两条）—— 与 R55 之前一致，故 `minFail` 未上调。
+       */
+      anchor: '    ipguard: {\n      rules: clone(ipGuard.listRules() || []), // listRules 已剥掉派生缓存 `_parsed`\n    },',
+      replacement: '    ipguard: {\n      rules: clone(ipGuard.listRules() || []), // listRules 已剥掉派生缓存 `_parsed`\n    },\n    users: clone(cfg.users || []),',
       testFile: 'audit38-regressions.test.js',
       minFail: 1,
     },
@@ -8548,6 +8556,116 @@ const CASES = [
       replacement: '  return Boolean(s && s.host && s.from && s.enabled);',
       testFile: 'audit53-regressions.test.js',
       minFail: 4,
+    },
+    {
+      /*
+       * R55-B1：`collect()` 不再输出发信设置。
+       *
+       * 这是「新条目只加在界面上、没接进载荷」的典型坏法：备份说明里写着含「发信设置」，
+       * 导出的码里却没有它 —— 用户在新实例上导入后，验证码 / 重置密码一封都发不出去，
+       * 而界面上一切正常（`smtpView().configured` 为 false，但没人会去看）。
+       * 实测 `fail=5`：`R38-02e` / `R38-02g`（分区集合必须与 SECTIONS 一致）+ `R55-01` / `R55-01b` / `R55-03`。
+       */
+      name: 'R55-B1 · collect() 不再输出发信设置（备份说明说含、载荷里却没有）',
+      file: 'server/backup.js',
+      anchor: '    // R55：发信设置（走 getSmtp —— 含明文口令，见 sanitizeSmtp 的说明）\n    smtp: sanitizeSmtp(configStore.getSmtp()),\n',
+      replacement: '',
+      testFile: 'audit38-regressions.test.js',
+      minFail: 5,
+    },
+    {
+      /*
+       * R55-B2：`collect()` 不再输出站点设置 —— 与 B1 同一个坏法的另一半
+       *（站点名称会决定浏览器标题栏与邮件发件人显示名，丢了以后新实例上「站名回到默认」
+       * 却没有任何提示）。
+       * 实测 `fail=4`：`R38-02e` / `R38-02g` + `R55-02` / `R55-03`。
+       */
+      name: 'R55-B2 · collect() 不再输出站点设置（站名 / 注册模式 / 新用户身份全丢）',
+      file: 'server/backup.js',
+      anchor: '    // R55：站点设置（站点名称 / 公开注册 / 新用户身份）\n    site: sanitizeSite(configStore.getSite()),\n',
+      replacement: '',
+      testFile: 'audit38-regressions.test.js',
+      minFail: 4,
+    },
+    {
+      /*
+       * R55-B3：`apply()` 不再**写回**发信设置。
+       *
+       * 与 B1 的区别是「导出对、导入漏」—— 这类缺陷在**导出端做全量检查**时完全看不出来
+       * （`decodeCode()` 里字段一个不少），只有真的导入一次才会发现凭据没回来。
+       * 实测 `fail=2`：`R55-01` / `R55-01b`（导出端的两条全绿，正是本条要说明的事）。
+       */
+      name: 'R55-B3 · apply() 不再写回发信设置（导出对、导入后凭据没回来）',
+      file: 'server/backup.js',
+      anchor: '  const sm = sanitizeSmtp(data.smtp);\n  configStore.saveSmtp(Object.assign({}, sm, { password: sm.password === \'\' ? null : sm.password }));\n',
+      replacement: '',
+      testFile: 'audit38-regressions.test.js',
+      minFail: 2,
+    },
+    {
+      /*
+       * R55-B4：`isEmptyData()` 不再把这两段新分区算进「全新实例」判据。
+       *
+       * 后果是**导入窗口在本该关闭时仍然开着**：老实例上一旦只配了发信 / 站点设置
+       *（这两样恰恰是最常单独配的），按钮就是可点的，而那一次点击会把线上配置整批覆盖掉，
+       * 不可撤销 —— 界面上此前一贯显示「本实例已有配置，导入已关闭」。
+       * 实测 `fail=1`：`R38-02l`（逐项枚举那一条；用例内部是个循环，首个失败的枚举项即中止本条用例）。
+       */
+      name: 'R55-B4 · isEmptyData 不再覆盖发信 / 站点设置（导入窗口在本该关闭时仍开着）',
+      file: 'server/backup.js',
+      anchor: '  if (!configStore.smtpIsDefault(data.smtp)) return false;\n  if (!configStore.siteIsDefault(data.site)) return false;\n',
+      replacement: '',
+      testFile: 'audit38-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * R55-B5：`smtpIsDefault()` 退回「只比有没有值」的朴素写法（忽略端口 / TLS 方式之差）。
+       *
+       * 这**不是**随手加的：发信设置的 `secure` 缺省**跟随端口**（465 → true），
+       * 所以「全新实例」的载荷里 `secure` 其实是 `true` —— 朴素写法要么把它判成「已配置」
+       *（导入窗口永远关着），要么漏掉「只改过端口」这一种改动（导入时静默覆盖掉它）。
+       * 本条钉住的是「判据必须与 `normalizeSmtpInto()` 同源」。
+       * 实测 `fail=1`：`R38-02l` —— 红的正是枚举里 `发信设置（仅端口）` 那一项。
+       */
+      name: 'R55-B5 · smtpIsDefault 忽略端口 / TLS 之差（只改过端口的那次改动被漏判）',
+      file: 'server/config-store.js',
+      anchor: '  return x.enabled === y.enabled && x.host === y.host && x.port === y.port\n    && x.secure === y.secure && x.user === y.user && x.password === y.password\n    && x.from === y.from && x.fromName === y.fromName;',
+      replacement: '  return x.enabled === y.enabled && x.host === y.host\n    && x.user === y.user && x.password === y.password\n    && x.from === y.from && x.fromName === y.fromName;',
+      testFile: 'audit38-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * R55-B6：`siteIsDefault()` 退回「有值就算配过」的朴素写法。
+       *
+       * 站点设置的默认值是**非空**的（站点名有默认名、注册模式默认 closed），
+       * 于是朴素写法会把**任何**一台机器都判成「已配置」—— 导入窗口一出生就是关着的，
+       * 且没有任何提示能解释「为什么全新部署也说已有配置」。
+       * 实测 `fail=1`：`R38-02l` —— 红的正是开头那句「全新实例必须允许导入」。
+       */
+      name: 'R55-B6 · siteIsDefault 退回「有值就算配过」（全新实例也被判成已配置）',
+      file: 'server/config-store.js',
+      anchor: '  return x.siteName === y.siteName\n    && x.registration === y.registration\n    && x.defaultRole === y.defaultRole;',
+      replacement: '  return !(x.siteName && x.registration && x.defaultRole);',
+      testFile: 'audit38-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * R55-B7：「邀请码不备份」这句用户要求的说明被删掉。
+       *
+       * 需求原话是「**再说明**『邀请码部分不备份，因为邀请码条数可能过多』」——
+       * 说明本身就是要交付的东西：只把 `invites` 排除掉而不写出来，用户会以为
+       * 「恢复之后邀请码也回来了」。
+       * 实测 `fail=1`：`R55-05`（`邀请码` 一词在别的卡片里也有，故真正把这条判红的是「条数可能过多」）。
+       */
+      name: 'R55-B7 · 界面删掉「邀请码不备份」的说明（用户按需求点名要写的那句）',
+      file: 'public/index.html',
+      anchor: '                  <li><b>为什么不含邀请码</b>：邀请码属于运行时数据，且<b>条数可能过多</b> ——',
+      replacement: '                  <li>（本说明已被反向对照移除）',
+      testFile: 'audit38-regressions.test.js',
+      minFail: 1,
     },
   ];
 
