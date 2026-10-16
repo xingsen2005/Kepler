@@ -338,6 +338,10 @@ let authMode = 'login';
 let forgotStep = 1;
 /** 「忘记密码」第一步提交的标识，第二步原样带回 */
 let forgotIdentifier = '';
+/** R57：第二步「重新发送验证码」的剩余秒数（0 = 可重发）；离开忘记密码形态即归零 */
+let resendLeft = 0;
+/** 上面那个倒计时的定时器；同一时刻最多存在一个 */
+let resendTimer = null;
 /**
  * 站点设置里的注册模式（`open` / `invite` / `closed`），由启动时的公开接口填充。
  * 默认取最保守的 `closed`：拿不到配置时不摆一个点了必然失败的「注册」入口。
@@ -503,6 +507,15 @@ function showAuthOverlay() {
     !(authMode === 'login' && (siteRegistration === 'open' || siteRegistration === 'invite'));
   document.getElementById('auth-back-login').hidden = authMode === 'login';
 
+  /**
+   * R57：标识输入框的**提示词必须与它上面的 label 同步**。
+   *
+   * `forgot` 形态的 label 是「用户名或邮箱」，而 `index.html` 里的 placeholder 写死成
+   * 「请输入用户名」—— 两处语义不一致，用户会以为这里只收用户名，明明绑过邮箱也不敢填。
+   * 四种形态里只有 `forgot` 的 label 不同，故只在这一个三元里分叉（一处真相）。
+   */
+  userInput.placeholder = isForgot ? '请输入用户名或已绑定的邮箱' : '请输入用户名';
+
   if (isInit) {
     title.textContent = '创建管理员账户';
     sub.textContent = '首次使用，请创建管理员账户以初始化系统';
@@ -574,6 +587,9 @@ function showAuthOverlay() {
 
   // 人机验证：服务端开启时渲染组件并加载对应脚本；关闭时零改动
   setupAuthCaptcha();
+  // R57：第二步那颗「重新发送验证码」的文案/可用性由 `resendLeft` 推出来 —— 重绘后必须重新渲染一次，
+  // 否则它会被 HTML 的初始文案"复原"，用户就能在冷却期内连点（服务端会拒，界面先骗了他一次）。
+  renderResendBtn();
 
   setTimeout(() => {
     // 忘记密码第二步：焦点落在验证码框（第一步已填的标识不必再点）
@@ -592,7 +608,14 @@ function showAuthOverlay() {
 /** 切到另一个认证形态并重绘 */
 function setAuthMode(mode) {
   authMode = mode;
-  if (mode !== 'forgot') { forgotStep = 1; forgotIdentifier = ''; }
+  // 离开忘记密码形态时把它的全部临时状态清干净：步号、标识、**以及重发倒计时**
+  // （不清的话定时器会在别的形态下继续空转，再进来时按钮上还会挂着上一次的剩余秒数）
+  if (mode !== 'forgot') {
+    forgotStep = 1;
+    forgotIdentifier = '';
+    resendLeft = 0;
+    stopResendCountdown();
+  }
   showAuthOverlay();
 }
 
@@ -732,7 +755,14 @@ function bindAuth() {
   const link = (id, fn) => { const el = document.getElementById(id); if (el) el.onclick = fn; };
   link('auth-register-link', () => setAuthMode('register'));
   link('auth-back-login', () => setAuthMode('login'));
-  link('auth-forgot-link', () => { forgotStep = 1; forgotIdentifier = ''; setAuthMode('forgot'); });
+  link('auth-forgot-link', () => {
+    forgotStep = 1; forgotIdentifier = '';
+    // R57：重发倒计时也一起归零 —— 这里就是"从头开始一次忘记密码"的入口
+    resendLeft = 0; stopResendCountdown();
+    setAuthMode('forgot');
+  });
+  // R57：第二步的「重新发送验证码」（与上面三个入口同款：直接赋 onclick，避免监听器叠加）
+  link('btn-auth-resend', resendForgotCode);
 }
 
 /** 当前形态下提交按钮的文案（重绘与"请求收尾还原"共用一处，避免两边写岔） */
@@ -741,6 +771,75 @@ function authSubmitLabel() {
   if (authMode === 'register') return '注 册';
   if (authMode === 'forgot') return forgotStep === 1 ? '发送验证码' : '重置密码';
   return '登 录';
+}
+
+/* ------------------ R57：忘记密码第二步的「重新发送验证码」 ------------------ */
+
+/**
+ * 那颗按钮的文案与可用性（**唯一渲染点**）。
+ *
+ * 倒计时每秒调它一次、遮罩每次重绘也调它一次。两处各写一遍是很自然的错误，
+ * 而后果不对称：重绘若把按钮"复原"成可点，用户就能在两封信的 60 秒冷却里连点
+ * （服务端会拒，但界面先骗了他一次）。
+ */
+function renderResendBtn() {
+  const btn = document.getElementById('btn-auth-resend');
+  if (!btn) return;
+  const waiting = resendLeft > 0;
+  btn.disabled = waiting;
+  btn.textContent = waiting ? `${resendLeft} 秒后可重新发送` : '重新发送验证码';
+}
+
+/** 停掉倒计时：离开忘记密码形态、以及重新开始倒计时之前都要先叫停 */
+function stopResendCountdown() {
+  if (resendTimer) { clearInterval(resendTimer); resendTimer = null; }
+}
+
+/**
+ * 开始重发倒计时（秒数由调用点给出，不在这里写死）。
+ *
+ * 秒数交给调用点是为了让「与哪个窗口对齐」这件事留在调用点上显形 ——
+ * 服务端的冷却窗口（`EMAIL_CODE_RESEND_MS` / 429 的 `Retry-After`）将来若变，
+ * 改的是调用点，这个函数不必动。
+ */
+function startResendCountdown(seconds) {
+  stopResendCountdown();
+  const n = Math.floor(Number(seconds));
+  resendLeft = Number.isFinite(n) && n > 0 ? n : 60;
+  renderResendBtn();
+  resendTimer = setInterval(() => {
+    resendLeft -= 1;
+    if (resendLeft <= 0) { resendLeft = 0; stopResendCountdown(); }
+    renderResendBtn();
+  }, 1000);
+}
+
+/**
+ * 重发验证码：与第一步走**同一条**接口（`/auth/forgot`）。
+ *
+ * 刻意不复用 `submitForgotAsk()`：那条路径的职责是"推进到第二步"，
+ * 而这里已经站在第二步上，再推一次只会把已填的验证码与新密码清空。
+ */
+async function resendForgotCode() {
+  const btn = document.getElementById('btn-auth-resend');
+  if (!btn || btn.disabled) return;
+  if (!forgotIdentifier) { showAuthError('请先填写用户名或已绑定的邮箱'); return; }
+  btn.disabled = true;
+  btn.textContent = '发送中…';
+  try {
+    await API.forgotPassword({ identifier: forgotIdentifier });
+    showAuthError('');
+    startResendCountdown(60);
+  } catch (e) {
+    showAuthError(e.message || '发送失败');
+    /**
+     * 失败**不进倒计时** —— 否则用户会被自己那次失败的结论锁住 60 秒。
+     * 唯一的例外是服务端 429（IP 限流）自带 `Retry-After`：那个窗口是真的，
+     * 照它倒计时才不会让用户在倒计时结束后立刻再点、再被拒一次。
+     */
+    if (e && e.retryAfter) startResendCountdown(e.retryAfter);
+    else { resendLeft = 0; stopResendCountdown(); renderResendBtn(); }
+  }
 }
 
 /** 忘记密码第一步：把验证码发到该账户已绑定的邮箱 */
@@ -757,6 +856,12 @@ async function submitForgotAsk(identifier, btn) {
     await API.forgotPassword({ identifier });
     forgotIdentifier = identifier;
     forgotStep = 2;
+    /**
+     * R57：进入第二步即开始 60 秒倒计时（与服务端 `EMAIL_CODE_RESEND_MS` 对齐）——
+     * 刚发出去的那封信，本来就不该马上再发一封。
+     * 必须在 `showAuthOverlay()` **之前**启动：重绘时那颗按钮的文案由 `resendLeft` 推出来。
+     */
+    startResendCountdown(60);
     showAuthOverlay(); // 重绘到第二步（会清空输入并把焦点放到验证码框）
   } catch (e) {
     showAuthError(e.message || '发送失败');

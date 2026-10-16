@@ -964,3 +964,85 @@ test('R54b-8 · 编辑资料弹窗：邮箱 + 验证码 + 发送按钮 + 倒计�
   assertMatch(p, /emailCode/, '保存时必须把验证码放进请求体');
   assertMatch(p, /body\.email\s*=/, '保存时必须把邮箱放进请求体');
 });
+
+/* ================================================================== *
+ * ⑧ R57 找回密码流程的三处修补（前端接线层）
+ * ================================================================== */
+
+test('R57-06 · 忘记密码第一步：标识输入框的提示词必须与「用户名或邮箱」的 label 同步', () => {
+  const main = readJs('main.js');
+  /**
+   * 一处真相：两个文案由**同一个三元**决定。分写两处必然分叉 —— 本轮修的就是这个
+   * （label 改成了「用户名或邮箱」，而 `index.html` 里的 placeholder 还写死「请输入用户名」，
+   * 用户会以为这里只收用户名，明明绑过邮箱也不敢填）。
+   */
+  assertMatch(main,
+    /userInput\.placeholder\s*=\s*isForgot\s*\?\s*'请输入用户名或已绑定的邮箱'\s*:\s*'请输入用户名'/,
+    'forgot 形态的 placeholder 必须说「用户名或邮箱」，其余形态回到「请输入用户名」');
+  assert(!/userInput\.placeholder\s*=\s*'请输入用户名';/.test(main),
+    '不得再有把 placeholder 写死成「请输入用户名」的地方 —— 那正是 label 与提示词不一致的来源');
+  // 静态 HTML 是登录形态，因此默认文案就该是「请输入用户名」
+  assertMatch(readHtml(), /id="auth-username"[^>]*placeholder="请输入用户名"/,
+    'index.html 的默认 placeholder 对登录形态仍是正确的');
+});
+
+test('R57-07 · 发送验证码失败时不得进入重置窗口（步号只能在 try 的成功分支里推进）', () => {
+  const src = readJs('main.js');
+  const i = src.indexOf('async function submitForgotAsk');
+  assert(i > 0, '自证：应当能取到 submitForgotAsk()');
+  const j = src.indexOf('async function submitForgotReset', i);
+  assert(j > i, '自证：应当能取到它后面的 submitForgotReset()');
+  const body = src.slice(i, j);
+
+  const iCatch = body.indexOf('} catch (');
+  assert(iCatch > 0, '自证：该函数应当有 catch 分支');
+  const tryPart = body.slice(0, iCatch);
+  const catchPart = body.slice(iCatch);
+  assert(tryPart.includes('await API.forgotPassword'), '自证：成功分支里应当真的调了发码接口');
+  assert(tryPart.includes('forgotStep = 2'), '推进步号必须发生在 await 成功之后');
+  assert(!/forgotStep\s*=\s*2/.test(catchPart),
+    '失败分支（catch）里绝不能推进步号 —— 那就是「发送失败也会立即进入重设密码的窗口」');
+  /**
+   * ⚠️ 这里钉住的是"前端不会无缘无故地推进"；「发送失败 ⇒ 真的不推进」的另一半
+   * 落在服务端：站点级失败（未配置 / 已停用 / 连不上 / 认证被拒）必须回非 2xx，
+   * 见 `audit53-regressions.test.js` 的 R57-02 / R57-04。两半合起来才是完整修复。
+   */
+});
+
+test('R57-08 · 重置窗口：「重新发送验证码」存在、带 60 秒倒计时，且重绘不会把它复原成可点', () => {
+  const html = readHtml();
+  assert(html.includes('id="btn-auth-resend"'), '重置窗口必须有「重新发送验证码」按钮');
+  // 与验证码输入框同一行（`.code-line`）：放到别处用户根本找不到重发入口
+  assert(/<div class="code-line">[\s\S]{0,400}?id="btn-auth-resend"/.test(html),
+    '重发按钮应与验证码输入框同一行');
+  assert(/type="button"[^>]*id="btn-auth-resend"|id="btn-auth-resend"[^>]*type="button"/.test(html),
+    '必须是 type="button" —— 默认的 submit 会被回车键连带触发');
+
+  const main = readJs('main.js');
+  assertMatch(main, /秒后可重新发送/, '倒计时期间必须显示剩余秒数（需求：60 秒后可重新发送）');
+  assertMatch(main, /function\s+renderResendBtn/, '按钮的文案/可用性必须有唯一渲染点');
+  assertMatch(main, /function\s+startResendCountdown/, '必须有倒计时实现');
+  assertMatch(main, /function\s+stopResendCountdown/, '必须有停止倒计时的实现（否则离开后定时器还在跑）');
+  assertMatch(main, /resendLeft/, '剩余秒数必须是状态，而不是只写进 DOM 文本');
+
+  // 首次发码成功后立刻开始倒计时（刚发出去的那封信，本来就不该马上再发一封）
+  const iAsk = main.indexOf('async function submitForgotAsk');
+  const askBody = main.slice(iAsk, main.indexOf('async function submitForgotReset', iAsk));
+  assert(askBody.includes('startResendCountdown(60)'), '首次发码成功后必须立刻开始倒计时');
+  // 重发入口必须真的调接口（只改 UI 就成了假按钮）
+  assertMatch(main, /async function resendForgotCode[\s\S]{0,1200}?API\.forgotPassword/,
+    '重发必须真的调 `/auth/forgot`，不能只改界面');
+  // 切走时停表；重绘后重新渲染（否则 HTML 的初始文案会把它"复原"成可点，用户能在冷却期内连点）
+  const iMode = main.indexOf('function setAuthMode');
+  assert(iMode > 0, '自证：应当能取到 setAuthMode()');
+  const modeBody = main.slice(iMode, main.indexOf('function hideAuthOverlay', iMode));
+  assert(modeBody.includes('stopResendCountdown()'),
+    '切走忘记密码形态时必须停掉倒计时 —— 否则定时器会在别的形态下继续空转，再进来时按钮上还挂着上次的剩余秒数');
+  const iOverlay = main.indexOf('function showAuthOverlay()');
+  assert(iOverlay > 0, '自证：应当能取到 showAuthOverlay()');
+  const overlayBody = main.slice(iOverlay, main.indexOf('function setAuthMode', iOverlay));
+  assert(overlayBody.includes('renderResendBtn()'),
+    '遮罩重绘后必须重新渲染重发按钮的文案与可用性 —— 否则它会被 HTML 的初始文案"复原"成可点');
+  // 绑定入口（与另外三个入口同款：直接赋 onclick，避免监听器叠加）
+  assertMatch(main, /link\('btn-auth-resend',\s*resendForgotCode\)/, '重发按钮必须被真正绑定');
+});

@@ -214,6 +214,99 @@ function clear() { codes.clear(); }
  */
 const CODE_FAIL_TEXT = '验证码不正确或已过期，请重新获取';
 
+/**
+ * 「现在能不能发系统邮件」的**站点级闸门**（唯一实现点）。
+ *
+ * ## 为什么这三条判据可以被如实回给匿名调用方
+ *
+ * 它回答的三件事（**配没配** / **开没开** / **连得上吗**）对**任何标识、任何收件人**
+ * 都是同一个答案。正因如此，`/auth/forgot` 才敢把它如实回出去 —— 攻击者拿任何
+ * 用户名 / 邮箱来问，得到的都是同一句话，构不成账户存在性 oracle。
+ * 与之相对，**按标识是否命中**而产生的差异必须继续静默（见 `routes/auth.js`）。
+ *
+ * ## 为什么闸门不折进 `smtpConfigured()`
+ *
+ * `smtpConfigured()` 还管着「界面显示已配置 / 未配置」与 `routes/smtp.js` 的
+ * 管理员测试邮件，而 R53 已定**测试邮件不受开关限制**（它是管理员手动触发的
+ * 一次性动作；若受限制，就关掉了「先配好、再验证」的窗口）。
+ * 把 `enabled` 折进那个判据会让卡片在停用后显示成「未配置」—— 配置明明还在。
+ *
+ * @param {object} cfg `smtpSendConfig()` 的返回值
+ * @returns {null|{status:number, error:string}} null = 放行
+ */
+function mailerGate(cfg) {
+  if (!cfg.configured) {
+    return {
+      status: 503,
+      error: '系统尚未配置发信（SMTP），无法发送邮件。请联系管理员在「系统设置 → 发信设置」中完成配置。',
+    };
+  }
+  /**
+   * 「发信设置」卡片上的启用开关（R55 追加）。
+   *
+   * 停用 = **系统自动发信一律不发** —— 验证码 / 重置密码这类信是服务端自己触发的，
+   * 管理员关掉开关要停的正是它们。两处调用方的表现刻意不同：
+   * `/auth/email/code` 需登录、且用户提交的是自己的新地址，**如实回 503**；
+   * `/auth/forgot` 匿名可达，但它同样**可以**如实回 —— 因为「停用」是站点级状态，
+   * 与标识无关（这正是 R57 修掉「配置全对却一封邮件也收不到、界面上却显示已发送」的关键）。
+   */
+  if (!cfg.enabled) {
+    return {
+      status: 503,
+      error: '系统发信已由管理员停用（系统设置 → 发信设置 → 启用发信功能），暂时无法发送邮件。',
+    };
+  }
+  return null;
+}
+
+/**
+ * 发信设置的**唯一读取点** ＋ 站点级闸门，一次算全。
+ *
+ * ⚠️ 全库**只有这里**读 `smtpSendConfig()`。理由是 R55 已经吃过一次亏：
+ * 发信路径一旦有人改回「对外视图」（`smtpView()` 里口令被裁成 `hasPassword`），
+ * 症状是**两极分化**的 —— 管理员手点的「发送测试邮件」走内部读、照样成功，
+ * 而系统邮件（验证码 / 重置密码）一封也发不出去，用户只会说「用户名密码都对，就是发不了信」。
+ * 收口成一处之后，「取配置」这个动作本身就只有一种写法。
+ */
+function mailerState() {
+  const cfg = configStore.smtpSendConfig();
+  return { cfg, gate: mailerGate(cfg) };
+}
+
+/**
+ * 发信前的**站点级健康探针**（R57）。
+ *
+ * ## 为什么需要它
+ *
+ * 系统自动发信失败时，`/auth/forgot` 必须**静默**处理（响应如实就会泄露
+ * 「这个标识命中了一个已绑定邮箱的账户」）。代价是「SMTP 看着配得好好的，
+ * 可一封邮件也收不到」时用户拿不到任何线索 —— 这类工单实测出现过两次
+ * （一次是口令被对外视图裁空，一次是启用开关没打开）。
+ *
+ * 本函数把失败里**与标识无关的那一部分**提前暴露出来：主机 / 端口 / 加密方式 /
+ * 登录口令所决定的「连不上、STARTTLS 未宣告、认证被拒、口令缺失」。它**不投递邮件**，
+ * 因此对任何标识都是同一句回答，可以安全地回给匿名调用方。
+ *
+ * ⚠️ 残留（刻意不消除）：**收件人本身**被拒（地址不存在 / 对方服务器拒收）仍只能静默 ——
+ * 那属于「按标识而变」的差异。用户侧由第二步的「验证码不正确或已过期」与
+ * 「重新发送验证码」兜住，不再是一句永远等不到的信。
+ *
+ * @returns {Promise<{ok:true}|{ok:false, status:number, error:string}>}
+ */
+async function probeMailer() {
+  const { cfg, gate } = mailerState();
+  if (gate) return { ok: false, status: gate.status, error: gate.error };
+  try {
+    await smtp.verify({
+      host: cfg.host, port: cfg.port, secure: cfg.secure,
+      user: cfg.user, password: cfg.password, from: cfg.from,
+    });
+    return { ok: true };
+  } catch (e) {
+    return { ok: false, status: 503, error: `系统发信当前不可用：${e.message}` };
+  }
+}
+
 /** 发一封带验证码的邮件（**唯一实现点**：SMTP 配置、站点名称、文案都只在这里拼一次） */
 async function sendCodeMail({ purpose, email, username, code }) {
   /**
@@ -223,32 +316,8 @@ async function sendCodeMail({ purpose, email, username, code }) {
    * **只要管理员填了登录用户名（真实 SMTP 几乎都要认证），系统邮件一封也发不出去**；
    * 而管理员手点的「发送测试邮件」走内部读、照样成功 —— 两者表现相反。
    */
-  const cfg = configStore.smtpSendConfig();
-  if (!cfg.configured) {
-    throw Object.assign(new Error(
-      '系统尚未配置发信（SMTP），无法发送邮件。请联系管理员在「系统设置 → 发信设置」中完成配置。',
-    ), { status: 503 });
-  }
-  /**
-   * 「发信设置」卡片上的启用开关（R55 追加）。
-   *
-   * 停用 = **系统自动发信一律不发** —— 验证码 / 重置密码这类信是服务端自己触发的，
-   * 管理员关掉开关要停的正是它们。闸门放在这里而不是 `smtpConfigured()`：
-   *
-   *  · `smtpConfigured()` 还管着「界面显示已配置 / 未配置」与 `routes/smtp.js` 的
-   *    管理员测试邮件，而 R53 已定**测试邮件不受开关限制**（它是管理员手动触发的
-   *    一次性动作；若受限制就关掉了「先配好、再验证」的窗口）；
-   *  · 把 `enabled` 折进那个判据会让卡片在停用后显示成「未配置」—— 配置明明还在。
-   *
-   * 两处调用方的表现刻意不同（与既有口径一致）：`/auth/forgot` 的 catch 只记日志、
-   * 响应**恒真**（它是匿名可达的，回不同的体就等于一条账户存在性 oracle）；
-   * `/auth/email/code` 需登录、且用户提交的是自己的新地址，故**如实回 503**。
-   */
-  if (!cfg.enabled) {
-    throw Object.assign(new Error(
-      '系统发信已由管理员停用（系统设置 → 发信设置 → 启用发信功能），暂时无法发送邮件。',
-    ), { status: 503 });
-  }
+  const { cfg, gate } = mailerState();
+  if (gate) throw Object.assign(new Error(gate.error), { status: gate.status });
   const siteName = configStore.siteView(configStore.load()).siteName;
   const title = purpose === 'reset' ? '重置密码' : '验证邮箱';
   const subject = `${siteName} ${title}验证码`;
@@ -300,5 +369,7 @@ module.exports = {
   CODE_PURPOSES, CODE_FAIL_TEXT, EMAIL_CODE_LEN,
   generateCode, issue, check, consume, rollback,
   sendCode, sendCodeMail,
+  // R57：站点级健康探针（「配没配 / 开没开 / 连得上吗」），供 `/auth/forgot` 如实回 503
+  probeMailer,
   size, clear,
 };

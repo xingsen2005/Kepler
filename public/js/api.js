@@ -162,6 +162,19 @@ const WRITE_EXEMPT = [
   { path: '/api/auth/login/webauthn', why: '② 登录第二步断言：同上' },
   { path: '/api/auth/init', why: '② 初始化管理员：成功后进入登录流程，此时尚无会话可同步' },
   { path: '/api/auth/logout', why: '② 登出：会话已销毁，再发同步请求只会拿到 401 并触发重定向' },
+  /**
+   * R57：注册 / 忘记密码 / 重置密码 —— 三条都是**登录之前**用的匿名端点。
+   *
+   * 漏登记的后果实测过：`POST /api/auth/forgot` 成功后触发一次界面同步，而同步的第一件事
+   * 就是 `GET /api/config`（需要会话）⇒ 401 ⇒ `loadConfig()` 的 catch 把服务端那句
+   * 401 文案 `toast` 出来。用户点「发送验证码」明明成功了，却先看到
+   * 「未登录或会话已过期，请重新登录」—— 而且**紧接着仍然进了重置密码窗口**，
+   * 两件事叠在一起，看起来就像"发送失败却放行了"。
+   * 这三条本来就无界面状态可同步（此刻连会话都没有）。
+   */
+  { path: '/api/auth/register', why: '② 登录前动作：此刻本无会话，同步界面必然 401' },
+  { path: '/api/auth/forgot', why: '② 同上（忘记密码第一步，匿名可达）' },
+  { path: '/api/auth/reset', why: '② 同上（重置密码，匿名可达）' },
   { path: '/api/enc/unlock', why: '③ 加密访问密码校验：只是会话内的解锁动作，不改任何设置' },
   { path: '/api/webauthn/register/options', why: '③ 生成 WebAuthn 挑战：随机数，不落库（随后的 verify 才是真写）' },
 ];

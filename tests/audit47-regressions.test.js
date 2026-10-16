@@ -314,6 +314,37 @@ test('R47-03c · 豁免必须是"那条探针"，不能顺手把同前缀的真�
   api.setWriteObserver(null);
 });
 
+/**
+ * R57：登录前的三个**匿名**写端点（注册 / 忘记密码 / 重置密码）也必须豁免界面同步。
+ *
+ * 漏登记的后果实测过：`POST /api/auth/forgot` 成功后触发一次界面同步，而同步的第一步
+ * 就是 `GET /api/config`（需要会话）⇒ 401 ⇒ `loadConfig()` 的 catch 把服务端那句
+ * 401 文案 `toast` 出来。于是用户点「发送验证码」明明成功了，却先看到
+ * 「未登录或会话已过期，请重新登录」；而窗口**紧接着又进了重置密码那一步** ——
+ * 两件事叠在一起，看起来就是"发送失败却放行了"。
+ *
+ * 判据刻意**先自证观察者是活的**：只断言"一条都没通知"的话，观察者没接上也会全绿。
+ */
+test('R57-05a · 登录前的匿名写端点不得触发界面同步（否则会 toast 一句假的"会话已过期"）', async () => {
+  const api = loadApi();
+  const seen = [];
+  api.setWriteObserver((p) => seen.push(p));
+
+  // 自证：普通写请求必须通知一次
+  await withFakeFetch({ ok: true, body: {} }, () => api.API.mkdir('/a'));
+  assertEqual(seen.length, 1, `自证：普通写请求应通知一次，实际：${JSON.stringify(seen)}`);
+
+  await withFakeFetch({ ok: true, body: {} }, async () => {
+    await api.API.register({ username: 'u', password: 'p' });
+    await api.API.forgotPassword({ identifier: 'u' });
+    await api.API.resetPassword({ identifier: 'u', code: '123456', password: 'p' });
+  });
+  assertEqual(seen.length, 1,
+    '登录前的三条匿名端点不得触发界面同步（此刻没有会话，同步必然 401 并把 401 文案弹给用户）'
+    + `，实际通知了：${JSON.stringify(seen)}`);
+  api.setWriteObserver(null);
+});
+
 test('R47-03d · 写请求失败绝不通知（失败没有需要同步的变更）', async () => {
   const api = loadApi();
   const seen = [];

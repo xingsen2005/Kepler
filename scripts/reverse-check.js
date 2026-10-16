@@ -8479,11 +8479,14 @@ const CASES = [
        * 照样成功 —— 同一份落盘配置、两个读法，用户看到的就是「用户名密码都填对了，
        * 却发不了信」。故变异必须打在**取配置那一行**上，而护栏也落在
        * 「假服务器收到的 AUTH 载荷里有没有那份口令」上（`R53-10 · 取用` 四条）。
+       *
+       * ⚠️ R57 起「取配置」这个动作收口成了**全库唯一一处**（`mailerState()`）：
+       * 发信与探针都从那里取，变异点随之从 `sendCodeMail` 移到那里（语义不变）。
        */
       name: 'R53-10a · 系统发信改回用「对外视图」取配置（口令被裁空 ⇒ 一封也发不出去）',
       file: 'server/email-code.js',
-      anchor: '  const cfg = configStore.smtpSendConfig();\n  if (!cfg.configured) {',
-      replacement: '  const cfg = configStore.smtpView(configStore.load());\n  if (!cfg.configured) {',
+      anchor: 'function mailerState() {\n  const cfg = configStore.smtpSendConfig();',
+      replacement: 'function mailerState() {\n  const cfg = configStore.smtpView(configStore.load());',
       testFile: 'audit53-regressions.test.js',
       minFail: 1,
     },
@@ -8525,16 +8528,23 @@ const CASES = [
        * R53-11a：「启用 / 停用发信功能」开关若不拦**系统发信**，它就只是个装饰 ——
        * 界面上写着「已停用」，登录页取码 / 忘记密码照样把邮件发出去。
        *
-       * 撤掉 `email-code.js` 里那道 `if (!cfg.enabled)` 即可复现。判据落在
-       * 「假服务器到底收到几行命令」上，故 ⑩ 层里三条会同时变红
-       * （实测 `fail=3`：停用后 503 / 匿名 forgot 一封不发 / email-code 如实 503）。
+       * 撤掉 `email-code.js` 里 `mailerGate()` 的那道 `if (!cfg.enabled)` 即可复现。
+       * 判据落在「假服务器到底收到几行命令」上，故 ⑩ 层里三条会同时变红
+       * （实测 `fail=3`：停用后 sendCodeMail 仍 503 / 匿名 forgot 如实 503 且一封不发 /
+       *  email-code 如实 503）。
+       *
+       * ⚠️ R57 起这条闸门的**形状**变了（原先是在 `sendCodeMail` 里直接 throw，
+       * 现在是 `mailerGate()` 返回一个 `{status,error}`），但语义一条没松：
+       * 停用 ⇒ 系统发信一律不发。**反向对照必须跟着改形状**，否则它会变成一条
+       * 「anchor 未命中」的假绿。
        */
       name: 'R53-11a · 系统发信的「启用开关」闸门被撤除（停用后照样发信）',
       file: 'server/email-code.js',
       anchor: '  if (!cfg.enabled) {\n'
-        + '    throw Object.assign(new Error(\n'
-        + '      \'系统发信已由管理员停用（系统设置 → 发信设置 → 启用发信功能），暂时无法发送邮件。\',\n'
-        + '    ), { status: 503 });\n'
+        + '    return {\n'
+        + '      status: 503,\n'
+        + "      error: '系统发信已由管理员停用（系统设置 → 发信设置 → 启用发信功能），暂时无法发送邮件。',\n"
+        + '    };\n'
         + '  }',
       replacement: '  // 启用开关闸门已被反向对照移除',
       testFile: 'audit53-regressions.test.js',
@@ -8665,6 +8675,112 @@ const CASES = [
       anchor: '                  <li><b>为什么不含邀请码</b>：邀请码属于运行时数据，且<b>条数可能过多</b> ——',
       replacement: '                  <li>（本说明已被反向对照移除）',
       testFile: 'audit38-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * R57-01a：站点级健康探针被摘成恒真 —— 这正是「配置全对却发不出去」卷土重来的入口。
+       *
+       * 探针的价值全在「真连一次 SMTP 服务器并完成登录」：只报健康的话，
+       * 认证被拒（服务商改成必须用授权码）与端口连不上这两类最常见的故障又会被
+       * 静默吞掉，用户重新回到「点发送验证码 → 界面说过已发送 → 永远收不到信」。
+       *
+       * 实测 `fail=3`：R57-01（探针没认证就报成功）+ R57-02（四类失败全判成通过）+
+       * R57-04（端到端又回 200「已发送」）。
+       */
+      name: 'R57-01a · 发信探针被摘成恒真（认证被拒 / 连不上又变成静默失败）',
+      file: 'server/email-code.js',
+      anchor: '    await smtp.verify({\n'
+        + '      host: cfg.host, port: cfg.port, secure: cfg.secure,\n'
+        + '      user: cfg.user, password: cfg.password, from: cfg.from,\n'
+        + '    });',
+      replacement: '    // 探针被反向对照摘除（直接报健康）',
+      testFile: 'audit53-regressions.test.js',
+      minFail: 3,
+    },
+    {
+      /**
+       * R57-02a：`/auth/forgot` 不再调用站点级闸门（退回 R57 之前的恒真行为）。
+       *
+       * 后果不是「多一条错误」，而是**用户彻底失去线索**：未配置 / 已停用 / 连不上
+       * 统统回 200「验证码已发送」—— 本轮两份工单的表象就是这么来的。
+       *
+       * 实测 `fail=3`：R53-11（停用后匿名忘记密码不再如实 503）+ R57-03（闸门顺序失守）
+       * + R57-04（配置齐全但连不上时不再 503）。`minFail` 取**实测条数**而非 1 ——
+       * 它同时是「这条变异应当红几条」的下界，调小会把「悄悄少红了」当成通过。
+       */
+      name: 'R57-02a · /auth/forgot 的站点级闸门被摘除（未配置也回「已发送」）',
+      file: 'server/routes/auth.js',
+      anchor: '    const gate = await emailCode.probeMailer();\n'
+        + '    if (!gate.ok) return res.status(gate.status || 503).json({ error: gate.error });',
+      replacement: '    const gate = { ok: true };\n'
+        + '    if (!gate.ok) return res.status(gate.status || 503).json({ error: gate.error });',
+      testFile: 'audit53-regressions.test.js',
+      minFail: 3,
+    },
+    {
+      /**
+       * R57-03a：登录前的匿名写端点失去界面同步豁免。
+       *
+       * 漏掉之后的症状极难反推：请求本身**成功**，界面却弹一句
+       * 「未登录或会话已过期，请重新登录」（那是同步请求 `GET /api/config` 的 401），
+       * 而流程还照常推进到下一步 —— 用户只会说「发送失败却放行了」。
+       */
+      name: 'R57-03a · 匿名三条端点失去「不触发界面同步」的豁免（点发送验证码会弹假 401）',
+      file: 'public/js/api.js',
+      anchor: "  { path: '/api/auth/register', why: '② 登录前动作：此刻本无会话，同步界面必然 401' },\n"
+        + "  { path: '/api/auth/forgot', why: '② 同上（忘记密码第一步，匿名可达）' },\n"
+        + "  { path: '/api/auth/reset', why: '② 同上（重置密码，匿名可达）' },",
+      replacement: '  // 登录前三条匿名端点的豁免被反向对照摘除',
+      testFile: 'audit47-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // R57-04a：提示词不再与 label 同步 —— label 写「用户名或邮箱」、输入框却提示「请输入用户名」。
+      name: 'R57-04a · 忘记密码的 placeholder 不与 label 同步（提示词只说「用户名」）',
+      file: 'public/js/main.js',
+      anchor: "  userInput.placeholder = isForgot ? '请输入用户名或已绑定的邮箱' : '请输入用户名';",
+      replacement: "  userInput.placeholder = '请输入用户名';",
+      testFile: 'audit54b-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * R57-05a：把「推进到第二步」也塞进失败分支 —— 就是用户报的
+       * 「点击发送验证码，即使发送失败也会立即进入重设密码的窗口」。
+       */
+      name: 'R57-05a · 发送验证码失败也推进到重置窗口（catch 里也置 forgotStep）',
+      file: 'public/js/main.js',
+      anchor: "  } catch (e) {\n    showAuthError(e.message || '发送失败');\n  } finally {",
+      replacement: "  } catch (e) {\n    showAuthError(e.message || '发送失败');\n    forgotStep = 2;\n  } finally {",
+      testFile: 'audit54b-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // R57-06a：首次发码后不启动倒计时 ⇒ 重发按钮一进第二步就是可点的（用户会在冷却期内连点）。
+      name: 'R57-06a · 首次发码后不启动重发倒计时（重发按钮一进来就能点）',
+      file: 'public/js/main.js',
+      anchor: '    startResendCountdown(60);\n    showAuthOverlay();',
+      replacement: '    showAuthOverlay();',
+      testFile: 'audit54b-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // R57-07a：重发按钮的文案丢掉剩余秒数 ⇒ 需求「60 秒后可重新发送」落空（只剩一个可点的按钮）。
+      name: 'R57-07a · 重发按钮不再显示倒计时秒数（需求「60 秒后可重新发送」落空）',
+      file: 'public/js/main.js',
+      anchor: "  btn.textContent = waiting ? `${resendLeft} 秒后可重新发送` : '重新发送验证码';",
+      replacement: "  btn.textContent = '重新发送验证码';",
+      testFile: 'audit54b-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // R57-08a：切走时不叫停定时器 ⇒ 它在别的形态下继续跑，再进来时按钮上还挂着上次的剩余秒数。
+      name: 'R57-08a · 离开忘记密码形态时不叫停倒计时（定时器跨形态空转）',
+      file: 'public/js/main.js',
+      anchor: '    resendLeft = 0;\n    stopResendCountdown();\n  }',
+      replacement: '    resendLeft = 0;\n  }',
+      testFile: 'audit54b-regressions.test.js',
       minFail: 1,
     },
   ];

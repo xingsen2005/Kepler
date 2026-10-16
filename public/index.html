@@ -798,7 +798,7 @@
             <div class="dash-card wide sysset-card">
               <h3 class="sysset-h3"><span class="sysset-tag about">关于</span>关于</h3>
               <div class="about-body">
-                <p><b>Kepler 对象存储管理系统</b> Build 1.8.2</p>
+                <p><b>Kepler 对象存储管理系统</b> Build 1.8.3</p>
                 <ul class="about-list">
                   <li>开发者：邢森</li>
                   <li>项目地址：<a href="https://github.com/xingsen2005/Kepler" target="_blank">https://github.com/xingsen2005/Kepler</a></li>
@@ -967,8 +967,12 @@
         <!-- R54②：忘记密码第二步的验证码（第一步只填「用户名或邮箱」） -->
         <div class="form-item" id="auth-code-item" hidden>
           <label for="auth-code">邮箱验证码 <span class="hint" style="margin-left:6px">6 位数字</span></label>
-          <input id="auth-code" type="text" inputmode="numeric" maxlength="6" autocomplete="one-time-code"
-            spellcheck="false" placeholder="请输入邮件里的 6 位验证码">
+          <div class="code-line">
+            <input id="auth-code" type="text" inputmode="numeric" maxlength="6" autocomplete="one-time-code"
+              spellcheck="false" placeholder="请输入邮件里的 6 位验证码">
+            <!-- R57：重发入口。倒计时 60 秒，与服务端 EMAIL_CODE_RESEND_MS 对齐 -->
+            <button type="button" id="btn-auth-resend" class="mini-btn">重新发送验证码</button>
+          </div>
         </div>
         <!-- R54③：邀请码注册（仅当站点设置为「邀请码」时出现；大小写与其中空格都会自动归一） -->
         <div class="form-item" id="auth-invite-item" hidden>

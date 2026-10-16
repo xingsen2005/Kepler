@@ -456,14 +456,52 @@ function normalizeOptions(opts) {
 
 /**
  * 发信前置校验（配置类问题 → 400）。
+ *
+ * 四条判据只有这一份实现，`sendMail()` 与 `verify()` 共用 —— 分叉的表现是
+ * 「探针报告链路健康，可真发时被判 400」，而那正是本轮要消灭的那类静默失败。
+ *
+ * @param {object} o 归一化后的选项
+ * @param {{requireTo?: boolean}} [opts] `requireTo: false` 供**不发信**的探针使用
+ *   （`verify()` 不投递任何邮件，自然没有收件人）
  * @returns {string} 空串 = 通过；非空 = 面向管理员的提示
  */
-function validateForSend(o) {
+function validateForSend(o, opts) {
+  const requireTo = !opts || opts.requireTo !== false;
   if (!o.host) return '尚未填写 SMTP 服务器地址';
   if (!o.from) return '尚未填写发件人地址';
-  if (!o.to) return '尚未填写收件人地址（留空则默认发给发件人自己）';
+  if (requireTo && !o.to) return '尚未填写收件人地址（留空则默认发给发件人自己）';
   if (o.user && !o.password) return '已填写登录用户名但密码为空（如需免密发信，请清空用户名）';
   return '';
+}
+
+/**
+ * 「建连 → 握手 → 按需 STARTTLS → 认证」的**唯一实现点**，`sendMail()` 与
+ * `verify()` 共用。
+ *
+ * 抽出来不是为了省几行，而是**两条路径必须走一模一样的登录链路**：
+ * 一旦分叉（例如探针少做一次 STARTTLS 后的重新 EHLO），探针就可能对着一条
+ * 「真发信时服务器并不接受」的路径报健康 —— 那比不做探针更糟。
+ *
+ * 任何失败都由这里用 `finally` 兜底 `quit()`，否则每次失败都泄漏一条 TCP 连接。
+ *
+ * @param {object} o 已归一化的选项
+ * @param {(s: SmtpSession, authUsed: string) => Promise<*>} fn 会话就绪后的动作
+ */
+async function withSession(o, fn) {
+  const s = new SmtpSession(o);
+  await s.connect();
+  try {
+    await s.handshake();
+    if (!s.encrypted && s.caps.starttls) await s._starttls();
+    let authUsed = '';
+    if (o.user) {
+      authUsed = s.caps.auth.indexOf('PLAIN') >= 0 ? 'PLAIN' : 'LOGIN';
+      await s.auth();
+    }
+    return await fn(s, authUsed);
+  } finally {
+    await s.quit().catch(() => {});
+  }
 }
 
 /**
@@ -477,21 +515,37 @@ async function sendMail(opts) {
   const o = normalizeOptions(opts);
   const problem = validateForSend(o);
   if (problem) throw configError(problem);
-  const s = new SmtpSession(o);
-  await s.connect();
-  try {
-    await s.handshake();
-    if (!s.encrypted && s.caps.starttls) await s._starttls();
-    let authUsed = '';
-    if (o.user) {
-      authUsed = s.caps.auth.indexOf('PLAIN') >= 0 ? 'PLAIN' : 'LOGIN';
-      await s.auth();
-    }
+  return withSession(o, async (s, authUsed) => {
     await s.send(buildMessage(o));
     return { ok: true, encrypted: s.encrypted, authUsed };
-  } finally {
-    await s.quit().catch(() => {});
-  }
+  });
 }
 
-module.exports = { sendMail, DEFAULT_TIMEOUT_MS, CODE, buildMessage, dotStuff, encodedWord };
+/**
+ * **发信前置探针**：只验证「连得上 + 握得了手 + 认得了证」，**不投递任何邮件**。
+ *
+ * ## 为什么需要它
+ *
+ * 系统自动发信（验证码 / 重置密码）失败时，`/auth/forgot` 只能**静默**处理
+ * （响应恒真，否则响应差异本身就是一条账户存在性 oracle）。代价是
+ * 「SMTP 配置看着全对，可一封邮件也收不到」时用户拿不到任何线索 ——
+ * 实测过两次这种工单。本函数把失败里**与标识无关的那一部分**
+ * （主机 / 端口 / 加密方式 / 登录口令 → 连不上、STARTTLS 未宣告、认证被拒、
+ * 地址或口令组合不合法）提前暴露出来，供调用方如实回 503。
+ *
+ * ⚠️ 它**不校验收件人**（探针不发信），其余判据与 `sendMail()` 逐字共用
+ * （`validateForSend(o, { requireTo: false })`）—— 否则会出现「探针说健康、
+ * 真发却判 400」的新一重静默失败。
+ */
+async function verify(opts) {
+  const o = normalizeOptions(opts);
+  const problem = validateForSend(o, { requireTo: false });
+  if (problem) throw configError(problem);
+  return withSession(o, async (s, authUsed) => (
+    { ok: true, encrypted: s.encrypted, authUsed }
+  ));
+}
+
+module.exports = {
+  sendMail, verify, DEFAULT_TIMEOUT_MS, CODE, buildMessage, dotStuff, encodedWord,
+};

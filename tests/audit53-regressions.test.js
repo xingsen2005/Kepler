@@ -302,6 +302,18 @@ function startMock(o) {
   const server = net.createServer((sock) => {
     let buf = '';
     let upgrading = false;
+    /**
+     * ⭐ 「本连接是否已升级」必须**按连接**记，不能共用 `rec.upgraded`。
+     *
+     * 「明文阶段只宣告 STARTTLS、升级后才给出 AUTH」是**每条连接各自**的事；
+     * 而 `rec.upgraded` 是整台假服务器的观察位（跨连接累积，见文件末尾的断言）。
+     * 两者共用会造出一种极隐蔽的假红：R57 起 `/auth/forgot` 先跑一次健康探针
+     * （第一条连接）、随后真发信才是第二条连接 —— 第二条一上来就看到
+     * `rec.upgraded === true`，于是**既不宣告 STARTTLS 又不给出 AUTH**，
+     * 客户端按「未加密的连接绝不发送口令」拒绝，真发信被路由静默吞掉，
+     * 用例报「没收到 RCPT TO」。真实服务器不会这样。
+     */
+    let upgradedConn = false;
     /** AUTH LOGIN 的三次握手进度：'' = 未开始 / 'user' = 等用户名 / 'pass' = 等口令 */
     let loginStage = '';
     /** 当前应当往哪个套接字写（升级前 = 明文，升级后 = TLS） */
@@ -328,8 +340,8 @@ function startMock(o) {
         if (opt.ehlo === null) return '502 Command not implemented\r\n';
         const caps = opt.ehlo.slice();
         // 与真实服务器一致：明文阶段只宣告 STARTTLS，升级后才给出登录方式
-        if (opt.starttls && !rec.upgraded) caps.push('STARTTLS');
-        if (opt.auth && (!opt.starttls || rec.upgraded)) caps.push(`AUTH ${opt.auth}`);
+        if (opt.starttls && !upgradedConn) caps.push('STARTTLS');
+        if (opt.auth && (!opt.starttls || upgradedConn)) caps.push(`AUTH ${opt.auth}`);
         return caps.map((c, idx) => (idx === caps.length - 1 ? `250 ${c}` : `250-${c}`)).join('\r\n') + '\r\n';
       }
       if (up.startsWith('HELO')) return '250 mock\r\n';
@@ -357,6 +369,7 @@ function startMock(o) {
       t.setEncoding('utf8');
       t.on('data', (chunk) => { drain(chunk); });
       out = t;
+      upgradedConn = true;
       rec.upgraded = true;
     }
 
@@ -1004,7 +1017,18 @@ test('R53-11 · 开关：停用不影响管理员手点的「发送测试邮件�
   }
 });
 
-test('R53-11 · 开关：停用时匿名「忘记密码」仍恒真 200，且一封都不发（不留 oracle）', async () => {
+/**
+ * ⚠️ R57 改写：本条原先是「停用时匿名『忘记密码』**仍恒真 200**，且一封都不发」。
+ *
+ * 那条口径把**站点级状态**与**标识级差异**混为一谈了。「停用」对任何标识都是同一个
+ * 答案（问谁都回「系统发信已停用」），如实回**不会**泄露出「这个用户名是否存在」；
+ * 而 200 的代价是用户收到一句「验证码已发送」然后永远等不到信 —— 实测工单两条，
+ * 都表现为「SMTP 配置全对，就是收不到邮件」。
+ *
+ * 因此本条改测**真正该守的性质**：站点级失败可以如实回，但**任意标识拿到的响应
+ * 必须逐字节相同**（那才是防枚举的判据），且停用后连一次连接都不该发起。
+ */
+test('R53-11 · 开关：停用后匿名「忘记密码」如实 503，且**对任意标识逐字节相同**（不泄露账户是否存在）', async () => {
   const mock = await startMock({ ehlo: ['mock'], auth: 'PLAIN LOGIN', starttls: true });
   await configStore.addUser({
     username: 'r53-disabled', password: 'Unit!2026abc', role: 'user', email: 'target2@example.com',
@@ -1019,19 +1043,23 @@ test('R53-11 · 开关：停用时匿名「忘记密码」仍恒真 200，且一
   const srv = http.createServer(app);
   await new Promise((r) => srv.listen(0, '127.0.0.1', r));
   try {
-    // 两个不同 IP 各发一次（限流是按 IP 的），一个命中真实账户、一个不命中
+    // 三个不同的 IP（限流是按 IP 的）分别覆盖「命中真实账户 / 完全不存在的标识 / 空标识」
     const hit = await request(srv.address().port, 'POST', '/api/auth/forgot', {
       headers: { 'X-Forwarded-For': '10.55.2.1' }, body: { identifier: 'r53-disabled' },
     });
     const miss = await request(srv.address().port, 'POST', '/api/auth/forgot', {
       headers: { 'X-Forwarded-For': '10.55.2.2' }, body: { identifier: 'r53-no-such-user' },
     });
-    assertEqual(hit.status, 200, `停用不是错误，响应仍须恒真 200，实际 ${hit.status}：${hit.raw}`);
-    assertEqual(hit.status, miss.status, '命中与未命中的状态码必须一致');
-    assertEqual(JSON.stringify(hit.json), JSON.stringify(miss.json),
-      '命中与未命中的响应体必须逐字节相同 —— 否则「停用」这个状态本身就成了一条账户存在性 oracle');
+    const empty = await request(srv.address().port, 'POST', '/api/auth/forgot', {
+      headers: { 'X-Forwarded-For': '10.55.2.3' }, body: { identifier: '' },
+    });
+    assertEqual(hit.status, 503,
+      `「停用」是站点级状态，应如实告知（与标识是否命中无关），实际 ${hit.status}：${hit.raw}`);
+    assertMatch(hit.json.error, /停用/, '提示必须写明「已停用」，不能与「尚未配置」混为一谈');
+    assertEqual(hit.raw, miss.raw, '命中与未命中的响应体必须逐字节相同 —— 否则就是一条账户存在性 oracle');
+    assertEqual(hit.raw, empty.raw, '空标识同理：站点级状态不随标识而变');
     assertEqual(mock.rec.lines.length, 0,
-      '停用后不得有任何发信连接（发信失败也只记日志、响应一字不变）');
+      '停用后不得有任何发信连接 —— 闸门必须先于探针（否则探针会替"停用"先连一次）');
   } finally {
     if (typeof srv.closeAllConnections === 'function') srv.closeAllConnections();
     srv.close();
@@ -1064,6 +1092,150 @@ test('R53-11 · 开关：停用时需登录的「发送邮箱验证码」如实�
       `需登录的接口应如实告知「发信已停用」（用户提交的是自己的新地址，不存在 oracle 顾虑），实际 ${r.status}：${r.raw}`);
     assertMatch(JSON.stringify(r.json), /停用/, '错误里必须写清是「已停用」而不是「未配置」');
     assertEqual(mock.rec.lines.length, 0, '停用后不得发起任何发信连接');
+  } finally {
+    if (typeof srv.closeAllConnections === 'function') srv.closeAllConnections();
+    srv.close();
+    mock.close();
+  }
+});
+
+/* ================================================================== *
+ * ⑪ R57 站点级健康探针：把「配置全对却发不出去」从静默失败变成可执行的提示
+ * ================================================================== */
+
+/**
+ * ⑪ 层为什么必要（两份真实工单）
+ *
+ *  工单一：系统邮件走的是「对外视图」取配置 ⇒ 口令被裁成 `hasPassword` ⇒ 一封也发不出去，
+ *         而管理员手点的测试邮件走内部读、照样成功（R55 的 `R53-10a` 已钉）。
+ *  工单二：启用开关没打开 —— 测试邮件**不受**开关限制，照样成功；系统邮件全部静默丢掉，
+ *         用户看到的只有一句「验证码已发送」。
+ *
+ * 两次的表象都是「用户名 / 密码 / 服务器 / 端口全对，就是收不到邮件」。
+ * 根因不在某一处配置，而在**失败被刻意静默**（`/auth/forgot` 恒真是防枚举的必要设计）。
+ * 修法不是把它改成如实报错（那会开出一条账户存在性 oracle），而是把失败里
+ * **与标识无关的那一部分**提前探出来：连不上 / STARTTLS 未宣告 / 认证被拒 / 口令缺失。
+ */
+test('R57-01 · 探针：真的连了一次 SMTP 服务器并完成登录，且**不投递**任何邮件', async () => {
+  const mock = await startMock({ ehlo: ['mock'], auth: 'PLAIN LOGIN', starttls: true });
+  try {
+    configStore.saveSmtp({
+      enabled: true, host: '127.0.0.1', port: mock.port, secure: false,
+      user: 'u@x.com', password: 'SECRET-PW', from: 'a@b.com', fromName: '',
+    });
+    const r = await withPsk(() => emailCode.probeMailer());
+    assertEqual(r.ok, true, `健康配置的探针必须通过，实际：${JSON.stringify(r)}`);
+    assertEqual(mock.rec.authSeen, 'PLAIN:\u0000u@x.com\u0000SECRET-PW',
+      '探针必须真的走完登录 —— 只连上不认证的话，它证明不了「那份口令还能用」'
+      + '（口令过期 / 被服务商要求用授权码，正是最常见的发信失败原因）');
+    // 不投递：没有信封、没有正文 —— 探针不能顺手发一封信给任何人
+    for (const verb of ['MAIL FROM', 'RCPT TO', 'DATA']) {
+      assert(!mock.rec.lines.some((l) => l === verb || l.startsWith(verb + ':') || l.startsWith(verb + ' ')),
+        `探针不得进入投递阶段（不得发出 ${verb}）—— 它只验链路`);
+    }
+  } finally {
+    mock.close();
+  }
+});
+
+test('R57-02 · 探针：认证被拒 / 连不上 / 未配置 / 已停用 四种失败都给出可执行的提示', async () => {
+  // ① 认证被拒（服务商改了授权码 / 口令里是登录密码而非授权码）—— 最常见的真故障
+  const bad = await startMock({ ehlo: ['mock'], auth: 'PLAIN LOGIN', starttls: true, authFail: true });
+  try {
+    configStore.saveSmtp({
+      enabled: true, host: '127.0.0.1', port: bad.port, secure: false,
+      user: 'u@x.com', password: 'WRONG-PW', from: 'a@b.com', fromName: '',
+    });
+    const r = await withPsk(() => emailCode.probeMailer());
+    assertEqual(r.ok, false, '认证被拒时必须判失败（否则又会回到「显示已发送、信永远不来」）');
+    assertEqual(r.status, 503, '配置类失败应是 503，而不是网络超时那种不确定状态');
+    assertMatch(r.error, /系统发信当前不可用/, '必须开门见山说明"现在发不出去"');
+    assertMatch(r.error, /登录（AUTH PLAIN）/, '必须说清是哪一步被拒 —— 否则管理员只能靠猜');
+    assertMatch(r.error, /535/, '要把服务端的原话带出来（它常直接写着"请使用授权码"这类真正的原因）');
+  } finally {
+    bad.close();
+  }
+
+  // ② 连不上：把主机指向一个**刚关闭**的端口（回环上立刻 ECONNREFUSED，不必等超时）
+  const closed = net.createServer();
+  await new Promise((r) => closed.listen(0, '127.0.0.1', r));
+  const deadPort = closed.address().port;
+  await new Promise((r) => closed.close(r));
+  configStore.saveSmtp({
+    enabled: true, host: '127.0.0.1', port: deadPort, secure: false,
+    user: 'u@x.com', password: 'SECRET-PW', from: 'a@b.com', fromName: '',
+  });
+  const c = await emailCode.probeMailer();
+  assertEqual(c.ok, false, '端口无人监听时必须判失败');
+  assertEqual(c.status, 503);
+  assertMatch(c.error, /连接 SMTP 服务器/, '错误里要说清连的是哪个主机端口 —— 这才是能照着改的信息');
+
+  // ③ 未配置与 ④ 已停用：两条闸门各自给出**不同**的文案（混成一句会让管理员去重填一份本来就对的配置）
+  configStore.save({ smtp: {} });
+  const n = await emailCode.probeMailer();
+  assertMatch(n.error, /尚未配置发信/, '未配置要指向「系统设置 → 发信设置」');
+
+  const mock = await startMock({ ehlo: ['mock'], auth: 'PLAIN LOGIN', starttls: true });
+  try {
+    configStore.saveSmtp({
+      enabled: false, host: '127.0.0.1', port: mock.port, secure: false,
+      user: 'u@x.com', password: 'SECRET-PW', from: 'a@b.com', fromName: '',
+    });
+    const d = await emailCode.probeMailer();
+    assertMatch(d.error, /停用/, '停用要写「已停用」，与「尚未配置」严格分开');
+    assertEqual(mock.rec.lines.length, 0, '停用判在探针之前 ⇒ 一个字节都不该发出去');
+  } finally {
+    mock.close();
+  }
+});
+
+test('R57-03 · 闸门顺序：站点级探针必须在**读取标识之前**执行（否则响应又随标识而变）', () => {
+  const src = fs.readFileSync(SERVER('routes', 'auth.js'), 'utf8');
+  const from = src.indexOf("router.post('/auth/forgot'");
+  const to = src.indexOf("router.post('/auth/reset'");
+  assert(from > 0 && to > from, '自证：应当能取到 /auth/forgot 的实现段');
+  const body = src.slice(from, to);
+
+  const iGate = body.indexOf('await emailCode.probeMailer()');
+  const iFind = body.indexOf('configStore.findUserByIdentifier(');
+  assert(iGate > 0, '/auth/forgot 必须调站点级探针');
+  assert(iFind > 0, '自证：该段里应当有按标识查用户的调用');
+  /**
+   * ⚠️ 这条顺序**就是判据本身**，不是风格问题：把探针挪进 `if (raw && email)` 里
+   * （"只有真要发信时才探"）会让响应随标识而变 —— 命中且发不出去 ⇒ 503，
+   * 未命中 ⇒ 200，这条匿名端点立刻变回一条账户存在性 oracle。
+   */
+  assert(iGate < iFind,
+    '探针必须先于标识查找 —— 它回答的是站点级状态，不能沾上标识');
+});
+
+test('R57-04 · 端到端：配置齐全但服务器认证被拒时，匿名「忘记密码」如实 503（不再回「已发送」）', async () => {
+  const mock = await startMock({ ehlo: ['mock'], auth: 'PLAIN LOGIN', starttls: true, authFail: true });
+  await configStore.addUser({
+    username: 'r57-authfail', password: 'Unit!2026abc', role: 'user', email: 'r57@example.com',
+  });
+  configStore.saveSmtp({
+    enabled: true, host: '127.0.0.1', port: mock.port, secure: false,
+    user: 'u@x.com', password: 'WRONG-PW', from: 'a@b.com', fromName: '',
+  });
+  const app = express();
+  app.use(express.json());
+  app.use('/api', require(SERVER('routes', 'auth.js')));
+  const srv = http.createServer(app);
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  try {
+    const hit = await withPsk(() => request(srv.address().port, 'POST', '/api/auth/forgot', {
+      headers: { 'X-Forwarded-For': '10.57.1.1' }, body: { identifier: 'r57-authfail' },
+    }));
+    const miss = await withPsk(() => request(srv.address().port, 'POST', '/api/auth/forgot', {
+      headers: { 'X-Forwarded-For': '10.57.1.2' }, body: { identifier: 'r57-nobody' },
+    }));
+    assertEqual(hit.status, 503,
+      `认证被拒时不能再回「已发送」—— 那正是用户"配置全对却收不到信"的来源，实际 ${hit.status}：${hit.raw}`);
+    assertEqual(hit.raw, miss.raw,
+      '站点级失败对命中与未命中必须逐字节相同（防枚举的判据落在这里，而不是"一律 200"）');
+    assert(!mock.rec.lines.some((l) => l.startsWith('MAIL FROM')),
+      '认证都没过，不该有任何投递动作');
   } finally {
     if (typeof srv.closeAllConnections === 'function') srv.closeAllConnections();
     srv.close();
