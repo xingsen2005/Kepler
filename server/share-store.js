@@ -1,0 +1,712 @@
+/**
+ * 分享链接存储 —— data/links.json（明文 JSON，不含密钥）
+ *
+ * 每条链接：
+ *  {
+ *    id, key, bucket, region,          // 目标对象与所属桶（创建时快照）
+ *    fileName, size,                   // 展示用元数据（创建时快照）
+ *    items,                            // R51：多文件 / 文件夹分享的条目快照（见下）
+ *    createdAt,
+ *    createdBy,                        // 创建者用户名（用于按角色隔离列表；历史数据为空）
+ *    expiresAt,                        // ISO 时间；null = 永久有效
+ *    maxDownloads,                     // 最大下载次数；0 = 不限制
+ *    downloads, lastDownloadAt,        // 已下载次数 / 最近下载时间
+ *    passwordSalt, passwordHash,       // scrypt 哈希；无则未启用密码
+ *    missingAt,                        // ISO 时间；非空 = 云端对象已不存在（见下方「对象缺失标记」）
+ *    paid: { required, amountFen, currency },  // 付费下载配置（分享者意图，永远原样保留）
+ *    speedLimit,                       // R37：下载限速（字节/秒；0 = 不限）。见下方「下载限速」
+ *  }
+ *
+ * ⚠️ `paid` 只表达**分享者的意图**，不代表当前一定收费。是否真的收费由
+ * `server/payment-rules.js` 的 `resolvePaidState()` 在读取时计算 ——
+ * 停用支付功能后链接自动转免费，重新启用又自然恢复，全程不需要改动本文件的数据。
+ *
+ * ⚠️ R37：「文件分享」与「链接管理」是**同一条记录上的同一个字段**（不是两份配置）——
+ * 分享方在创建时填的限速，与链接管理列表里改的限速，读写的是同一个 `speedLimit`。
+ * 这也是需求里「两者之间可随意修改」的落地方式。它与其它层的关系（取最小值、
+ * 上层能否被下层放宽）由 `server/throttle.js` 的 `resolveLimit()` 单独判定，
+ * 本文件只负责**存**这个值。
+ *
+ * ## R51：`items` —— 多文件 / 文件夹分享的条目快照
+ *
+ * `items: [{ key, size, dir }]`，**创建时冻结**（不是每次访问现列）：
+ *
+ *  · 冻结而非现列：分享页要分页展示、要在下载时校验「你勾的这个 key 是否属于这条
+ *    分享」。若每次现列，则 ① 每次访问都要打云端（`/s/:id` 是匿名可达的公开页面，
+ *    等于给任何人一个免费的列举接口）；② 校验时列举会与展示时不一致，
+ *    用户勾上的东西在下载那一刻"不属于这条分享"；③ 分享者后续往文件夹里丢文件，
+ *    已经发出去的链接内容会**悄悄变大**。
+ *  · 上限 {@link SNAPSHOT_MAX}：`items` 是列表页每次都要遍历的数据，也是
+ *    `links.json` 的体积来源。超限时**截断并如实告知**（不静默截断）。
+ *  · **历史链接（R51 之前）没有 `items`**，`view()` 会用 `key` / `size` 合成一条，
+ *    因此所有下游都只有一条代码路径，不必到处判「有没有 items」。
+ */
+
+/** 一条分享最多快照多少个条目（含文件夹行）。超过即截断并如实告知。 */
+const SNAPSHOT_MAX = 2000;
+
+const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
+const configStore = require('./config-store');
+const secureStore = require('./secure-store');
+// R37：限速值的唯一判据在 limits.js（无 require 的叶子模块）——
+// share-store 与 config-store 都要用它写盘，而 throttle.js 反过来要 require 两者。
+const { normalizeSpeedLimit } = require('./limits');
+
+// 数据目录：走 data-dir.js 的唯一实现点（`S3_DATA_DIR`）—— 与 payment-orders /
+// enc-store / stats-store / upload-sessions 一致的测试隔离开关
+// （此前缺失，用例只能写真实 data/links.json）
+const DATA_DIR = require('./data-dir').dataDir();
+const FILE = path.join(DATA_DIR, 'links.json');
+
+let cache = null;
+
+function ensureDataDir() {
+  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+}
+
+function load() {
+  if (cache) return cache;
+  try {
+    // S4：加密存储（兼容历史明文文件）
+    const raw = secureStore.readJson(FILE, null);
+    if (raw && Array.isArray(raw.links)) {
+      cache = raw;
+      return cache;
+    }
+  } catch (e) {
+    // SEC-09：损坏时不静默重建 —— 打出告警；secure-store 已锁定该文件写入，
+    // 磁盘上的损坏文件（及其 .corrupt-* 备份）不会被空表覆盖。
+    console.error('[share-store] 分享链接文件损坏，已降级为空列表并锁定写入：', e.message);
+  }
+  cache = { links: [] };
+  return cache;
+}
+
+function persist() {
+  ensureDataDir();
+  // N5：异步串行写入（secure-store 内部按文件维度排队 + 原子写），
+  // 优雅关闭时由 index.js 的 secureStore.flush() 兜底不丢数据
+  secureStore.writeJsonAsync(FILE, cache);
+}
+
+/**
+ * 分享链接 ID：16 字节 base64url（22 字符，128 位熵）—— 与 config-store.newId 的熵要求
+ * 保持一致（此前为 9 字节/72 位）。链接 ID 会出现在公开 URL 中，故不能过短；
+ * 历史 8/12 字符 ID 仍可正常访问（不做强制迁移）。
+ */
+function newId() {
+  return crypto.randomBytes(16).toString('base64url');
+}
+
+/**
+ * 口令哈希（SEC-05：异步）。
+ * 分享密码是**攻击者可达的校验入口**（`/s/:id` 输入密码即触发），
+ * 旧版 scryptSync 会被用来阻塞事件循环，故一律走异步 scrypt。
+ */
+function hashPassword(pw, salt) {
+  return new Promise((resolve, reject) => {
+    crypto.scrypt(String(pw), Buffer.from(salt, 'hex'), 32, (err, key) => {
+      if (err) reject(err); else resolve(key.toString('hex'));
+    });
+  });
+}
+
+/* ------------------------- 视图 / 状态 ------------------------- */
+
+/**
+ * 条目归一化 —— **`items` 的唯一读取点**。
+ *
+ * 历史链接（R51 之前）只有单个对象（`key` / `size`），这里为它合成一条，于是
+ * 下游（分享页列表、下载选择、链接管理）都只有一条代码路径，不必各自判
+ * 「这条链接有没有 items」。空 key 的条目一律丢弃（防御性：磁盘上的脏数据不该
+ * 变成列表里的一个空行，也不该成为一个可被勾选的下载目标）。
+ *
+ * @returns {Array<{key: string, size: number, dir: boolean}>}
+ */
+function itemList(l) {
+  if (!l) return [];
+  if (Array.isArray(l.items) && l.items.length) {
+    const out = [];
+    for (const it of l.items) {
+      const key = String((it && it.key) || '');
+      if (!key) continue;
+      out.push({ key, size: Number(it && it.size) || 0, dir: Boolean(it && it.dir) });
+    }
+    if (out.length) return out;
+  }
+  if (l.key) return [{ key: String(l.key), size: Number(l.size) || 0, dir: String(l.key).endsWith('/') }];
+  return [];
+}
+
+/** 条目自身的显示名（相对路径的最后一段；目录去掉结尾斜杠） */
+function itemName(key) {
+  const s = String(key || '').replace(/\/+$/, '');
+  return s.split('/').pop() || s;
+}
+
+/**
+ * R52-05：条目的**展示路径** —— 抹掉「分享根之上」的祖先目录名。
+ *
+ * ## 要解决什么
+ *
+ * 列表页每行原先直接写**完整对象 key**：分享 `photos/2024/` 时，页面与归档里都是
+ * `photos/2024/a.jpg` —— 把 `photos/` 这一层（用户并**没有**分享的那个上级目录）
+ * 也一并暴露给了所有拿到链接的人。归档更严重：解包出来的目录结构就是
+ * `photos/2024/`，即使只是转发一条链接，对方也能看到分享者的目录组织方式。
+ *
+ * ## 抹到哪一层（判据）
+ *
+ * 取全部条目的**共同祖先目录** `ancestor`（按 `/` 分段求最长公共前缀）：
+ *
+ *  · `ancestor` **本身**就是被选中的一个目录 ⇒ 只抹掉它之上的部分，保留它自己的名字
+ *    （它就是"被分享的那一层"，页面上必须还能看到它）。
+ *    例：`['photos/2024/']` → 显示 `2024/`、`2024/a.jpg`。
+ *  · 否则 `ancestor` 只是这些条目的**共同容器** ⇒ 整段抹掉。
+ *    例：`['photos/a.jpg','photos/b.txt']` → 显示 `a.jpg`、`b.txt`（`photos/` 只是它们所在目录）。
+ *  · 没有共同祖先（跨目录的多选，如 `['photos/a.jpg','music/c.mp3']`）⇒ 原样
+ *    **只能如此**：抹掉任意一段都会让两条路径撞成同一个名字。
+ *  · 顶层条目（`a.txt` / 直接选中的 `dir/`）的共同祖先为空 ⇒ 原样，不变。
+ *
+ * ## 只影响展示，不影响取对象
+ *
+ * 复选框的 `value`、下载校验（`parseSelection`）、加密元数据、`itemList` 的形状
+ * 全部仍用**原始 key** —— 展示名与对象键是两件事，混在一起会让"显示的名字"
+ * 变成能决定从桶里取哪个对象的输入。因此这里只产出一张 `key → 展示名` 的映射。
+ *
+ * @param {Array<{key:string,dir?:boolean}|string>} items 条目快照（对象或裸 key 字符串均可）
+ * @returns {string} 需要抹掉的前缀（不含尾斜杠；空串 = 不抹）
+ */
+function maskPrefix(items) {
+  const list = Array.isArray(items) ? items : [];
+  let common = null;              // 按 `/` 分段的公共前缀
+  const dirSelves = new Set();    // 被显式选中的目录自身的路径（无尾斜杠）
+  for (const it of list) {
+    // 允许裸字符串形式（`normalizeItems` 的入参就长这样）—— 否则传错了形状会**静默不脱敏**，
+    // 那是最不该出错的方向：一个"看着像在工作"的隐私修复。
+    const key = typeof it === 'string' ? it : String((it && it.key) || '');
+    if (!key) continue;
+    // 目录标记以「显式 dir 字段」或「结尾斜杠」任一为准 —— 磁盘上的快照可能只带其一
+    const isDir = typeof it === 'string' ? key.endsWith('/') : (Boolean(it && it.dir) || key.endsWith('/'));
+    const self = key.replace(/\/+$/, '');
+    if (isDir) dirSelves.add(self);
+    const parts = self.split('/');
+    if (common === null) { common = parts; continue; }
+    let n = 0;
+    while (n < common.length && n < parts.length && common[n] === parts[n]) n += 1;
+    common = common.slice(0, n);
+    if (!common.length) return ''; // 已经没有公共祖先，再算下去也不会变
+  }
+  if (!common || !common.length) return '';
+  const ancestor = common.join('/');
+  // 共同祖先就是被选中的那个目录 → 只抹掉它之上的部分（保留它自己的名字）
+  if (dirSelves.has(ancestor)) return common.slice(0, -1).join('/');
+  return ancestor;
+}
+
+/**
+ * 把条目 key 按 {@link maskPrefix} 给出的前缀抹成展示名。
+ *
+ * ⚠️ 只在 key **确实位于该前缀之下**时才抹：否则 `['photos'(文件), 'photos/a.txt']`
+ * 这种情形会把那个**恰好与祖先同名的文件**抹成一个空名字（整行只剩图标与大小）。
+ * 抹不动就原样返回 —— 展示名宁可多露一层，也不能变成空行。
+ */
+function maskedPath(key, cut) {
+  const k = String(key || '');
+  const c = String(cut || '');
+  if (!c || !k.startsWith(c + '/')) return k;
+  return k.slice(c.length + 1);
+}
+
+/**
+ * 条目 key → 展示路径 的映射（`maskPrefix` + `maskedPath` 的**唯一调用点**）。
+ *
+ * 列表行的显示名与打包归档内的条目名必须同源 —— 两处各算一遍，迟早会出现
+ * "页面上看不到 `photos/`、下下来却有"这种一半脱敏的状态。
+ *
+ * @param {Array<{key:string,dir?:boolean}|string>} items
+ * @returns {Map<string,string>} key（原样，含尾斜杠）→ 展示名
+ */
+function itemPaths(items) {
+  const list = Array.isArray(items) ? items : [];
+  const cut = maskPrefix(list);
+  const map = new Map();
+  for (const it of list) {
+    const key = typeof it === 'string' ? it : String((it && it.key) || '');
+    if (!key) continue;
+    map.set(key, maskedPath(key, cut));
+  }
+  return map;
+}
+
+/**
+ * 安全的条目视图（原样返回 key，供分享页拼相对路径与下载校验用）
+ *
+ * ⚠️ 这里返回的是**原始 key**，不是展示名 —— 需要展示名请用 {@link itemPaths}。
+ */
+function viewItems(l) {
+  return itemList(l).map((it) => ({
+    key: it.key,
+    name: itemName(it.key),
+    size: it.size,
+    dir: it.dir,
+  }));
+}
+
+function itemStats(items) {
+  let totalSize = 0;
+  let dirCount = 0;
+  for (const it of items) {
+    if (it.dir) dirCount += 1;
+    else totalSize += Number(it.size) || 0;
+  }
+  return { itemCount: items.length, dirCount, totalSize };
+}
+
+/**
+ * 安全视图：不含密码哈希。
+ *
+ * @param {object} l 原始记录
+ * @param {object} [opts] `{ items: true }` 时**附带**完整条目数组。
+ *   ⚠️ 默认不带：`listFor()` 会把全部链接一次性返回给链接管理页，
+ *   若每条都捎上最多 2000 个条目，一次请求就是几 MB JSON；而链接管理页只需要
+ *   「几个项目」这个数字（`itemCount`），不需要知道都有哪些。
+ *   只有分享页（要渲染列表）与下载端点（要校验勾选）明确要 `items: true`。
+ */
+function view(l, opts = {}) {
+  const items = itemList(l);
+  const st = itemStats(items);
+  const v = {
+    id: l.id,
+    key: l.key,
+    bucket: l.bucket,
+    region: l.region,
+    fileName: l.fileName || (items[0] ? itemName(items[0].key) : ''),
+    size: Number(l.size) || 0,
+    createdAt: l.createdAt,
+    createdBy: l.createdBy || '',
+    expiresAt: l.expiresAt || null,
+    maxDownloads: Number(l.maxDownloads) || 0,
+    downloads: Number(l.downloads) || 0,
+    lastDownloadAt: l.lastDownloadAt || null,
+    hasPassword: Boolean(l.passwordHash),
+    missingAt: l.missingAt || null,
+    missing: Boolean(l.missingAt),
+    paid: {
+      required: Boolean(l.paid && l.paid.required),
+      amountFen: Number(l.paid && l.paid.amountFen) || 0,
+      currency: (l.paid && l.paid.currency) || 'CNY',
+    },
+    // R37：链接级下载限速（0 = 不限）。历史记录无此字段 → 归一化为 0，等价于旧行为
+    speedLimit: normalizeSpeedLimit(l.speedLimit),
+    // R51：多条目相关的派生字段
+    itemCount: st.itemCount,
+    dirCount: st.dirCount,
+    totalSize: st.totalSize,
+    /**
+     * R51：是否以**列表**形式呈现（并采用「勾选 + 打包」语义）。
+     *   · 单个普通文件 → false ⇒ 保持 R50 之前的单文件页（图标 + 大小 + 一个下载按钮）
+     *   · 多条目，或唯一一条是文件夹 → true ⇒ 列表页（分页 + 勾选 + 打包下载）
+     * 判据放在服务端，因为「要不要列表」不是纯展示选择：它决定了下载端点是
+     * 单文件直传还是打包，两边必须同一个判据（否则会出现"页面是列表、下载却
+     * 只认第一个文件"这种半吊子状态）。
+     */
+    listView: st.itemCount > 1 || (st.itemCount === 1 && items[0].dir),
+  };
+  if (opts.items) v.items = items.map((it) => ({ key: it.key, size: it.size, dir: it.dir }));
+  return v;
+}
+
+/**
+ * 链接状态：deleted | expired | exhausted | active
+ *
+ * 「文件已删除」排在最前：对象没了是最根本的事实，也是管理员最需要知道的 ——
+ * 否则管理页只显示「有效」，管理员会去改有效期/次数，改完照样下不了。
+ */
+function status(l, now = Date.now()) {
+  if (l.missingAt) return 'deleted';
+  if (l.expiresAt && new Date(l.expiresAt).getTime() <= now) return 'expired';
+  if (Number(l.maxDownloads) > 0 && Number(l.downloads) >= Number(l.maxDownloads)) return 'exhausted';
+  return 'active';
+}
+
+function list() {
+  return load().links.map(view);
+}
+
+/**
+ * 按创建者过滤列表：
+ * - 管理员：全部链接
+ * - 普通用户：仅自己创建的链接（历史无 createdBy 的链接对普通用户不可见）
+ */
+function listFor(role, username) {
+  const all = load().links.map(view);
+  if (role === 'admin') return all;
+  return all.filter((l) => l.createdBy && l.createdBy === username);
+}
+
+/** 判断某用户是否有权操作指定链接（管理员任意；普通用户仅限自己创建的） */
+function canManage(link, role, username) {
+  if (!link) return false;
+  if (role === 'admin') return true;
+  return Boolean(link.createdBy) && link.createdBy === username;
+}
+
+function get(id) {
+  return load().links.find((l) => l.id === id) || null;
+}
+
+/* ------------------------- 增删改 ------------------------- */
+
+/**
+ * 规范化并**截断**条目快照（唯一实现点）。
+ *
+ * 上限 {@link SNAPSHOT_MAX} 是硬约束：`items` 会进 `links.json`、会随每次分享页
+ * 请求被遍历，没有上限就等于让一次"分享一个十万文件的目录"把元数据文件写爆。
+ * 截断发生在**这里**而不是路由层，保证任何调用方都拿不到超限的快照。
+ *
+ * @param {Array<string|{key,size,dir}>} raw
+ * @returns {Array<{key,size,dir}>}
+ */
+function normalizeItems(raw) {
+  const list = Array.isArray(raw) ? raw : [];
+  const out = [];
+  for (const it of list) {
+    if (out.length >= SNAPSHOT_MAX) break;
+    const key = typeof it === 'string' ? it : String((it && it.key) || '');
+    if (!key) continue;
+    const dir = typeof it === 'string' ? key.endsWith('/') : Boolean(it.dir);
+    out.push({ key, size: dir ? 0 : Number(it && it.size) || 0, dir });
+  }
+  return out;
+}
+
+/**
+ * 展示名（列表页标题、链接管理、支付订单标题共用一份）。
+ * 多条目时写成「首项名 等 N 项」—— 支付订单标题、审计日志都靠它认出"分享的是什么"。
+ */
+function displayName(items, fallback) {
+  if (!items.length) return fallback || 'file';
+  if (items.length === 1) return itemName(items[0].key) || fallback || 'file';
+  return `${itemName(items[0].key)} 等 ${items.length} 项`;
+}
+
+/**
+ * 规范化付费配置（防御性：路由层已做过带错误提示的校验，这里只保证落盘数据合法）
+ * @returns {{required: boolean, amountFen: number, currency: string}}
+ */
+function normalizePaid(paid) {
+  if (!paid || typeof paid !== 'object') return { required: false, amountFen: 0, currency: 'CNY' };
+  const required = Boolean(paid.required);
+  const fen = Number(paid.amountFen);
+  const amountFen = Number.isInteger(fen) && fen > 0 ? fen : 0;
+  // 要求付费却没有合法金额 → 视为未启用（宁可免费，也不要出现"必须付 0 元"的怪状态）
+  return { required: required && amountFen > 0, amountFen, currency: 'CNY' };
+}
+
+/**
+ * @param {object} o
+ *  - items: R51 的条目快照（多文件 / 文件夹分享）。**传了就以它为准**：
+ *    单一普通文件时按旧形态落盘（`key` / `fileName` / `size`，不写 `items`），
+ *    与 R51 之前的记录逐字段一致 —— 这样历史数据的读路径与新建数据的读路径
+ *    仍然是同一条，不会因为我加了新字段而分叉出两种记录形状。
+ */
+async function create({ key, bucket, region, fileName, size, items, expiresHours, maxDownloads, password, createdBy, paid, speedLimit }) {
+  const links = load().links;
+  const snap = normalizeItems(items);
+  const singleFile = snap.length === 1 && !snap[0].dir;
+  const st = itemStats(snap);
+  const l = {
+    id: newId(),
+    key: snap.length ? (singleFile ? snap[0].key : (key || snap[0].key)) : key,
+    bucket,
+    region,
+    fileName: snap.length ? displayName(snap) : (fileName || String(key).split('/').pop() || 'file'),
+    size: snap.length ? st.totalSize : Number(size) || 0,
+    createdAt: new Date().toISOString(),
+    createdBy: createdBy || '',
+    expiresAt: expiresHours ? new Date(Date.now() + expiresHours * 3600 * 1000).toISOString() : null,
+    maxDownloads: Number(maxDownloads) || 0,
+    downloads: 0,
+    lastDownloadAt: null,
+    paid: normalizePaid(paid),
+    speedLimit: normalizeSpeedLimit(speedLimit), // R37：链接级下载限速（0 = 不限）
+  };
+  // 单一普通文件不写 items（与旧记录同形）；多条目与文件夹才写快照
+  if (snap.length && !singleFile) l.items = snap;
+  if (password) {
+    const salt = crypto.randomBytes(16).toString('hex');
+    l.passwordSalt = salt;
+    l.passwordHash = await hashPassword(password, salt);
+  }
+  links.unshift(l);
+  persist();
+  return view(l);
+}
+
+async function update(id, patch) {
+  const l = get(id);
+  if (!l) return null;
+  if (patch.expiresHours !== undefined) {
+    const h = patch.expiresHours;
+    l.expiresAt = h ? new Date(Date.now() + h * 3600 * 1000).toISOString() : null;
+  }
+  if (patch.maxDownloads !== undefined) l.maxDownloads = Number(patch.maxDownloads) || 0;
+  if (patch.password !== undefined) {
+    if (patch.password === null || patch.password === '') {
+      delete l.passwordHash;
+      delete l.passwordSalt;
+    } else {
+      const salt = crypto.randomBytes(16).toString('hex');
+      l.passwordSalt = salt;
+      l.passwordHash = await hashPassword(patch.password, salt);
+    }
+  }
+  if (patch.resetCount) {
+    l.downloads = 0;
+    l.lastDownloadAt = null;
+  }
+  if (patch.paid !== undefined) l.paid = normalizePaid(patch.paid);
+  if (patch.speedLimit !== undefined) l.speedLimit = normalizeSpeedLimit(patch.speedLimit); // R37：未传即保持
+  persist();
+  return view(l);
+}
+
+function remove(id) {
+  const links = load().links;
+  const i = links.findIndex((l) => l.id === id);
+  if (i < 0) return false;
+  links.splice(i, 1);
+  persist();
+  return true;
+}
+
+/**
+ * 删除全部**失效**链接 —— 管理端「删除失效链接」按钮的**唯一实现点**。
+ *
+ * 失效 = `deleted`（文件已删除）或 `expired`（已过期）。
+ *
+ * ⚠️ **刻意不含 `exhausted`（已关闭）**：次数用尽是一个**可逆**状态 ——
+ * 管理员在编辑弹窗里把「可下载次数」调大，链接立刻复活。把它一并删掉，
+ * 等于让「先收紧配额、之后再放开」这个正常运维动作变得不可逆。
+ * 而 `deleted`（云端对象真的没了）与 `expired`（时间已经过了）都无法靠改配置恢复。
+ *
+ * 作用域与 `listFor()` 同一把尺子（`canManage`）：管理员删全部，普通用户只删自己创建的。
+ * 这一点与订单管理不同，必须显式处理 —— 链接管理页**普通用户也能进**，
+ * 若照抄订单那边「反正调用方是管理员」的假设，就会变成普通用户可越权删掉别人的链接。
+ *
+ * 判定复用 `status()`，不另写一份状态规则（前端 `share-status.js` 的 `isDead()` 与它同序）。
+ *
+ * @param {'admin'|string} role 当前用户角色
+ * @param {string} username 当前用户名（管理员可传空）
+ * @param {number} [now] 判定时刻（测试注入用）
+ * @returns {number} 实际删除的条数
+ */
+function removeDead(role, username, now = Date.now()) {
+  const links = load().links;
+  let removed = 0;
+  // 倒序删除：splice 会改变后续下标，从尾部往前走才不会漏项
+  for (let i = links.length - 1; i >= 0; i--) {
+    const l = links[i];
+    const st = status(l, now);
+    if (st !== 'deleted' && st !== 'expired') continue;
+    if (!canManage(l, role, username)) continue;
+    links.splice(i, 1);
+    removed++;
+  }
+  if (removed > 0) persist();
+  return removed;
+}
+
+/* ------------------------- 对象缺失标记 ------------------------- */
+
+/**
+ * 标记「该链接指向的云端对象已不存在」。
+ *
+ * 链接在创建时快照了 key/bucket，云端对象被删掉后链接本身毫发无损 —— 旧行为是：
+ * 分享页照常显示下载按钮（点了才报"文件不存在"），管理页则完全无感知，仍显示「有效」。
+ * 这里把「对象没了」落成链接上的一个字段，让**分享页与管理页共用同一个事实来源**，
+ * 避免两边各判一套、又出现改一半的漏网之鱼。
+ *
+ * @returns {boolean} 是否真的发生了状态变化（未变化就不落盘）
+ */
+function markMissing(id) {
+  const l = get(id);
+  if (!l || l.missingAt) return false;
+  l.missingAt = new Date().toISOString();
+  persist();
+  return true;
+}
+
+/** 取消「已删除」标记（对象被重新上传到同一个 key） */
+function clearMissing(id) {
+  const l = get(id);
+  if (!l || !l.missingAt) return false;
+  delete l.missingAt;
+  persist();
+  return true;
+}
+
+/**
+ * 批量标记：给定 bucket 下**已确认删除**的 key 集合。
+ *
+ * 刻意只接受「云端确认删掉的 key」集合，而不是前缀 —— 删除目录时若被截断，
+ * 按前缀标记会把还活着的对象误判成已删除（与 FUN-04「元数据只按已确认删除的 key 清」
+ * 是同一个约束）。
+ *
+ * R9-07：与 {@link markMissingByBucket} 不同，这里**保留宽松口径**是成立的 ——
+ * 判据是「该 key 在云端被**明确确认**删除」，是一条事实而不是猜测。
+ * 历史链接（无 `bucket` 字段）的 key 确实被删了，标记它是正确的。
+ *
+ * 唯一的风险是「不同桶下同名 key」被误伤：此时 `l.bucket` 非空且与本次删除的
+ * `bucket` 不同 → 下面的条件会跳过它（这是有意的，避免跨桶误判）。
+ * 真正的历史遗留问题（无 bucket + 猜不出桶）见 `markMissingByBucket` 的注释：
+ * 那类链接需要 `bucket` 回填，而不是靠自愈。
+ *
+ * @returns {number} 本次新标记的数量
+ */
+function markMissingByKeys(bucket, keys) {
+  const set = new Set(Array.isArray(keys) ? keys : []);
+  if (!set.size) return 0;
+  const now = new Date().toISOString();
+  let n = 0;
+  for (const l of load().links) {
+    if (l.missingAt || !set.has(l.key)) continue;
+    // 有 bucket 且与本次删除的桶不同 → 跳过（跨桶同名 key 不能误伤）。
+    // 无 bucket 的历史链接：该 key 已被云端明确确认删除，标记是事实 → 不跳过。
+    if (l.bucket && bucket && l.bucket !== bucket) continue;
+    l.missingAt = now;
+    n += 1;
+  }
+  if (n) persist();
+  return n;
+}
+
+/**
+ * 整桶标记：该存储桶已不存在（彻底删桶）→ 指向它的全部链接一律判「文件已删除」。
+ *
+ * R7-03：彻底删桶此前只清了 IP 规则、加密元数据、统计，**唯独不动分享链接**。
+ * 桶都没了，`effectiveForBucket()` 拿不到凭据，分享页的惰性探测会 fail-open，
+ * 于是页面一直显示可下载、点了才报错 —— 比「清空桶」更糟，因为连兜底探测都失效了。
+ *
+ * 这里按**桶**而不是按 key 标记：桶整体消失时，它下面任何 key 都不可能还在，
+ * 不需要（也拿不到）逐个 key 的删除确认。
+ *
+ * R8-24 曾把这里改成「宽松口径」—— 连**没有 `bucket` 字段的历史链接**也一并标记，
+ * 理由是「猜错了的链接会被分享页的惰性探测在 60 秒内判回有效」。R9-07 复核后确认
+ * 这条论证**不成立**，宽松口径是净负，因此改回**严格口径**：
+ *
+ *   `configStore.effectiveForBucket(undefined)` 走的是
+ *   `buckets.find(x => x.bucket === undefined)` —— 永远不命中，返回 `null`。
+ *   而分享页的自愈逻辑（`share-routes.probeObjectMissing`）在 `cfg` 为 null 时
+ *   **刻意不探测、也不改判**（fail-open 只适用于「不确定」，不适用于「连探都没探成」）。
+ *   于是这类链接被标记后**既不打云端、也不会 `clearMissing`**，永久停在 410 ——
+ *   恰好就是注释声称要避免的「永久错误状态」。
+ *
+ * 严格口径（无 bucket 就跳过）下，这类历史链接保持原状态：分享页会照常探测
+ * （`l.bucket` 为 undefined 时 `effectiveForBucket` 同样返回 null → 维持原判），
+ * 至少不会因为一次「彻底删桶」就被误判成永久失效。
+ * 真要对它们生效，正确做法是**回填 `bucket`**（见 `links.json` 的迁移），
+ * 而不是靠一条不成立的自愈论证去猜。
+ *
+ * @returns {number} 本次新标记的数量
+ */
+function markMissingByBucket(bucket) {
+  if (!bucket) return 0;
+  const now = new Date().toISOString();
+  let n = 0;
+  for (const l of load().links) {
+    if (l.missingAt) continue;
+    // R9-07：严格口径 —— 无 bucket 的历史链接**跳过**（理由见函数头注释）。
+    // 注意不能写成 `l.bucket && l.bucket !== bucket`：那正是被否掉的宽松口径。
+    if (l.bucket !== bucket) continue;
+    l.missingAt = now;
+    n += 1;
+  }
+  if (n) persist();
+  return n;
+}
+
+/* ------------------------- 校验 / 计数 ------------------------- */
+
+/** 校验分享密码（SEC-05：async） */
+async function checkPassword(l, pw) {
+  if (!l.passwordHash) return true;
+  try {
+    const h = Buffer.from(await hashPassword(pw, l.passwordSalt), 'hex');
+    const t = Buffer.from(l.passwordHash, 'hex');
+    return h.length === t.length && crypto.timingSafeEqual(h, t);
+  } catch (e) {
+    return false;
+  }
+}
+
+/**
+ * 原子地占用一次下载名额（先计数后传输，保证并发下不超限）
+ * Node 单线程下，tryAcquire / release 的临界区全程为同步 JS 代码（get + 修改 + persist 都是同步），
+ * 不会在执行中途被其他请求切换；故读-改-写天然原子，不会出现 maxDownloads 被突破。
+ * 此注释专门回应 Claude 安全建议 #7。
+ */
+function tryAcquire(id) {
+  const l = get(id);
+  if (!l) return { ok: false, reason: 'notfound' };
+  const st = status(l);
+  if (st !== 'active') return { ok: false, reason: st, link: l };
+  l.downloads = Number(l.downloads) + 1;
+  l.lastDownloadAt = new Date().toISOString();
+  persist();
+  return { ok: true, link: l };
+}
+
+/** 回滚一次下载计数（下载启动前失败时调用，如云端对象已不存在） */
+function release(id) {
+  const l = get(id);
+  if (!l || Number(l.downloads) <= 0) return;
+  l.downloads = Number(l.downloads) - 1;
+  persist();
+}
+
+/* ------------------------- 密码通过后的访问令牌（Cookie） ------------------------- */
+
+/** 主密钥统一由 config-store 持有（S4：复用同一 data/secret.key，原子写入） */
+function masterKey() {
+  return configStore.getMasterKey();
+}
+
+/**
+ * 密码通过后的访问令牌。
+ *
+ * SEC-10：令牌必须**与当前密码哈希绑定**，而不是只与链接 id 绑定。
+ * 旧实现是 `HMAC(key, 'share-pass:' + id)` —— 无过期时间、且**改密码/清密码后仍然有效**，
+ * 于是"修改分享密码"这一动作无法撤回已获授权的访问者（安全语义不符）。
+ * 现在把 passwordHash 纳入签名输入：改密码 → 令牌自然失效，旧 Cookie 立即失效。
+ * 使用 HMAC 而非明文比较，故哈希本身不会泄露给客户端。
+ */
+function accessToken(link) {
+  const l = typeof link === 'string' ? get(link) : link;
+  const id = (l && l.id) || String(link || '');
+  const bind = (l && l.passwordHash) || 'no-pass';
+  return crypto.createHmac('sha256', masterKey()).update('share-pass:' + id + '|' + bind).digest('hex');
+}
+
+function verifyToken(link, token) {
+  if (typeof token !== 'string' || token.length !== 64) return false;
+  const expected = accessToken(link);
+  try {
+    return crypto.timingSafeEqual(Buffer.from(token), Buffer.from(expected));
+  } catch (e) {
+    return false;
+  }
+}
+
+module.exports = {
+  list, listFor, canManage, get, create, update, remove, status, view,
+  removeDead, // R32-02：管理端「删除失效链接」（仅 deleted / expired，不含可逆的 exhausted）
+  checkPassword, tryAcquire, release, accessToken, verifyToken,
+  markMissing, clearMissing, markMissingByKeys, markMissingByBucket,
+  // R51：多文件 / 文件夹分享
+  SNAPSHOT_MAX, itemList, itemName, itemStats, viewItems, normalizeItems, displayName,
+  // R52-05：展示路径（抹掉「分享根之上」的祖先）—— 列表行与归档条目名的唯一实现点
+  maskPrefix, maskedPath, itemPaths,
+};

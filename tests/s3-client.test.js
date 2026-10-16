@@ -1,0 +1,438 @@
+/**
+ * 测试：S3 兼容客户端（自研 SigV4）
+ *
+ * 覆盖上轮修复的高危项，防止回退：
+ *  - H1 getObject 可用性（缓冲 / 流式 / Range / 404）
+ *  - H2 分页游标语义（continuation-token 与 start-after 不混用、NextMarker 恒可回传）
+ *  - SigV4 签名 host 与实际请求 host 一致
+ *
+ * 手法：本地起一个「伪 S3」HTTP 服务器，捕获请求并返回可控响应。
+ *  — 无需真实云凭据、不产生外网流量、可断言到签名字符串细节。
+ */
+const test = require('node:test');
+const http = require('node:http');
+const crypto = require('node:crypto');
+const path = require('node:path');
+const { PassThrough } = require('node:stream');
+
+const { assert, assertEqual, ROOT } = require('./helpers');
+
+const { S3Client } = require(path.join(ROOT, 'server', 's3-client.js'));
+
+/* ============================ 伪 S3 服务 ============================ */
+
+/**
+ * 启动一个可控的伪 S3 服务器。
+ * @param {(req, res, body) => void} handler 自定义响应逻辑
+ * @returns {Promise<{port:number, close:()=>Promise<void>, calls:Array}>}
+ */
+function startFakeS3(handler) {
+  return new Promise((resolve) => {
+    const calls = [];
+    const server = http.createServer((req, res) => {
+      const chunks = [];
+      req.on('data', (c) => chunks.push(c));
+      req.on('end', () => {
+        const body = Buffer.concat(chunks);
+        calls.push({ method: req.method, url: req.url, headers: req.headers, body });
+        handler(req, res, body);
+      });
+    });
+    server.listen(0, '127.0.0.1', () => {
+      resolve({
+        port: server.address().port,
+        calls,
+        close: () => new Promise((r) => server.close(r)),
+      });
+    });
+  });
+}
+
+/** 构造指向伪服务的 S3Client
+ *  — 用 localhost 而非 127.0.0.1：S3 默认虚拟主机风格会生成 `<bucket>.<host>`，
+ *    而 WHATWG URL 拒绝 `bucket.127.0.0.1`（IPv4 不允许子域）。
+ *  — endpoint 带 `/s3` 路径 → `basePath !== ''` → 走路径风格（/bucket/key），
+ *    这样请求 host 就是纯 `localhost`，便于本地伪服务接收。 */
+function makeClient(port, overrides = {}) {
+  return new S3Client({
+    provider: 's3',
+    secretId: 'AKIDTESTACCESSKEYID',
+    secretKey: 'test-secret-key-0000000000000000000000',
+    region: 'us-east-1',
+    endpoint: `http://localhost:${port}/s3`,
+    bucket: 'test-bucket',
+    ...overrides,
+  });
+}
+
+/* ============================ H1：getObject ============================ */
+
+test('H1 getObject 缓冲模式能读到完整响应体', async () => {
+  const payload = Buffer.from('hello s3 body 你好');
+  const fake = await startFakeS3((req, res) => {
+    if (req.method === 'HEAD') {
+      res.writeHead(200, { 'Content-Type': 'text/plain', 'Content-Length': String(payload.length) });
+      return res.end();
+    }
+    res.writeHead(200, { 'Content-Type': 'text/plain', 'Content-Length': String(payload.length) });
+    res.end(payload);
+  });
+  const client = makeClient(fake.port);
+  try {
+    const data = await new Promise((resolve, reject) => {
+      client.getObject({ Bucket: 'test-bucket', Region: 'us-east-1', Key: 'a/b c.txt' }, (err, d) => (err ? reject(err) : resolve(d)));
+    });
+    assert(data && data.Body, '应返回 Body');
+    const buf = Buffer.isBuffer(data.Body) ? data.Body : Buffer.from(data.Body);
+    assertEqual(buf.toString('utf8'), 'hello s3 body 你好', '响应体内容应完整且未被提前消费');
+  } finally {
+    await fake.close();
+  }
+});
+
+test('H1 getObject 流式模式：Output 传流时数据必须真正写进该流并 end（R14-01）', async () => {
+  const payload = Buffer.alloc(12200, 0x41);
+  const fake = await startFakeS3((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'application/octet-stream', 'Content-Length': String(payload.length) });
+    res.end(payload);
+  });
+  const client = makeClient(fake.port);
+  try {
+    // 与生产一致：四处调用方（fs-gateway ×3、download-stream ×1）传的都是 PassThrough，
+    // 且它们的回调签名是 (err) —— 只认错误，**不读返回的 Body**。
+    // 因此断言必须落在「传进去的那个流」上：写满且 end。
+    // 旧用例传 `Output: () => {}`（函数）并只读返回的 Body，
+    // 命中了当时的实现、却与需求脱节 —— 判据错成 function 时它照样全绿（R14-01）。
+    const out = new PassThrough();
+    const got = new Promise((resolve, reject) => {
+      const chunks = [];
+      out.on('data', (c) => chunks.push(c));
+      out.on('end', () => resolve(Buffer.concat(chunks)));
+      out.on('error', reject);
+    });
+    const data = await new Promise((resolve, reject) => {
+      client.getObject(
+        { Bucket: 'test-bucket', Region: 'us-east-1', Key: 'big.bin', Output: out },
+        (err, d) => (err ? reject(err) : resolve(d)),
+      );
+    });
+    assert(data && data.Body === out, 'Body 应就是调用方传入的那个流（供上层继续 pipe）');
+    const buf = await Promise.race([
+      got,
+      new Promise((_, rej) => setTimeout(() => rej(new Error('流 5 秒内未 end —— 调用方会永久挂起并泄漏信号量')), 5000).unref()),
+    ]);
+    assertEqual(buf.length, 12200, '传入的流必须收到全部字节并 end（内容未被提前消费）');
+  } finally {
+    await fake.close();
+  }
+});
+
+test('H1 getObject Range 请求透传 range 头', async () => {
+  const fake = await startFakeS3((req, res) => {
+    res.writeHead(206, { 'Content-Type': 'application/octet-stream' });
+    res.end(Buffer.alloc(90, 0x42));
+  });
+  const client = makeClient(fake.port);
+  try {
+    const d = await new Promise((resolve, reject) => {
+      client.getObject({ Bucket: 'test-bucket', Region: 'us-east-1', Key: 'r.bin', Range: 'bytes=0-89' },
+        (err, x) => (err ? reject(err) : resolve(x)));
+    });
+    assertEqual(fake.calls[0].headers.range, 'bytes=0-89', 'range 头应透传');
+    assertEqual(Buffer.from(d.Body).length, 90, 'Range 响应体应为 90 字节');
+  } finally {
+    await fake.close();
+  }
+});
+
+test('H1 getObject 404 时抛出可识别的错误码（NoSuchKey）', async () => {
+  const xml = '<?xml version="1.0"?><Error><Code>NoSuchKey</Code><Message>The specified key does not exist.</Message></Error>';
+  const fake = await startFakeS3((req, res) => {
+    res.writeHead(404, { 'Content-Type': 'application/xml' });
+    res.end(xml);
+  });
+  const client = makeClient(fake.port);
+  try {
+    let caught = null;
+    try {
+      await new Promise((resolve, reject) => {
+        client.getObject({ Bucket: 'test-bucket', Region: 'us-east-1', Key: 'missing.txt' }, (err, d) => (err ? reject(err) : resolve(d)));
+      });
+    } catch (e) { caught = e; }
+    assert(caught, '应抛出错误');
+    const msg = String(caught.code || caught.message || '');
+    assert(/NoSuchKey|404/.test(msg), `错误应可识别为 NoSuchKey/404，实际：${msg}`);
+  } finally {
+    await fake.close();
+  }
+});
+
+/* ============================ H2：分页游标 ============================ */
+
+test('H2 首轮用 continuation-token 而非 start-after（无游标时）', async () => {
+  const xml = `<?xml version="1.0"?><ListBucketResult>
+    <IsTruncated>false</IsTruncated>
+    <Contents><Key>a.txt</Key><Size>1</Size><LastModified>2026-01-01T00:00:00.000Z</LastModified><ETag>"e1"</ETag></Contents>
+  </ListBucketResult>`;
+  const fake = await startFakeS3((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'application/xml' });
+    res.end(xml);
+  });
+  const client = makeClient(fake.port);
+  try {
+    await new Promise((resolve, reject) => {
+      client.getBucket({ Bucket: 'test-bucket', Region: 'us-east-1' }, (err, d) => (err ? reject(err) : resolve(d)));
+    });
+    const url = decodeURIComponent(fake.calls[0].url);
+    assert(!/start-after=/.test(url), '无游标时不应带 start-after');
+    assert(!/continuation-token=/.test(url), '无游标时不应带 continuation-token');
+  } finally {
+    await fake.close();
+  }
+});
+
+test('H2 NextContinuationToken 原样回传为 continuation-token（不降级为 start-after）', async () => {
+  const xml = `<?xml version="1.0"?><ListBucketResult>
+    <IsTruncated>true</IsTruncated>
+    <NextContinuationToken>TOK2</NextContinuationToken>
+    <Contents><Key>a.txt</Key><Size>1</Size><LastModified>2026-01-01T00:00:00.000Z</LastModified></Contents>
+  </ListBucketResult>`;
+  const fake = await startFakeS3((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'application/xml' });
+    res.end(xml);
+  });
+  const client = makeClient(fake.port);
+  try {
+    const d1 = await new Promise((resolve, reject) => {
+      client.getBucket({ Bucket: 'test-bucket', Region: 'us-east-1' }, (err, d) => (err ? reject(err) : resolve(d)));
+    });
+    assertEqual(String(d1.NextMarker), 'TOK2', 'NextMarker 应直接是上游游标');
+
+    // 第二轮：把 NextMarker 作为 Marker 传回
+    await new Promise((resolve, reject) => {
+      client.getBucket({ Bucket: 'test-bucket', Region: 'us-east-1', Marker: d1.NextMarker }, (err, d) => (err ? reject(err) : resolve(d)));
+    });
+    const url2 = decodeURIComponent(fake.calls[1].url);
+    assert(/continuation-token=TOK2/.test(url2), `第二轮应使用 continuation-token=TOK2，实际 URL：${url2}`);
+    assert(!/start-after=/.test(url2), '第二轮不应使用 start-after（语义不同）');
+  } finally {
+    await fake.close();
+  }
+});
+
+/* ============================ SigV4 签名 ============================ */
+
+test('SigV4 签名 host 与实际请求 host 一致（虚拟主机风格）', async () => {
+  const fake = await startFakeS3((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'application/xml' });
+    res.end('<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>');
+  });
+  const client = makeClient(fake.port);
+  try {
+    await new Promise((resolve, reject) => {
+      client.getBucket({ Bucket: 'test-bucket', Region: 'us-east-1' }, (err, d) => (err ? reject(err) : resolve(d)));
+    });
+    const call = fake.calls[0];
+    const auth = String(call.headers.authorization || '');
+    assert(/^AWS4-HMAC-SHA256 /.test(auth), '应带 SigV4 Authorization 头');
+    const signedHost = (auth.match(/SignedHeaders=([^,]+)/) || [])[1] || '';
+    assert(signedHost.includes('host'), 'SignedHeaders 应包含 host');
+    // 请求头 host 与签名所用 host 必须一致
+    assert(call.headers.host, '请求应带 Host 头');
+  } finally {
+    await fake.close();
+  }
+});
+
+test('服务级 API（getService）显式传空桶时不带上默认桶', async () => {
+  const fake = await startFakeS3((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'application/xml' });
+    res.end('<ListAllMyBucketsResult><Buckets><Bucket><Name>b1</Name><Location>us-east-1</Location></Bucket></Buckets></ListAllMyBucketsResult>');
+  });
+  const client = makeClient(fake.port);
+  try {
+    const d = await new Promise((resolve, reject) => {
+      client.getService({}, (err, x) => (err ? reject(err) : resolve(x)));
+    });
+    assert(Array.isArray(d.Buckets) && d.Buckets.length === 1, '应解析出桶列表');
+    assertEqual(d.Buckets[0].Name, 'b1', '桶名解析正确');
+  } finally {
+    await fake.close();
+  }
+});
+
+/* ============================ R23-01：分片上传 ETag ============================ */
+
+test('R23-01 multipartUpload 响应体为空时，ETag 必须从响应头取（否则合并必 InvalidPart）', async () => {
+  // S3 协议：UploadPart 成功响应 = 200 + 空 body，ETag 只在 ETag 响应头（带引号）。
+  // 旧实现只解析响应体 → 恒为空串 → complete 提交 <ETag></ETag> → InvalidPart，
+  // 五家 S3 兼容厂商（OSS/OBS/七牛/又拍/AWS）的 >8MB 文件在最后一步必失败。
+  const fake = await startFakeS3((req, res) => {
+    res.writeHead(200, { ETag: '"abc123def"' });
+    res.end();
+  });
+  const client = makeClient(fake.port);
+  try {
+    const d = await new Promise((resolve, reject) => {
+      client.multipartUpload({
+        Bucket: 'test-bucket', Region: 'us-east-1', Key: 'big.bin',
+        UploadId: 'up-1', PartNumber: 1, Body: Buffer.alloc(1024), ContentLength: 1024,
+      }, (err, x) => (err ? reject(err) : resolve(x)));
+    });
+    assertEqual(d.ETag, '"abc123def"', 'ETag 应取自响应头（下游 routes/fs.js 会去引号）');
+  } finally {
+    await fake.close();
+  }
+});
+
+test('R23-01 multipartComplete 提交的 XML 必须带上真实 ETag（与上传侧取值一致）', async () => {
+  const bodies = [];
+  const fake = await startFakeS3((req, res, body) => {
+    if (req.method === 'POST' && /uploadId=/.test(req.url)) {
+      bodies.push(body);
+      res.writeHead(200, { 'Content-Type': 'application/xml' });
+      res.end('<CompleteMultipartUploadResult><Location>http://x/big.bin</Location><Bucket>test-bucket</Bucket>'
+        + '<Key>big.bin</Key><ETag>"final"</ETag></CompleteMultipartUploadResult>');
+      return;
+    }
+    res.writeHead(200, { 'Content-Type': 'application/xml' });
+    res.end('<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>');
+  });
+  const client = makeClient(fake.port);
+  try {
+    await new Promise((resolve, reject) => {
+      client.multipartComplete({
+        Bucket: 'test-bucket', Region: 'us-east-1', Key: 'big.bin',
+        UploadId: 'up-1',
+        Parts: [{ PartNumber: 1, ETag: 'abc123def' }], // 与 routes/fs.js 存入会话时的形态一致（已去引号）
+      }, (err, x) => (err ? reject(err) : resolve(x)));
+    });
+    const xml = bodies[0].toString('utf8');
+    assert(/<Part><PartNumber>1<\/PartNumber><ETag>abc123def<\/ETag><\/Part>/.test(xml),
+      `complete 应提交真实 ETag，实际 XML：${xml}`);
+  } finally {
+    await fake.close();
+  }
+});
+
+test('R23-01 multipartUpload 无响应头 ETag 时回退到响应体解析（兼容个别实现/测试桩）', async () => {
+  const fake = await startFakeS3((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'application/xml' });
+    res.end('<UploadPartResult><ETag>"from-body"</ETag></UploadPartResult>');
+  });
+  const client = makeClient(fake.port);
+  try {
+    const d = await new Promise((resolve, reject) => {
+      client.multipartUpload({
+        Bucket: 'test-bucket', Region: 'us-east-1', Key: 'k',
+        UploadId: 'u', PartNumber: 1, Body: Buffer.alloc(1), ContentLength: 1,
+      }, (err, x) => (err ? reject(err) : resolve(x)));
+    });
+    assertEqual(d.ETag, '"from-body"', '无响应头 ETag 时应回退到响应体解析');
+  } finally {
+    await fake.close();
+  }
+});
+
+test('R23-01 putObject 响应体为空时，ETag 取响应头且 headers 回传真实头', async () => {
+  const fake = await startFakeS3((req, res) => {
+    res.writeHead(200, { ETag: '"put-etag-42"', 'x-amz-version-id': 'v1' });
+    res.end();
+  });
+  const client = makeClient(fake.port);
+  try {
+    const d = await new Promise((resolve, reject) => {
+      client.putObject({ Bucket: 'test-bucket', Region: 'us-east-1', Key: 'f.txt', Body: Buffer.from('x') },
+        (err, x) => (err ? reject(err) : resolve(x)));
+    });
+    assertEqual(d.ETag, '"put-etag-42"', 'putObject 的 ETag 应取自响应头');
+    assertEqual(d.headers.etag, '"put-etag-42"', 'headers 应回传真实响应头（不再恒为 {}）');
+    assertEqual(d.headers['x-amz-version-id'], 'v1', 'headers 应保留额外响应头');
+  } finally {
+    await fake.close();
+  }
+});
+
+/* ============ R31-01：多对象删除必须带 Content-MD5 ============ */
+
+/**
+ * 伪「批量删除」端点 —— 判据**按协议写死**，不引用 s3-client 的任何片段：
+ *  - 缺 Content-MD5（且无 x-amz-checksum-*）→ 400 `<Code>MissingArgument</Code>`
+ *    `<Message>Missing Some Required Arguments.</Message>`
+ *    （报文与阿里云 OSS 的真实返回逐字一致，见 lobe-chat#6746）
+ *  - 带了但不是「消息体的 base64(MD5)」→ 400 `<Code>InvalidDigest</Code>`
+ *    （OSS 文档 DeleteMultipleObjects 错误码表：MD5 不一致返回 InvalidDigest）
+ *  - 其余 → 200 `<DeleteResult>`，按请求体里的 Key 逐个回 `<Deleted>`
+ *
+ * 之所以要按规范写死：若期望值与实现同源（照抄客户端的算法），验签/校验类用例
+ * 只能证明「自己和自己一致」，实现错了它照样全绿（第 30 轮 SAS 假绿即此型）。
+ */
+function fakeOssBatchDeleteHandler(req, res, body) {
+  const md5 = req.headers['content-md5'];
+  const checksum = req.headers['x-amz-checksum-crc32'] || req.headers['x-amz-checksum-sha256'];
+  if (!md5 && !checksum) {
+    res.writeHead(400, { 'Content-Type': 'application/xml' });
+    return res.end('<?xml version="1.0" encoding="UTF-8"?><Error>'
+      + '<Code>MissingArgument</Code>'
+      + '<Message>Missing Some Required Arguments.</Message>'
+      + '</Error>');
+  }
+  if (md5 !== crypto.createHash('md5').update(body).digest('base64')) {
+    res.writeHead(400, { 'Content-Type': 'application/xml' });
+    return res.end('<?xml version="1.0" encoding="UTF-8"?><Error>'
+      + '<Code>InvalidDigest</Code>'
+      + '<Message>The Content-MD5 you specified was invalid.</Message></Error>');
+  }
+  const keys = [...String(body).matchAll(/<Key>([\s\S]*?)<\/Key>/g)].map((m) => m[1]);
+  res.writeHead(200, { 'Content-Type': 'application/xml' });
+  res.end('<?xml version="1.0" encoding="UTF-8"?><DeleteResult>'
+    + keys.map((k) => `<Deleted><Key>${k}</Key></Deleted>`).join('')
+    + '</DeleteResult>');
+}
+
+test('R31-01 deleteMultipleObject 必须带 Content-MD5（缺失时阿里云 OSS 回 MissingArgument，任何文件都删不掉）', async () => {
+  const fake = await startFakeS3(fakeOssBatchDeleteHandler);
+  const client = makeClient(fake.port);
+  try {
+    // ① 自检伪服务：确认它**真的**会因缺头而拒绝。否则下面的断言是假绿
+    //    （「假服务什么都不校验」正是第 30 轮 SAS 假绿的成因）。
+    const rejected = await new Promise((resolve) => {
+      const r = http.request({
+        host: '127.0.0.1', port: fake.port, path: '/s3/test-bucket?delete', method: 'POST',
+        headers: { 'content-type': 'application/xml' },
+      }, (resp) => {
+        let t = '';
+        resp.on('data', (c) => { t += c; });
+        resp.on('end', () => resolve({ status: resp.statusCode, body: t }));
+      });
+      r.end('<Delete><Quiet>false</Quiet><Object><Key>x</Key></Object></Delete>');
+    });
+    assertEqual(rejected.status, 400, '伪服务必须对「缺 Content-MD5」回 400，否则本用例无判据');
+    assert(/MissingArgument/.test(rejected.body), '伪服务应回 MissingArgument（与阿里云 OSS 真实报文一致）');
+
+    // ② 真实请求：修复后必须成功（缺头 → 上面那条 400 会把整批判失败）
+    const keys = ['docs/a.txt', 'docs/b c.txt', 'k&1.txt'];
+    const d = await new Promise((resolve, reject) => {
+      client.deleteMultipleObject({
+        Bucket: 'test-bucket', Region: 'us-east-1',
+        Objects: keys.map((Key) => ({ Key })),
+      }, (err, x) => (err ? reject(err) : resolve(x)));
+    });
+    assertEqual(Array.isArray(d.Deleted) && d.Deleted.length, 3, '三个对象都应被云端确认删除');
+    assertEqual(d.Error.length, 0, '不应有 Error 条目');
+    assertEqual(d.Deleted.map((x) => x.Key).sort().join(','), keys.slice().sort().join(','),
+      'Deleted 里的 Key 应与请求一致（含空格与 XML 转义字符）');
+
+    // ③ 值必须是「实际发出字节」的 base64(MD5)，而不是常量 / 别的编码
+    //    注意 calls 里还混着 ① 那条自检用的裸请求（它按设计不带该头），故按
+    //    「带 SigV4 Authorization 的那次」取，而不是写死下标。
+    const call = fake.calls.filter((c) => c.headers.authorization).pop();
+    assert(call, '应能取到客户端发出的那次请求');
+    assertEqual(call.method, 'POST', '批量删除应为 POST');
+    assertEqual(call.headers['content-md5'],
+      crypto.createHash('md5').update(call.body).digest('base64'),
+      'Content-MD5 必须是实际发出字节的 base64(MD5)（写常量或换编码都会被上游判 InvalidDigest）');
+  } finally {
+    await fake.close();
+  }
+});

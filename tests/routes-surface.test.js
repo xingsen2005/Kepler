@@ -1,0 +1,359 @@
+/**
+ * 测试：路由表面积与权限守卫的静态一致性
+ *
+ * 目的：拆分 routes.js（2200 行）为 server/routes/ 子模块后，确保
+ *  1. 路由总量与关键路径未丢失、未重复；
+ *  2. 敏感接口仍挂载 requireAdmin；
+ *  3. 挂载顺序未破坏（/credentials/visibility 先于 /credentials/:id）。
+ * 这类断言不需要启动服务、不触碰 data/，是重构后最有价值的「防回退」网。
+ */
+const test = require('node:test');
+const path = require('node:path');
+
+const { assert, assertEqual, ROOT } = require('./helpers');
+
+const routes = require(path.join(ROOT, 'server', 'routes.js'));
+
+/** 展开 express 路由栈为 ['GET /a/b', ...] */
+function listRoutes(router) {
+  const out = [];
+  const walk = (stack) => {
+    for (const layer of stack || []) {
+      if (layer.route) {
+        const methods = Object.keys(layer.route.methods).map((m) => m.toUpperCase());
+        for (const m of methods) out.push(`${m} ${layer.route.path}`);
+      } else if (layer.handle && layer.handle.stack) {
+        walk(layer.handle.stack);
+      }
+    }
+  };
+  walk(router.stack);
+  return out;
+}
+
+const ROUTES = listRoutes(routes);
+
+/** 完整路由清单（重构基线 + WebAuthn 增量，用于回归比对） */
+const EXPECTED = [
+  'POST /auth/login', 'POST /auth/login/webauthn',
+  'POST /auth/logout', 'POST /auth/logout-all', 'GET /auth/me', 'POST /auth/init',
+  // R54②：注册 / 忘记密码 / 重置密码三条**公开**接口（已登记进 index.js 的匿名白名单
+  // PUBLIC_API），外加一条**需登录**的邮箱验证码接口。前三条都在拿到会话之前就要用
+  // （登录页的「注册」「忘记密码」），故不能挂鉴权；第四条要给当前账号绑定新邮箱，
+  // 必须是有身份的人，所以不在白名单里。
+  'POST /auth/register', 'POST /auth/forgot', 'POST /auth/reset', 'POST /auth/email/code',
+  'GET /users/me', 'PUT /users/me',
+  'GET /users', 'POST /users', 'PUT /users/:id', 'DELETE /users/:id', 'POST /users/:id/logout',
+  // R33：账户封禁 / 解封（管理员在「用户管理」中的封禁按钮与本行的时间选择器）
+  'POST /users/:id/ban', 'POST /users/:id/unban',
+  'GET /captcha/public', 'GET /captcha/config', 'PUT /captcha/config',
+  'GET /payment/config', 'PUT /payment/config/:platform',
+  'POST /payment/config/:platform/validate', 'DELETE /payment/config/:platform',
+  'PUT /payment/enabled', 'PUT /payment/config/:platform/enabled',
+  'PUT /payment/site-url', 'GET /payment/orders', 'POST /payment/orders/:id/refund',
+  // R32-01：批量删除「支付失败」的订单（管理端「删除失效订单」按钮）
+  'DELETE /payment/orders/failed',
+  'POST /webauthn/register/options', 'POST /webauthn/register/verify',
+  'POST /webauthn/disable', 'POST /users/:id/webauthn/disable',
+  'GET /config', 'PUT /config',
+  'GET /credentials', 'POST /credentials', 'PUT /credentials/:id/active', 'PUT /credentials/visibility',
+  'PUT /credentials/:id', 'DELETE /credentials/:id',
+  'POST /config/verify',
+  // R25：只读的「按 API Key 的空间用量汇总」，管理员专属（对应系统设置页的负载均衡卡片）
+  'GET /credentials/quota-usage',
+  // 注意：云端桶列表的 `GET /buckets` 已删除（死代码），唯一入口是 POST /config/verify
+  'GET /buckets/local', 'POST /buckets/local', 'PUT /buckets/local/:id',
+  // R53：发信设置（SMTP）三条接口，全部仅管理员 —— 主机 / 用户名 / 发件人都属全局配置，
+  // 且 `POST /smtp/test` 会用**表单里尚未保存的密码**真的发一封信出去。
+  'GET /smtp/config', 'PUT /smtp/config', 'POST /smtp/test',
+  // R54：站点设置。`GET /site/info` **刻意不挂** requireAdmin —— 登录页在拿到会话之前
+  // 就要用站点名称设浏览器标题栏（已登记进 index.js 的 PUBLIC_API）；它只回站点名称一个字段。
+  'GET /site/info', 'GET /site/config', 'PUT /site/config',
+  // R54③：邀请码设置六条，**全部 requireAdmin** —— 邀请码是一枚免注册口令
+  // （身份还可能是管理员），可见面与「用户管理」同级。
+  // ⚠️ 导出（`POST /invites/export`）是 POST 而不是 GET：响应体是明文邀请码集合，
+  // GET 会把整批码写进浏览器历史与反向代理的 access log。
+  // ⚠️ 三条字面量路径（bulk / delete / export）必须排在 `PUT /invites/:id` 之前。
+  'GET /invites', 'POST /invites', 'POST /invites/bulk',
+  'POST /invites/delete', 'POST /invites/export', 'PUT /invites/:id',
+  'PUT /buckets/local/:id/enabled', 'PUT /buckets/local/:id/active', 'PUT /buckets/visibility',
+  'DELETE /buckets/local/:id', 'GET /buckets/stats',
+  'POST /buckets/local/:id/clear', 'GET /buckets/local/:id/fragments',
+  'POST /buckets/local/:id/fragments/clear', 'GET /buckets/local/:id/destroy-check',
+  'POST /buckets/local/:id/destroy', 'PUT /buckets/local/:id/block-overseas',
+  'GET /acl-check', 'PUT /acl-check/disabled',
+  'GET /ipguard', 'POST /ipguard/rules', 'PUT /ipguard/rules/:id',
+  'PUT /ipguard/rules/:id/enabled', 'DELETE /ipguard/rules/:id', 'GET /ipguard/test',
+  // R37：查「上层已经设了多小的下载限速」——四个设置入口的提示文案用它。
+  // 不挂 requireAdmin（普通用户在「创建分享链接」时也要能看到自己的上限）。
+  'GET /throttle/ceiling',
+  // R38：配置备份。四条全部挂 requireAdmin —— 实时码里含 API Key / 支付凭证 /
+  // WebDAV 口令的**明文**（它们本就在 config.enc 里，只是被整文件加密保护）。
+  'GET /backup/status', 'GET /backup/code',
+  'POST /backup/export', 'POST /backup/import',
+  'GET /enc/settings', 'PUT /enc/settings', 'POST /enc/unlock',
+  // R8-14：只回 `{ passwordSet }`（不含 mode / 魔数）的只读端点，普通用户也可访问
+  // —— 前端 `ensureUnlocked()` 靠它判断「要不要弹查看密码框」。见下方 selfServe。
+  'GET /enc/status',
+  'GET /upload-excludes', 'PUT /upload-excludes',
+  // R48：线程并发（同时上传 / 加密的文件数）。**只有写接口** —— 读走 GET /config 的
+  // `concurrency`（对全部登录用户下发），再开一个 GET 就出现了第二个读取口径。
+  'PUT /concurrency',
+  'GET /webdav', 'PUT /webdav/enabled', 'POST /webdav/accounts',
+  'PUT /webdav/accounts/:id', 'DELETE /webdav/accounts/:id', 'GET /webdav/accounts/:id/password',
+  'GET /links', 'POST /links', 'PUT /links/:id', 'DELETE /links/:id',
+  // R32-02：批量删除失效链接（「删除失效链接」按钮）；必须注册在 /links/:id 之前
+  'DELETE /links/dead',
+  // R50：分享链接的二维码（「链接创建成功」弹窗用）。单段路径，与 GET /links 精确匹配不冲突
+  'GET /links/qrcode',
+  'GET /fs/list', 'GET /fs/stat', 'GET /fs/search', 'POST /fs/mkdir',
+  'PUT /fs/upload/simple', 'POST /fs/upload/init', 'PUT /fs/upload/chunk',
+  'POST /fs/upload/complete', 'POST /fs/upload/abort', 'GET /fs/sessions',
+  // R11-05：`/fs/download` 的 HEAD 必须显式注册（express 对 HEAD 有「退化成 get」的
+  // 回退，不注册就会走 streamDownload 全路径 —— 整份下载 + 污染流量统计）
+  'HEAD /fs/download',
+  'GET /fs/download', 'GET /fs/thumb', 'GET /fs/presign',
+  'POST /fs/rename', 'POST /fs/move', 'POST /fs/copy', 'POST /fs/delete', 'GET /fs/tree',
+  'GET /stats/speed', 'GET /stats/storage', 'GET /stats/summary', 'GET /stats/logs',
+  'GET /health',
+  // R34：「关于」卡片的「检查更新」（服务端代理 GitHub，见 server/update-check.js）
+  'GET /update/check',
+];
+
+test('路由总数与重构前一致', () => {
+  assertEqual(ROUTES.length, EXPECTED.length, '路由数量应保持不变');
+});
+
+test('无路由丢失', () => {
+  const missing = EXPECTED.filter((r) => !ROUTES.includes(r));
+  assertEqual(missing.length, 0, '以下路由在拆分后丢失：' + missing.join(', '));
+});
+
+test('无路由重复注册', () => {
+  const seen = new Set();
+  const dup = [];
+  for (const r of ROUTES) {
+    if (seen.has(r)) dup.push(r);
+    seen.add(r);
+  }
+  assertEqual(dup.length, 0, '以下路由被重复注册：' + dup.join(', '));
+});
+
+test('敏感接口均挂载 requireAdmin', () => {
+  // 这些路由的 handler 链中必须存在 requireAdmin（否则普通用户可越权）
+  // 通过 express 路由层的 handle 列表逐一核查
+  const adminGuarded = [];
+  const walk = (stack, prefix) => {
+    for (const layer of stack || []) {
+      if (layer.route) {
+        const h = layer.route.stack || layer.route.handlers || [];
+        const names = h.map((x) => (x && x.name) || '');
+        if (names.includes('requireAdmin')) {
+          const methods = Object.keys(layer.route.methods).map((m) => m.toUpperCase());
+          for (const m of methods) adminGuarded.push(`${m} ${layer.route.path}`);
+        }
+      } else if (layer.handle && layer.handle.stack) {
+        walk(layer.handle.stack, prefix);
+      }
+    }
+  };
+  walk(routes.stack, '');
+
+  const mustBeAdmin = [
+    // 注意：GET /users 不在此列 —— 普通用户也需要它来读自己的资料，
+    // 服务端按 role 过滤返回内容（scope: 'all' | 'self'），而非拒绝访问。
+    'POST /users', 'PUT /users/:id', 'DELETE /users/:id', 'POST /users/:id/logout',
+    'POST /users/:id/webauthn/disable',
+    // R33：封禁会让账户立即失去登录能力（且波及资金/数据访问），属最高一级的管理动作
+    'POST /users/:id/ban', 'POST /users/:id/unban',
+    'PUT /config',
+    // 连接验证会回传云端全部桶名（SEC-11 账号资产）且请求方可带 endpoint（SEC-03 SSRF）
+    'POST /config/verify',
+    'POST /credentials', 'PUT /credentials/:id/active', 'PUT /credentials/visibility',
+    'PUT /credentials/:id', 'DELETE /credentials/:id',
+    // R25：给出全部 API Key 的用量与上限，属账号资产信息 → 仅管理员
+    'GET /credentials/quota-usage',
+    // 桶集合由管理员统一维护（普通用户不再自行添加：不知道桶名/地域，也无枚举权限）
+    'POST /buckets/local',
+    'PUT /buckets/local/:id/enabled', 'PUT /buckets/visibility', 'DELETE /buckets/local/:id',
+    'POST /buckets/local/:id/clear', 'POST /buckets/local/:id/fragments/clear',
+    'POST /buckets/local/:id/destroy', 'PUT /buckets/local/:id/block-overseas',
+    // R8-08：彻底删除前的三项前置读/写（fragments、fragments/clear、destroy）原先只有
+    // destroy-check 漏挂 —— 它会暴露**不可见桶**的对象数/碎片数/可删性，并真实发起
+    // getBucket + 分片全量列举。登记在此，避免下次重构再漏。
+    'GET /buckets/local/:id/destroy-check', 'GET /buckets/local/:id/fragments',
+    'PUT /acl-check/disabled',
+    'GET /ipguard', 'POST /ipguard/rules', 'PUT /ipguard/rules/:id',
+    'PUT /ipguard/rules/:id/enabled', 'DELETE /ipguard/rules/:id', 'GET /ipguard/test',
+    // 退款会把订单置为不可逆终态并让支付凭证失效，必须与其它写操作同级保护
+    'POST /payment/orders/:id/refund',
+    // R32-01：批量删除订单流水（不可逆），与退款同级 —— 同样是「一点就是一片」的写操作
+    'DELETE /payment/orders/failed',
+    'GET /enc/settings', 'PUT /enc/settings',
+    'GET /upload-excludes', 'PUT /upload-excludes',
+    // R48：并发数决定服务端同时起多少个加密工作线程（整机 CPU / 内存占用），属系统级配置
+    'PUT /concurrency',
+    'GET /webdav', 'PUT /webdav/enabled', 'POST /webdav/accounts',
+    'PUT /webdav/accounts/:id', 'DELETE /webdav/accounts/:id', 'GET /webdav/accounts/:id/password',
+    // R53：发信配置属全局设置；测试接口更是会拿着界面上刚填的密码去连 SMTP 服务器
+    'GET /smtp/config', 'PUT /smtp/config', 'POST /smtp/test',
+    // R54：站点名称 / 公开注册 / 新用户身份都是全局设置。
+    // ⚠️ `GET /site/info` 故意**不在**此列 —— 它是公开只读、只回站点名称。
+    'GET /site/config', 'PUT /site/config',
+    // R54③：邀请码六条**全部**要求管理员。这一条不是形式主义 ——
+    // `GET /invites` 会原样回传邀请码明文（管理员要复制分发，打码就失去意义），
+    // 少挂一个 requireAdmin 就等于给任何登录用户一条「批量读取免注册口令」的通道。
+    'GET /invites', 'POST /invites', 'POST /invites/bulk',
+    'POST /invites/delete', 'POST /invites/export', 'PUT /invites/:id',
+  ];
+  const unprotected = mustBeAdmin.filter((r) => !adminGuarded.includes(r));
+  assertEqual(unprotected.length, 0,
+    '以下敏感路由缺少 requireAdmin 保护：\n  ' + unprotected.join('\n  '));
+});
+
+test('明文密码接口受管理员保护（WebDAV）', () => {
+  const s = require('node:fs').readFileSync(
+    path.join(ROOT, 'server', 'routes', 'webdav.js'), 'utf8');
+  assert(/requireAdmin/.test(s), 'webdav.js 必须引用 requireAdmin');
+  assert(/accounts\/:id\/password',\s*requireAdmin/.test(s),
+    '/webdav/accounts/:id/password 必须显式挂载 requireAdmin');
+});
+
+test('/credentials/visibility 先于 /credentials/:id 注册', () => {
+  const iv = ROUTES.indexOf('PUT /credentials/visibility');
+  const id = ROUTES.indexOf('PUT /credentials/:id');
+  assert(iv >= 0 && id >= 0, '两个路由都应存在');
+  assert(iv < id, '/credentials/visibility 必须在 /credentials/:id 之前，否则会被参数捕获');
+});
+
+/**
+ * R32-02：批量清理失效链接的两条约束 —— 注册顺序与守卫强度。
+ *
+ * 顺序：express 按注册顺序匹配，`DELETE /links/dead` 若排在参数路由 `DELETE /links/:id`
+ * 之后，路径里的 `dead` 会被当成一个链接 id 吞掉。此时**路由表里两条路径都在**、
+ * 「无路由丢失」也照样绿，只有真正打请求才暴露 —— 所以顺序必须单独断言。
+ *
+ * 守卫：与订单管理不同，链接管理页**普通用户也能进**（每条链接按 `createdBy` 隔离），
+ * 因此这里**不能**挂 requireAdmin，否则普通用户的按钮一点就是 403；越权由
+ * `shareStore.removeDead()` 内部的 `canManage` 兜住。
+ */
+test('/links/dead 先于 /links/:id 注册，且不挂 requireAdmin（普通用户也要能清自己的失效链接）', () => {
+  const dead = ROUTES.indexOf('DELETE /links/dead');
+  const byId = ROUTES.indexOf('DELETE /links/:id');
+  assert(dead >= 0 && byId >= 0, '两个路由都应存在');
+  assert(dead < byId,
+    'DELETE /links/dead 必须在 DELETE /links/:id 之前，否则 dead 会被 :id 当成链接 id 吞掉'
+    + '（界面表现：点「删除失效链接」提示「链接不存在」）');
+
+  const guardMap = new Map();
+  const walk = (stack) => {
+    for (const layer of stack || []) {
+      if (layer.route) {
+        const h = layer.route.stack || layer.route.handlers || [];
+        const names = h.map((x) => (x && x.name) || '');
+        const methods = Object.keys(layer.route.methods).map((m) => m.toUpperCase());
+        for (const m of methods) guardMap.set(`${m} ${layer.route.path}`, names.includes('requireAdmin'));
+      } else if (layer.handle && layer.handle.stack) {
+        walk(layer.handle.stack);
+      }
+    }
+  };
+  walk(routes.stack);
+  assert(guardMap.has('DELETE /links/dead'), '守卫表应包含 DELETE /links/dead（避免拼写错误导致断言空过）');
+  assertEqual(guardMap.get('DELETE /links/dead'), false,
+    'DELETE /links/dead 不得挂 requireAdmin：链接管理页普通用户也能进，'
+    + '越权由 shareStore.removeDead() 的 canManage 隔离，误挂管理员守卫会让普通用户直接 403');
+});
+
+test('/users/me 先于 /users/:id 注册（否则自助接口被参数路由吞掉）', () => {
+  const getMe = ROUTES.indexOf('GET /users/me');
+  const putMe = ROUTES.indexOf('PUT /users/me');
+  const putId = ROUTES.indexOf('PUT /users/:id');
+  // ⚠️ 这两个下标是**全局注册序号**，任何在 `/users/me` 之前新增的路由都会把它往后推。
+  // R54② 在 auth 段新增了 4 条（register / forgot / reset / email/code）⇒ 6/7 → 10/11。
+  // 断言的意义不在具体数字，而在「/users/me 排在 /users/:id 之前」——数字只是顺手钉住位置。
+  assertEqual(getMe, 10, 'GET /users/me 应为第 11 条路由');
+  assertEqual(putMe, 11, 'PUT /users/me 应为第 12 条路由');
+  assert(putId > putMe, 'PUT /users/me 必须在 PUT /users/:id 之前');
+});
+
+test('自助接口不挂 requireAdmin（普通用户必须可用）', () => {
+  // GET/PUT /users/me、/webauthn/register|disable 属"人人可用"，误挂管理员守卫会导致
+  // 普通用户无法修改自己的资料 / 启用 Windows Hello。
+  const selfServe = [
+    'GET /users/me', 'PUT /users/me',
+    'POST /webauthn/register/options', 'POST /webauthn/register/verify',
+    'POST /webauthn/disable',
+    'POST /auth/login/webauthn',
+    // R8-14：只回 `{ passwordSet }`（不含 mode / 魔数）。普通用户必须能读到它，
+    // 否则前端 `ensureUnlocked()` 恒真、加密文件的密码验证框永不出现。
+    'GET /enc/status',
+    // R34：「关于」是设置页里**唯一保留给普通用户**的卡片（见 syssettings.js 的
+    // ADMIN_ONLY_CARDS），它上面的「检查更新」按钮就必须人人可点；误挂管理员守卫
+    // 会让普通用户一点就 403。只读、无参数、结果有 10 分钟缓存，无需写操作级保护。
+    'GET /update/check',
+    // R54：站点名称是**公开信息**（登录页在登录之前就要拿它设浏览器标题栏）。
+    // 误挂 requireAdmin 会让未登录的登录页永远拿不到站点名称 —— 而且这条错
+    // 在界面上表现为「标题栏一直是那串硬编码」，很难联想到是服务端 401。
+    'GET /site/info',
+  ];
+  const guardMap = new Map();
+  const walk = (stack) => {
+    for (const layer of stack || []) {
+      if (layer.route) {
+        const h = layer.route.stack || layer.route.handlers || [];
+        const names = h.map((x) => (x && x.name) || '');
+        const methods = Object.keys(layer.route.methods).map((m) => m.toUpperCase());
+        for (const m of methods) guardMap.set(`${m} ${layer.route.path}`, names.includes('requireAdmin'));
+      } else if (layer.handle && layer.handle.stack) {
+        walk(layer.handle.stack);
+      }
+    }
+  };
+  walk(routes.stack);
+  const wrong = selfServe.filter((r) => guardMap.get(r) === true);
+  assertEqual(wrong.length, 0, '以下自助路由不应挂 requireAdmin：\n  ' + wrong.join('\n  '));
+  // 反向确认这些路由确实存在于守卫表中（避免拼写错误导致断言空过）
+  const absent = selfServe.filter((r) => !guardMap.has(r));
+  assertEqual(absent.length, 0, '自助路由清单存在拼写错误：\n  ' + absent.join('\n  '));
+});
+
+test('两步登录的第二步在匿名白名单中（index.js PUBLIC_API）', () => {
+  // /auth/login/webauthn 在"密码已校验但尚未签发会话"的中间态被调用，
+  // 因此必须可匿名到达，否则第二步一定 401。
+  const idx = require('node:fs').readFileSync(path.join(ROOT, 'server', 'index.js'), 'utf8');
+  assert(/\/auth\/login\/webauthn/.test(idx), "index.js 的 PUBLIC_API 应包含 '/auth/login/webauthn'");
+});
+
+test('/auth/me 与 /auth/login 位于匿名白名单所需位置（auth 模块优先挂载）', () => {
+  // index.js 的 PUBLIC_API 依赖 /auth/login、/auth/me、/auth/init 可匿名到达；
+  // 拆分后 auth 模块必须第一个挂载（无前置鉴权中间件阻断）
+  const idx = require('node:fs').readFileSync(path.join(ROOT, 'server', 'routes.js'), 'utf8');
+  const authPos = idx.indexOf("require('./routes/auth')");
+  const others = ["require('./routes/users')", "require('./routes/fs')", "require('./routes/buckets')"]
+    .map((s) => idx.indexOf(s)).filter((x) => x >= 0);
+  assert(authPos >= 0, 'routes.js 应挂载 auth 模块');
+  assert(others.every((x) => x > authPos), 'auth 模块应最先挂载');
+});
+
+/**
+ * 文档侧的反向护栏：真实路由必须在 `Develop_Document.md` 里**逐条**出现。
+ *
+ * 起因：第 7 章的 API 表习惯用「家族记法」压缩同类路由（如
+ * `PUT /buckets/local/:id/active` · `/enabled` · `/buckets/visibility`），
+ * 被压缩掉的那几条在全文里根本搜不到完整路径 —— 二开的人只能去翻源码。
+ * 曾经漏掉的就是 `PUT /buckets/local/:id/enabled`、`PUT /ipguard/rules/:id/enabled`、
+ * `GET /webdav/accounts/:id/password`、`POST /fs/upload/abort` 这四条。
+ *
+ * 判据只看「路径是否出现」，不要求与方法同框：8.3 的支付接口表、模块说明里的
+ * 单行提及都算数。这样既拦得住整条漏列，又不会因为表格排版调整而误报。
+ */
+test('全部路由都能在开发文档中搜到完整路径（防「家族记法」漏列）', () => {
+  const doc = require('node:fs').readFileSync(path.join(ROOT, 'Develop_Document.md'), 'utf8');
+  const missing = EXPECTED.filter((r) => {
+    const routePath = r.slice(r.indexOf(' ') + 1);
+    return doc.indexOf(routePath) < 0;
+  });
+  assertEqual(missing.length, 0,
+    '以下路由在开发文档里搜不到完整路径（多半是被「家族记法」压掉了）：' + missing.join('、'));
+});

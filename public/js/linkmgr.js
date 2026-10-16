@@ -1,0 +1,377 @@
+/** 链接管理页 —— 查看全部分享链接，编辑 / 删除 / 复制 */
+import { API } from './api.js';
+import { toast, confirmDialog, openModal, escapeHtml, fmtSize, fmtTime, matchesQuery, previewMoreState } from './util.js';
+import { openListDialog, bucketSelectOptions } from './listdialog.js';
+import { STATUS_META, statusOf, isDead } from './share-status.js';
+// R37：「限速」列（四张列表卡片共用的唯一实现点）
+import { openSpeedLimitDialog, speedCellHtml } from './speedlimit.js';
+
+let linksCache = [];
+let wired = false;
+
+/**
+ * 「分享链接管理」卡片列表的**预览条数上限**（R36 需求 3：最多显示 100 个）。
+ *
+ * 与另外三张卡片的 10 条不同 —— 链接是「一次性产物」，动辄成百上千条，
+ * 截到 10 条会让卡片本身失去概览价值；而 100 行已经远超前端表格一屏的可读量，
+ * 再多就该进对话框配合搜索来看了。
+ */
+const LINK_PREVIEW_LIMIT = 100;
+
+/** 「全部链接」对话框的句柄（`null` = 未打开）；见 credmgr.js 的同类说明 */
+let linksDialog = null;
+
+function wire() {
+  if (wired) return;
+  wired = true;
+  const btn = document.getElementById('btn-links-refresh');
+  if (btn) btn.onclick = () => refresh();
+  const clean = document.getElementById('btn-links-clean');
+  if (clean) clean.onclick = () => removeDeadLinks();
+  const all = document.getElementById('btn-link-all');
+  if (all) all.onclick = showAllLinks;
+}
+
+function fmtExpiry(l) {
+  if (!l.expiresAt) return '永久';
+  return fmtTime(l.expiresAt);
+}
+
+function fmtCount(l) {
+  return l.maxDownloads > 0 ? `${l.downloads} / ${l.maxDownloads}` : `${l.downloads} / ∞`;
+}
+
+/**
+ * 付费列：链接上的 `required` 只是**分享者的意图**，是否真的收费取决于
+ * 支付功能总开关与可用渠道，因此这里只展示配置本身，不臆断当前是否收费。
+ */
+function fmtPaid(l) {
+  const p = l.paid || {};
+  if (!p.required) return '—';
+  return `<b style="color:#b45309">¥${(Number(p.amountFen || 0) / 100).toFixed(2)}</b>`;
+}
+
+/** 创建者：历史链接没有该字段（早于「按创建者隔离」时创建），显示占位符而非 undefined */
+function fmtOwner(l) {
+  return l.createdBy ? escapeHtml(l.createdBy) : '<span class="lk-dash" title="创建于按创建者隔离之前的旧链接">—</span>';
+}
+
+/** 存储桶：同样是创建时快照的；历史数据可能为空 */
+function fmtBucket(l) {
+  return l.bucket
+    ? `<span class="lk-bucket" title="${escapeHtml(l.bucket)}">${escapeHtml(l.bucket)}</span>`
+    : '<span class="lk-dash">—</span>';
+}
+
+export function refresh() {
+  wire();
+  const box = document.getElementById('linkmgr-table');
+  if (!box) return;
+  API.links().then((r) => {
+    linksCache = r.links || [];
+    render();
+  }).catch((e) => {
+    box.innerHTML = `<div class="lk-empty">加载失败：${escapeHtml(e.message)}</div>`;
+  });
+}
+
+function render() {
+  const box = document.getElementById('linkmgr-table');
+  const head = document.getElementById('linkmgr-count');
+  if (!box) return;
+  if (head) head.textContent = linksCache.length ? `（共 ${linksCache.length} 条）` : '';
+  if (!linksCache.length) {
+    box.innerHTML = `<div class="lk-empty">还没有分享链接。在文件列表中选中文件 → 点击“复制链接”即可创建。</div>`;
+    updateLinkMore(0);
+    repaintAllLinks();
+    return;
+  }
+  // 需求 3：卡片列表最多展示前 LINK_PREVIEW_LIMIT 条链接
+  const shown = linksCache.slice(0, LINK_PREVIEW_LIMIT);
+  box.innerHTML = linkTableHtml(shown);
+  bindLinkRowActions(box, shown);
+
+  updateLinkMore(linksCache.length);
+  repaintAllLinks(); // 对话框开着时同步刷新：删链接后两边必须一致
+}
+
+/**
+ * 链接表格 HTML —— 卡片列表与「全部链接」对话框的**唯一渲染器**（R36）。
+ *
+ * 10 列的宽表格尤其不能抄两份：新增一列（比如以后加「付费金额」）只改一处，
+ * 另一处会静默少一列，而表头与数据错位的表格在视觉上很难被立刻发现。
+ */
+function linkTableHtml(links) {
+  return `<table class="lk-table">
+    <thead><tr>
+      <th>文件</th><th>分享者</th><th>存储桶</th><th>状态</th><th>有效期至</th><th>下载次数</th><th>密码</th><th>付费</th><th>限速</th><th>创建时间</th><th style="width:150px">操作</th>
+    </tr></thead>
+    <tbody>
+      ${links.map((l) => {
+        const st = statusOf(l);
+        const sm = STATUS_META[st];
+        // 文件已被删除：整行灰化 + 划线（.lk-dim 只标数据列，状态列与操作列保持可读）
+        const gone = st === 'deleted';
+        const dim = gone ? ' class="lk-dim"' : '';
+        // R51：多条目分享的 `key` 为空（它对应的是若干对象而不是一个），
+        // 悬停提示改述「N 项」，单元格右侧补一个条目数徽标 —— 否则一行只显示
+        // 「a.txt 等 3 项」，用户无从知道到底分享了多少东西。
+        const multi = l.itemCount > 1;
+        const tipTarget = l.key || `${l.itemCount} 项`;
+        return `<tr data-id="${escapeHtml(l.id)}"${gone ? ' class="row-gone"' : ''}>
+          <td class="lk-file${gone ? ' lk-dim' : ''}" title="${escapeHtml(l.bucket)}/${escapeHtml(tipTarget)}（${fmtSize(l.size)}）">${escapeHtml(l.fileName || l.key)}${multi ? `<span class="lk-count">${l.itemCount} 项</span>` : ''}</td>
+          <td${dim}>${fmtOwner(l)}</td>
+          <td${dim}>${fmtBucket(l)}</td>
+          <td><span class="lk-badge ${sm.cls}">${sm.label}</span></td>
+          <td${dim}>${escapeHtml(fmtExpiry(l))}</td>
+          <td${dim}>${escapeHtml(fmtCount(l))}</td>
+          <td${dim}>${l.hasPassword ? '🔒 已启用' : '—'}</td>
+          <td${dim}>${fmtPaid(l)}</td>
+          <td${dim}>${speedCellHtml('link', l.id, l.speedLimit, true)}</td>
+          <td${dim}>${escapeHtml(fmtTime(l.createdAt))}</td>
+          <td class="lk-acts">
+            <button class="mini-btn" data-act="copy" data-id="${escapeHtml(l.id)}">复制</button>
+            <button class="mini-btn" data-act="edit" data-id="${escapeHtml(l.id)}">编辑</button>
+            <button class="mini-btn danger" data-act="del" data-id="${escapeHtml(l.id)}">删除</button>
+          </td>
+        </tr>`;
+      }).join('')}
+    </tbody></table>`;
+}
+
+/**
+ * 行内按钮绑定 —— 卡片与对话框共用（R36），否则对话框里的按钮会「看得见、点不动」。
+ * 写法与 `syssettings.js` 的 `bindUserRowActions` 严格同型（见 credmgr.js 的同类说明）。
+ */
+function bindLinkRowActions(root, links) {
+  root.querySelectorAll('[data-act]').forEach((btn) => {
+    const act = btn.getAttribute('data-act');
+    const l = links.find((x) => x.id === btn.getAttribute('data-id'));
+    if (!l) return;
+    btn.onclick = () => {
+      if (act === 'copy') copyUrl(l);
+      else if (act === 'edit') openEditDialog(l);
+      /**
+       * R37：链接的限速。「文件分享」（创建链接对话框）与「链接管理」是同一条记录上的
+       * **同一个字段**，所以这里改的就是需求里「两者之间可随意修改」的那一处。
+       * 列表能看到的链接本来就都是自己创建的（普通用户）或全部（管理员），
+       * 与「编辑 / 删除」按钮同一口径，故 `canEdit` 恒为真。
+       */
+      else if (act === 'speed') openSpeedLimitDialog({
+        scope: 'link', id: l.id, name: l.fileName || l.key,
+        current: l.speedLimit, onSaved: refresh,
+      });
+      else if (act === 'del') removeLink(l);
+    };
+  });
+}
+
+/**
+ * 「显示全部」按钮的显隐与提示文案（需求 3）。
+ * 判据下沉到 `util.previewMoreState()`（四张卡片共用）—— 用的是**严格大于**：
+ * 正好 100 条时卡片已完整展示，再摆一个「显示全部」点开只能看到一字不差的副本。
+ */
+function updateLinkMore(total) {
+  const more = document.getElementById('link-more');
+  const hint = document.getElementById('link-more-hint');
+  const { over, hint: hintText } = previewMoreState(total, LINK_PREVIEW_LIMIT, '条链接');
+  if (more) more.hidden = !over;
+  if (hint) hint.textContent = hintText;
+}
+
+/** 重绘「全部链接」列表（对话框没开时是空操作） */
+function repaintAllLinks() {
+  if (linksDialog) linksDialog.repaint();
+}
+
+/**
+ * 按关键词 / 存储桶筛选链接（R36 需求 3）。
+ *
+ * 关键词同时匹配「文件名」与「分享者」—— 二者是页面上最常用的两个定位维度，
+ * 而它们的值都不会互相包含（文件名里几乎不会出现用户名），合成一个框不会产生歧义。
+ * 规则本身走 `util.matchesQuery()`（四张卡片同一条）。
+ *
+ * 历史链接的 `bucket` 可能为空串（早于「按创建者隔离」的旧数据）——
+ * 那类条目在「全部存储桶」下仍可见，不会被这项筛选悄悄藏起来。
+ */
+function filterLinks(list, query, bucket) {
+  const want = String(bucket == null ? '' : bucket).trim();
+  return (Array.isArray(list) ? list : []).filter((l) => (!want || String((l && l.bucket) || '') === want)
+    && matchesQuery(query, [(l && (l.fileName || l.key)) || '', (l && l.createdBy) || '']));
+}
+
+/** 打开「全部链接」对话框（需求 3：存储桶下拉 + 搜索文件名与分享者） */
+function showAllLinks() {
+  if (linksDialog) return; // 连点两次不得叠出第二层遮罩（句柄在 onClose 里复位）
+  linksDialog = openListDialog({
+    idPrefix: 'link-all',
+    title: `全部分享链接（共 ${linksCache.length} 条）`,
+    placeholder: '搜索文件名或分享者（不区分大小写）',
+    cls: 'link-all-dialog', // 10 列表格要的宽度（见 style.css）
+    unit: '条链接',
+    unitShort: '条',
+    emptyAll: '还没有分享链接',
+    emptyMatch: '没有匹配的链接',
+    selects: [{
+      id: 'bucket',
+      title: '按存储桶筛选',
+      value: '',
+      options: bucketSelectOptions(linksCache, '全部存储桶'),
+    }],
+    items: () => linksCache,
+    filter: (list, st) => filterLinks(list, st.query, st.filters.bucket),
+    // 卡片与对话框共用同一个表格渲染器与同一套行按钮绑定
+    rowHtml: (shown) => linkTableHtml(shown),
+    bindRows: (list, shown) => bindLinkRowActions(list, shown),
+    onClose: () => { linksDialog = null; },
+  });
+}
+
+async function copyUrl(l) {
+  const url = location.origin + '/s/' + l.id;
+  try {
+    await navigator.clipboard.writeText(url);
+    toast('链接已复制到剪贴板', { type: 'success' });
+  } catch (e) {
+    openModal({
+      title: '分享链接', body: `<textarea readonly style="width:100%;height:84px;border:1px solid var(--border-strong);border-radius:6px;padding:8px;font-size:12px;resize:none">${escapeHtml(url)}</textarea>`,
+      foot: [{ text: '关闭' }],
+    });
+  }
+}
+
+async function removeLink(l) {
+  const ok = await confirmDialog({ allowHtml: true,
+    title: '删除分享链接',
+    message: `确定删除 <b>${escapeHtml(l.fileName || l.key)}</b> 的分享链接吗？<br><span style="color:var(--text-2)">仅删除本地分享记录，<b>不会删除云端文件</b>；已送达访问者的链接将立即失效。</span>`,
+    okText: '删除', danger: true,
+  });
+  if (!ok) return;
+  try {
+    await API.deleteLink(l.id);
+    toast('链接已删除', { type: 'success' });
+    refresh();
+  } catch (e) {
+    toast('删除失败：' + e.message, { type: 'error' });
+  }
+}
+
+/**
+ * 删除全部失效链接（「文件已删除」与「已过期」）。
+ *
+ * 「哪些算失效」**不在这里另写一份判据** —— 它取自 `share-status.js` 的 `isDead()`，
+ * 而那份与服务端 `share-store.status()` 是同序的单一事实源。本地只拿它数一下
+ * 待删条数（用于确认框文案），真正的删改由服务端 `shareStore.removeDead()` 执行。
+ *
+ * ⚠️ 「已关闭」（下载次数用尽）**不算**失效：它在「编辑」里调大次数即可复活，
+ * 删掉就不可逆了 —— 故 `isDead()` 明确把它排除在外，确认框也如实说明这一点。
+ */
+async function removeDeadLinks() {
+  const n = linksCache.filter((l) => isDead(l)).length;
+  const ok = await confirmDialog({ allowHtml: true,
+    title: '删除失效链接',
+    message: `确定删除全部<b>文件已删除</b>与<b>已过期</b>的分享链接吗？<br><br>`
+      + `<span style="color:var(--text-2)">当前列表中共 <b>${n}</b> 条；仅删除本地分享记录，`
+      + `<b>不会删除云端文件</b>。「已关闭」（下载次数已用尽）的链接不会被删除 —— `
+      + `在「编辑」里调大下载次数即可让它恢复，属于可以改回来的状态。</span>`,
+    okText: '删除', danger: true,
+  });
+  if (!ok) return;
+  try {
+    const r = await API.deleteDeadLinks();
+    const removed = (r && Number(r.removed)) || 0;
+    toast(removed ? `已删除 ${removed} 条失效链接` : '没有需要删除的失效链接', { type: 'success' });
+    refresh();
+  } catch (e) {
+    toast('删除失败：' + e.message, { type: 'error' });
+  }
+}
+
+/** 编辑链接：有效期 / 次数 / 密码 / 重置计数 */
+function openEditDialog(l) {
+  const remainH = l.expiresAt ? Math.max(0, (new Date(l.expiresAt).getTime() - Date.now()) / 3600000) : null;
+  const keepLabel = remainH === null ? '保持当前（永久有效）' : `保持当前（剩余 ${remainH >= 48 ? (remainH / 24).toFixed(1) + ' 天' : remainH.toFixed(1) + ' 小时'}）`;
+  const wrap = document.createElement('div');
+  wrap.innerHTML = `
+    <div class="form-item"><label>文件</label>
+      <div class="hint" style="word-break:break-all">${escapeHtml(l.bucket)}/${escapeHtml(l.key)}</div>
+      ${l.missing ? '<div class="hint" style="color:var(--danger)">该文件已被删除，此链接当前无法下载。若把同名文件重新上传到同一位置，链接会自动恢复。</div>' : ''}
+      <div class="hint">已下载 ${l.downloads} 次${l.lastDownloadAt ? '，最近 ' + escapeHtml(fmtTime(l.lastDownloadAt)) : ''}</div></div>
+    <div class="form-item"><label>链接有效时间</label>
+      <select id="le-expires" class="full">
+        <option value="keep" selected>${escapeHtml(keepLabel)}</option>
+        <option value="1">重新计为 1 小时</option>
+        <option value="24">重新计为 1 天</option>
+        <option value="168">重新计为 7 天</option>
+        <option value="720">重新计为 30 天</option>
+        <option value="0">改为永久有效</option>
+      </select></div>
+    <div class="form-item"><label>可下载次数</label>
+      <input id="le-count" type="number" min="0" step="1" value="${l.maxDownloads}" placeholder="0">
+      <div class="hint">0 表示不限制；修改为小于已下载次数将立即关闭链接。</div></div>
+    <div class="form-item"><label>访问密码</label>
+      <label class="check-line"><input id="le-pw-on" type="checkbox" ${l.hasPassword ? 'checked' : ''}>${l.hasPassword ? '保持密码保护' : '启用密码保护'}</label>
+      <input id="le-pw" type="text" maxlength="64" placeholder="${l.hasPassword ? '留空保持原密码不变' : '请输入访问密码'}" ${l.hasPassword ? '' : 'disabled'} autocomplete="off">
+      <div class="hint">${l.hasPassword ? '取消勾选将清除密码保护；输入新密码将替换原密码。' : '启用后，访问者需输入正确密码方可下载。'}</div></div>
+    <div class="form-item"><label>付费下载</label>
+      <label class="check-line"><input id="le-paid-on" type="checkbox" ${l.paid && l.paid.required ? 'checked' : ''}>  需要付费后才能下载</label>
+      <div id="le-paid-row" style="display:${l.paid && l.paid.required ? '' : 'none'};margin-top:8px">
+        <input id="le-paid-amount" type="number" min="0.01" step="0.01" value="${l.paid && l.paid.amountFen ? (l.paid.amountFen / 100).toFixed(2) : '1.00'}" placeholder="1.00">
+        <div class="hint">当前仅支持人民币（CNY），最低 <b>0.01</b> 元。取消勾选不会清空金额，重新勾选时保留。</div>
+      </div></div>
+    <div class="form-item"><label>下载计数</label>
+      <label class="check-line"><input id="le-reset" type="checkbox">重置已下载次数为 0</label></div>`;
+
+  const pwOn = wrap.querySelector('#le-pw-on');
+  const pwInput = wrap.querySelector('#le-pw');
+  pwOn.addEventListener('change', () => { pwInput.disabled = !pwOn.checked; if (pwOn.checked) pwInput.focus(); });
+  const paidOn = wrap.querySelector('#le-paid-on');
+  const paidRow = wrap.querySelector('#le-paid-row');
+  const paidAmount = wrap.querySelector('#le-paid-amount');
+  paidOn.addEventListener('change', () => {
+    paidRow.style.display = paidOn.checked ? '' : 'none';
+    if (paidOn.checked) paidAmount.focus();
+  });
+
+  openModal({
+    title: '编辑分享链接', body: wrap,
+    foot: [
+      { text: '取消' },
+      { text: '保存', cls: 'primary', onClick: async (o, close) => {
+        const body = {};
+        const ev = wrap.querySelector('#le-expires').value;
+        if (ev !== 'keep') body.expiresHours = Number(ev) || null;
+        const cnt = wrap.querySelector('#le-count').value.trim();
+        if (cnt !== '') {
+          const n = Number(cnt);
+          if (!Number.isInteger(n) || n < 0) return toast('可下载次数必须是不小于 0 的整数（0 表示不限制）', { type: 'error' });
+          body.maxDownloads = n;
+        }
+        if (!pwOn.checked) {
+          body.password = null; // 清除密码
+        } else if (pwInput.value) {
+          if (pwInput.value.length > 64) return toast('密码长度不能超过 64 个字符', { type: 'error' });
+          body.password = pwInput.value; // 替换密码
+        } // 勾选且留空：保持原密码，不传字段
+        if (wrap.querySelector('#le-reset').checked) body.resetCount = true;
+        // 付费配置：勾选时金额最低 0.01 元；未勾选时金额一并提交以便保留
+        if (paidOn.checked) {
+          const amount = Number(paidAmount.value);
+          if (!Number.isFinite(amount) || amount < 0.01) return toast('付费金额最低 0.01 元', { type: 'error' });
+          body.paid = { required: true, amount };
+        } else if (l.paid && l.paid.amountFen) {
+          body.paid = { required: false, amount: l.paid.amountFen / 100 };
+        }
+        try {
+          const r = await API.updateLink(l.id, body);
+          toast('链接已更新', { type: 'success' });
+          close();
+          refresh();
+          if (r && r.warn) toast(r.warn, { type: 'warn', duration: 6000 });
+        } catch (e) {
+          toast('保存失败：' + e.message, { type: 'error' });
+        }
+      } },
+    ],
+  });
+}

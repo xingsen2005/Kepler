@@ -1,0 +1,1433 @@
+/* ============ 全局 ============ */
+:root {
+  --bg: #f3f3f3;
+  --panel: #ffffff;
+  --border: #e1e1e1;
+  --border-strong: #cfcfcf;
+  --text: #1b1b1b;
+  --text-2: #616161;
+  --accent: #0067c0;
+  --accent-weak: #e8f1fb;
+  --danger: #e5484d;
+  --ok: #2e9e5b;
+  --warn: #d97706;
+  --hover: #f0f6fd;
+  --selected: #cfe4f9;
+  --radius: 8px;
+  --tb-h: 46px;
+  --sb-h: 30px;
+  --shadow: 0 8px 30px rgba(0, 0, 0, .14);
+  --font: "Microsoft YaHei", "Segoe UI", "PingFang SC", system-ui, -apple-system, sans-serif;
+
+  /* ---- R40：明暗主题共用的语义槽位 ----
+     下面这批颜色原先在规则里**逐处写死**（全表 100 处）。暗黑模式如果只改上面那 13 个
+     变量，输入框、下拉、列表 hover、代码块、各种提示底色仍会是一片白 —— 于是要么在
+     暗色块里把 40 多个选择器逐个再抄一遍（新增组件永远漏），要么把写死的值就地改成
+     主题变量。这里选后者：**唯一实现点**，换主题只改这一个地方。
+     绝大多数槽位的浅色取值 = 它替换掉的那个字面量，**浅色模式看不出来**。
+     两处刻意的归一化（都是「同一个角色被写成了好几个值」，并列只会让暗色适配漏掉其中几个）：
+       · `#333` / `#444` → `--text`；`#555` → `--text-2`
+       · `#888` / `#aaa` / `#6b7280` → `--muted`（连同 `#999`）
+     另有两处近似合并（`#fafbfd`→`--surface-2`、`#f1f2f4`→`--surface-3`），肉眼无差。 */
+  --ctrl-bg: #fff;        /* 输入框 / 按钮 / 下拉 / 列表 / 对话框的底 */
+  --surface-2: #f8fafc;   /* 次级面板底（统计块、说明块） */
+  --surface-3: #f3f4f6;   /* 更浅的填充（标签底、分组表头） */
+  --field-bg: #f9f9f9;    /* 地址栏 / 搜索框底 */
+  --row-hover: #f1f5fa;   /* 列表行 hover（浅蓝） */
+  --hover-2: #f1f1f1;     /* 中性 hover 一级 */
+  --hover-3: #f6f6f6;     /* 中性 hover 二级 */
+  --hover-4: #ececec;     /* 中性 hover 三级 / 进度条槽 */
+  --line-soft: #f1f1f1;   /* 表格内的细分隔线 */
+  --muted: #999;          /* 更弱的说明文字 */
+  --icon: #98a1ad;        /* 列表 / 侧栏的图标 */
+  --tint-ok: #e9f7ef;     /* 成功态底色 */
+  --tint-bad: #fdecec;    /* 失败态底色 */
+  --tint-warn: #fffbeb;   /* 警示态底色 */
+  --tint-warn-2: #fff7ed; /* 警示态底色（深一档） */
+  --tint-info: #e0f2fe;   /* 信息态底色 */
+  --tint-enc: #fef3c7;    /* 加密相关标签底 */
+  color-scheme: light;    /* 原生控件（下拉 / 复选框 / 滚动条 / 日期选择器）跟随主题 */
+}
+* { box-sizing: border-box; margin: 0; padding: 0; }
+[hidden] { display: none !important; }
+html, body { height: 100%; }
+body {
+  font-family: var(--font); font-size: 13px; color: var(--text); background: var(--bg);
+  overflow: hidden; -webkit-font-smoothing: antialiased;
+}
+button { font-family: inherit; font-size: inherit; cursor: pointer; border: none; background: none; color: inherit; }
+button:disabled { opacity: .45; cursor: default; }
+input, select { font-family: inherit; font-size: inherit; color: inherit; }
+svg { display: block; }
+
+#app { height: 100%; display: flex; flex-direction: column; }
+
+/* ============ 工具栏 ============ */
+#toolbar { background: var(--panel); border-bottom: 1px solid var(--border); user-select: none; flex: none; }
+.tb-row { display: flex; align-items: center; gap: 6px; padding: 4px 10px; }
+.tb-ops { padding-top: 0; padding-bottom: 6px; flex-wrap: wrap; }
+.tb-left { display: flex; align-items: center; gap: 4px; flex: 1 1 340px; min-width: 0; }
+.tb-center { flex: 1 1 280px; display: flex; justify-content: center; min-width: 0; }
+.tb-right { flex: 0 0 auto; display: flex; align-items: center; gap: 4px; }
+
+.icon-btn {
+  width: 32px; height: 32px; border-radius: 6px; display: inline-flex; align-items: center; justify-content: center;
+  color: var(--text);
+}
+.icon-btn:hover:not(:disabled) { background: #e0e0e0; }
+.icon-btn:active:not(:disabled) { background: #d0d0d0; }
+.icon-btn.small { width: 24px; height: 24px; }
+.icon-btn svg { width: 17px; height: 17px; }
+.icon-btn.small svg { width: 14px; height: 14px; }
+
+.address-bar {
+  flex: 1; min-width: 60px; height: 32px; display: flex; align-items: center; gap: 2px; overflow: hidden;
+  background: var(--field-bg); border: 1px solid var(--border); border-radius: 6px; padding: 0 8px; white-space: nowrap;
+}
+.address-bar .crumb {
+  padding: 3px 6px; border-radius: 4px; color: var(--text); max-width: 180px; overflow: hidden;
+  text-overflow: ellipsis; flex: none;
+}
+.address-bar .crumb:hover { background: #e9e9e9; }
+.address-bar .crumb.current { background: var(--accent-weak); color: var(--accent); font-weight: 600; }
+.address-bar .sep { color: var(--muted); flex: none; }
+.address-bar.fade-l { mask-image: linear-gradient(to right, transparent, #000 24px); }
+
+#search-box {
+  display: flex; align-items: center; gap: 4px; width: 100%; max-width: 460px; height: 32px;
+  background: var(--field-bg); border: 1px solid var(--border); border-radius: 6px; padding: 0 4px 0 8px;
+}
+#search-box:focus-within { border-color: var(--accent); background: var(--ctrl-bg); }
+#search-box svg { width: 15px; height: 15px; color: var(--muted); flex: none; }
+#search-input { flex: 1; min-width: 40px; border: none; outline: none; background: transparent; }
+
+.seg { display: inline-flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+.seg button { width: 34px; height: 30px; display: inline-flex; align-items: center; justify-content: center; color: var(--text-2); }
+.seg button + button { border-left: 1px solid var(--border); }
+.seg button:hover { background: var(--hover-2); }
+.seg button.active { background: var(--accent-weak); color: var(--accent); }
+.seg svg { width: 16px; height: 16px; }
+
+.tb-btn {
+  height: 30px; padding: 0 10px; border-radius: 6px; display: inline-flex; align-items: center; gap: 5px; color: var(--text);
+}
+.tb-btn:hover { background: var(--hover-4); }
+.tb-btn svg { width: 15px; height: 15px; }
+.tb-sep { width: 1px; height: 20px; background: var(--border-strong); margin: 0 4px; }
+/* 顶部「日间 / 暗黑」快捷切换（R40）：纯图标按钮，宽度与 .icon-btn 对齐。
+   两颗图标都写在 HTML 里，靠 `[data-theme="dark"]` 决定露哪一颗 —— 不写 `display: inline`
+   就会被下面的 svg 尺寸规则与 flex 布局一起放大。 */
+.tb-btn.theme-btn { width: 30px; padding: 0; justify-content: center; }
+.theme-btn .ic-sun { display: none; }
+.theme-btn .ic-moon { display: inline; }
+[data-theme="dark"] .theme-btn .ic-sun { display: inline; }
+[data-theme="dark"] .theme-btn .ic-moon { display: none; }
+
+.op-btn {
+  height: 30px; padding: 0 10px; border-radius: 6px; display: inline-flex; align-items: center; gap: 6px;
+  border: 1px solid transparent; color: #242424;
+}
+.op-btn:hover:not(:disabled) { background: var(--hover-4); }
+.op-btn svg { width: 15px; height: 15px; color: var(--text-2); }
+.op-btn.danger { color: var(--danger); }
+.op-btn.danger svg { color: var(--danger); }
+.op-btn.ghost { color: var(--text-2); }
+.only-narrow { display: none; }
+
+/* ============ 主体 ============ */
+#body { flex: 1; display: flex; min-height: 0; }
+#sidebar {
+  width: 232px; flex: none; background: var(--panel); border-right: 1px solid var(--border);
+  display: flex; flex-direction: column; min-height: 0;
+}
+.side-head { display: flex; align-items: center; justify-content: space-between; padding: 10px 10px 4px 14px; }
+.side-title { font-weight: 600; color: var(--text-2); font-size: 12px; letter-spacing: .04em; }
+.side-head-btns { display: inline-flex; gap: 2px; }
+/* 存储桶列表 */
+.bucket-list { list-style: none; margin: 2px 8px 8px; max-height: 180px; overflow: auto; flex: none; }
+.bucket-empty { color: var(--muted); font-size: 12px; padding: 8px 10px; line-height: 1.6; }
+.bucket-empty.clickable { cursor: pointer; border-radius: 7px; }
+.bucket-empty.clickable:hover { background: var(--row-hover); color: var(--accent); }
+.bucket-item {
+  display: flex; align-items: center; gap: 7px; padding: 5px 8px; border-radius: 7px;
+  cursor: pointer; color: var(--text); user-select: none; position: relative;
+}
+.bucket-item:hover { background: var(--row-hover); }
+.bucket-item.active { background: var(--accent-weak); color: var(--accent); }
+.bucket-item .bk-ic { width: 16px; height: 16px; flex: none; color: var(--icon); }
+.bucket-item.active .bk-ic { color: var(--accent); }
+.bucket-item .bk-text { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.bucket-item .bk-text b {
+  font-weight: 500; font-size: 12.5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.bucket-item.active .bk-text b { font-weight: 600; }
+.bucket-item .bk-text i {
+  font-style: normal; font-size: 11px; color: var(--icon); white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.bucket-item .bk-acts { display: none; flex: none; gap: 0; }
+.bucket-item:hover .bk-acts { display: inline-flex; }
+.bucket-item .bk-acts .icon-btn { width: 20px; height: 20px; color: var(--icon); }
+.bucket-item .bk-acts .icon-btn:hover { background: rgba(0, 0, 0, .07); color: var(--danger); }
+.bucket-item .bk-acts .icon-btn.bk-edit:hover { color: var(--accent); }
+/* 密钥列表（设置弹窗） */
+.cred-list { max-height: 180px; overflow: auto; margin-bottom: 4px; }
+.cred-row {
+  display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: 7px;
+  cursor: pointer; border: 1px solid transparent;
+}
+.cred-row:hover { background: var(--row-hover); }
+.cred-row.active { background: var(--accent-weak); border-color: #bcd6f2; }
+.cred-row .cred-radio { color: var(--accent); font-size: 12px; width: 14px; flex: none; }
+.cred-row .cred-text { flex: 1; min-width: 0; display: flex; align-items: baseline; gap: 8px; }
+.cred-row .cred-text b { font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.cred-row .cred-text i { font-style: normal; font-size: 11px; color: var(--icon); }
+.cred-row .cred-badge {
+  flex: none; font-size: 10.5px; color: var(--accent); background: var(--ctrl-bg);
+  border: 1px solid #bcd6f2; border-radius: 10px; padding: 1px 7px;
+}
+.cred-row .cred-del { flex: none; width: 22px; height: 22px; color: var(--icon); }
+.cred-row .cred-del:hover { background: rgba(0, 0, 0, .07); color: var(--danger); }
+/* R44：侧栏「文件类型」筛选 —— 取代原先与顶部地址栏（面包屑）功能重复的「文件夹导航」树。
+   `.tree-row` / `.tree-kids` 仍被「移动到…」的文件夹选择器复用，故保留在下方。 */
+.filetype { flex: 1; overflow: auto; padding: 6px; display: flex; flex-direction: column; gap: 2px; }
+.ft-row {
+  display: flex; align-items: center; gap: 9px; height: 32px; padding: 0 8px; border-radius: 6px;
+  cursor: pointer; color: var(--text); white-space: nowrap; user-select: none;
+}
+.ft-row:hover { background: var(--row-hover); }
+.ft-row.active { background: var(--accent-weak); color: var(--accent); font-weight: 600; }
+.ft-row .ft-ic { display: inline-flex; flex: none; }
+.ft-row .ft-ic .fic { width: 20px; height: 20px; display: block; }
+.ft-row .ft-lb { flex: 1; overflow: hidden; text-overflow: ellipsis; }
+.ft-row .ft-ct { flex: none; font-size: 11px; color: var(--muted); font-variant-numeric: tabular-nums; }
+.ft-row.active .ft-ct { color: var(--accent); }
+.tree-node { user-select: none; }
+.tree-row {
+  display: flex; align-items: center; gap: 6px; height: 28px; padding: 0 6px; border-radius: 6px; cursor: pointer; color: var(--text);
+  white-space: nowrap;
+}
+.tree-row:hover { background: var(--row-hover); }
+.tree-row.active { background: var(--accent-weak); color: var(--accent); font-weight: 600; }
+.tree-row svg { width: 16px; height: 16px; color: #e8b339; flex: none; }
+.tree-row .tw { width: 16px; height: 16px; flex: none; display: flex; align-items: center; justify-content: center; color: var(--muted); }
+.tree-row .tw svg { width: 10px; height: 10px; color: var(--muted); }
+.tree-row .nm { overflow: hidden; text-overflow: ellipsis; }
+/* R52-02：「移动到…」选择器里只在**当前所在目录**上挂的角标。
+   它刻意不参与 `.active` 高亮 —— active 表示「已选中的移动目标」，
+   而当前目录只是个参考信息，默认不该替用户做主。 */
+.tree-row.cur .nm { color: var(--muted); }
+.tree-row .fp-cur {
+  margin-left: 6px; flex: none; font-size: 10px; line-height: 14px; padding: 0 5px; border-radius: 7px;
+  background: var(--surface-2, rgba(127, 127, 127, .14)); color: var(--muted); font-weight: 400;
+}
+.tree-kids { margin-left: 16px; border-left: 1px solid #eee; padding-left: 4px; }
+.side-foot { border-top: 1px solid var(--border); padding: 6px; display: flex; flex-direction: column; gap: 2px; }
+.side-link { text-align: left; padding: 7px 10px; border-radius: 6px; color: var(--text); }
+.side-link:hover { background: var(--row-hover); }
+#sidebar-mask { display: none; }
+
+#main { flex: 1; min-width: 0; display: flex; flex-direction: column; background: var(--panel); }
+
+/* ============ 文件区 ============ */
+#explorer { flex: 1; display: flex; flex-direction: column; min-height: 0; }
+#search-banner {
+  display: flex; align-items: center; gap: 10px; padding: 6px 14px; background: var(--accent-weak);
+  color: var(--accent); border-bottom: 1px solid var(--border); font-size: 12px;
+}
+.mini-btn {
+  height: 24px; padding: 0 10px; border-radius: 5px; background: var(--ctrl-bg); border: 1px solid var(--border); color: var(--text); font-size: 12px;
+}
+.mini-btn:hover { border-color: var(--accent); color: var(--accent); }
+.mini-btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.mini-btn.primary:hover { background: #005aa8; color: #fff; }
+/* R54②：「编辑资料」的验证码一行 —— 输入框占满，按钮贴着右边缘 */
+.code-line { display: flex; align-items: center; gap: 8px; }
+.code-line input { flex: 1; min-width: 0; }
+.code-line .mini-btn { flex: none; height: 32px; }
+/* R54②：用户表的邮箱列 —— 地址可能很长，限宽省略，完整值放在 title 里 */
+.user-tbl .lk-email { max-width: 210px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.mini-select { height: 24px; border: 1px solid var(--border); border-radius: 5px; background: var(--ctrl-bg); font-size: 12px; }
+
+#file-area { flex: 1; overflow: auto; outline: none; position: relative; padding-bottom: 20px; }
+#file-area.dropping { outline: 2px dashed var(--accent); outline-offset: -6px; background: #f4faff; }
+
+/* R50：左键框选（橡皮筋）选框。
+   `position: fixed` 是刻意的 —— 命中判据用的是 `getBoundingClientRect()`（视口坐标），
+   固定定位与之同一坐标系，滚动时不必换算；也不会被 #file-area 的 overflow 裁掉。
+   `pointer-events:none` 保证选框不会自己挡住后续 mousemove 的 target。 */
+.marquee {
+  position: fixed; z-index: 40; pointer-events: none;
+  border: 1px solid var(--accent); background: rgba(0, 103, 192, .12); border-radius: 3px;
+}
+/* 拖动期间禁止文字选择：否则整个列表会被选蓝，看起来像"框错了整页" */
+body.marquee-dragging { user-select: none; -webkit-user-select: none; }
+
+#load-more { display: flex; align-items: center; justify-content: center; gap: 10px; padding: 10px; }
+.loading-spin {
+  width: 16px; height: 16px; border: 2px solid #cfe0f0; border-top-color: var(--accent); border-radius: 50%;
+  animation: spin .8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+#empty-hint { padding: 60px 20px; text-align: center; color: var(--text-2); }
+#empty-hint .big { font-size: 40px; margin-bottom: 10px; }
+/* R44：「该类型下没有文件」的空态展示同类型的图标 */
+#empty-hint .big .fic { width: 56px; height: 56px; display: inline-block; vertical-align: middle; }
+
+/* ---- 列表视图 ---- */
+table.file-list { width: 100%; border-collapse: collapse; }
+table.file-list th, table.file-list td { text-align: left; padding: 0 10px; height: 30px; white-space: nowrap; }
+table.file-list thead th {
+  position: sticky; top: 0; z-index: 2; background: var(--panel); border-bottom: 1px solid var(--border);
+  font-weight: 400; color: var(--text-2); font-size: 12px; user-select: none; cursor: pointer;
+}
+table.file-list thead th:hover { background: var(--hover-3); }
+table.file-list thead th .arr { font-size: 10px; margin-left: 3px; }
+table.file-list tbody tr { cursor: default; }
+table.file-list tbody tr:hover { background: var(--hover); }
+table.file-list tbody tr.selected { background: var(--selected); }
+table.file-list tbody tr.cut { opacity: .55; }
+td.c-name, th.c-name { min-width: 200px; }
+td.c-size, th.c-size { width: 100px; }
+td.c-type, th.c-type { width: 90px; }
+td.c-date, th.c-date { width: 150px; }
+.f-ic { display: inline-flex; align-items: center; gap: 8px; max-width: 100%; overflow: hidden; }
+/* R44：文件 / 文件夹图标统一走雪碧（`<use>`），尺寸在这里定；底色与图形都在图标里 */
+.f-ic .fic { width: 20px; height: 20px; flex: none; display: block; }
+.f-ic .f-name { overflow: hidden; text-overflow: ellipsis; }
+
+/* ---- 图标/缩略图视图 ---- */
+.grid-wrap { display: flex; flex-wrap: wrap; gap: 6px; padding: 10px 12px; align-content: flex-start; }
+.grid-item {
+  border-radius: 8px; display: flex; flex-direction: column; align-items: center; justify-content: flex-start;
+  padding: 8px 4px; cursor: default; text-align: center; border: 1px solid transparent; position: relative;
+}
+.grid-item:hover { background: var(--hover); }
+.grid-item.selected { background: var(--selected); border-color: #a9ccf0; }
+.grid-item .thumb {
+  display: flex; align-items: center; justify-content: center; margin-bottom: 6px; overflow: hidden; border-radius: 6px;
+  background: #f7f7f7; flex: none; position: relative;
+}
+/* 图标是占位（未加载 / 非图片时的最终形态）；真实缩略图加载完成后叠在其上 */
+.grid-item .thumb .fic { display: block; }
+.grid-item .thumb img { position: absolute; inset: 0; width: 100%; height: 100%; object-fit: cover; display: none; }
+.grid-item .thumb img.loaded { display: block; }
+.grid-item .nm {
+  width: 100%; overflow: hidden; text-overflow: ellipsis; display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical;
+  word-break: break-all; line-height: 1.35; font-size: 12px;
+}
+.view-large .grid-item { width: 128px; }
+.view-large .grid-item .thumb { width: 88px; height: 88px; }
+.view-large .grid-item .thumb .fic { width: 68px; height: 68px; }
+.view-small .grid-item { width: 260px; flex-direction: row; text-align: left; padding: 4px 8px; gap: 8px; }
+.view-small .grid-item .thumb { width: 26px; height: 26px; margin-bottom: 0; }
+.view-small .grid-item .thumb .fic { width: 22px; height: 22px; }
+.view-small .grid-item .nm { -webkit-line-clamp: 1; flex: 1; }
+.view-thumbs .grid-item { width: 132px; }
+.view-thumbs .grid-item .thumb { width: 112px; height: 84px; }
+.view-thumbs .grid-item .thumb .fic { width: 76px; height: 76px; }
+
+/* 文件类型图标：底色与图形都烘在 index.html 的雪碧符号里（R44），此处不再有颜色规则 */
+
+/* ============ 状态栏 ============ */
+#statusbar {
+  height: var(--sb-h); background: var(--panel); border-top: 1px solid var(--border); flex: none;
+  display: flex; align-items: center; gap: 4px; padding: 0 10px; font-size: 12px; color: var(--text-2); user-select: none;
+}
+.st-item { display: inline-flex; align-items: center; gap: 6px; padding: 0 8px; height: 22px; border-radius: 4px; white-space: nowrap; }
+.st-btn:hover { background: var(--hover-2); }
+.st-flex { flex: 1; }
+.dot { width: 8px; height: 8px; border-radius: 50%; background: #b9b9b9; display: inline-block; }
+.dot.ok { background: var(--ok); }
+.dot.bad { background: var(--danger); }
+.quota-bar {
+  width: 90px; height: 6px; background: #e6e6e6; border-radius: 3px; overflow: hidden; display: inline-block;
+}
+.quota-bar i { display: block; height: 100%; width: 0; background: linear-gradient(90deg, #4f8ef7, #39b97b); transition: width .3s; }
+.quota-bar.hot i { background: linear-gradient(90deg, #f0a13c, #e5484d); }
+.quota-bar.unlimited i { background: #dce8f7; }
+
+/* ============ 抽屉（上传管理） ============ */
+#upload-drawer {
+  position: fixed; right: 14px; bottom: 40px; width: 420px; max-width: calc(100vw - 28px);
+  max-height: 55vh; background: var(--panel); border: 1px solid var(--border); border-radius: 12px;
+  box-shadow: var(--shadow); display: flex; flex-direction: column; z-index: 60;
+}
+.drawer-head {
+  display: flex; align-items: center; gap: 10px; padding: 10px 12px; border-bottom: 1px solid var(--border);
+}
+.drawer-head b { font-size: 13px; }
+#upload-summary { color: var(--text-2); font-size: 12px; flex: 1; }
+.drawer-actions { display: flex; gap: 6px; align-items: center; }
+#upload-list { overflow: auto; padding: 6px; }
+.up-item { padding: 8px 10px; border-radius: 8px; }
+.up-item:hover { background: #f7f9fb; }
+.up-row1 { display: flex; align-items: center; gap: 8px; }
+.up-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 12px; }
+.up-state { font-size: 11px; color: var(--text-2); flex: none; }
+.up-state.ok { color: var(--ok); }
+.up-state.bad { color: var(--danger); }
+.up-actions { display: flex; gap: 2px; }
+.up-actions .icon-btn { width: 24px; height: 24px; }
+.up-bar { height: 4px; background: var(--hover-4); border-radius: 2px; margin-top: 6px; overflow: hidden; }
+.up-bar i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .2s; border-radius: 2px; }
+.up-sub { font-size: 11px; color: var(--muted); margin-top: 3px; display: flex; justify-content: space-between; }
+.up-empty { text-align: center; color: var(--muted); padding: 26px 0; }
+
+/* ============ 弹窗 ============ */
+#modal-root .overlay {
+  position: fixed; inset: 0; background: rgba(0, 0, 0, .35); z-index: 100; display: flex; align-items: flex-start;
+  justify-content: center; padding: 60px 16px 16px; overflow: auto;
+}
+.dialog {
+  background: var(--panel); border-radius: 12px; box-shadow: var(--shadow); width: 480px; max-width: 100%;
+  display: flex; flex-direction: column; max-height: calc(100vh - 80px);
+}
+.dialog.wide { width: 720px; }
+.dialog-head { display: flex; align-items: center; padding: 14px 16px 8px; }
+.dialog-head b { font-size: 15px; flex: 1; }
+.dialog-body { padding: 6px 16px; overflow: auto; }
+.dialog-foot { display: flex; justify-content: flex-end; gap: 8px; padding: 12px 16px 16px; }
+.btn {
+  height: 32px; padding: 0 16px; border-radius: 6px; border: 1px solid var(--border-strong); background: var(--ctrl-bg); color: var(--text);
+}
+.btn:hover { background: var(--hover-3); }
+.btn.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
+.btn.primary:hover { background: #0875d4; }
+.btn.danger { background: var(--danger); border-color: var(--danger); color: #fff; }
+.btn.danger:hover { filter: brightness(1.08); }
+.form-item { margin-bottom: 14px; }
+/* ⚠️ 这里的两条「输入框样式」必须排除 checkbox。
+   `.form-item input` 会把**任何**后代 input 拉成 100% 宽 × 34px 带边框的输入框；
+   而「label 内嵌 checkbox」的写法（.check-line / .u-hello-label）一旦落在 .form-item 里，
+   就表现为「复选框变成一个巨大的方框」。历史上已为此打过两次补丁（.u-hello-label、
+   .perm-transfer），现在改为**从源头排除**，新增场景不再复发。 */
+/* ⚠️ 必须用**直接子代** `>`：.form-item 里还会嵌套「label 作为卡片」的组件
+   （.pv-picker > .pv-opt 厂商选择器、.enc-modes > .enc-mode-opt 加密方式、
+   .check-line / .u-hello-label 复选项）。用后代选择器会把它们一起拉成
+   display:block —— 厂商选择器就曾因此把 LOGO 与名称挤在同一行。
+   只作用于「表单项自身的标题 label」，组件卡片一律不命中。 */
+.form-item > label:not(.check-line):not(.u-hello-label) { display: block; font-size: 12px; color: var(--text-2); margin-bottom: 4px; }
+.form-item .req { color: var(--danger); margin-left: 2px; }
+.form-item input:not([type="checkbox"]), .form-item select {
+  width: 100%; height: 34px; border: 1px solid var(--border-strong); border-radius: 6px; padding: 0 10px; background: var(--ctrl-bg); outline: none;
+}
+.form-item input:not([type="checkbox"]):focus, .form-item select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(0, 103, 192, .2); }
+.form-item .hint { font-size: 11px; color: var(--muted); margin-top: 4px; line-height: 1.5; }
+.form-row { display: flex; gap: 10px; }
+.form-row .form-item { flex: 1; }
+.form-msg { font-size: 12px; border-radius: 6px; padding: 8px 10px; margin-bottom: 12px; display: none; }
+.form-msg.show { display: block; }
+.form-msg.ok { background: var(--tint-ok); color: var(--ok); }
+.form-msg.bad { background: var(--tint-bad); color: var(--danger); }
+.form-msg.info { background: var(--accent-weak); color: var(--accent); }
+
+/* 视图选项 / 筛选 */
+.check-line { display: flex; align-items: center; gap: 8px; height: 32px; cursor: pointer; }
+.check-line input[type="checkbox"] { width: 15px; height: 15px; cursor: pointer; }
+.check-line:has(input:disabled) { cursor: not-allowed; opacity: .6; }
+.seg-col { display: flex; gap: 6px; flex-wrap: wrap; }
+.seg-col .chip {
+  height: 30px; padding: 0 12px; border: 1px solid var(--border-strong); border-radius: 15px; color: var(--text);
+}
+.seg-col .chip.active { background: var(--accent-weak); border-color: var(--accent); color: var(--accent); }
+.hr { height: 1px; background: var(--border); margin: 12px 0; }
+
+/* 上下文菜单 */
+#ctx-menu {
+  position: fixed; z-index: 130; background: var(--panel); border: 1px solid var(--border); border-radius: 8px;
+  box-shadow: var(--shadow); padding: 4px; min-width: 180px;
+}
+#ctx-menu .mi {
+  display: flex; align-items: center; gap: 8px; height: 32px; padding: 0 10px; border-radius: 6px; cursor: pointer; font-size: 13px;
+}
+#ctx-menu .mi:hover { background: var(--row-hover); }
+#ctx-menu .mi.danger { color: var(--danger); }
+#ctx-menu .mi .k { margin-left: auto; color: var(--muted); font-size: 11px; }
+#ctx-menu .sep { height: 1px; background: var(--border); margin: 4px 6px; }
+
+/* ============ 仪表盘 & 统一容器 ============ */
+/* 卡片式主视图（仪表盘 / 桶管理 / 链接管理 / 订单管理 / 密钥 / 系统设置）。
+   ⚠️ 这里**不要**再写成 ID 白名单 —— 历史上是
+   `#dashboard, #bucketmgr, #linkmgr, #credmgr, #systemsettings`，
+   每新增一个主视图都必须记得回来补一个 ID，漏了就表现为「该页卡片贴边、无内边距、
+   不滚动」（订单管理页正是这样）。现在改为**类选择器**：新视图在 index.html 的
+   <section> 上加 class="card-view" 即可，样式与既有页面天然一致。
+   （文件浏览页 #explorer 不在此列：它有自己的工具栏 / 内容区 / 状态栏布局。） */
+.card-view { flex: 1; overflow: auto; padding: 16px; }
+.dash-grid { display: grid; grid-template-columns: repeat(2, minmax(280px, 1fr)); gap: 14px; }
+.dash-card {
+  background: var(--panel); border: 1px solid var(--border); border-radius: 12px; padding: 14px 16px; min-width: 0;
+}
+.dash-card.wide { grid-column: 1 / -1; }
+.dash-card h3 { font-size: 13px; font-weight: 600; margin-bottom: 10px; display: flex; align-items: center; gap: 8px; }
+.dash-card h3.mt { margin-top: 14px; }
+.card-note { font-size: 11px; color: var(--muted); margin-top: 8px; line-height: 1.6; }
+.storage-flex { display: flex; align-items: center; gap: 18px; }
+.storage-legend { flex: 1; min-width: 0; }
+.storage-legend .lg-row { display: flex; justify-content: space-between; padding: 5px 0; border-bottom: 1px dashed #eee; font-size: 12px; }
+.storage-legend .lg-row:last-child { border-bottom: none; }
+.storage-legend .lg-row b { font-variant-numeric: tabular-nums; }
+.storage-legend .dot { margin-right: 6px; }
+.kv-big { display: flex; gap: 8px; }
+.kv-big > div { flex: 1; background: var(--surface-2); border-radius: 8px; padding: 10px 12px; }
+.kv-big label { display: block; font-size: 11px; color: var(--text-2); margin-bottom: 4px; }
+.kv-big b { font-size: 16px; font-variant-numeric: tabular-nums; }
+.kv-big b.ok { color: var(--ok); }
+.kv-big b.bad { color: var(--danger); }
+.chart-wrap { width: 100%; }
+.chart-wrap canvas { width: 100%; height: auto; display: block; }
+.chart-legend { display: flex; gap: 16px; font-size: 12px; color: var(--text-2); margin-top: 6px; }
+.chart-legend i { display: inline-block; width: 10px; height: 10px; border-radius: 2px; margin-right: 5px; }
+.logs-table { font-size: 12px; max-height: 320px; overflow: auto; }
+.logs-table table { width: 100%; border-collapse: collapse; }
+.logs-table th, .logs-table td { text-align: left; padding: 5px 8px; border-bottom: border-bottom: 1px solid var(--line-soft);; white-space: nowrap; }
+.logs-table td.det { white-space: normal; word-break: break-all; color: var(--text-2); }
+.logs-table .lv { padding: 1px 8px; border-radius: 9px; font-size: 11px; }
+.lv.info { background: #eef3f8; color: #5a6b7c; }
+.lv.warn { background: #fdf3e0; color: var(--warn); }
+.lv.error { background: var(--tint-bad); color: var(--danger); }
+.dash-err { background: var(--tint-bad); color: var(--danger); padding: 10px 14px; border-radius: 8px; margin-bottom: 12px; font-size: 12px; }
+
+/* ============ Toast ============ */
+#toast-root {
+  position: fixed; top: 14px; left: 50%; transform: translateX(-50%); z-index: 200; display: flex;
+  flex-direction: column; gap: 8px; align-items: center; pointer-events: none;
+}
+.toast {
+  background: #2b2f36; color: #fff; border-radius: 8px; padding: 9px 16px; font-size: 13px; box-shadow: var(--shadow);
+  animation: tin .18s ease; max-width: 80vw; display: flex; gap: 8px; align-items: center; pointer-events: auto;
+}
+.toast.success { background: #1f7a44; }
+.toast.error { background: #b3323a; }
+.toast.warn { background: #b4741c; }
+@keyframes tin { from { opacity: 0; transform: translateY(-8px); } }
+
+/* ============ 帮助 ============ */
+.help-toc { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 10px; }
+.help-sec h4 { margin: 14px 0 6px; font-size: 13px; color: var(--accent); }
+.help-sec p, .help-sec li { font-size: 12.5px; line-height: 1.8; color: var(--text); }
+.help-sec ul, .help-sec ol { padding-left: 20px; }
+.help-sec code { background: #f2f4f7; border-radius: 4px; padding: 1px 5px; font-size: 12px; }
+.help-sec table { border-collapse: collapse; width: 100%; margin: 6px 0; }
+.help-sec th, .help-sec td { border: 1px solid var(--border); padding: 5px 9px; font-size: 12px; text-align: left; }
+
+/* ============ 响应式 ============ */
+@media (max-width: 1024px) {
+  .only-narrow { display: inline-flex; }
+  #sidebar { position: fixed; top: 0; bottom: 0; left: 0; z-index: 90; transform: translateX(-105%); transition: transform .2s; box-shadow: var(--shadow); }
+  #sidebar.open { transform: none; }
+  #sidebar-mask { display: block; position: fixed; inset: 0; background: rgba(0,0,0,.3); z-index: 80; }
+}
+@media (max-width: 760px) {
+  .tb-main { flex-wrap: wrap; }
+  .tb-left { flex: 1 1 100%; }
+  .tb-center { flex: 1 1 60%; justify-content: flex-start; }
+  .tb-right { margin-left: auto; }
+  .dash-grid { grid-template-columns: 1fr; }
+  #upload-drawer { right: 8px; width: calc(100vw - 16px); }
+  .tb-btn span { display: none; }
+  .op-btn { padding: 0 8px; }
+}
+@media (max-width: 560px) {
+  #statusbar .st-item.hide-sm { display: none; }
+  .view-small .grid-item { width: 100%; }
+  td.c-type, th.c-type { display: none; }
+  td.c-size, th.c-size { width: 80px; }
+  td.c-date, th.c-date { width: 120px; }
+  td.c-name, th.c-name { min-width: 120px; }
+  table.file-list th, table.file-list td { padding: 0 6px; }
+  #upload-drawer { right: 6px; bottom: 34px; width: calc(100vw - 12px); max-height: 60vh; }
+  .up-item { padding: 6px 8px; }
+  .drawer-head { padding: 8px 10px; }
+}
+
+/* ============================ 分享链接 ============================ */
+
+/* 创建链接弹窗：链接类型单选 */
+.link-type-row { display: flex; flex-direction: column; gap: 6px; }
+.radio-line { display: flex; align-items: center; gap: 8px; font-size: 13px; color: var(--text); cursor: pointer; }
+.radio-line input[type="radio"] { width: 14px; height: 14px; }
+.radio-line .rl-sub { font-size: 11px; color: var(--muted); }
+.ok-note { background: var(--tint-ok); color: var(--ok); border-radius: 6px; padding: 8px 12px; font-size: 13px; margin-bottom: 12px; }
+
+/* R51：「链接创建成功」弹窗要装下**一行**的链接 —— 默认 480px 宽减去左侧
+   172px 二维码与两侧内边距后只剩 ~290px，托管链接（`https://<域名>/s/<22 字符>`）
+   就已经贴着边界，预签名直链更是必然折行。故这个弹窗单独给宽容度。
+   与 .user-all-dialog 一组（同样按内容给宽度），只是这里不需要 1040px。 */
+.dialog.link-result-dialog { width: min(900px, 96vw); }
+/* R50：「链接创建成功」弹窗 —— 左二维码、右信息。
+   二维码在左是需求指定的布局：扫码时手机对着左下角，拇指不会挡住右侧的文字信息。
+
+   R52：两侧**视觉等高**。右侧信息区是「链接框 + 六行信息」（`.lr-row` 每行
+   ≈26px，合计 ≈208px），而二维码框原先固定 172px —— 左侧明显矮一截，看着像
+   没对齐。两处对齐后（① 尺寸提到 208px；② 交叉轴 stretch，信息区因长文件名
+   折行而变高时二维码列也跟着撑满并居中），左右两条边就落在同一条线上。
+   ⚠️ 改 `.lr-row` 的行数或每行内边距，必须同步改这里的尺寸（反之亦然）。 */
+.lr-wrap { display: flex; gap: 16px; align-items: stretch; }
+.lr-qr { flex: 0 0 208px; min-height: 208px; display: flex; align-items: center; justify-content: center; }
+.lr-qr svg { width: 208px; height: 208px; border: 1px solid var(--border-strong);
+  border-radius: 10px; padding: 6px; background: #fff; }
+/* 生成中 / 生成不出来（内容超长、服务不可达）时的说明文字，占住同一块位置不留空洞 */
+.lr-qr-note { font-size: 12px; color: var(--text-2); line-height: 1.7; text-align: center; word-break: break-all; }
+.lr-main { flex: 1; min-width: 0; }
+.lr-url-row { display: flex; gap: 8px; align-items: flex-start; }
+/* R51：链接**不折行**（需求：一行显示完）。
+   旧写法是 `word-break: break-all`（逐字符强断），配合 290px 的可用宽度把一条
+   正常长度的地址折成两三行。现在改为单行 + 必要时横向滚动：托管链接在
+   900px 的弹窗里必然一行放得下，只有预签名直链（400+ 字节）会超出 ——
+   那时给出横向滚动条，而不是把地址切碎成看不懂的多行。
+   仍保留 `user-select:text`，用户可手动框选复制。 */
+.lr-url { flex: 1; min-width: 0; border: 1px solid var(--border-strong); border-radius: 6px;
+  padding: 8px 10px; font-size: 12px; line-height: 1.7;
+  white-space: nowrap; overflow-x: auto; overflow-y: hidden;
+  background: var(--hover); user-select: text; -webkit-user-select: text; }
+.lr-meta { margin-top: 12px; }
+.lr-row { display: flex; justify-content: space-between; gap: 12px; font-size: 13px;
+  padding: 5px 0; border-bottom: 1px dashed var(--border); }
+.lr-row:last-child { border-bottom: 0; }
+.lr-row span { color: var(--text-2); flex: none; }
+.lr-row b { font-weight: 500; text-align: right; word-break: break-all; }
+
+/* 链接管理页 */
+.lk-count { font-size: 12px; color: var(--muted); font-weight: 400; margin-left: 4px; }
+.lk-empty { color: var(--muted); font-size: 13px; padding: 26px 10px; text-align: center; line-height: 1.8; }
+
+/* ============================ 系统设置页 ============================ */
+.sysset-card { padding: 18px 20px; }
+.sysset-h3 {
+  font-size: 14px; font-weight: 600; margin-bottom: 12px; display: flex; align-items: center; gap: 8px;
+}
+.sysset-action { margin-left: auto; }
+.sysset-tag {
+  display: inline-flex; align-items: center; justify-content: center;
+  font-size: 10px; font-weight: 600; padding: 1px 7px; border-radius: 4px;
+  letter-spacing: .03em; line-height: 18px; flex-shrink: 0;
+  background: var(--tint-info); color: #0369a1; /* 默认：用户标签蓝色 */
+}
+.sysset-tag.enc { background: var(--tint-enc); color: #92400e; }
+.sysset-tag.excl { background: #e0e7ff; color: #3730a3; }
+.sysset-tag.wd { background: #d1fae5; color: #065f46; }
+.sysset-tag.about { background: var(--surface-3); color: #52525b; }
+.sysset-tag.cap { background: #fce7f3; color: #9d174d; }
+.sysset-tag.lb { background: #ecfdf5; color: #047857; }
+.sysset-tag.conc { background: #eef2ff; color: #4338ca; }
+/* R53：发信设置（青色，与「均衡」的绿 / 「并发」的靛蓝区分开） */
+.sysset-tag.mail { background: #cffafe; color: #155e75; }
+/* R54：站点设置（紫色 —— 它是设置页最靠前的一张卡，用更"标识性"的颜色） */
+.sysset-tag.site { background: #ede9fe; color: #5b21b6; }
+
+/* 登录页人机验证容器（仅服务端开启时显示） */
+.auth-captcha { margin: 4px 0 10px; }
+.auth-captcha .captcha-holder { display: flex; justify-content: center; }
+.auth-captcha-msg { font-size: 12px; color: #b45309; background: var(--tint-warn); border: 1px solid #fde68a; border-radius: 6px; padding: 7px 10px; margin: 0 0 10px; line-height: 1.6; }
+
+/* 系统设置：关于（纯文本介绍卡片） */
+.about-body { font-size: 12.5px; line-height: 1.8; color: var(--text); }
+.about-body p { margin-bottom: 10px; }
+.about-body b { color: var(--text); }
+.about-list { margin: 0 0 10px; padding: 0; list-style: none; }
+.about-list li { position: relative; padding-left: 14px; margin-bottom: 6px; color: var(--text-2); }
+.about-list li::before { content: '•'; position: absolute; left: 2px; color: #a1a1aa; }
+.about-list b { color: var(--text); }
+.about-list code { background: #f2f4f7; border-radius: 4px; padding: 1px 5px; font-size: 11.5px; }
+.about-sub { font-size: 11.5px; color: var(--muted); margin-bottom: 0; }
+/* R34：检查更新（按钮 + 结果文案） */
+.about-update { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; padding-top: 10px; border-top: 1px dashed #e5e7eb; }
+.about-update-result { font-size: 12px; color: #666; }
+.about-update-result.ok { color: #16a34a; }
+.about-update-result.warn { color: #d97706; }
+
+/* 系统设置：文件加密 */
+.enc-warn { background: var(--tint-warn); border: 1px solid #fde68a; border-radius: 8px; padding: 10px 14px; font-size: 12.5px; line-height: 1.7; color: #78350f; margin-bottom: 16px; }
+.enc-warn b { color: #b45309; }
+.enc-warn-list { margin: 6px 0 0; padding: 0; list-style: none; }
+.enc-warn-list li { position: relative; padding-left: 14px; margin-top: 3px; }
+.enc-warn-list li::before { content: '•'; position: absolute; left: 2px; color: #d97706; }
+.enc-warn-list b { color: #b45309; }
+/* S6：魔数模式强度警示（红色强调，区别于普通提示） */
+.enc-warn.danger { background: #fdecea; border-color: #f5c6c2; color: #7d2b26; }
+.enc-warn.danger b { color: #a32d2d; }
+
+/* R41：两种验证码服务商的凭证分组（各自独立保存，`is-active` 标记当前选用的那一套） */
+.cap-prov { border: 1px solid var(--line-soft); border-radius: 8px; padding: 12px 14px 2px; margin-bottom: 12px; background: var(--surface-2); }
+.cap-prov-h { font-size: 12.5px; font-weight: 600; color: var(--muted); margin-bottom: 10px; }
+.cap-prov.is-active { border-color: #3b82f6; background: var(--tint-info); }
+.cap-prov.is-active .cap-prov-h { color: #1d4ed8; }
+/* 加密方式：可勾选卡片组（沿用 .seg/.chip 的强调色语汇，与表单卡片风格一致） */
+.enc-modes { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 10px; }
+/* 注意：卡片本身是 <label>，会被全局 .form-item label 命中（display:block / 12px / 灰字 / 下边距），
+   故此处用 .enc-modes .enc-mode-opt 提升权重并显式复位这些继承样式，避免布局被拉平。 */
+.enc-modes .enc-mode-opt {
+  position: relative;
+  display: flex; align-items: flex-start; gap: 10px;
+  padding: 12px 14px; margin-bottom: 0;
+  font-size: 13px; line-height: 1.5; color: var(--text);
+  border: 1px solid var(--border); border-radius: var(--radius); background: var(--panel);
+  cursor: pointer; -webkit-user-select: none; user-select: none;
+  transition: border-color .18s ease, background-color .18s ease, box-shadow .18s ease, transform .18s ease;
+}
+.enc-modes .enc-mode-opt:hover { border-color: var(--border-strong); background: var(--hover); }
+.enc-modes .enc-mode-opt:active { transform: translateY(1px); }
+/* 选中：accent 描边 + 浅蓝底；内阴影补一圈描边，避免加粗边框造成尺寸跳动 */
+.enc-modes .enc-mode-opt:has(input:checked) {
+  border-color: var(--accent); background: var(--accent-weak);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+/* 键盘焦点：与表单控件一致的聚焦光环 */
+.enc-modes .enc-mode-opt:has(input:focus-visible) { box-shadow: 0 0 0 3px rgba(0, 103, 192, .2); }
+.enc-modes .enc-mode-opt:has(input:disabled) { opacity: .55; cursor: not-allowed; background: var(--panel); pointer-events: none; }
+/* 原生 radio 仅保留功能与可访问性，视觉由 .enc-mode-mark 承担 */
+.enc-mode-opt input[type="radio"] {
+  position: absolute; width: 1px; height: 1px; margin: 0; padding: 0;
+  opacity: 0; pointer-events: none;
+}
+.enc-mode-mark {
+  flex: 0 0 auto; display: block; box-sizing: border-box;
+  width: 16px; height: 16px; margin-top: 2px;
+  border: 1.5px solid var(--border-strong); border-radius: 50%; background: var(--panel);
+  transition: border-color .18s ease, background-color .18s ease, box-shadow .18s ease;
+}
+.enc-mode-opt input:checked + .enc-mode-mark {
+  border-color: var(--accent); background: var(--accent);
+  box-shadow: inset 0 0 0 3px var(--panel);
+}
+.enc-mode-opt input:disabled + .enc-mode-mark { background: #f0f0f0; border-color: var(--border); }
+.enc-mode-text { flex: 1 1 auto; min-width: 0; }
+.enc-mode-opt b {
+  display: block; font-size: 13px; font-weight: 500; margin: 0 0 3px;
+  color: var(--text); transition: color .18s ease;
+}
+.enc-mode-opt input:checked ~ .enc-mode-text b { color: var(--accent); }
+.enc-mode-opt .bk-sub { display: block; margin: 0; font-size: 11.5px; color: var(--text-2); line-height: 1.5; }
+#enc-magic-block, #enc-crypto-block { border: 1px dashed var(--border-strong); border-radius: 8px; padding: 14px; margin: 6px 0 14px; background: var(--surface-2); }
+.enc-lock { display: inline-block; margin-left: 5px; font-size: 11px; opacity: .85; vertical-align: 1px; cursor: help; }
+
+/* 上传排除分组 */
+.excludes-group {
+  display: flex; flex-wrap: wrap; gap: 6px 20px;
+  padding: 10px 14px; background: var(--surface-2); border-radius: 8px; border: 1px solid var(--border);
+  margin-bottom: 10px;
+}
+.excludes-group .check-line { height: 28px; }
+
+/* 系统设置备注列表 */
+.note-list { margin: 0; padding: 0; list-style: none; }
+.note-list li { position: relative; padding-left: 14px; margin-top: 3px; line-height: 1.6; }
+.note-list li::before { content: '·'; position: absolute; left: 3px; color: #bbb; font-weight: 700; }
+.note-list li:first-child { margin-top: 0; }
+.lk-table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+.lk-table th { text-align: left; color: var(--text-2); font-weight: 500; padding: 8px 10px; border-bottom: 1px solid var(--border); white-space: nowrap; }
+.lk-table td { padding: 9px 10px; border-bottom: 1px solid var(--border); vertical-align: middle; }
+.lk-table tr:hover td { background: #f7f9fc; }
+.lk-file { max-width: 300px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; }
+.lk-badge { display: inline-block; padding: 2px 10px; border-radius: 10px; font-size: 11px; }
+.lk-badge.ok { background: var(--tint-ok); color: var(--ok); }
+.lk-badge.bad { background: var(--tint-bad); color: var(--danger); }
+.lk-badge.warn { background: var(--tint-warn-2); color: #b45309; }
+.lk-acts { white-space: nowrap; }
+.lk-acts .mini-btn { margin-right: 4px; }
+.lk-acts .mini-btn.danger { color: var(--danger); border-color: #f3c1c1; }
+/* 失效行：整行灰化 + 数据列划线（状态列与操作列保持可读）。
+   row-gone = 分享文件已被删除；row-refunded = 订单已退款 */
+.lk-table tr.row-gone td, .lk-table tr.row-refunded td { color: #a0a5ad; }
+.lk-table tr.row-gone td.lk-dim, .lk-table tr.row-refunded td.lk-dim { text-decoration: line-through; }
+.lk-table tr.row-gone td.lk-dim b, .lk-table tr.row-refunded td.lk-dim b { color: inherit; }
+.lk-badge.gone { background: var(--surface-3); color: var(--muted); }
+.lk-badge.refund { background: #eef0f3; color: #616a75; }
+/* 占位符（无值字段）与长桶名的宽度收敛 */
+.lk-dash { color: #b8bcc4; }
+.lk-bucket { display: inline-block; max-width: 170px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; vertical-align: middle; }
+/* 订单管理：状态与"是否已下载"的轻量标记 */
+.ord-dash { color: #b8bcc4; }
+.ord-yes { color: var(--ok); }
+.ord-no { color: var(--muted); }
+.ord-no-wrap { white-space: nowrap; font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 11.5px; }
+.lk-acts .mini-btn.danger:hover { background: var(--tint-bad); color: var(--danger); }
+
+/* ------------------------- 厂商标识（LOGO 徽标） ------------------------- */
+/* 各家 SVG 的 viewBox 宽高比差异极大（阿里云 4608:1024、七牛云 1:1 等），
+   故统一放进固定尺寸的白底容器，图形以 xMidYMid meet 等比缩放后居中，
+   保证不同厂商标识在列表与选择器中的视觉重量一致。 */
+.pv-logo {
+  flex: 0 0 auto;
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 28px; height: 28px; padding: 4px; box-sizing: border-box;
+  background: var(--ctrl-bg); border: 1px solid var(--border); border-radius: 6px;
+  overflow: hidden;
+}
+.pv-logo svg { width: 100%; height: 100%; display: block; }
+.pv-logo--sm { width: 22px; height: 22px; padding: 3px; border-radius: 5px; }
+.pv-logo--lg { width: 40px; height: 40px; padding: 6px; border-radius: 9px; }
+
+/* 密钥表格：服务商列（仅文字，不使用 LOGO） */
+.lk-provider { white-space: nowrap; color: var(--text); }
+.lk-provider .bk-sub { display: block; margin: 0; }
+
+/* 厂商选择器：图标卡片组（非下拉菜单，点击卡片直接选中） */
+.pv-picker { display: flex; flex-wrap: wrap; gap: 8px; }
+/* 卡片为 <label>，会被全局 .form-item label 命中（display:block / 灰字 / 下边距），
+   此处提权并显式复位，避免布局被拉平（与 .enc-modes 的处理方式一致）。 */
+.pv-picker .pv-opt {
+  display: flex; flex-direction: column; align-items: center; gap: 5px;
+  position: relative; margin-bottom: 0; padding: 8px 6px;
+  width: 78px; box-sizing: border-box; cursor: pointer;
+  font-size: 11.5px; line-height: 1.4; color: var(--text-2); text-align: center;
+  border: 1px solid var(--border); border-radius: var(--radius); background: var(--panel);
+  -webkit-user-select: none; user-select: none;
+  transition: border-color .18s ease, background-color .18s ease, box-shadow .18s ease;
+}
+.pv-picker .pv-opt:hover { border-color: var(--border-strong); background: var(--hover); }
+/* 原生 radio 仅保留功能与可访问性，视觉由卡片高亮承担 */
+.pv-picker .pv-opt input[type="radio"] {
+  position: absolute; width: 1px; height: 1px; margin: 0; padding: 0;
+  opacity: 0; pointer-events: none;
+}
+/* 选中：accent 描边 + 浅蓝底；内阴影补描边，避免加粗边框造成尺寸跳动 */
+.pv-picker .pv-opt:has(input:checked) {
+  border-color: var(--accent); background: var(--accent-weak);
+  box-shadow: inset 0 0 0 1px var(--accent); color: var(--accent);
+}
+.pv-picker .pv-opt:has(input:focus-visible) { box-shadow: 0 0 0 3px rgba(0, 103, 192, .2); }
+/* R30：`pv-opt--planned`（「（即将支持）」角标）已随 Microsoft Azure 正式接入而移除 ——
+   全部登记厂商均可连接，再保留这条规则只会让「已支持」与「即将支持」的样式分叉。 */
+.pv-picker .pv-name { font-weight: 500; }
+
+/* ------------------------- 存储桶管理页 ------------------------- */
+.bm-table td { font-variant-numeric: tabular-nums; }
+/* 已停用存储桶行：整体弱化显示 */
+.bm-table tr.row-disabled td { opacity: .55; }
+.bm-table tr.row-disabled .lk-badge.warn { opacity: 1; }
+/* 屏蔽海外 IP 复选框列 */
+.bm-oversea-cell { text-align: center; }
+.bm-oversea-cell .check-line { display: inline-flex; align-items: center; gap: 4px; cursor: pointer; }
+.bm-oversea-cell input[type="checkbox"] { width: 16px; height: 16px; cursor: pointer; }
+.bm-name-code {
+  display: block; margin: 6px 0; padding: 7px 10px; cursor: pointer;
+  background: #f4f6f9; border: 1px dashed var(--border-strong); border-radius: 6px;
+  font-family: Consolas, "Courier New", monospace; font-size: 13px; word-break: break-all;
+  user-select: all; position: relative;
+}
+.bm-name-code:hover { border-color: var(--accent); color: var(--accent); }
+.bm-name-code::after {
+  content: '点击复制'; position: absolute; right: 8px; top: 50%; transform: translateY(-50%);
+  font-family: "Segoe UI", "Microsoft YaHei", sans-serif; font-size: 11px; color: #aab;
+}
+.bm-warn-text { font-size: 13px; line-height: 1.8; }
+.bm-warn-text.bm-strong { color: var(--danger); font-weight: 600; }
+.bm-cond-list { list-style: none; margin: 10px 0; padding: 0; }
+.bm-cond-list li { padding: 5px 0 5px 2px; font-size: 13px; }
+.bm-cond-list li.ok { color: var(--ok); }
+.bm-cond-list li.bad { color: var(--danger); }
+.bm-frag-table { width: 100%; border-collapse: collapse; font-size: 12px; margin: 8px 0; }
+.bm-frag-table td { padding: 4px 8px; border-bottom: 1px dashed var(--border); text-align: left; }
+.bm-sub-bad { color: var(--danger); font-size: 11px; }
+input.full { width: 100%; }
+
+/* ------------------------- 桶可见性权限（穿梭框） ------------------------- */
+.perm-transfer { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+.perm-toolbar { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.perm-search { flex: 1; min-width: 180px; }
+.perm-search input { width: 100%; height: 32px; border: 1px solid var(--border-strong); border-radius: 6px; padding: 0 10px; outline: none; }
+.perm-search input:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(0, 103, 192, .15); }
+.perm-filter { flex: none; }
+.perm-filter.seg button { width: auto; padding: 0 10px; }
+.perm-hint { font-size: 12px; color: var(--text-2); }
+.perm-body { display: flex; align-items: stretch; gap: 12px; }
+.perm-col { flex: 1; min-width: 0; display: flex; flex-direction: column; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+.perm-col-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 8px;
+  padding: 8px 12px; font-size: 12.5px; font-weight: 500; color: var(--text);
+  background: #f6f8fb; border-bottom: 1px solid var(--border);
+}
+.perm-checkall { font-size: 11.5px; color: var(--text-2); display: flex; align-items: center; gap: 4px; cursor: pointer; user-select: none; }
+.perm-badge { margin-left: 5px; padding: 1px 7px; border-radius: 999px; font-size: 11px; font-weight: 500; }
+.perm-badge.on { background: #e6f6ec; color: #15803d; }
+.perm-badge.off { background: var(--surface-3); color: var(--muted); }
+.perm-list { list-style: none; margin: 0; padding: 4px; overflow-y: auto; max-height: 340px; min-height: 120px; }
+.perm-item {
+  display: flex; align-items: flex-start; gap: 8px; padding: 7px 8px; border-radius: 6px;
+  cursor: pointer; transition: background .12s ease;
+}
+.perm-item:hover { background: var(--hover); }
+.perm-item.checked { background: var(--accent-weak); }
+.perm-item input { margin-top: 3px; flex: none; accent-color: var(--accent); }
+.perm-itembody { min-width: 0; display: flex; flex-direction: column; }
+.perm-itembody b { font-size: 12.5px; font-weight: 500; color: var(--text); display: flex; align-items: center; gap: 6px; }
+.perm-itembody i { font-size: 11px; color: var(--text-2); font-style: normal; }
+.perm-active { font-size: 10px; padding: 0 5px; border-radius: 3px; background: var(--accent); color: #fff; font-weight: 400; }
+.perm-switch { flex: none; display: flex; flex-direction: column; justify-content: center; gap: 6px; }
+.perm-switch .mini-btn { width: 32px; padding: 0; }
+.perm-foot { font-size: 12px; }
+
+/* 穿梭框样式隔离（CSS 权重陷阱）：穿梭框嵌在 .form-item 内时（如 IP 规则·作用范围），
+   .form-item label / .form-item input 权重 (0,1,1) 会入侵组件内的 label 与 checkbox
+   （checkbox 被拉成 100%×34px 带边框的输入框、"全选"被 display:block 拉平）。
+   按项目约定用两级类/属性选择器提权复位，保证组件在弹窗 body 与 form-item 内观感一致。 */
+.perm-transfer .perm-checkall {
+  display: flex; align-items: center; gap: 4px; margin-bottom: 0;
+  font-size: 11.5px; color: var(--text-2); cursor: pointer; user-select: none;
+}
+.perm-transfer input[type="checkbox"] {
+  width: 15px; height: 15px; margin: 0; padding: 0;
+  border: none; background: none; box-shadow: none; flex: none;
+}
+.perm-transfer .perm-item input[type="checkbox"] { margin-top: 3px; accent-color: var(--accent); }
+.perm-transfer input[type="checkbox"]:focus { box-shadow: none; }
+
+/* ACL 权限安全警告弹窗 */
+.acl-warn-text { font-size: 13px; line-height: 1.8; margin-bottom: 12px; }
+.acl-warn-text b { color: var(--danger); }
+.acl-warn-table { width: 100%; border-collapse: collapse; font-size: 12.5px; }
+.acl-warn-table th { text-align: left; color: var(--text-2); font-weight: 500; padding: 6px 8px; border-bottom: 1px solid var(--border); }
+.acl-warn-table td { padding: 7px 8px; border-bottom: 1px solid var(--border); }
+.acl-warn-table .bk-sub { color: var(--muted); font-style: normal; }
+
+/* ------------------------- 属性面板 ------------------------- */
+.prop-loading { text-align: center; padding: 24px 0; color: var(--text-2); }
+.prop-loading .loading-spin { margin: 0 auto 10px; }
+.prop-path {
+  font-size: 11.5px; color: var(--text-2); background: #f6f7f9; border: 1px solid var(--border);
+  border-radius: 6px; padding: 5px 8px; margin-bottom: 10px; word-break: break-all;
+}
+.prop-row {
+  display: flex; align-items: baseline; gap: 12px; padding: 8px 2px;
+  border-bottom: 1px solid var(--border); font-size: 13px;
+}
+.prop-row:last-child { border-bottom: none; }
+.prop-label { flex: none; width: 76px; color: var(--text-2); }
+.prop-value { flex: 1; word-break: break-all; }
+
+/* ------------------------- IP 访问屏蔽 ------------------------- */
+.ipguard-china-row {
+  display: flex; align-items: center; gap: 14px; padding: 10px 12px; margin-bottom: 10px;
+  background: #f4f8ff; border: 1px solid #cfe0f7; border-radius: 8px;
+}
+.ipguard-china-row.on { background: #eefaf1; border-color: #bce3c9; }
+.ipguard-china-text { flex: 1; font-size: 13px; }
+.ipguard-china-text b { font-size: 13.5px; }
+.ipguard-china-text .bk-sub { display: block; margin-top: 3px; line-height: 1.5; }
+.ip-switch { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; user-select: none; flex: none; }
+.ip-switch input { display: none; }
+.ip-switch i {
+  width: 42px; height: 22px; border-radius: 11px; background: #cfd6df; position: relative; transition: background .15s;
+}
+.ip-switch i::after {
+  content: ''; position: absolute; top: 2px; left: 2px; width: 18px; height: 18px; border-radius: 50%;
+  background: var(--ctrl-bg); transition: left .15s; box-shadow: 0 1px 2px rgba(0,0,0,.25);
+}
+.ip-switch input:checked + i { background: #39b97b; }
+.ip-switch input:checked + i::after { left: 22px; }
+.ip-switch input:disabled + i { opacity: .6; }
+.ip-switch span { font-size: 12px; color: var(--text-2); width: 40px; }
+.ipguard-test-row { display: flex; align-items: center; gap: 8px; margin-bottom: 10px; font-size: 12.5px; flex-wrap: wrap; }
+.ipguard-test-row input {
+  height: 28px; width: 190px; border: 1px solid var(--border-strong); border-radius: 6px; padding: 0 8px; font-size: 12.5px;
+}
+.ipguard-test-row select { height: 28px; }
+.ipg-method {
+  display: inline-block; padding: 1px 7px; margin-right: 3px; border-radius: 4px;
+  background: #eef1f5; color: #4a5568; font-size: 11px; font-family: Consolas, monospace;
+}
+.ipg-method.m-write { background: #fdeee6; color: #b45309; }
+.ipg-methods { display: flex; gap: 14px; flex-wrap: wrap; padding: 4px 0; }
+.ipg-methods .check-line { display: inline-flex; align-items: center; gap: 5px; font-size: 13px; }
+.ipg-test-ok { color: #16a34a; }
+.ipg-test-bad { color: var(--danger); }
+
+/* ---------------------- R37：下载限速 / IP 地址管理 ---------------------- */
+
+/* 「限速」列：数值徽章 + 「限速」按钮同行。四张列表卡片（用户 / 访问密钥 /
+   存储桶 / 分享链接）与它们各自的「显示全部」对话框共用 `speedlimit.speedCellHtml()`
+   这一个渲染器，所以只需要一条规则。 */
+.lk-speed { white-space: nowrap; }
+.lk-speed .mini-btn { margin-left: 6px; }
+
+/* IP 地址管理页的规则表：目标列是单个 IP / CIDR，等宽字体便于核对位数；
+   整行不折行（列多，折行会把「操作」列挤到看不清）。 */
+.ipg-table { min-width: 900px; }
+.ipg-table .lk-file { font-family: Consolas, "Courier New", monospace; }
+.ipg-table th, .ipg-table td { white-space: nowrap; }
+
+/* 规则弹窗里的「作用范围」穿梭框容器（内容复用 listdialog.buildTransferBox） */
+.ipg-scope-box { margin-top: 4px; }
+
+/* 预检结果里「命中限速但不拦截」的那一段：与「会被屏蔽」必须一眼可分 */
+.ipg-test-warn { color: #b45309; }
+
+/* 下载限速对话框（speedlimit.js）。
+   内容只有「实体名 + 一个数字输入框 + 说明」，刻意做窄（默认 480px 会显得空）。
+   上层提示行按需求原文句式渲染（「已在 X 中设置限速为 N MB/S」），用暖色底与
+   说明文字区分 —— 它是**提示**而非错误，但比普通说明更需要被看到。 */
+.dialog.speedlimit-dialog { width: min(420px, 94vw); }
+.sl-form { display: flex; flex-direction: column; gap: 10px; padding: 2px 0 4px; }
+.sl-line { display: flex; align-items: center; gap: 8px; }
+.sl-name { flex: 1 1 auto; min-width: 0; font-size: 13px; color: var(--text); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sl-sub { font-size: 12px; color: var(--text-2); }
+.sl-input {
+  width: 130px; height: 34px; padding: 0 10px; font-size: 14px; text-align: right;
+  border: 1px solid var(--border-strong); border-radius: 6px; background: var(--ctrl-bg); color: var(--text);
+}
+.sl-input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-weak); }
+.sl-unit { font-size: 13px; color: var(--text-2); }
+.sl-note { font-size: 12px; line-height: 1.6; color: var(--text-2); }
+.sl-note b { color: var(--text); }
+.sl-ceil {
+  font-size: 12px; line-height: 1.6; color: #b45309; background: var(--tint-warn-2);
+  border: 1px solid #fde3c0; border-radius: 6px; padding: 6px 10px;
+}
+.sl-err { font-size: 12px; color: var(--danger); }
+
+/* ---------------------- R38：备份配置 ---------------------- */
+.sysset-tag.backup { background: #6b4fbb; color: #fff; }
+.backup-code-wrap { margin: 8px 0 6px; }
+.backup-code {
+  width: 100%; min-height: 88px; max-height: 220px; resize: vertical;
+  box-sizing: border-box; padding: 8px 10px;
+  font-family: Consolas, "Courier New", monospace; font-size: 11px; line-height: 1.5;
+  color: var(--text); background: var(--panel, #f8f9fb);
+  border: 1px solid var(--border-strong); border-radius: 6px;
+  word-break: break-all; white-space: pre-wrap;
+}
+.backup-meta { margin-top: 4px; }
+.backup-meta-text { font-size: 12px; color: var(--text-2); }
+.backup-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 4px 0 6px; }
+.backup-import-hint { font-size: 12px; color: var(--text-2); }
+.backup-import-hint.backup-import-open { color: var(--success, #1a7f37); }
+.backup-live-note { margin-top: 6px; }
+.backup-form { display: flex; flex-direction: column; gap: 10px; }
+.backup-form .bk-input { width: 100%; box-sizing: border-box; text-align: left; }
+.backup-form textarea.backup-code { min-height: 96px; }
+.backup-import-warn { margin-bottom: 4px; }
+.dialog.backup-dialog { width: min(560px, 94vw); }
+/* 导入按钮在「已有配置」的实例上禁用：disabled 的元素必须看得出来不能点 */
+.backup-actions .mini-btn:disabled { opacity: .5; cursor: not-allowed; }
+
+/* ------------------------- WebDAV 服务 ------------------------- */
+.wd-url-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.wd-url {
+  flex: 1; min-width: 0; font-family: Consolas, "Courier New", monospace; font-size: 12.5px;
+  background: #f4f6fa; border: 1px solid var(--border); border-radius: 6px; padding: 6px 10px;
+  color: var(--text); word-break: break-all; user-select: all;
+}
+.wd-list-head { display: flex; align-items: center; justify-content: space-between; margin: 6px 0 8px; }
+.wd-list-head label { font-size: 12px; color: var(--text-2); }
+.wd-account-list {
+  max-height: 320px; overflow-y: auto; border: 1px solid var(--border); border-radius: 8px;
+  background: var(--surface-2);
+}
+.wd-account-list:empty::before {
+  content: '暂无 WebDAV 账户，点击右上角"添加新账户"创建。';
+  display: block; text-align: center; color: var(--muted); font-size: 12.5px; padding: 26px 10px; line-height: 1.7;
+}
+.wd-card {
+  display: flex; align-items: center; gap: 10px; padding: 9px 12px; border-bottom: 1px solid var(--border);
+}
+.wd-card:last-child { border-bottom: none; }
+.wd-card:hover { background: #f0f5ff; }
+.wd-card-main { flex: 1; min-width: 0; }
+.wd-card-app {
+  font-size: 13px; font-weight: 600; color: var(--text); display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+}
+.wd-card-app .wd-badge {
+  font-size: 10px; font-weight: 500; padding: 1px 6px; border-radius: 10px; background: #eef1f5; color: var(--muted);
+}
+.wd-card-app .wd-badge.run { background: #e6f7ed; color: #16a34a; }
+.wd-card-sub { font-size: 11.5px; color: var(--text-2); margin-top: 2px; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.wd-card-sub code { font-family: Consolas, monospace; color: #374151; }
+.wd-pw { font-family: Consolas, monospace; color: #374151; }
+.wd-acts { white-space: nowrap; display: flex; gap: 4px; }
+.wd-acts .mini-btn.danger { color: var(--danger); border-color: #f3c1c1; }
+.wd-acts .mini-btn.danger:hover { background: var(--tint-bad); color: var(--danger); }
+.wd-form { min-width: 320px; }
+.wd-form .form-item { margin-bottom: 12px; }
+.wd-form .form-item input:not([type="checkbox"]) { width: 100%; box-sizing: border-box; }
+.wd-form .hint { font-size: 11px; color: var(--muted); margin-top: 4px; line-height: 1.5; }
+
+/* ============================ 登录 / 初始化遮罩 ============================ */
+.auth-overlay {
+  position: fixed; inset: 0; z-index: 200;
+  background: linear-gradient(135deg, #0f172a 0%, #1e3a5f 50%, #0f172a 100%);
+  display: flex; align-items: center; justify-content: center;
+}
+.auth-card {
+  width: 380px; max-width: calc(100vw - 32px);
+  background: var(--ctrl-bg); border-radius: 14px; padding: 36px 32px 28px;
+  box-shadow: 0 20px 60px rgba(0,0,0,.35);
+}
+.auth-logo { text-align: center; margin-bottom: 16px; }
+.auth-logo svg { width: 52px; height: 52px; border-radius: 12px; }
+.auth-card h2 { text-align: center; margin: 0 0 6px; font-size: 20px; font-weight: 600; color: #1e293b; }
+.auth-sub { text-align: center; margin: 0 0 22px; font-size: 13px; color: #64748b; }
+.auth-card .form-item { margin-bottom: 14px; }
+.auth-card .form-item > label:not(.check-line) { display: block; font-size: 12.5px; color: #475569; margin-bottom: 5px; font-weight: 500; }
+/* 同上：登录页的「记住登录状态」是 label 内嵌 checkbox，不能被输入框样式拉伸 */
+.auth-card .form-item input:not([type="checkbox"]) {
+  width: 100%; box-sizing: border-box; height: 38px; padding: 0 12px;
+  border: 1px solid #d1d5db; border-radius: 8px; font-size: 14px;
+  transition: border-color .15s, box-shadow .15s;
+  background: var(--ctrl-bg);
+}
+.auth-card .form-item input:not([type="checkbox"]):focus {
+  outline: none; border-color: var(--accent);
+  box-shadow: 0 0 0 3px rgba(0,103,192,.12);
+}
+.auth-card .form-item > label.check-line {
+  display: inline-flex; align-items: center; gap: 7px;
+  height: auto; margin: 0 0 6px; font-size: 13px; font-weight: 500; color: #475569; cursor: pointer;
+}
+.auth-card .form-item > label.check-line input[type="checkbox"] {
+  width: 15px; height: 15px; flex: none; margin: 0; padding: 0;
+  accent-color: var(--accent); cursor: pointer;
+}
+.auth-error {
+  background: #fef2f2; border: 1px solid #fecaca; color: #b91c1c;
+  border-radius: 8px; padding: 8px 12px; font-size: 12.5px; margin-bottom: 14px; line-height: 1.5;
+}
+.auth-btn {
+  width: 100%; height: 40px; border: none; border-radius: 8px;
+  background: var(--accent, #0067c0); color: #fff; font-size: 14px; font-weight: 600; cursor: pointer;
+  transition: background .15s;
+}
+.auth-btn:hover { background: #0056a4; }
+.auth-btn:disabled { background: #94a3b8; cursor: not-allowed; }
+.auth-foot { text-align: center; margin: 14px 0 0; font-size: 11.5px; color: #94a3b8; line-height: 1.6; }
+/* R54②：「注册」「忘记密码」「返回登录」三个入口 —— 同一行居中，按模式整条换掉 */
+.auth-links { display: flex; justify-content: center; flex-wrap: wrap; gap: 8px 18px; margin: 10px 0 0; font-size: 12.5px; }
+.auth-links a { color: var(--accent, #0067c0); text-decoration: none; cursor: pointer; }
+.auth-links a:hover { text-decoration: underline; }
+.auth-links a[hidden] { display: none; }
+
+/* ============================ 右上角用户菜单 ============================ */
+.user-menu-wrap { position: relative; }
+.user-menu-btn {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 4px 10px !important; height: 30px; font-size: 12.5px;
+}
+.user-menu-btn svg { width: 18px; height: 18px; }
+.um-caret { font-size: 10px; opacity: .7; line-height: 1; }
+.user-menu {
+  position: absolute; top: calc(100% + 6px); right: 0;
+  min-width: 180px; background: var(--ctrl-bg); border: 1px solid var(--border);
+  border-radius: 8px; box-shadow: 0 8px 24px rgba(0,0,0,.12);
+  z-index: 150; overflow: hidden;
+  animation: um-fade .12s ease-out;
+}
+@keyframes um-fade { from { opacity: 0; transform: translateY(-4px); } to { opacity: 1; transform: none; } }
+.um-head {
+  padding: 10px 14px; font-size: 12px; color: var(--text-2);
+  border-bottom: 1px solid var(--border); background: var(--surface-2);
+  white-space: nowrap;
+}
+.um-item {
+  padding: 9px 14px; font-size: 13px; cursor: pointer;
+  transition: background .1s;
+}
+.um-item:hover { background: #f0f5ff; color: var(--accent); }
+.um-item.danger { color: var(--danger); }
+.um-item.danger:hover { background: #fef2f2; color: var(--danger); }
+.um-sep { height: 1px; background: var(--border); margin: 2px 0; }
+
+/* ============================ 用户管理表格 ============================ */
+.user-table { margin-top: 4px; }
+.user-tbl .lk-badge.admin { background: var(--tint-info); color: #0369a1; }
+.user-tbl .lk-badge.self { background: var(--tint-enc); color: #92400e; }
+.user-tbl td b { font-size: 13px; }
+.user-tbl .mini-btn:disabled { opacity: .45; cursor: not-allowed; }
+.user-tbl .mini-btn:disabled:hover { background: transparent; color: inherit; }
+
+/* 「显示全部」行（R35 用户卡片起，R36 扩到密钥 / 存储桶 / 分享链接卡片）：
+   仅当条目数超过预览上限时出现（hidden 由各卡片的 xxMore 判据控制） */
+.list-more { display: flex; align-items: center; justify-content: center; gap: 10px; margin-top: 10px; }
+.list-more[hidden] { display: none; }
+.list-more-hint { font-size: 12px; color: var(--text-2); }
+
+/* 「全部列表」对话框（R35 / R36）—— 五张卡片共用同一个组件（`listdialog.js` 的
+   `openListDialog()`），组件按 `idPrefix` 生成 `user-all-* / cred-all-* /
+   bucket-all-* / link-all-* / invite-all-*` 五组类名，因此下面的规则都是
+   **同一条规则的五份选择器**。
+   保留前缀（而不是统一成一个类名）是为了让每张卡片的样式断言能各自锚定。
+   列数最多的分享链接有 10 列，故统一给到 1040px（用 min() 兼顾窄屏）。 */
+.dialog.user-all-dialog, .dialog.cred-all-dialog, .dialog.bucket-all-dialog, .dialog.link-all-dialog, .dialog.invite-all-dialog { width: min(1040px, 96vw); }
+.user-all, .cred-all, .bucket-all, .link-all, .invite-all { display: flex; flex-direction: column; gap: 10px; min-width: 0; }
+/* 工具条固定在顶部：滚动只发生在下面的列表里，否则筛完还得往上滚回来 */
+.user-all-bar, .cred-all-bar, .bucket-all-bar, .link-all-bar, .invite-all-bar { display: flex; align-items: center; gap: 10px; }
+.user-all-search, .cred-all-search, .bucket-all-search, .link-all-search, .invite-all-search {
+  flex: 1 1 auto; min-width: 0; height: 32px; padding: 0 10px; font-size: 13px;
+  border: 1px solid var(--border-strong); border-radius: 6px; background: var(--ctrl-bg); color: var(--text);
+}
+.user-all-search:focus, .cred-all-search:focus, .bucket-all-search:focus, .link-all-search:focus, .invite-all-search:focus { outline: none; border-color: var(--accent); }
+/* 下拉筛选（服务商 / 存储桶 / 角色 / 邀请码状态）：与搜索框同一行、同一高度 */
+.user-all-select, .cred-all-select, .bucket-all-select, .link-all-select, .invite-all-select {
+  flex: none; height: 32px; max-width: 190px; padding: 0 6px; font-size: 13px;
+  border: 1px solid var(--border-strong); border-radius: 6px; background: var(--ctrl-bg); color: var(--text);
+}
+.user-all-count, .cred-all-count, .bucket-all-count, .link-all-count, .invite-all-count { flex: none; font-size: 12px; color: var(--text-2); white-space: nowrap; }
+/* 列表自带滚动条（表头吸顶，长列表滚动时仍知道每列是什么） */
+.user-all-body, .cred-all-body, .bucket-all-body, .link-all-body, .invite-all-body {
+  max-height: min(54vh, 460px); overflow: auto; border: 1px solid var(--border);
+  border-radius: var(--radius); background: var(--ctrl-bg);
+}
+.user-all-body .lk-table thead th, .cred-all-body .lk-table thead th, .bucket-all-body .lk-table thead th, .link-all-body .lk-table thead th, .invite-all-body .lk-table thead th { position: sticky; top: 0; background: var(--panel); z-index: 1; }
+.user-all-body .lk-table tr:last-child td, .cred-all-body .lk-table tr:last-child td, .bucket-all-body .lk-table tr:last-child td, .link-all-body .lk-table tr:last-child td, .invite-all-body .lk-table tr:last-child td { border-bottom: 0; }
+.user-all-body .lk-empty, .cred-all-body .lk-empty, .bucket-all-body .lk-empty, .link-all-body .lk-empty, .invite-all-body .lk-empty { padding: 22px 0; }
+
+/* ============================ 邀请码设置（R54③） ============================ */
+/* 批量设置栏：一行放「已选提示 + 三个控件 + 两个按钮」，窄屏由 flex-wrap 自动换行。
+   底色用 --surface-2（次级面板）而不是卡片底色，好让「这条是对选中项生效的」一眼可见。 */
+.inv-bulk {
+  display: flex; flex-wrap: wrap; align-items: center; gap: 10px;
+  padding: 10px 12px; margin-bottom: 14px;
+  border: 1px solid var(--border); border-radius: var(--radius); background: var(--surface-2);
+}
+.inv-bulk[hidden] { display: none; }
+.inv-bulk-tip { flex: none; font-size: 12.5px; color: var(--text-2); }
+.inv-bulk-item { display: flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--text-2); }
+.inv-bulk-item input, .inv-bulk-item select {
+  height: 30px; padding: 0 8px; font-size: 13px;
+  border: 1px solid var(--border-strong); border-radius: 6px;
+  background: var(--ctrl-bg); color: var(--text);
+}
+.inv-bulk-item input[type="number"] { width: 96px; }
+
+.inv-table .inv-check { width: 34px; text-align: center; }
+.inv-table .inv-check input { cursor: pointer; }
+/* 邀请码用等宽字体：便于逐位核对。字符集里已去掉 0/O 与 1/I/L，
+   但「等宽」仍然是抄写与肉眼比对时最有用的那一点。 */
+.inv-table .inv-code code {
+  font-family: Consolas, "Courier New", monospace;
+  font-size: 12.5px; letter-spacing: .6px;
+}
+
+/* 生成 / 编辑对话框：四个字段分两行，比默认宽度稍宽即可 */
+.dialog.invite-dialog { width: min(620px, 96vw); }
+
+/* ============================ 负载均衡（按 API Key 的配额，R25） ============================ */
+/* 风箱（手风琴）式列表：默认全部折叠，点标题行展开该密钥下各桶占用 */
+.lb-list { margin-top: 6px; display: flex; flex-direction: column; gap: 10px; }
+.lb-item { border: 1px solid var(--border); border-radius: var(--radius); background: #fafbfc; overflow: hidden; }
+.lb-item.over { border-color: var(--danger); background: #fff8f8; }
+.lb-head { display: flex; align-items: center; gap: 10px; padding: 10px 12px; cursor: pointer; user-select: none; }
+.lb-head:hover { background: var(--hover); }
+.lb-caret { flex: none; width: 12px; color: var(--text-2); font-size: 10px; transition: transform .15s; }
+.lb-item.open .lb-caret { transform: rotate(90deg); }
+.lb-title { flex: 1 1 auto; min-width: 0; display: flex; flex-direction: column; gap: 2px; }
+.lb-key { font-weight: 600; font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lb-sub { font-size: 11px; color: var(--text-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lb-usage { flex: none; width: 200px; display: flex; flex-direction: column; align-items: flex-end; gap: 3px; }
+.lb-num { font-size: 12px; font-variant-numeric: tabular-nums; white-space: nowrap; }
+.lb-num.over { color: var(--danger); font-weight: 600; }
+.lb-bar { width: 100%; height: 6px; border-radius: 3px; background: #e6e8eb; overflow: hidden; }
+.lb-bar > i { display: block; height: 100%; width: 0; background: var(--accent); transition: width .2s; }
+.lb-bar.warn > i { background: var(--warn); }
+.lb-bar.over > i { background: var(--danger); }
+.lb-quota { flex: none; display: flex; align-items: center; gap: 5px; font-size: 12px; color: var(--text-2); }
+.lb-quota input { width: 96px; height: 28px; padding: 0 6px; border: 1px solid var(--border); border-radius: 6px; background: var(--panel); text-align: right; font-variant-numeric: tabular-nums; }
+.lb-body { border-top: 1px solid var(--border); background: var(--panel); padding: 6px 12px 10px; }
+/* 折叠态由 `.open` 唯一决定（渲染时无需再写 hidden，避免两处状态不一致） */
+.lb-item:not(.open) .lb-body { display: none; }
+.lb-bkt { display: flex; align-items: center; gap: 10px; padding: 7px 0; border-bottom: 1px dashed var(--border); }
+.lb-bkt:last-child { border-bottom: none; }
+.lb-bkt-name { flex: 1 1 auto; min-width: 0; font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lb-bkt-name code { font-size: 12px; }
+.lb-bkt-bar { flex: none; width: 150px; }
+.lb-bkt-num { flex: none; width: 118px; text-align: right; font-variant-numeric: tabular-nums; font-size: 12px; white-space: nowrap; }
+.lb-empty { color: var(--text-2); font-size: 12px; padding: 6px 2px; }
+
+/* ============================ Windows Hello（WebAuthn）开关 ============================ */
+/* 权重陷阱：.form-item label 为 (0,1,1)，会把它拉成 block / 12px / 灰字 / 下边距。
+   这里用两级类选择器 (0,2,0) 提权并复位，使 label 内的 checkbox 与文字横向对齐。 */
+.form-item .u-hello-label {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 0;
+  font-size: 13px;
+  color: var(--text-1);
+  cursor: pointer;
+  user-select: none;
+}
+.form-item .u-hello-label input[type="checkbox"] {
+  width: 16px;
+  height: 16px;
+  margin: 0;
+  flex: 0 0 auto;
+  accent-color: var(--accent);
+  cursor: pointer;
+}
+.form-item .u-hello-label input[type="checkbox"]:disabled { cursor: not-allowed; }
+.form-item .u-hello-label:has(input:disabled) { cursor: not-allowed; opacity: .6; }
+/* 表单内禁用态的文本输入（如"角色"只读展示） */
+.form-item input[type="text"]:disabled { background: var(--bg-2, #f3f4f6); color: var(--text-2); cursor: not-allowed; }
+
+/* ===================== 支付设置（系统设置卡片） ===================== */
+.sysset-tag.pay { background: var(--tint-info); color: #075985; }
+
+/* 平台切换标签：沿用 .pv-logo 白底容器，与云服务厂商 LOGO 视觉一致 */
+.pay-tabs { display: flex; gap: 8px; flex-wrap: wrap; }
+.pay-tab {
+  display: inline-flex; align-items: center; gap: 7px;
+  padding: 6px 11px 6px 7px; border: 1px solid var(--border); border-radius: 8px;
+  background: var(--panel); color: var(--text); font-size: 12px; cursor: pointer;
+  transition: border-color .15s, background .15s, color .15s;
+}
+.pay-tab:hover { border-color: var(--accent); }
+.pay-tab.active { border-color: var(--accent); background: var(--accent-weak); color: var(--accent); font-weight: 600; }
+.pay-tab .pv-logo { flex: none; }
+/* 渠道已停用时整块淡化，与"已启用"形成明确对比 */
+.pay-tab.off { opacity: .5; }
+.pay-tab.off .pv-logo { filter: grayscale(1); }
+/* 配置状态圆点：未配置灰 / 部分填写橙 / 已完整配置绿 */
+.pay-dot { width: 6px; height: 6px; border-radius: 50%; background: #d1d5db; flex: none; }
+.pay-dot.part { background: var(--warn); }
+.pay-dot.on { background: var(--ok); }
+
+.pay-doc { font-size: 11px; color: var(--muted); margin-bottom: 12px; line-height: 1.6; }
+/* 字段两列自适应：窄屏自动单列 */
+.pay-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 0 20px; }
+/* 密钥 / 证书这类长字段独占一行 */
+.pay-grid .form-item { margin-bottom: 14px; }
+
+.pay-input {
+  width: 100%; box-sizing: border-box; font-size: 13px; padding: 7px 9px;
+  border: 1px solid var(--border-strong); border-radius: 6px; background: var(--panel); color: var(--text);
+  font-family: var(--font);
+}
+.pay-input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px rgba(0, 103, 192, .2); }
+.pay-input.pay-mono { font-family: Consolas, "Courier New", monospace; font-size: 12px; resize: vertical; line-height: 1.5; }
+.pay-input.pay-bad { border-color: var(--danger); }
+.pay-input.pay-bad:focus { box-shadow: 0 0 0 3px rgba(229, 72, 77, .18); }
+
+.pay-err { font-size: 11px; color: var(--danger); margin-top: 4px; display: none; line-height: 1.5; }
+.pay-err.show { display: block; }
+/* 字段标签右侧的官方字段名（如 app_id / mchid），便于对照各平台控制台 */
+.pay-official {
+  margin-left: 6px; font-size: 10px; padding: 1px 5px; border-radius: 4px;
+  background: var(--surface-3); color: var(--muted); font-family: Consolas, "Courier New", monospace;
+}
+.pay-opt { margin-left: 4px; font-size: 10px; color: var(--muted); }
+.pay-state { margin-left: 6px; font-size: 10px; color: var(--ok); }
+
+/* ============================== 暗黑主题（R40） ============================== *
+ * 开关只有一条：`<html data-theme="dark">`。由 `public/js/theme.js` 在 <head> 里
+ * **同步**设置（普通脚本、非 module —— 理由见 index.html 的注释），并把选择持久化。
+ *
+ * 分两层，新增组件请优先走第 ① 层：
+ *   ① 变量层 —— `:root` 里的 30 个语义槽位，改一处全站生效；
+ *   ② 兜底层 —— 只出现过一次的浅色（进度条槽、开关轨道、登录卡片、各类提示块、
+ *      设置页彩色标签）没有做成变量，按选择器逐条覆盖。
+ *
+ * ⚠️ 本块必须排在 `:root` **之后**：两者特异度同为 (0,1,0)，靠先后顺序决胜。
+ * ========================================================================== */
+
+[data-theme="dark"] {
+  color-scheme: dark;          /* 原生下拉 / 复选框 / 滚动条 / 日期选择器一起变暗 */
+
+  --bg: #16181d;
+  --panel: #1e2127;
+  --border: #2c313a;
+  --border-strong: #3c434f;
+  --text: #e6e8ec;
+  --text-2: #a3aab6;
+  --accent: #4c9aff;
+  --accent-weak: #1d2b3f;
+  --danger: #ff6b70;
+  --ok: #4ade80;
+  --warn: #fbbf24;
+  --hover: #232830;
+  --selected: #2b3a52;
+  --shadow: 0 8px 30px rgba(0, 0, 0, .55);
+
+  --ctrl-bg: #232830;
+  --surface-2: #1b1f26;
+  --surface-3: #262b33;
+  --field-bg: #20242b;
+  --row-hover: #232c39;
+  --hover-2: #2a2f38;
+  --hover-3: #262b33;
+  --hover-4: #343a43;
+  --line-soft: #2a2f38;
+  --muted: #8b93a1;
+  --icon: #7f8896;
+  --tint-ok: #14301f;
+  --tint-bad: #3a1d20;
+  --tint-warn: #362c14;
+  --tint-warn-2: #3a2716;
+  --tint-info: #14303f;
+  --tint-enc: #3a3115;
+}
+
+/* ---- ② 兜底层 ---- */
+
+/* 第二排操作按钮写死的近黑（底是 --panel，暗色下必须跟着变亮，否则整排看不见） */
+[data-theme="dark"] .op-btn { color: #d7dae1; }
+[data-theme="dark"] .op-btn svg { color: var(--text-2); }
+
+/* 中性 hover：底已是深色，浅灰 hover 会「闪一下白」 */
+[data-theme="dark"] .icon-btn:hover:not(:disabled) { background: #2f3540; }
+[data-theme="dark"] .icon-btn:active:not(:disabled) { background: #3a414d; }
+[data-theme="dark"] .address-bar .crumb:hover { background: #2f3540; }
+[data-theme="dark"] .up-item:hover { background: #232830; }
+[data-theme="dark"] .lk-table tr:hover td { background: #232830; }
+[data-theme="dark"] .wd-card:hover { background: #232830; }
+[data-theme="dark"] #file-area.dropping { background: #1b2634; }
+
+/* 进度槽 / 轨道 / 小圆点 / 开关 */
+[data-theme="dark"] .quota-bar { background: #343a43; }
+[data-theme="dark"] .quota-bar.unlimited i { background: #3d4a63; }
+[data-theme="dark"] .lb-bar { background: #343a43; }
+[data-theme="dark"] .dot { background: #5a6272; }
+[data-theme="dark"] .pay-dot { background: #4a5160; }
+[data-theme="dark"] .ip-switch i { background: #4a5160; }
+[data-theme="dark"] .enc-mode-opt input:disabled + .enc-mode-mark { background: #2a2f38; }
+/* 与亮色那条 `.form-item input[type="text"]:disabled` 逐字对应 —— 限定 type 是必须的：
+   不加的话这一条会把 label 里内嵌的复选框也拉成整行输入框（frontend.test.js 有护栏） */
+[data-theme="dark"] .form-item input[type="text"]:disabled { background: #262b33; }
+[data-theme="dark"] .grid-item .thumb { background: #232830; }
+
+/* 代码块 / 路径 / 说明块 / 列表条目 */
+[data-theme="dark"] .help-sec code,
+[data-theme="dark"] .about-list code { background: #262b33; }
+[data-theme="dark"] .prop-path { background: #20242b; }
+[data-theme="dark"] .bm-name-code { background: #20242b; }
+[data-theme="dark"] .wd-url { background: #20242b; }
+[data-theme="dark"] .perm-col-head { background: #232830; }
+[data-theme="dark"] .lb-item { background: #232830; }
+[data-theme="dark"] .lb-item.over { background: #3a1d20; }
+
+/* 语义提示块：底色已被上层调暗，写死的深绿 / 深红 / 深棕必须一并提亮 */
+[data-theme="dark"] .enc-warn { color: #f0c67a; }
+[data-theme="dark"] .enc-warn.danger { background: #3a1d20; border-color: #5c2b2b; color: #ffb3b0; }
+[data-theme="dark"] .auth-captcha-msg { color: #e3b341; border-color: #5a4a1c; }
+[data-theme="dark"] .auth-error { background: #3a1d20; border-color: #5c2b2b; color: #ffb3b0; }
+[data-theme="dark"] .lv.info { background: #212936; color: #9fb3c8; }
+[data-theme="dark"] .lv.warn { background: #362c14; }
+[data-theme="dark"] .lk-badge.warn { color: #fbbf24; }
+[data-theme="dark"] .lk-badge.refund { background: #262b33; color: #9aa3b0; }
+[data-theme="dark"] .perm-badge.on { background: #14301f; color: #6ee7a8; }
+[data-theme="dark"] .ipguard-china-row { background: #1b2634; border-color: #2c3f57; }
+[data-theme="dark"] .ipguard-china-row.on { background: #14301f; border-color: #2f6b47; }
+[data-theme="dark"] .ipg-method { background: #262b33; color: #9aa3b0; }
+[data-theme="dark"] .ipg-method.m-write { background: #3a2716; color: #fbbf24; }
+[data-theme="dark"] .wd-card-app .wd-badge { background: #262b33; }
+[data-theme="dark"] .wd-card-app .wd-badge.run { background: #14301f; color: #6ee7a8; }
+
+/* 设置页的彩色标签：暗色下统一改成「深底 + 亮字」，与上面那批提示块同一观感 */
+[data-theme="dark"] .sysset-tag { background: #14303f; color: #6cb6e8; }
+[data-theme="dark"] .sysset-tag.enc { background: #3a3115; color: #e3b341; }
+[data-theme="dark"] .sysset-tag.excl { background: #262a4d; color: #a5b4fc; }
+[data-theme="dark"] .sysset-tag.wd { background: #12331f; color: #6ee7a8; }
+[data-theme="dark"] .sysset-tag.about { background: #2b3038; color: #b6bcc6; }
+[data-theme="dark"] .sysset-tag.cap { background: #3a1f30; color: #f0a6c8; }
+[data-theme="dark"] .sysset-tag.lb { background: #123024; color: #6ee7b7; }
+[data-theme="dark"] .sysset-tag.mail { background: #10333d; color: #67e8f9; }
+[data-theme="dark"] .sysset-tag.site { background: #2a2145; color: #c4b5fd; }
+
+/* 登录卡片：外层本来就是深色渐变，卡片跟着暗下来才不刺眼（原先恒为白卡）。
+   卡片用 --panel（比 --ctrl-bg 暗一档），输入框留在 --ctrl-bg，两者才有层次。 */
+[data-theme="dark"] .auth-card { background: var(--panel); }
+[data-theme="dark"] .auth-card h2 { color: var(--text); }
+[data-theme="dark"] .auth-sub { color: var(--text-2); }
+[data-theme="dark"] .auth-card .form-item > label:not(.check-line),
+[data-theme="dark"] .auth-card .form-item > label.check-line { color: var(--text-2); }
+[data-theme="dark"] .auth-card .form-item input:not([type="checkbox"]) { border-color: var(--border-strong); }
+[data-theme="dark"] .auth-foot { color: var(--muted); }

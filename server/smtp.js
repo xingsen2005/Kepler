@@ -1,0 +1,497 @@
+'use strict';
+
+/**
+ * 零依赖 SMTP 发信客户端（R53）
+ *
+ * ## 为什么自己写
+ *
+ * 需求是「允许管理员设置 SMTP」，且**尽量不新增任何依赖**。业界通行方案是
+ * `nodemailer`（本体 + 十余个传递依赖），为一个「保存后发一封测试信」的用途
+ * 引入整棵依赖树并不划算。SMTP 会话本身是**行式文本协议**（RFC 5321），
+ * 核心握手只有六条命令，用 `node:net` + `node:tls` 即可完整实现：
+ *
+ *   S: 220 问候
+ *   C: EHLO <helo>        → S: 250-…（能力清单）
+ *   C: STARTTLS           → S: 220      （仅明文端口；升级后必须重发 EHLO）
+ *   C: AUTH PLAIN <b64>   → S: 235
+ *   C: MAIL FROM:<addr>   → S: 250
+ *   C: RCPT TO:<addr>     → S: 250 / 251
+ *   C: DATA               → S: 354
+ *   C: …信头␍␊␍␊正文… + "."  → S: 250
+ *   C: QUIT               → S: 221
+ *
+ * ## 支持范围（刻意收窄）
+ *
+ *  - 加密：隐式 TLS（465，`secure: true`）+ STARTTLS（587 / 25，服务端宣告才升级）；
+ *  - 登录：`AUTH PLAIN` 优先，服务端不支持时退回 `AUTH LOGIN`；两者都不支持却又
+ *    填了用户名 ⇒ **直接报错**，不静默降级为「不登录直接发」（那会被绝大多数
+ *    服务器拒收，且报错看起来像网络不通，极难排查）；
+ *  - 编码：主题走 RFC 2047 编码字、正文走 base64，统一 UTF-8；
+ *  - 不支持：附件 / HTML 正文 / DKIM 签名 —— 本功能只需要发纯文本测试信。
+ *
+ * ## ⚠️ 信头注入（本模块最硬的一条约束）
+ *
+ * SMTP 是行式协议，`MAIL FROM:<…>` 与 `From: …` 都是**手工拼进命令与信头**的。
+ * 一旦外部字符串里带 CR / LF，攻击者就能追加任意命令或信头（伪造 `Bcc`、
+ * 覆盖 `Subject`），即经典的 SMTP 头部注入。base64 化正文挡不住它 ——
+ * 只有**在入口处拒绝换行**才行，判据在 `limits.js` 的 `parseSmtpAddressInput` /
+ * `parseSmtpTextInput`。本模块再做一层 `oneLine()` 兜底（退化为空格），
+ * 但**不能**因此放宽入口校验 —— 兜底是为了「万一漏了也不至于被注入」。
+ */
+
+const net = require('node:net');
+const tls = require('node:tls');
+const os = require('node:os');
+const crypto = require('node:crypto');
+const { normalizeSmtpPort } = require('./limits');
+
+/** 建连 / 每条命令的默认超时（毫秒） */
+const DEFAULT_TIMEOUT_MS = 15000;
+
+/** 各阶段可接受的响应码（RFC 5321 §4.2） */
+const CODE = {
+  greeting: [220],
+  ehlo: [250],
+  starttls: [220],
+  authChallenge: [334],
+  authOk: [235],
+  mail: [250],
+  rcpt: [250, 251],
+  dataReady: [354],
+  dataDone: [250],
+  quit: [221],
+};
+
+/** 配置类问题（口令缺失 / 地址不合法 …）—— 400，提示管理员去改设置 */
+function configError(msg) {
+  return Object.assign(new Error(msg), { status: 400 });
+}
+
+/** 把底层网络错误包一层，带上「连的是谁」—— 否则日志里只有 ECONNREFUSED 一个词 */
+function wrapConnError(e, o, when) {
+  const err = new Error(`连接 SMTP 服务器 ${o.host}:${o.port} 失败（${when}）：${(e && e.message) || e}`);
+  err.cause = e;
+  return err;
+}
+
+/**
+ * EHLO / HELO 的域名参数。
+ *
+ * 部分服务器会拒绝 `localhost` 或含非法字符的主机名（501 或直接断连），
+ * 因此这里收敛字符集；取不到合法主机名时用地址字面量 `[127.0.0.1]`
+ * （RFC 5321 §4.1.4 允许，且不需要 DNS 反解）。
+ */
+function heloName() {
+  const raw = String(os.hostname() || '').replace(/[^A-Za-z0-9.-]/g, '');
+  const safe = raw.replace(/^[.-]+/, '').replace(/[.-]+$/, '');
+  return safe || '[127.0.0.1]';
+}
+
+/** 任意文本 → 单行（换行一律退化为空格），防命令 / 信头注入的最后一道兜底 */
+function oneLine(v) {
+  return String(v == null ? '' : v).replace(/[\r\n]+/g, ' ');
+}
+
+/**
+ * RFC 2047 编码字（base64、UTF-8），并按 76 字符折行。
+ *
+ * 纯 ASCII 且不含 `=?` 时原样返回 —— 让绝大多数普通信件保持人类可读，
+ * 也避免在 `Subject` 上无谓地套一层编码。
+ */
+function encodedWord(v) {
+  const s = oneLine(v);
+  if (/^[\x20-\x7E]*$/.test(s) && s.indexOf('=?') < 0) return s;
+  const b = Buffer.from(s, 'utf8').toString('base64');
+  const chunks = b.match(/.{1,48}/g) || [''];
+  return chunks.map((c) => `=?UTF-8?B?${c}?=`).join('\r\n ');
+}
+
+/** 取邮箱的域名部分（用于 Message-ID 右半边）；取不到时退回 localhost */
+function domainOf(addr) {
+  const at = String(addr || '').lastIndexOf('@');
+  const d = at < 0 ? '' : String(addr).slice(at + 1).replace(/[^A-Za-z0-9.-]/g, '');
+  return d || 'localhost';
+}
+
+/**
+ * 解析 EHLO 应答里的能力清单。
+ *
+ * 只要三件事：是否支持 STARTTLS、支持哪些登录方式（AUTH 之后的机制列表）、
+ * 是否支持 SMTPUTF8。其余扩展一律忽略 —— 本模块只发纯文本测试信。
+ */
+function parseCaps(lines) {
+  const auth = [];
+  let starttls = false;
+  let utf8 = false;
+  for (const raw of (lines || [])) {
+    const line = String(raw || '').trim();
+    if (!line) continue;
+    if (/^STARTTLS$/i.test(line)) { starttls = true; continue; }
+    if (/^SMTPUTF8$/i.test(line)) { utf8 = true; continue; }
+    const m = /^AUTH(?:\s+|=)(.+)$/i.exec(line);
+    if (!m) continue;
+    for (const mech of m[1].split(/\s+/)) {
+      const up = String(mech || '').toUpperCase();
+      if (up && auth.indexOf(up) < 0) auth.push(up);
+    }
+  }
+  return { auth, starttls, utf8 };
+}
+
+/**
+ * 点填充（dot-stuffing）：正文里行首的 `.` 必须写成 `..`，
+ * 否则服务端会把该行当成 DATA 结束标记（`.` 单行）而提前截断信件。
+ */
+function dotStuff(msg) {
+  return String(msg).split('\r\n').map((l) => (l.charAt(0) === '.' ? `.${l}` : l)).join('\r\n');
+}
+
+/** 一次性构造完整信件（信头 + 空行 + 正文），不含 DATA 结束的 `.` */
+function buildMessage(o) {
+  const b64 = Buffer.from(typeof o.text === 'string' ? o.text : '', 'utf8').toString('base64');
+  const body = (b64.match(/.{1,76}/g) || ['']).join('\r\n');
+  const fromHeader = o.fromName ? `${encodedWord(o.fromName)} <${o.from}>` : `<${o.from}>`;
+  const headers = [
+    `Date: ${new Date().toUTCString()}`,
+    `From: ${fromHeader}`,
+    `To: <${o.to}>`,
+    `Subject: ${encodedWord(o.subject)}`,
+    `Message-ID: <${crypto.randomBytes(12).toString('hex')}@${domainOf(o.from)}>`,
+    'MIME-Version: 1.0',
+    'Content-Type: text/plain; charset=UTF-8',
+    'Content-Transfer-Encoding: base64',
+  ];
+  return `${headers.join('\r\n')}\r\n\r\n${body}\r\n`;
+}
+
+/**
+ * 一个 SMTP 会话。
+ *
+ * 生命周期由 `connect()` → `handshake()` → （`auth()`）→ `send()` → `quit()`
+ * 组成；**任何一步失败都必须由调用方走 `quit()`** 兜底关闭套接字
+ * （`sendMail()` 用 `try/finally` 保证），否则会泄漏一条 TCP 连接。
+ */
+class SmtpSession {
+  constructor(opts) {
+    this.opts = opts;
+    this.sock = null;
+    this.buf = '';
+    /** 正在累积的多行响应（250- 续行） */
+    this.lines = [];
+    /** 已完整收到、尚未被取走的响应 */
+    this.responses = [];
+    /** 当前等待响应的取件人 */
+    this.waiter = null;
+    /** 首个致命错误；置上之后所有后续操作直接抛它 */
+    this.failure = null;
+    /** 已进入收尾（QUIT / destroy）—— 此后的 'close' 不再算异常 */
+    this.closing = false;
+    /** 当前这条连接是否已加密（隐式 TLS 或 STARTTLS 升级后） */
+    this.encrypted = false;
+    this.caps = { auth: [], starttls: false, utf8: false };
+  }
+
+  /** 建连。隐式 TLS 与明文走不同分支，之后统一挂长期监听。 */
+  async connect() {
+    const o = this.opts;
+    const sock = o.secure
+      ? tls.connect({ host: o.host, port: o.port, servername: net.isIP(o.host) ? undefined : o.host })
+      : net.connect({ host: o.host, port: o.port });
+    this.sock = sock;
+    sock.setEncoding('utf8');
+    /**
+     * ⚠️ 监听必须挂在**握手完成之前**：`net.connect` 返回后读写已就绪，
+     * 220 问候可能在 'connect' 事件之前就已进缓冲区 —— 若等 `await` 之后再挂
+     * 'data'（微任务晚于 I/O 回调），问候就丢了，表现为「连上了但一直等不到响应」。
+     */
+    sock.on('data', (chunk) => this._onData(chunk));
+    await new Promise((resolve, reject) => {
+      const onErr = (e) => { cleanup(); reject(wrapConnError(e, o, '建连')); };
+      const onOk = () => { cleanup(); resolve(); };
+      function cleanup() {
+        sock.removeListener('error', onErr);
+        sock.removeListener('connect', onOk);
+        sock.removeListener('secureConnect', onOk);
+      }
+      sock.once('error', onErr);
+      sock.once(o.secure ? 'secureConnect' : 'connect', onOk);
+    });
+    this.encrypted = !!o.secure;
+    this._bindLongLived(sock);
+  }
+
+  /** 连接建立后的长期监听：错误 / 超时 / 关闭统一收口到 `_fail()` */
+  _bindLongLived(sock) {
+    const o = this.opts;
+    sock.setTimeout(o.timeoutMs);
+    sock.on('error', (e) => this._fail(wrapConnError(e, o, '通信')));
+    sock.on('timeout', () => this._fail(new Error(`SMTP 服务器 ${o.host}:${o.port} 超过 ${o.timeoutMs} 毫秒没有响应`)));
+    sock.on('close', () => this._fail(new Error(`SMTP 服务器 ${o.host}:${o.port} 关闭了连接`)));
+  }
+
+  /** 逐行切分服务端响应；续行（`250-`）累积，末行（`250 `）成帧 */
+  _onData(chunk) {
+    this.buf += chunk;
+    for (;;) {
+      const i = this.buf.indexOf('\r\n');
+      if (i < 0) break;
+      const line = this.buf.slice(0, i);
+      this.buf = this.buf.slice(i + 2);
+      const code = Number.parseInt(line.slice(0, 3), 10);
+      if (!Number.isFinite(code)) continue; // 认不出的行直接丢，不污染响应帧
+      this.lines.push(line.slice(4));
+      if (line.charAt(3) === '-') continue;
+      this.responses.push({ code, lines: this.lines.slice() });
+      this.lines.length = 0;
+      this._pump();
+    }
+  }
+
+  /** 把已收到的响应交给正在等待的取件人 */
+  _pump() {
+    while (this.waiter && this.responses.length) {
+      const w = this.waiter;
+      this.waiter = null;
+      w.resolve(this.responses.shift());
+    }
+  }
+
+  /**
+   * 致命错误：记下首个错误、叫醒（并拒绝）当前等待者、销毁套接字。
+   * 之后的 `_read()` 都会直接抛同一个错误 —— 不会有人永远挂住。
+   */
+  _fail(err) {
+    const e = err instanceof Error ? err : new Error(String(err));
+    if (!this.failure) this.failure = e;
+    if (this.waiter) {
+      const w = this.waiter;
+      this.waiter = null;
+      w.reject(e);
+    }
+    this.responses.length = 0;
+    if (!this.closing) {
+      this.closing = true;
+      try {
+        if (this.sock && !this.sock.destroyed) this.sock.destroy();
+      } catch (_) { /* 销毁失败无需再处理 */ }
+    }
+  }
+
+  /** 取下一个完整响应（无超时上限 —— 由套接字层的 `setTimeout` 兜底） */
+  _read() {
+    return new Promise((resolve, reject) => {
+      if (this.failure) return reject(this.failure);
+      this.waiter = { resolve, reject };
+      this._pump();
+    });
+  }
+
+  /** 发一条命令，原样返回响应（调用方自行判定响应码） */
+  async _cmd(line) {
+    if (this.failure) throw this.failure;
+    const p = this._read();
+    this.sock.write(`${line}\r\n`, 'utf8');
+    return p;
+  }
+
+  /** 发一条命令，并断言响应码；不符则抛错（带上服务端的原话，便于排查） */
+  async _cmdOk(line, expect, label) {
+    const res = await this._cmd(line);
+    this._assertCode(res, expect, label);
+    return res;
+  }
+
+  _assertCode(res, expect, label) {
+    if (!expect.includes(res.code)) {
+      const detail = (res.lines || []).filter(Boolean).slice(0, 3).join(' ').slice(0, 300);
+      const e = new Error(`SMTP 服务器拒绝了「${label}」：${res.code} ${detail}`.trim());
+      e.smtpCode = res.code;
+      throw e;
+    }
+    return res;
+  }
+
+  /** 问候 + EHLO（+ 明文段按需升级 STARTTLS） */
+  async handshake() {
+    this._assertCode(await this._read(), CODE.greeting, '服务器问候');
+    await this._ehlo();
+  }
+
+  async _ehlo() {
+    const name = heloName();
+    const res = await this._cmd(`EHLO ${name}`);
+    if (res.code === 250) {
+      this.caps = parseCaps(res.lines);
+      return;
+    }
+    /**
+     * 老式服务器不认 EHLO（按 RFC 5321 应回 502）—— 退回 HELO：
+     * 没有能力清单，一律按「无任何扩展」处理（不加密、不登录）。
+     */
+    const r2 = await this._cmd(`HELO ${name}`);
+    this._assertCode(r2, CODE.ehlo, 'HELO');
+    this.caps = { auth: [], starttls: false, utf8: false };
+  }
+
+  async _starttls() {
+    const o = this.opts;
+    await this._cmdOk('STARTTLS', CODE.starttls, 'STARTTLS（请求加密）');
+    const raw = this.sock;
+    /**
+     * 交接瞬间底层 TCP 会触发 'close' / 'error'，若不摘掉旧监听，
+     * 会被 `_fail()` 误判成「服务器断了」而把一条本来正常的加密连接掐掉。
+     */
+    raw.removeAllListeners('data');
+    raw.removeAllListeners('timeout');
+    raw.removeAllListeners('error');
+    raw.removeAllListeners('close');
+    const secure = tls.connect({
+      socket: raw,
+      servername: net.isIP(o.host) ? undefined : o.host,
+    });
+    secure.setEncoding('utf8');
+    secure.on('data', (chunk) => this._onData(chunk));
+    await new Promise((resolve, reject) => {
+      const onErr = (e) => { reject(wrapConnError(e, o, 'TLS 握手')); };
+      const onOk = () => { secure.removeListener('error', onErr); resolve(); };
+      secure.once('error', onErr);
+      secure.once('secureConnect', onOk);
+    });
+    this.sock = secure;
+    this.encrypted = true;
+    this._bindLongLived(secure);
+    /**
+     * ⚠️ 升级后必须**重新** EHLO。明文阶段的能力清单不可信 ——
+     * 大量服务器在加密前刻意隐瞒 AUTH（防口令走明文），升级后才给出完整清单。
+     */
+    await this._ehlo();
+  }
+
+  /**
+   * 登录。
+   *
+   * ⚠️ 两条硬约束：
+   *  1. **未加密的连接一律不发送口令**（明文口令会被整条链路看到）；
+   *  2. 服务端不宣告任何登录方式时**报错**，不静默改为「不登录直接发」。
+   */
+  async auth() {
+    const o = this.opts;
+    if (!this.encrypted) {
+      throw configError(`SMTP 服务器 ${o.host}:${o.port} 未宣告 STARTTLS —— `
+        + '已拒绝以明文发送登录口令（请改用 465 端口的隐式 TLS，或在服务端开启 STARTTLS）');
+    }
+    const sup = this.caps.auth;
+    if (!sup.length) {
+      throw configError(`SMTP 服务器 ${o.host}:${o.port} 未宣告任何登录方式 —— `
+        + '若该服务器本就不需要登录，请清空「用户名」与「密码」后再试');
+    }
+    if (sup.indexOf('PLAIN') >= 0) {
+      const cred = Buffer.from(`\u0000${o.user}\u0000${o.password}`, 'utf8').toString('base64');
+      await this._cmdOk(`AUTH PLAIN ${cred}`, CODE.authOk, '登录（AUTH PLAIN）');
+      return;
+    }
+    if (sup.indexOf('LOGIN') >= 0) {
+      await this._cmdOk('AUTH LOGIN', CODE.authChallenge, '登录（发起 AUTH LOGIN）');
+      await this._cmdOk(Buffer.from(o.user, 'utf8').toString('base64'), CODE.authChallenge, '登录（提交用户名）');
+      await this._cmdOk(Buffer.from(o.password, 'utf8').toString('base64'), CODE.authOk, '登录（提交口令）');
+      return;
+    }
+    throw configError(`SMTP 服务器支持的登录方式（${sup.join('、')}）均不受支持（本模块支持 PLAIN 与 LOGIN）`);
+  }
+
+  /** 投递一封信（envelope → DATA → `.`） */
+  async send(message) {
+    await this._cmdOk(`MAIL FROM:${this._envelopeAddr(this.opts.from)}`, CODE.mail, '发件人（MAIL FROM）');
+    await this._cmdOk(`RCPT TO:${this._envelopeAddr(this.opts.to)}`, CODE.rcpt, '收件人（RCPT TO）');
+    await this._cmdOk('DATA', CODE.dataReady, '正文（DATA）');
+    this.sock.write(`${dotStuff(message)}.\r\n`, 'utf8');
+    this._assertCode(await this._read(), CODE.dataDone, '正文投递');
+  }
+
+  /** envelope 地址：非 ASCII 时必须带 `SMTPUTF8`（RFC 6531），否则服务端会拒 */
+  _envelopeAddr(addr) {
+    if (/^[\x20-\x7E]*$/.test(addr)) return `<${addr}>`;
+    if (!this.caps.utf8) {
+      throw configError(`邮件地址「${oneLine(addr)}」含非 ASCII 字符，而该 SMTP 服务器未宣告支持 SMTPUTF8`);
+    }
+    return `<${addr}> SMTPUTF8`;
+  }
+
+  /**
+   * 收尾：先礼后兵 —— 发 QUIT，等一小会儿（服务器也可能直接 FIN 不等），
+   * 再无条件销毁套接字。失败一律忽略：收尾阶段的错误不该盖掉真正的业务错误。
+   */
+  async quit() {
+    this.closing = true;
+    const sock = this.sock;
+    if (!sock || sock.destroyed) return;
+    try {
+      sock.setTimeout(Math.min(3000, this.opts.timeoutMs));
+      await this._cmd('QUIT');
+    } catch (_) { /* 服务器可能直接断连，属正常 */ }
+    try {
+      if (!sock.destroyed) sock.destroy();
+    } catch (_) { /* 同上 */ }
+  }
+}
+
+/** 入参收敛：缺字段补默认值，所有文本统一转字符串（不信任调用方类型） */
+function normalizeOptions(opts) {
+  const o = opts || {};
+  const n = Number(o.timeoutMs);
+  return {
+    host: String(o.host || '').trim(),
+    port: normalizeSmtpPort(o.port),
+    secure: o.secure !== false,
+    user: String(o.user || '').trim(),
+    password: typeof o.password === 'string' ? o.password : '',
+    from: String(o.from || '').trim(),
+    fromName: String(o.fromName || '').trim(),
+    to: String(o.to || '').trim(),
+    subject: String(o.subject || '').trim() || 'Kepler 发信测试',
+    text: typeof o.text === 'string' ? o.text : '',
+    timeoutMs: Number.isFinite(n) && n > 0 ? Math.floor(n) : DEFAULT_TIMEOUT_MS,
+  };
+}
+
+/**
+ * 发信前置校验（配置类问题 → 400）。
+ * @returns {string} 空串 = 通过；非空 = 面向管理员的提示
+ */
+function validateForSend(o) {
+  if (!o.host) return '尚未填写 SMTP 服务器地址';
+  if (!o.from) return '尚未填写发件人地址';
+  if (!o.to) return '尚未填写收件人地址（留空则默认发给发件人自己）';
+  if (o.user && !o.password) return '已填写登录用户名但密码为空（如需免密发信，请清空用户名）';
+  return '';
+}
+
+/**
+ * 发一封信。
+ *
+ * @param {object} opts `{ host, port, secure, user, password, from, fromName, to, subject, text, timeoutMs }`
+ * @returns {Promise<{ok: boolean, encrypted: boolean, authUsed: string}>}
+ * @throws {Error} 配置问题带 `status = 400`；网络 / 协议错误为 500（由 `apiHandler` 落地）
+ */
+async function sendMail(opts) {
+  const o = normalizeOptions(opts);
+  const problem = validateForSend(o);
+  if (problem) throw configError(problem);
+  const s = new SmtpSession(o);
+  await s.connect();
+  try {
+    await s.handshake();
+    if (!s.encrypted && s.caps.starttls) await s._starttls();
+    let authUsed = '';
+    if (o.user) {
+      authUsed = s.caps.auth.indexOf('PLAIN') >= 0 ? 'PLAIN' : 'LOGIN';
+      await s.auth();
+    }
+    await s.send(buildMessage(o));
+    return { ok: true, encrypted: s.encrypted, authUsed };
+  } finally {
+    await s.quit().catch(() => {});
+  }
+}
+
+module.exports = { sendMail, DEFAULT_TIMEOUT_MS, CODE, buildMessage, dotStuff, encodedWord };

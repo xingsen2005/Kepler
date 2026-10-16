@@ -1,0 +1,2596 @@
+/**
+ * 配置存储模块 —— 配置信息本地加密存储与验证机制
+ *
+ * 安全设计：
+ *  - 首次运行生成 32 字节随机主密钥，保存在 data/secret.key（仅本机可读）
+ *  - 配置使用 AES-256-GCM 加密（随机 IV + 认证标签），存于 data/config.enc
+ *  - GCM 认证标签可检测配置文件是否被篡改/损坏（完整性验证）
+ *  - SecretKey 永不回传前端，仅返回掩码信息
+ *
+ * 数据结构（v3，多云服务商 + 多密钥 + 多存储桶）：
+ *  {
+ *    credentials: [{ id, provider, secretId, secretKey, remark, endpoint, createdAt }],
+ *    activeCredentialId: string,
+ *    buckets: [{ id, provider, bucket, region, remark, quotaBytes, credentialId, createdAt }],
+ *    activeBucketId: string,
+ *    domains: { primary, backup },
+ *    createdAt, updatedAt,
+ *  }
+ * 旧版（v1，扁平 secretId/secretKey/bucket/region/quotaBytes）在 load() 时自动迁移。
+ * v2（无 provider 字段）在 normalize() 中统一兜底为腾讯云，保证历史配置继续可用。
+ */
+const crypto = require('crypto');
+const fs = require('fs');
+const atomic = require('./atomic-write');
+const path = require('path');
+const providers = require('./providers');
+const paymentProviders = require('./payment-providers');
+const { assertSafeEndpoint } = require('./endpoint-guard');
+// R37：限速值的归一化判据（叶子模块，不会成环）
+// R53：SMTP 端口的归一化判据同上 —— `config-store`（读盘）与 `routes/smtp.js`（入参）共用
+// R54：站点名称的默认值 / 注册模式与默认身份三者的归一化判据同源于 `limits.js`
+// R54②：用户邮箱的归一化判据也在这里（`normalizeEmail`）—— 读盘兜底与入参校验共用同一口径
+const {
+  normalizeSpeedLimit, CONCURRENCY_FILES_MAX, normalizeSmtpPort, SMTP_PORT_DEFAULT,
+  SITE_NAME_DEFAULT, normalizeRegistrationMode, normalizeDefaultRole, normalizeEmail,
+} = require('./limits');
+
+/**
+ * R12-01：此前这里是全库唯一一处**硬编码**的 data 目录
+ * （`const DATA_DIR = path.join(__dirname, '..', 'data')`），不读数据目录开关。
+ *
+ * 后果已经实际发生过一次：`tests/audit6-regressions.test.js` 里几处 `configStore.save({})`
+ * 在跑全量测试时**直接改写了生产 `data/config.enc`**（内含云厂商密钥 / 桶 / 账户）——
+ * AES-GCM 每次 IV 随机，文件内容等价但字节全变、`updatedAt` 被改写。更危险的是：
+ * 将来任何一条用例只要在 `save()` 里带上真实字段，就会静默覆盖生产凭据，而测试一样全绿。
+ *
+ * 现在与其它 store 同款写法；`KEY_FILE`（主密钥）一并纳入，否则测试会用到生产主密钥。
+ */
+const DATA_DIR = require('./data-dir').dataDir();
+const KEY_FILE = path.join(DATA_DIR, 'secret.key');
+const CONFIG_FILE = path.join(DATA_DIR, 'config.enc');
+
+let cached = null; // 解密后的配置缓存
+let cachedAt = 0; // 缓存载入时间戳（P13：60 秒 TTL）
+const CACHE_TTL_MS = 60 * 1000;
+let corrupted = false;
+let masterKeyCache = null; // N3：主密钥内存缓存，避免每次加解密同步读盘
+
+function ensureDataDir() {
+  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+}
+
+/**
+ * 把可疑/损坏的 data 文件另存一份备份（FUN-03 / FUN-04）。
+ *
+ * 与 `secure-store.backupCorrupt()` 同款语义：让「不可逆」降级为「可人工恢复」。
+ * 每个进程对同一文件**只备份一次** —— 否则损坏状态下反复调用会产生一堆
+ * `.corrupt-<ts>` 副本，反而淹没真正需要的那一份。
+ *
+ * @param {string} file 绝对路径
+ * @param {'corrupt'|'bad'} tag 备份后缀标记
+ * @returns {string} 备份文件路径（失败返回空串）
+ */
+const backedUp = new Set();
+function backupDataFile(file, tag) {
+  const key = `${tag}:${file}`;
+  if (backedUp.has(key)) return '';
+  backedUp.add(key);
+  try {
+    if (!fs.existsSync(file)) return '';
+    const dst = `${file}.${tag}-${Date.now()}`;
+    fs.copyFileSync(file, dst);
+    return dst;
+  } catch (e) {
+    return '';
+  }
+}
+
+/**
+ * 构造一个「数据文件不可写」错误（调用方应向上抛，由路由层转成 5xx）。
+ *
+ * 对外导出是为了让 `enc-store.js` 等持有同类关键文件的模块复用同一套语义
+ * （FUN-04 的备份 + 拒绝覆盖），而不是各自再写一份。
+ *
+ * @param {string} file 绝对路径
+ * @param {'corrupt'|'bad'} tag 备份后缀标记
+ * @param {string} why 人类可读的原因
+ */
+function unwritableError(file, tag, why) {
+  const bak = backupDataFile(file, tag);
+  const err = new Error(
+    `${path.basename(file)} ${why}；为防覆盖造成的不可逆数据丢失，`
+    + (bak ? `已备份为 ${path.basename(bak)}，` : '（备份失败，请立即手工复制该文件）')
+    + '并拒绝写入。请先恢复或确认无误后手工处理该文件，再重启服务。'
+  );
+  err.status = 500;
+  err.corrupt = true;
+  err.file = file;
+  return err;
+}
+
+function getMasterKey() {
+  if (masterKeyCache) return masterKeyCache;
+  ensureDataDir();
+  if (fs.existsSync(KEY_FILE)) {
+    const hex = fs.readFileSync(KEY_FILE, 'utf8').trim();
+    if (/^[0-9a-f]{64}$/i.test(hex)) {
+      /**
+       * R28-04：读取路径上的权限自愈。
+       * `secret.key` 正常运行时**永不重建**，所以 R27-13（创建即 0600）救不了
+       * 「修复之前就已存在的 0644 密钥文件」—— 那台机器的暴露会一直留着。
+       */
+      if (atomic.ensurePrivateModeSync(KEY_FILE)) {
+        console.warn('[config-store] 检测到 data/secret.key 权限过宽，已收紧为 0600');
+      }
+      masterKeyCache = Buffer.from(hex, 'hex');
+      return masterKeyCache;
+    }
+    // FUN-04：文件存在但内容不是合法密钥 —— **绝不能**静默生成新密钥覆盖它。
+    //
+    // 旧密钥是 config.enc / enc-meta / links / payments 的唯一解密凭据，
+    // 一旦被覆盖，全部历史数据永久不可解（空文件、BOM、少一个字符都会走到这里）。
+    // 这里备份异常内容后直接抛错，让故障显式化：宁可起不来，也不能悄悄把数据判死刑。
+    // 运维确认该文件确实无用后，手工删除即可让服务重新生成新密钥。
+    throw unwritableError(KEY_FILE, 'bad', '内容不是合法的 32 字节十六进制密钥');
+  }
+  const key = crypto.randomBytes(32);
+  // R27-13：以 0600 **创建**（旧实现先按默认 0644 落地、再 chmod，中间有一个
+  // 同机可读的窗口，窗口内被强杀则权限永久停在 0644）。chmod 保留为兜底。
+  atomic.writeAtomicSync(KEY_FILE, key.toString('hex'), { mode: 0o600 });
+  try { fs.chmodSync(KEY_FILE, 0o600); } catch (e) { /* 部分平台不支持 */ }
+  masterKeyCache = key;
+  return key;
+}
+
+function encrypt(obj) {
+  const iv = crypto.randomBytes(12);
+  const cipher = crypto.createCipheriv('aes-256-gcm', getMasterKey(), iv);
+  const plain = Buffer.from(JSON.stringify(obj), 'utf8');
+  const enc = Buffer.concat([cipher.update(plain), cipher.final()]);
+  const tag = cipher.getAuthTag();
+  // base64( iv(12) | tag(16) | ciphertext )
+  return Buffer.concat([iv, tag, enc]).toString('base64');
+}
+
+function decrypt(b64) {
+  const raw = Buffer.from(b64, 'base64');
+  if (raw.length < 29) throw new Error('CONFIG_FORMAT_INVALID');
+  const iv = raw.subarray(0, 12);
+  const tag = raw.subarray(12, 28);
+  const data = raw.subarray(28);
+  const decipher = crypto.createDecipheriv('aes-256-gcm', getMasterKey(), iv);
+  decipher.setAuthTag(tag); // 认证失败将抛出异常 => 配置被篡改或损坏
+  const plain = Buffer.concat([decipher.update(data), decipher.final()]);
+  return JSON.parse(plain.toString('utf8'));
+}
+
+/**
+ * 实体 ID 生成：统一 16 字节（128 位熵）hex。
+ *
+ * 历史上本处为 8 字节（64 位），share-store 另用 9 字节 base64url —— 两者不一致且
+ * 熵偏低。现统一为 16 字节：既有 16 位 ID 的历史数据仍可正常读取（ID 只作标识、不解析），
+ * 但**新建**实体一律 32 位 hex。后续新增实体类型请复用本函数。
+ */
+function newId() {
+  return crypto.randomBytes(16).toString('hex');
+}
+
+/**
+ * R48：「线程并发」——同时上传 / 加密的**文件数**上限。`1` 表示不并发。
+ *
+ * 默认 3 而不是历史值 2：2 是前端一个硬编码常量与「浏览器 HTTP/1.1 每主机 6 连接」
+ * 相乘后的保守解（2 文件 × 3 分片 = 6）。改为可配置之后，前端按**连接预算**反推
+ * 单文件的分片并发（见 `public/js/upload.js` 的 `uploadPlan()`），默认 3 → 每文件
+ * 2 分片，3 × 2 = 6 仍然恰好用满连接池，但「同时传几个文件」从 2 提到了 3。
+ *
+ * 上下界常量在 `limits.js`（叶子模块）：读盘归一化与本处、与路由入参校验共用同一个数。
+ */
+const DEFAULT_CONCURRENCY_FILES = 3;
+
+/**
+ * 归一化「同时上传 / 加密的文件数」。
+ *
+ * 三种输入分成三种处置，**不能合并**（合并过一版：把「缺失」也当成「非法」，
+ * 结果所有历史配置在升级后都被悄悄降到 1 —— 用户看到的是「升级之后上传变慢了」，
+ * 而配置页显示的又是 1，看起来像是自己设的）：
+ *
+ *  缺失（`undefined`）→ 历史配置没有这一段 ⇒ 用**新默认值** 3；
+ *  非法（`0` / 负数 / `NaN`）→ 脏值 ⇒ 退到最保守的 **1**（不并发），
+ *    宁可串行，也不要因为一个脏值把并发放大到用户没打算设的档位；
+ *  合法 → 向下取整并夹到上界。
+ */
+function normalizeConcurrencyFiles(v) {
+  if (v === undefined || v === null || v === '') return DEFAULT_CONCURRENCY_FILES;
+  const n = Number(v);
+  if (!Number.isFinite(n) || n < 1) return 1;
+  return Math.min(Math.floor(n), CONCURRENCY_FILES_MAX);
+}
+
+const DEFAULT_CONFIG = {
+  credentials: [],
+  activeCredentialId: '',
+  buckets: [],
+  activeBucketId: '',
+  domains: { primary: '', backup: '' },
+  prefs: { aclReminderDisabled: false }, // 用户偏好：ACL 安全提醒"不再提醒"
+  uploadExcludes: { dsStore: false, thumbsDb: false, gitignore: false }, // 上传排除规则
+  concurrency: { files: DEFAULT_CONCURRENCY_FILES }, // R48：同时上传 / 加密的文件数（最小 1）
+  // R54：站点设置（站点名称 / 公开注册 / 新用户身份）。默认「关闭注册」——
+  // 本版本之前系统没有注册入口，默认成 open/invite 等于升级即悄悄开门。
+  site: {
+    siteName: SITE_NAME_DEFAULT, // 浏览器标题栏 + 邮件发件人显示名的兜底
+    registration: 'closed', // 'open' | 'invite' | 'closed'
+    defaultRole: 'user', // 新注册用户直接赋予的身份
+    updatedAt: '',
+  },
+  // R53：发信设置（SMTP）。`password` 的处置与验证码 `secretKey` 完全一致 ——
+  // 只存在于加密的 config.enc 里，任何视图都不回传明文（界面只见 `hasPassword`）。
+  smtp: {
+    enabled: false,
+    host: '', port: SMTP_PORT_DEFAULT, secure: true, // 465 + 隐式 TLS 为默认组合
+    user: '', password: '',
+    from: '', fromName: '',
+    updatedAt: '',
+  },
+  webdav: { enabled: false, accounts: [] }, // WebDAV 服务（开关 + 账户，密码字段级加密）
+  users: [], // 登录用户（username / passwordHash / passwordSalt / role）
+  captcha: {
+    enabled: false, provider: 'recaptcha',
+    timeoutMs: 5000, onError: 'block',
+    // R41：两种服务商各自独立保存一套凭证（`provider` 只决定登录页用哪一套）
+    providers: {
+      recaptcha: { siteKey: '', secretKey: '' },
+      turnstile: { siteKey: '', secretKey: '' },
+    },
+  }, // 登录人机验证（默认关闭；secretKey 仅为服务端用，绝不下发前端）
+  payment: { platforms: {} }, // 支付平台凭证（仅基础配置与合法性校验，字段见 server/payment-providers.js）
+  createdAt: '',
+  updatedAt: '',
+};
+
+const DEFAULT_UPLOAD_EXCLUDES = { dsStore: false, thumbsDb: false, gitignore: false };
+
+// 旧版默认配额（用于百分比展示）；0 表示无限制
+const DEFAULT_QUOTA = 50 * 1024 * 1024 * 1024;
+
+/** 旧版(v1)扁平配置 -> v2 多密钥多桶结构 */
+function migrateV1(raw) {
+  const now = new Date().toISOString();
+  const cfg = Object.assign({}, DEFAULT_CONFIG, {
+    domains: raw.domains || { primary: '', backup: '' },
+    createdAt: raw.createdAt || now,
+    updatedAt: raw.updatedAt || now,
+  });
+  let credId = '';
+  if (raw.secretId && raw.secretKey) {
+    const cred = {
+      id: newId(),
+      provider: providers.DEFAULT_PROVIDER_ID,
+      secretId: String(raw.secretId),
+      secretKey: String(raw.secretKey),
+      remark: '',
+      endpoint: '',
+      quotaBytes: 0, // R25：凭据级配额（0 = 无限制）
+      createdAt: raw.createdAt || now,
+    };
+    cfg.credentials.push(cred);
+    credId = cred.id;
+    cfg.activeCredentialId = cred.id;
+  }
+  if (raw.bucket && raw.region) {
+    const b = {
+      id: newId(),
+      provider: providers.DEFAULT_PROVIDER_ID,
+      bucket: String(raw.bucket),
+      region: String(raw.region),
+      remark: '',
+      quotaBytes: Number.isFinite(Number(raw.quotaBytes)) ? Number(raw.quotaBytes) : DEFAULT_QUOTA,
+      credentialId: credId,
+      createdAt: raw.createdAt || now,
+    };
+    cfg.buckets.push(b);
+    cfg.activeBucketId = b.id;
+  }
+  return cfg;
+}
+
+/**
+ * R41：验证码支持的服务商清单。
+ *
+ * 两种服务商各自保存**一整套**凭证（`providers[provider] = { siteKey, secretKey }`），
+ * 顶层的 `provider` 只决定「登录页实际用哪一套」。用户因此可以两套都填好、随时切换，
+ * 而不必每换一次就重填一遍密钥。
+ */
+const CAPTCHA_PROVIDERS = ['recaptcha', 'turnstile'];
+
+/**
+ * 把任意历史形态的 captcha 配置归一为 `{ recaptcha:{…}, turnstile:{…} }`（唯一实现点）。
+ *
+ * 兼容两种落盘形态：
+ *  - 旧形态（≤1.6.3）：顶层扁平 `siteKey` / `secretKey`（只有一套，跟着 `provider` 走）；
+ *  - 新形态（R41）：`providers` 两套并存。
+ * 归一后**只保留** `providers`，扁平键被吸收进来 —— 这样「哪一套生效」永远只有
+ * `provider` 一个判据，不会出现「扁平键与新结构各说各话」的双真相。
+ *
+ * @param {object} c captcha 配置（可能只有扁平键、只有 providers、或两者都有）
+ */
+function captchaProvidersOf(c) {
+  const src = (c && typeof c === 'object') ? c : {};
+  const flatProvider = CAPTCHA_PROVIDERS.includes(src.provider) ? src.provider : 'recaptcha';
+  const existing = (src.providers && typeof src.providers === 'object') ? src.providers : {};
+  const out = {};
+  for (const p of CAPTCHA_PROVIDERS) {
+    const e = (existing[p] && typeof existing[p] === 'object') ? existing[p] : {};
+    let siteKey = typeof e.siteKey === 'string' ? e.siteKey : '';
+    let secretKey = typeof e.secretKey === 'string' ? e.secretKey : '';
+    // 旧扁平键只在「该服务商还没有自己的记录」时搬进来（新结构优先，避免覆盖已保存值）
+    if (!e.siteKey && !e.secretKey && p === flatProvider) {
+      siteKey = typeof src.siteKey === 'string' ? src.siteKey : '';
+      secretKey = typeof src.secretKey === 'string' ? src.secretKey : '';
+    }
+    out[p] = { siteKey, secretKey };
+  }
+  return out;
+}
+
+/**
+ * 就地归一 `cfg.captcha`（唯一实现点）：把旧扁平键吸收进 `providers`，随后抹掉扁平键。
+ *
+ * 两处都要调它，少一处就有「两个真相」：
+ *  - `normalize()`（**读盘**时）—— 升级后把历史配置里的 `siteKey`/`secretKey` 搬进
+ *    `providers[provider]`，否则管理员会发现密钥凭空消失；
+ *  - `save()`（**部分写入**时）—— `save(partial)` 是「顶层键替换」，若只有读取侧归一，
+ *    一次 `save({ captcha: { siteKey } })` 就会留下「扁平键 + providers」并存的状态，
+ *    而读取侧只认 `providers` ⇒ **写入静默失效**（存了但没生效）。
+ * @param {object} cfg 配置对象
+ */
+function normalizeCaptchaInto(cfg) {
+  if (!cfg || !cfg.captcha || typeof cfg.captcha !== 'object') return;
+  cfg.captcha.providers = captchaProvidersOf(cfg.captcha);
+  delete cfg.captcha.siteKey;
+  delete cfg.captcha.secretKey;
+}
+
+/**
+ * 就地归一 `cfg.smtp`（唯一实现点）。
+ *
+ * 三处都调它，少一处就有「两个真相」：
+ *  - `normalize()`（**读盘**时）—— 历史配置没有这一段，升级后补齐；
+ *  - `save()`（**部分写入**时）—— `save(partial)` 是顶层键替换，一次
+ *    `save({ smtp: { host } })` 会留下缺 `port` / `secure` 的半截对象，
+ *    而发信时 `port` 落到 `undefined` 会让 `net.connect` 直接抛类型错误；
+ *  - `getSmtp()` —— 即便磁盘上已是半截结构，读出来的也永远是完整对象。
+ *
+ * ⚠️ 归一化只负责「补结构」，**不负责拒绝非法入参** —— 那是路由层的事
+ * （见 `routes/smtp.js` 的 `parseSmtp*` 一族）。分工与 `parseSpeedLimitInput` /
+ * `normalizeSpeedLimit` 相同：入参非法一律显式 400，落盘静默补齐。
+ *
+ * @param {object} cfg 任意对象（以其 `smtp` 字段为准）
+ */
+function normalizeSmtpInto(cfg) {
+  const src = (cfg && cfg.smtp && typeof cfg.smtp === 'object') ? cfg.smtp : {};
+  const port = normalizeSmtpPort(src.port);
+  cfg.smtp = {
+    enabled: src.enabled === true,
+    host: typeof src.host === 'string' ? src.host.trim() : '',
+    port,
+    // `secure` 缺省**跟随端口**：465（隐式 TLS）→ true；587 / 25 → false（走 STARTTLS）。
+    // 这样管理员只填端口也能得到正确组合，不必知道「465 必须配 TLS」这个细节。
+    secure: typeof src.secure === 'boolean' ? src.secure : port === SMTP_PORT_DEFAULT,
+    user: typeof src.user === 'string' ? src.user.trim() : '',
+    /**
+     * 口令**刻意不 trim()**：首尾空格可能是口令本身的一部分，
+     * 界面也不该替用户悄悄改掉它。其余字段（主机 / 用户名 / 地址）都 trim。
+     */
+    password: typeof src.password === 'string' ? src.password : '',
+    from: typeof src.from === 'string' ? src.from.trim() : '',
+    fromName: typeof src.fromName === 'string' ? src.fromName.trim() : '',
+    updatedAt: typeof src.updatedAt === 'string' ? src.updatedAt : '',
+  };
+}
+
+/**
+ * 就地归一 `cfg.site`（唯一实现点）。
+ *
+ * 与 `normalizeSmtpInto()` 同一套路数，四处都调它：
+ *  - `normalize()`（**读盘**时）—— 历史配置没有这一段，升级后补齐；
+ *  - `save()`（**部分写入**时）—— `save(partial)` 是顶层键替换，一次
+ *    `save({ site: { siteName } })` 会留下缺 `registration` / `defaultRole`
+ *    的半截对象；
+ *  - `getSite()` —— 即便磁盘上已是半截结构，读出来的也永远是完整对象；
+ *  - `siteView()` —— 对外视图自己也有一次（与 `smtpView()` 同款：视图不信任入参）。
+ *
+ * ⚠️ **站点名称的空串在这里被换成默认名**（而不是原样保留空串）：
+ * 它要显示在浏览器标题栏与邮件 `From:` 头里，「一个没有名字的站点」没有意义，
+ * 而且空串在不同消费方手里会各自解释（有的显示空白、有的显示 undefined）。
+ * 界面上「留空 = 恢复默认名」正是靠这一条成立的。
+ *
+ * 归一化只负责「补结构 + 兜底」，**不负责拒绝非法入参** —— 那是路由层的事
+ * （见 `routes/site.js` 的 `parseSiteNameInput`）。
+ *
+ * @param {object} cfg 任意对象（以其 `site` 字段为准）
+ */
+function normalizeSiteInto(cfg) {
+  const src = (cfg && cfg.site && typeof cfg.site === 'object') ? cfg.site : {};
+  const name = typeof src.siteName === 'string' ? src.siteName.trim() : '';
+  cfg.site = {
+    siteName: name || SITE_NAME_DEFAULT,
+    registration: normalizeRegistrationMode(src.registration),
+    defaultRole: normalizeDefaultRole(src.defaultRole),
+    updatedAt: typeof src.updatedAt === 'string' ? src.updatedAt : '',
+  };
+}
+
+function normalize(raw) {
+  if (!raw || typeof raw !== 'object') return null;
+  // v1 判定：存在扁平 secretId/bucket 且没有 credentials 数组
+  if (!Array.isArray(raw.credentials) && (raw.secretId !== undefined || raw.bucket !== undefined)) {
+    return migrateV1(raw);
+  }
+  const cfg = Object.assign({}, DEFAULT_CONFIG, raw);
+  if (!Array.isArray(cfg.credentials)) cfg.credentials = [];
+  if (!Array.isArray(cfg.buckets)) cfg.buckets = [];
+  // 密钥记录兜底：历史密钥无 provider 字段，统一视为腾讯云；endpoint 自定义端点（S3 兼容厂商可选）
+  for (const c of cfg.credentials) {
+    if (!c || typeof c !== 'object') continue;
+    if (!providers.get(c.provider)) c.provider = providers.DEFAULT_PROVIDER_ID;
+    if (typeof c.endpoint !== 'string') c.endpoint = '';
+    c.quotaBytes = normalizeQuotaBytes(c.quotaBytes); // R25：凭据级配额兜底（历史记录 = 0 = 无限制）
+    // R37：历史密钥没有限速字段 → 0 = 不限速（**默认不限**，与本功能引入前的行为一致）
+    c.speedLimit = normalizeSpeedLimit(c.speedLimit);
+  }
+  // 桶记录兜底：历史桶默认启用（enabled 向后兼容）；blockOverseasIP 默认关闭（按桶屏蔽海外 IP，向后兼容）
+  for (const b of cfg.buckets) {
+    if (!b || typeof b !== 'object') continue;
+    if (!providers.get(b.provider)) b.provider = providers.DEFAULT_PROVIDER_ID;
+    if (typeof b.endpoint !== 'string') b.endpoint = '';
+    if (b.enabled === undefined) b.enabled = true;
+    if (typeof b.blockOverseasIP !== 'boolean') b.blockOverseasIP = false;
+    b.speedLimit = normalizeSpeedLimit(b.speedLimit); // R37：桶级下载限速（0 = 不限）
+  }
+  // 用户记录兜底（R37：用户级下载限速）
+  for (const u of (Array.isArray(cfg.users) ? cfg.users : [])) {
+    if (!u || typeof u !== 'object') continue;
+    u.speedLimit = normalizeSpeedLimit(u.speedLimit);
+  }
+  if (!cfg.domains || typeof cfg.domains !== 'object') cfg.domains = { primary: '', backup: '' };
+  if (!cfg.prefs || typeof cfg.prefs !== 'object') cfg.prefs = { aclReminderDisabled: false };
+  if (cfg.prefs.aclReminderDisabled === undefined) cfg.prefs.aclReminderDisabled = false;
+  if (!cfg.uploadExcludes || typeof cfg.uploadExcludes !== 'object') cfg.uploadExcludes = { dsStore: false, thumbsDb: false, gitignore: false };
+  for (const k of ['dsStore', 'thumbsDb', 'gitignore']) {
+    if (cfg.uploadExcludes[k] === undefined) cfg.uploadExcludes[k] = false;
+  }
+  // R48：线程并发（同时上传 / 加密的文件数）。历史配置没有这一段 —— 读盘时补齐，
+  // 且一律走同一个归一化判据（缺失按新默认值补、脏值退到最保守的 1）。
+  if (!cfg.concurrency || typeof cfg.concurrency !== 'object') cfg.concurrency = {};
+  cfg.concurrency.files = normalizeConcurrencyFiles(cfg.concurrency.files);
+  // R53：发信设置（SMTP）。历史配置没有这一段 —— 读盘时补齐为关闭状态，
+  // 绝不因为「配置里没有 smtp」就让发信功能处于未定义行为。
+  normalizeSmtpInto(cfg);
+  // R54：站点设置。同理 —— 历史配置没有这一段，读盘时补齐为「默认站点名 + 关闭注册」。
+  normalizeSiteInto(cfg);
+  if (!cfg.webdav || typeof cfg.webdav !== 'object') cfg.webdav = { enabled: false, accounts: [] };
+  if (typeof cfg.webdav.enabled !== 'boolean') cfg.webdav.enabled = false;
+  if (!Array.isArray(cfg.webdav.accounts)) cfg.webdav.accounts = [];
+  if (!Array.isArray(cfg.users)) cfg.users = [];
+  // 验证码配置兜底：补全结构并归一化枚举，避免历史脏配置影响运行
+  if (!cfg.captcha || typeof cfg.captcha !== 'object') cfg.captcha = {};
+  if (typeof cfg.captcha.enabled !== 'boolean') cfg.captcha.enabled = false;
+  if (!CAPTCHA_PROVIDERS.includes(cfg.captcha.provider)) cfg.captcha.provider = 'recaptcha';
+  if (cfg.captcha.onError !== 'degrade') cfg.captcha.onError = 'block';
+  if (!Number.isFinite(Number(cfg.captcha.timeoutMs)) || cfg.captcha.timeoutMs <= 0) cfg.captcha.timeoutMs = 5000;
+  // R41：把两套凭证归一（旧扁平键在此被吸收进 providers），随后抹掉扁平键
+  normalizeCaptchaInto(cfg);
+  // 用户记录兜底：过滤非法项并补齐字段，避免历史脏数据导致运行异常
+  cfg.users = cfg.users.filter((u) => u && typeof u === 'object' && typeof u.username === 'string' && u.username);
+  for (const u of cfg.users) {
+    if (typeof u.username !== 'string') u.username = '';
+    if (!['admin', 'user'].includes(u.role)) u.role = 'user';
+    if (!u.permissions || typeof u.permissions !== 'object') u.permissions = {};
+    if (typeof u.passwordHash !== 'string') u.passwordHash = '';
+    if (typeof u.passwordSalt !== 'string') u.passwordSalt = '';
+    // Windows Hello（WebAuthn）凭据兜底：结构不完整即视为未启用，
+    // 避免脏数据导致登录时校验逻辑拿到半截字段而误放行。
+    u.webauthn = normalizeWebauthn(u.webauthn);
+    /**
+     * R54②：用户邮箱。
+     *
+     * 归一化（去空白 + 转小写）是**判据**的一部分而非格式化：`findUserByIdentifier()`
+     * 与「邮箱唯一性」都按归一值比对，读盘时不归一就会出现「落盘是小写、比对用原文」
+     * 的分叉。含换行的脏值直接归零（`normalizeEmail` 内部处理）——邮箱会被拼进信头。
+     */
+    u.email = normalizeEmail(u.email);
+    /**
+     * R33：`u.ban` **刻意不在这里兜底**。
+     *
+     * 封禁标记的**唯一**读取入口是 `banInfo()`，而它内部无条件跑 `normalizeBan()`
+     * （写路径也由 `setUserBan` / `clearUserBan` 保证结构规范）。因此再在加载期
+     * 归一化一次，不会产生任何调用方能观察到的差异 —— 那就会是一行**没有护栏可钉**
+     * 的代码（谁把它删掉都不会有测试变红，久而久之被当成死代码）。宁可不要。
+     */
+  }
+  return cfg;
+}
+
+function load() {
+  // P13：缓存带 60 秒 TTL，外部修改 config.enc 后最多 1 分钟内自动生效
+  if (cached && Date.now() - cachedAt < CACHE_TTL_MS) return cached;
+  ensureDataDir();
+  if (!fs.existsSync(CONFIG_FILE)) {
+    corrupted = false;
+    cached = null;
+    cachedAt = Date.now();
+    return null;
+  }
+  try {
+    const b64 = fs.readFileSync(CONFIG_FILE, 'utf8').trim();
+    const cfg = normalize(decrypt(b64));
+    corrupted = false;
+    cached = cfg;
+    cachedAt = Date.now();
+    return cfg;
+  } catch (e) {
+    // 认证失败或格式错误：标记损坏，避免使用被篡改的数据
+    corrupted = true;
+    cached = null;
+    return null;
+  }
+}
+
+/* 配置落盘：串行队列 + 去抖合并（PERF-02）
+
+   旧实现每次 `persist()` 都把**整个配置**序列化 → AES-GCM 加密 → 原子写盘一次。
+   连续改多个桶的可见性、批量保存支付配置这类操作会产生 N 次全量写，
+   而真正需要落盘的只有**最后一次**的结果 —— 中间态既没人读，也活不过 250ms。
+
+   改为「去抖合并 + 串行执行」：
+    - 内存缓存**立即**更新（读路径完全不受影响，仍是同步可见）；
+    - 磁盘写入延迟 DEBOUNCE_MS，窗口内的后续变更只替换待写对象，不排队；
+    - `flush()`（优雅关闭 / 单测）会立刻取消去抖、同步发起写入并等待完成，
+      因此「进程退出丢最后一次变更」这个风险点由既有停机流程覆盖；
+    - `CONFIG_WRITE_DEBOUNCE_MS=0` 可退回「立即写」（排查落盘问题时用）。
+*/
+
+let writeQueue = Promise.resolve();
+let lastWriteError = null;
+let pendingCfg = null;   // 去抖窗口内待写的最新配置
+let debounceTimer = null;
+
+function debounceMs() {
+  const raw = process.env.CONFIG_WRITE_DEBOUNCE_MS;
+  if (raw === undefined || raw === '') return 250;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : 250;
+}
+
+/** 真正执行一次落盘（内部用；不为它单独设去抖） */
+function writeNow(cfg) {
+  cfg.updatedAt = new Date().toISOString();
+  ensureDataDir();
+  const text = encrypt(cfg);
+  writeQueue = writeQueue.then(() => atomic.writeAtomic(CONFIG_FILE, text)).catch((e) => {
+    lastWriteError = e;
+    // FUN-13：写盘失败时**必须**让内存缓存失效。
+    // 否则内存里是新配置、磁盘上还是旧的，进程会一直按"已保存"的样子运行，
+    // 直到某次重启才暴露「配置回到过去」，且期间任何排障都看不到真实状态。
+    cached = null;
+    cachedAt = 0;
+    console.error('[Storage Manager] 配置写入磁盘失败，已丢弃内存缓存：', (e && e.message) || e);
+  });
+  return writeQueue;
+}
+
+function persist(cfg) {
+  // FUN-03：损坏护栏 —— 磁盘上那份 config.enc 虽读不出来，却是恢复数据的最后凭据。
+  // 旧实现在 load() 失败后由 requireStore() 拿 DEFAULT_CONFIG 覆盖落盘，
+  // 一次「随手保存」即永久清空全部密钥 / 多桶 / 用户（含管理员）。
+  // 这里与 secure-store 的 SEC-09 对齐：先备份再拒绝写入，故障显式化。
+  // 「文件不存在」不属于损坏（首次运行或已手工清空），照常允许写入。
+  if (corrupted && fs.existsSync(CONFIG_FILE)) {
+    throw unwritableError(CONFIG_FILE, 'corrupt', '无法解密或解析（可能已被篡改或损坏）');
+  }
+  cached = cfg;
+  cachedAt = Date.now();
+  corrupted = false;
+
+  pendingCfg = cfg;
+  if (debounceMs() <= 0) {
+    // 立即写分支必须**同步清掉** pendingCfg —— 否则它会被 flushPending()
+    // 当成"窗口内尚未落盘的变更"再写一遍（同一次变更写两次，正是去抖要消除的浪费）。
+    pendingCfg = null;
+    writeNow(cfg);
+    return cfg;
+  }
+  if (debounceTimer) return cfg; // 窗口内已有排程：它自然会写入最新对象
+  debounceTimer = setTimeout(() => {
+    debounceTimer = null;
+    const target = pendingCfg;
+    pendingCfg = null;
+    if (target) writeNow(target);
+  }, debounceMs());
+  if (debounceTimer.unref) debounceTimer.unref(); // 不阻止进程退出
+  return cfg;
+}
+
+/** 取消去抖并立即落盘（若有待写内容），返回可等待的 Promise */
+function flushPending() {
+  if (debounceTimer) {
+    clearTimeout(debounceTimer);
+    debounceTimer = null;
+  }
+  if (pendingCfg) {
+    const target = pendingCfg;
+    pendingCfg = null;
+    writeNow(target);
+  }
+  return writeQueue;
+}
+
+/** 等待全部待落盘任务完成（优雅关闭前调用） */
+function flush() { return flushPending(); }
+
+/**
+ * 兜底：去抖窗口内进程被强杀（Ctrl+C 之外的 kill / 崩溃）时的最后一道保险。
+ * 优雅停机走 index.js 的 `configStore.flush()`；这里只补那之外的情形，
+ * 且**只在确实有待写内容时才动磁盘**，正常退出时是彻底的空操作。
+ */
+process.on('exit', () => {
+  if (!pendingCfg) return;
+  try {
+    /**
+     * R12-03：`secure-store` 依赖 `config-store`（读主密钥），反过来在**模块顶层**
+     * require 它就成环了。退出钩子此刻两个模块必定都已加载完毕，这里延迟取用是安全的，
+     * 且换来了「判据只有一个实现点」—— 比在 config-store 里再内联一份 `existsSync` 强。
+     */
+    // eslint-disable-next-line global-require
+    const secureStore = require('./secure-store');
+    pendingCfg.updatedAt = new Date().toISOString();
+    /**
+     * R11-07：退出路径只写不建 —— 与 `upload-sessions` / `enc-store` 同一条纪律。
+     *
+     * `ensureDataDir()` 会在退出阶段把已被删除的 `data/` 重建并写回 `config.enc`，
+     * 让"清理"被自己的退出钩子撤销。在线路径仍照常建目录（首次写入时它可能尚
+     * 不存在），只有退出阶段受此约束。
+     *
+     * R12-03：判据改用**唯一实现点** `secureStore.exitPathWritable()` —— 此前这里是
+     * 第三份内联实现（`upload-sessions` 还有一份私有副本），于是"唯一实现点"
+     * 事实上名存实亡：把它改成 `return true`，两套护栏全绿。
+     */
+    if (!secureStore.exitPathWritable(DATA_DIR)) return;
+    atomic.writeAtomicSync(CONFIG_FILE, encrypt(pendingCfg));
+  } catch (e) { /* 退出阶段无法补救，尽力而为 */ }
+});
+/** 最近一次落盘错误（健康检查/排障用） */
+function getLastWriteError() { return lastWriteError; }
+
+/**
+ * 合并写入配置（唯一调用点：`PUT /api/config`）
+ *
+ * SEC-01：这里**必须在当前配置对象上就地合并**，不能再用
+ * 「读快照 → 复制出新对象 → 整体写回」。
+ *
+ * 快照写法会在并发下**静默丢更新**：另一个写操作（如 addUser，它校验密码时有
+ * await）已先读过同一个对象，本函数用复制出的新对象整体替换缓存之后，
+ * 那个操作稍后把自己手里的**旧引用**写回 —— 本次的变更就凭空消失了。
+ * 丢的可能是访问密钥、桶绑定或用户角色，而且没有任何报错。
+ *
+ * 其余写操作（addBucket / updateBucket / addUser / updateUser …）都是在
+ * `requireStore()` 返回的**同一个**对象上就地修改后 `persist(cfg)`，
+ * 因此彼此并发是安全的；快照式替换是全库唯一会替换缓存对象的写法。
+ */
+function save(partial) {
+  const cur = requireStore();
+  Object.assign(cur, partial);
+  // R41：captcha 必须就地归一 —— `save(partial)` 是顶层键替换，若这里不归一，
+  // 一次带扁平 siteKey/secretKey 的部分写入就会与 providers 并存两个真相，
+  // 而读取侧只认 providers ⇒ 写入静默失效。见 `normalizeCaptchaInto()`。
+  normalizeCaptchaInto(cur);
+  // R53：smtp 同理（顶层键替换 ⇒ 半截对象会让发信时端口变成 undefined）
+  normalizeSmtpInto(cur);
+  // R54：site 同理（顶层键替换 ⇒ 半截对象会让站点名变成 undefined，标题栏与邮件都受影响）
+  normalizeSiteInto(cur);
+  return persist(cur);
+}
+
+/* ============================ 生效配置（运行时视图） ============================ */
+
+function activeBucket(cfg) {
+  if (!cfg.buckets.length) return null;
+  // 优先返回激活桶（且未停用）；否则回退到第一个未停用的桶
+  const active = cfg.buckets.find((b) => b.id === cfg.activeBucketId);
+  if (active && active.enabled !== false) return active;
+  return cfg.buckets.find((b) => b.enabled !== false) || cfg.buckets[0];
+}
+
+/**
+ * 解析某桶应使用的密钥。
+ *
+ * ## 铁律（FUN-09）：**绝不跨厂商猜测密钥**
+ *
+ * 桶属于某个厂商（阿里云的桶用腾讯云密钥必然 403 / 签名错误）。因此当已知目标厂商
+ * 却又找不到**同厂商的启用密钥**时，正确行为是**返回 null 并让调用方报「该桶无可用密钥」**，
+ * 而不是"还有一个启用密钥就拿来用" —— 后者会把用户的密钥发给错误厂商，
+ * 表现为难以定位的 403，同时造成凭据外发。
+ *
+ * 仅在**完全无法确定目标厂商**（无桶上下文）时才允许回退到激活密钥 / 首个启用密钥。
+ *
+ * @param {object} cfg 完整配置
+ * @param {object|null} bucket 目标桶记录（可为 null）
+ * @returns {object|null} 密钥记录；无法确定且无合理回退时为 null
+ */
+function activeCredential(cfg, bucket) {
+  if (!cfg.credentials.length) return null;
+  const enabled = cfg.credentials.filter((x) => x.enabled !== false);
+  if (!enabled.length) return null;
+
+  let hintProvider = null; // 已知的"目标厂商"线索
+
+  // ① 桶显式绑定密钥：绑定本身即最强约束
+  if (bucket && bucket.credentialId) {
+    const c = cfg.credentials.find((x) => x.id === bucket.credentialId);
+    if (c && c.enabled !== false) return c;
+    // 绑定的密钥已停用 → 只能用**同一厂商**的其它启用密钥替代
+    if (c && c.provider) {
+      hintProvider = c.provider;
+      const same = enabled.find((x) => x.provider === c.provider);
+      if (same) return same;
+    }
+  }
+  // ② 桶声明的 provider
+  if (!hintProvider && bucket && bucket.provider) hintProvider = bucket.provider;
+  if (hintProvider) {
+    const same = enabled.find((x) => x.provider === hintProvider);
+    if (same) return same;
+    // ⚠️ 已知厂商却无同厂商启用密钥 —— 宁可显式失败，也不跨厂商串访
+    return null;
+  }
+  // ③ 无桶上下文（如"先用某个可用密钥拉桶列表"）：回退到激活密钥 → 首个启用密钥
+  const active = enabled.find((x) => x.id === cfg.activeCredentialId);
+  return active || enabled[0];
+}
+
+/**
+ * R25：桶归属于哪把凭据 —— **按 API Key 聚合配额用量**的唯一定义点。
+ *
+ * 判据与「实际写入时用哪把密钥」**严格同源**（都走 {@link activeCredential}）：
+ *   ① 桶显式绑定 credentialId → 该凭据；
+ *   ② 未绑定 → 按 provider 落到同厂商的启用凭据（与上传时 `effectiveForBucket` 一致）；
+ *   ③ 无任何可用凭据 → 返回 ''（此时该桶本就无法写入，不归任何配额）。
+ *
+ * ⚠️ 为什么不能只看 `b.credentialId`：历史桶 / 未绑定桶在**上传时其实由某把启用密钥
+ * 服务**，若聚合时把它们排除，配额统计就会**低估**真实占用，闸门形同虚设 ——
+ * 「界面显示没超，实际早该拦」正是这类字段不一致的典型症状。
+ *
+ * @param {object} cfg 完整配置（来自 `load()`）
+ * @param {object} b   桶记录
+ * @returns {string} 凭据 id；无归属时为空串
+ */
+function credentialIdForBucket(cfg, b) {
+  if (!b || !cfg) return '';
+  const c = activeCredential(cfg, b);
+  return c ? c.id : '';
+}
+
+/**
+ * 生效配置：扁平形状 { provider, secretId, secretKey, bucket, region, quotaBytes, domains }
+ * 供 s3.js / 文件操作路由直接使用，保持与旧版一致。
+ * 桶与密钥的服务商不一致时以桶为准（桶绑定密钥通常已保证一致），未绑定时用密钥的服务商。
+ *
+ * ## FUN-15：**必须与界面读端同源**
+ *
+ * 列表 / 上传 / 下载 / 删除 / 统计全部经由 `requireConfig() → get() → effective()`
+ * 进入这里。若此处读全局而界面读会话，用户切桶后就会出现
+ * 「界面显示新桶名、实际操作仍打全局桶」的错位 —— 更糟的是当全局默认桶对该用户
+ * 不可见时，操作层会持续读写一个他本不该访问的桶（越权读取面）。
+ *
+ * @param {boolean} [isAdmin] 省略时按当前请求角色判定（无上下文按管理员）
+ */
+function effective(isAdmin) {
+  const cfg = load();
+  if (!cfg) return null;
+  const admin = isAdmin === undefined ? (sessionRole() !== 'user') : isAdmin === true;
+  const b = resolveEffectiveBucket(cfg, admin);
+  const c = activeCredential(cfg, b);
+  const pid = (b && b.provider) || (c && c.provider) || providers.DEFAULT_PROVIDER_ID;
+  return {
+    provider: pid,
+    secretId: c ? c.secretId : '',
+    secretKey: c ? c.secretKey : '',
+    credentialId: c ? c.id : '',
+    endpoint: (c && c.endpoint) || (b && b.endpoint) || providers.endpointFor(pid, b ? b.region : ''),
+    bucket: b ? b.bucket : '',
+    region: b ? b.region : '',
+    bucketId: b ? b.id : '',
+    bucketRemark: b ? b.remark || '' : '',
+    quotaBytes: b ? (Number.isFinite(Number(b.quotaBytes)) ? Number(b.quotaBytes) : 0) : 0,
+    domains: cfg.domains || { primary: '', backup: '' },
+    updatedAt: cfg.updatedAt,
+  };
+}
+
+/** 同 {@link effective}；`requireConfig()` 与所有 /api/fs/* 操作读端都经由此处 */
+function get(isAdmin) {
+  return effective(isAdmin);
+}
+
+/**
+ * 按桶名解析生效配置（用于分享链接下载：目标桶可能不是当前激活桶）
+ *
+ * ## FUN-09：桶记录不存在时**必须失败，不得猜测密钥**
+ *
+ * 旧实现里 `b` 为 undefined 会使 `wantProvider = null`，从而让 `activeCredential()`
+ * 回退到「激活密钥 / 首个启用密钥」—— 若那把密钥属于另一厂商，请求会带着
+ * **错误厂商的密钥与端点**发出，既是 403 的来源，也把用户凭据外发给了非目标厂商。
+ * 正确做法是返回 null，由调用方给出明确错误。
+ *
+ * @param {string} bucketName
+ * @param {string} [fallbackRegion] 仅用于兼容早期分享链接中保存的地域快照
+ * @returns {object|null} 桶记录不存在、或无同厂商可用密钥时返回 null
+ */
+function effectiveForBucket(bucketName, fallbackRegion) {
+  const cfg = load();
+  if (!cfg) return null;
+  const b = cfg.buckets.find((x) => x.bucket === bucketName);
+  if (!b) return null; // 桶已被移除/改名 → 拒绝猜测密钥
+
+  const c = activeCredential(cfg, b);
+  if (!c) return null; // 该厂商无可用启用密钥 → 拒绝跨厂商串访
+
+  const pid = b.provider || c.provider;
+  const region = b.region || fallbackRegion || '';
+  return {
+    provider: pid,
+    secretId: c.secretId,
+    secretKey: c.secretKey,
+    credentialId: c.id,
+    endpoint: c.endpoint || b.endpoint || providers.endpointFor(pid, region),
+    bucket: bucketName,
+    bucketId: b.id,
+    region,
+  };
+}
+
+/* ============================ 密钥管理 ============================ */
+
+function requireStore() {
+  let cfg = load();
+  if (!cfg) {
+    // FUN-03：配置**损坏**（而非「不存在」）时绝不用空配置顶上 ——
+    // 那等于把磁盘上唯一还能人工抢救的密文换成一份空表。
+    // 这里直接抛错，让所有写操作显式失败并引导恢复；
+    // 「文件不存在」由 load() 区分（corrupted=false），仍走下面的首次初始化。
+    if (corrupted) {
+      throw unwritableError(CONFIG_FILE, 'corrupt', '无法解密或解析（可能已被篡改或损坏）');
+    }
+    // 首次运行：尚无配置文件，初始化空配置
+    cfg = persist(Object.assign({}, DEFAULT_CONFIG, { createdAt: new Date().toISOString() }));
+  }
+  return cfg;
+}
+
+function maskSecretId(sid) {
+  sid = String(sid || '');
+  return sid.length > 8 ? sid.slice(0, 4) + '****' + sid.slice(-4) : (sid ? '****' : '');
+}
+
+/**
+ * R25：凭据（API Key）级配额上限（字节）。
+ *
+ * `0` 表示**无限制** —— 与「桶配额」`quotaBytes` 同一约定（见 `bucketView`）。
+ * 语义上，凭据配额是该密钥下**所有桶占用之和**的上限；桶配额仍是单桶上限，
+ * 两者**并存且都在写入入口判定**（谁先命中谁拦），互不替代。
+ *
+ * 归一化统一走这里（`Number(...)` + 非正数一律落回 0），保证「界面上填 0」与
+ * 「历史记录缺字段」得到同一个数字，不会出现 `undefined` 参与算术得到 `NaN`。
+ */
+function normalizeQuotaBytes(v) {
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
+}
+
+function credentialView(c) {
+  return {
+    id: c.id,
+    provider: providers.get(c.provider) ? c.provider : providers.DEFAULT_PROVIDER_ID,
+    providerName: providers.nameOf(c.provider),
+    endpoint: c.endpoint || '',
+    secretIdMasked: maskSecretId(c.secretId),
+    remark: c.remark || '',
+    quotaBytes: normalizeQuotaBytes(c.quotaBytes), // R25：凭据级配额（0 = 无限制）
+    speedLimit: normalizeSpeedLimit(c.speedLimit), // R37：密钥级下载限速（0 = 不限）
+    visibleToUsers: c.visibleToUsers !== false, // 对普通用户可见（默认 true，历史密钥向后兼容）
+    enabled: c.enabled !== false, // 启用/停用（默认 true，历史密钥向后兼容）
+    createdAt: c.createdAt || '',
+  };
+}
+
+function listCredentials() {
+  const cfg = load();
+  if (!cfg) return { credentials: [], activeCredentialId: '' };
+  return {
+    credentials: cfg.credentials.map(credentialView),
+    activeCredentialId: (activeCredential(cfg, activeBucket(cfg)) || {}).id || '',
+  };
+}
+
+/**
+ * 按角色列出密钥（可见性过滤）：
+ *  - admin：始终返回全部密钥
+ *  - 其他（普通用户）：仅返回 visibleToUsers !== false 的密钥
+ *  activeCredentialId 若指向不可见密钥，则回退到第一个可见密钥（无可见密钥则为空）。
+ */
+function listCredentialsFor(role) {
+  const { credentials, activeCredentialId } = listCredentials();
+  if (role === 'admin') return { credentials, activeCredentialId };
+  const visible = credentials.filter((c) => c.visibleToUsers !== false);
+  let activeId = activeCredentialId;
+  if (!visible.some((c) => c.id === activeId)) {
+    activeId = visible.length ? visible[0].id : '';
+  }
+  return { credentials: visible, activeCredentialId: activeId };
+}
+
+/**
+ * 批量设置密钥对普通用户的可见性。
+ * @param {string[]} visibleIds 对普通用户可见的密钥 id 集合（不在集合内的一律设为不可见）
+ * @returns {{ ok: boolean, visibleCount: number }}
+ */
+function setCredentialsVisibility(visibleIds) {
+  const cfg = requireStore();
+  const set = new Set(Array.isArray(visibleIds) ? visibleIds : []);
+  let visibleCount = 0;
+  for (const c of cfg.credentials) {
+    c.visibleToUsers = set.has(c.id);
+    if (c.visibleToUsers) visibleCount++;
+  }
+  persist(cfg);
+  return { ok: true, visibleCount };
+}
+
+/**
+ * 要求用户提供端点的厂商（MinIO 的访问地址 / R2 的账户 ID）缺失端点时必须**当场拒绝**。
+ *
+ * 为什么不在连接时才报：`s3.js` 到那时才抛错，而那时这条密钥**已经落库**了 ——
+ * 用户看到的是一条「配置看着齐全、每次操作用它都失败」的记录，且失败文案是
+ * 「网络连接异常」（端点被拼成一个不存在的域名），完全指不到「少填了账户 ID」。
+ * 把判定放在唯一的写入点上，问题就停在表单里。
+ */
+function assertEndpointProvided(pid, endpoint) {
+  if (endpoint || !providers.endpointRequired(pid)) return;
+  const meta = providers.resolve(pid);
+  const err = new Error(`${meta.name} 需要填写「${meta.endpointLabel || '服务端点'}」`);
+  err.status = 400;
+  throw err;
+}
+
+function addCredential({ provider, secretId, secretKey, remark, endpoint, quotaBytes, visibleToUsers, enabled, speedLimit }) {
+  const cfg = requireStore();
+  const now = new Date().toISOString();
+  const pid = providers.get(provider) ? provider : providers.DEFAULT_PROVIDER_ID;
+  /**
+   * 只有「入参 provider 是已注册厂商」才算**显式指定**（与 `addBucket` 的 SEC-01 同款
+   * 判据）。区分它的必要性：同 SecretId 的重存会走到下面的更新分支，若在那里无条件
+   * 写 provider，一次「只改备注」的保存就会把该密钥回落到默认厂商（腾讯云）——
+   * 于是 R2 这类**端点由厂商模板推导**的记录会被按腾讯云的规则重算，端点被写坏。
+   */
+  const explicitProvider = providers.get(provider) ? provider : '';
+  // 同 SecretId 视为更新（便于重新保存同一密钥）
+  const exist = cfg.credentials.find((c) => c.secretId === secretId);
+  /**
+   * 端点按厂商规则组装（唯一实现点 `providers.composeEndpoint`）。
+   *
+   * 界面上「服务端点」这一栏对不同厂商含义不同：Cloudflare R2 填的是**账户 ID**、
+   * MinIO 填的是**完整访问地址**、其余厂商填的是自定义端点。组装必须在**校验之前**
+   * 完成 —— 否则 R2 的账户 ID 会被 `assertSafeEndpoint()` 当成一个非法 URL 拒掉。
+   *
+   * ⚠️ 组装必须按「这条记录**最终生效**的厂商」来做，而不是入参里的那个：
+   * 重新保存一条 R2 密钥时调用方往往**不带** provider（`PUT /config` 的扁平入参就是
+   * 这样），此时用默认厂商（腾讯云）去组装只会原样透传账户 ID `1a2b…`，
+   * 紧接着的 `assertSafeEndpoint()` 便以「服务端点格式不正确」**拒掉整次保存** ——
+   * 一条完全正确的密钥，仅仅因为调用方没重复声明厂商就存不回去。
+   * 取值顺序与更新分支最终写入的 `exist.provider` 严格一致：显式厂商 → 既有厂商 → 默认。
+   */
+  const epProvider = explicitProvider || (exist && exist.provider) || pid;
+  const ep = providers.composeEndpoint(epProvider, endpoint);
+  // SEC-03：写入前校验自定义端点（禁云元数据/回环/私网，非回环强制 https），
+  // 避免把危险端点持久化后由后续任意请求触发。
+  if (ep) assertSafeEndpoint(ep);
+  if (exist) {
+    exist.secretKey = secretKey || exist.secretKey;
+    if (explicitProvider) exist.provider = pid;
+    // 端点**仅在显式提交时**改写（与 remark / quotaBytes 同款「未传即保持」约定）。
+    // 历史实现无条件 `exist.endpoint = ep`，于是在未传 endpoint 的调用方
+    // （如 `PUT /config` 的旧版扁平入参）手里，一次保存就会把已有自定义端点清空。
+    if (endpoint !== undefined) {
+      // ⚠️ 顺序：**先校验、后落值**。反过来的话，一次被拒绝的更新已经在内存里把
+      // `c.endpoint` 改成了非法值（`persist` 虽未执行，但这份 cfg 对象继续被同批请求
+      // 读用），表现为「明明报了错，密钥却真的坏了」。
+      assertEndpointProvided(exist.provider, ep);
+      exist.endpoint = ep;
+    }
+    if (remark !== undefined) exist.remark = String(remark || '');
+    if (quotaBytes !== undefined) exist.quotaBytes = normalizeQuotaBytes(quotaBytes); // R25
+    if (speedLimit !== undefined) exist.speedLimit = normalizeSpeedLimit(speedLimit); // R37：未传即保持
+    if (visibleToUsers !== undefined) exist.visibleToUsers = visibleToUsers !== false;
+    if (enabled !== undefined) exist.enabled = enabled !== false;
+    // FUN-06：不再顺手改写全局 activeCredentialId。
+    // 「保存一个密钥」与「切换到这个密钥」是两件事，混在一起会让写操作产生
+    // 意料之外的全局副作用。需要切换请走 setActiveCredential()（管理员专属入口）。
+    persist(cfg);
+    return credentialView(exist);
+  }
+  // 新增记录：该厂商要求用户提供端点时必须当场给到（见 assertEndpointProvided 说明）
+  assertEndpointProvided(pid, ep);
+  const cred = {
+    id: newId(),
+    provider: pid,
+    secretId,
+    secretKey,
+    remark: String(remark || ''),
+    endpoint: ep,
+    quotaBytes: normalizeQuotaBytes(quotaBytes), // R25：凭据级配额（0 = 无限制）
+    speedLimit: normalizeSpeedLimit(speedLimit), // R37：密钥级下载限速（0 = 不限）
+    visibleToUsers: visibleToUsers !== false, // 默认对普通用户可见
+    enabled: enabled !== false, // 默认启用（历史密钥向后兼容）
+    createdAt: now,
+  };
+  cfg.credentials.push(cred);
+  // FUN-06：同上，新增密钥不再自动设为当前密钥（由路由层显式决定是否切换）
+  persist(cfg);
+  return credentialView(cred);
+}
+
+function removeCredential(id) {
+  const cfg = requireStore();
+  const idx = cfg.credentials.findIndex((c) => c.id === id);
+  if (idx < 0) return false;
+  cfg.credentials.splice(idx, 1);
+  if (cfg.activeCredentialId === id) cfg.activeCredentialId = (cfg.credentials[0] || {}).id || '';
+  // 桶上引用该密钥的，清除引用（回退为使用当前密钥）
+  for (const b of cfg.buckets) if (b.credentialId === id) b.credentialId = '';
+  persist(cfg);
+  return true;
+}
+
+function setActiveCredential(id) {
+  const cfg = requireStore();
+  const c = cfg.credentials.find((c) => c.id === id);
+  if (!c) return false;
+  if (c.enabled === false) return false; // 不能激活已停用的凭证
+  cfg.activeCredentialId = id;
+  persist(cfg);
+  return true;
+}
+
+function updateCredentialRemark(id, remark) {
+  const cfg = requireStore();
+  const c = cfg.credentials.find((x) => x.id === id);
+  if (!c) return false;
+  c.remark = String(remark || '');
+  persist(cfg);
+  return true;
+}
+
+/** 更新密钥（服务商 / 端点 / 备注 / 可见性 / 启用状态）——停用时自动设为不可见 */
+function updateCredential(id, patch) {
+  const cfg = requireStore();
+  const c = cfg.credentials.find((x) => x.id === id);
+  if (!c) return false;
+  if (patch.provider !== undefined && providers.get(patch.provider)) c.provider = patch.provider;
+  /**
+   * 厂商与端点两者**任一被改动**都要先算出「改完之后的状态」再校验，最后才落值：
+   *  - 只改 `provider`（换成 MinIO）而端点仍是旧厂商的空值 → 会得到一条
+   *    「落库成功但永远连不上」的密钥，所以判据必须覆盖这两种改动的组合；
+   *  - **先校验后落值**：反过来的话，一次被拒绝的更新已经在内存里留下了脏值。
+   */
+  let nextEndpoint = c.endpoint;
+  if (patch.endpoint !== undefined) {
+    // 同 addCredential：端点必须先按厂商规则组装（R2 的账户 ID → 完整端点），
+    // 再送安全校验 —— 顺序反了会把合法的账户 ID 当成非法 URL 拒掉。
+    nextEndpoint = providers.composeEndpoint(c.provider, patch.endpoint);
+    if (nextEndpoint) assertSafeEndpoint(nextEndpoint); // SEC-03：同 addCredential
+  }
+  if (patch.provider !== undefined || patch.endpoint !== undefined) {
+    assertEndpointProvided(c.provider, nextEndpoint);
+  }
+  if (patch.endpoint !== undefined) c.endpoint = nextEndpoint;
+  if (patch.remark !== undefined) c.remark = String(patch.remark || '');
+  // R25：凭据级配额（0 = 无限制）。与桶配额同款归一化，负数/非法值一律落回 0。
+  if (patch.quotaBytes !== undefined) c.quotaBytes = normalizeQuotaBytes(patch.quotaBytes);
+  // R37：密钥级下载限速（0 = 不限）。与配额同款「未传即保持」。
+  if (patch.speedLimit !== undefined) c.speedLimit = normalizeSpeedLimit(patch.speedLimit);
+  if (patch.visibleToUsers !== undefined) c.visibleToUsers = patch.visibleToUsers !== false;
+  if (patch.enabled !== undefined) {
+    c.enabled = patch.enabled !== false;
+    if (!c.enabled) c.visibleToUsers = false; // 停用时自动对普通用户不可见
+  }
+  persist(cfg);
+  return true;
+}
+
+/* ============================ 存储桶管理 ============================ */
+
+function bucketView(b) {
+  return {
+    id: b.id,
+    provider: providers.get(b.provider) ? b.provider : providers.DEFAULT_PROVIDER_ID,
+    providerName: providers.nameOf(b.provider),
+    bucket: b.bucket,
+    region: b.region,
+    remark: b.remark || '',
+    displayName: b.remark || b.bucket,
+    quotaBytes: Number.isFinite(Number(b.quotaBytes)) ? Number(b.quotaBytes) : 0,
+    credentialId: b.credentialId || '',
+    visibleToUsers: b.visibleToUsers !== false, // 对普通用户可见（默认 true，历史桶向后兼容）
+    enabled: b.enabled !== false, // 启用/停用（默认 true，历史桶向后兼容）
+    blockOverseasIP: b.blockOverseasIP === true, // 仅屏蔽海外 IP（按桶生效，默认 false）
+    speedLimit: normalizeSpeedLimit(b.speedLimit), // R37：桶级下载限速（0 = 不限）
+    createdAt: b.createdAt || '',
+  };
+}
+
+function listBuckets() {
+  const cfg = load();
+  if (!cfg) return { buckets: [], activeBucketId: '' };
+  const active = activeBucket(cfg);
+  return { buckets: cfg.buckets.map(bucketView), activeBucketId: (active || {}).id || '' };
+}
+
+/**
+ * 当前**会话**生效的桶 id（FUN-15）
+ *
+ * 取值优先级：请求上下文（本次请求内已切换） → 会话记录（跨请求保持） → 空串。
+ * 返回空串表示"跟随系统默认桶"，调用方应回退到 `cfg.activeBucketId`。
+ *
+ * 之所以不直接 require 这两个模块：它们在初始化路径上会反向依赖 config-store，
+ * 函数内懒加载可彻底避免循环依赖。
+ */
+function sessionActiveBucketId() {
+  let ctx;
+  let authSession;
+  try {
+    ctx = require('./request-context');
+    authSession = require('./auth-session');
+  } catch (e) {
+    return '';
+  }
+  const direct = ctx.activeBucketId();
+  if (direct) return direct;
+  const t = ctx.token();
+  if (!t) return '';
+  try {
+    return authSession.getSessionBucket(t) || '';
+  } catch (e) {
+    return '';
+  }
+}
+
+/**
+ * 当前请求的角色（用于可见性收窄）。
+ *
+ * 无请求上下文时返回 'admin' —— 那是 WebDAV / 分享链接 / 启动自检等**可信内部路径**，
+ * 它们本就按系统默认桶工作，不应被普通用户的可见性规则影响。
+ */
+function sessionRole() {
+  let ctx;
+  try {
+    ctx = require('./request-context');
+  } catch (e) {
+    return 'admin';
+  }
+  try {
+    return ctx.role() || 'admin';
+  } catch (e) {
+    return 'admin';
+  }
+}
+
+/**
+ * 按会话 + 角色解析出生效桶记录（无会话数据时回退全局默认）
+ *
+ * **这是「当前桶」唯一的权威读取入口** —— 界面（listBucketsFor / safeView）与
+ * 操作（effective / get / requireConfig）都必须走这里，否则会出现
+ * 「界面显示 A、实际操作打 B」的错位。
+ */
+function resolveEffectiveBucket(cfg, isAdmin) {
+  if (!cfg || !cfg.buckets.length) return null;
+  const admin = isAdmin === true;
+  const usable = (b) => Boolean(b) && b.enabled !== false && (admin || b.visibleToUsers !== false);
+
+  // ① 会话级当前桶：存在且对该角色可用时才认
+  const sid = sessionActiveBucketId();
+  if (sid) {
+    const b = cfg.buckets.find((x) => x.id === sid);
+    if (usable(b)) return b;
+    // 会话里可能残留已停用 / 已被收窄可见性的桶 —— 一律忽略
+  }
+
+  // ② 无会话信息：管理员走全局默认；
+  //    普通用户**必须**回退到第一个可见且启用的桶 —— 全局默认桶可能对他不可见，
+  //    直接回退会让他持续读写一个本不该访问的桶（FUN-15 的边界越权面）。
+  if (admin) return activeBucket(cfg);
+  const visible = cfg.buckets.filter((b) => b.enabled !== false && b.visibleToUsers !== false);
+  if (!visible.length) return null; // 没有任何可见桶 → 宁可显式失败，也不放行不可见桶
+  return visible.find((b) => b.id === cfg.activeBucketId) || visible[0];
+}
+
+/**
+ * 按角色列出桶（可见性过滤）：
+ *  - admin：始终返回全部桶
+ *  - 其他（普通用户）：仅返回 visibleToUsers !== false **且 enabled !== false** 的桶
+ *  activeBucketId 若指向不可见/已停用桶，则回退到第一个可见且启用的桶（无则为空）。
+ *  优先采用**会话级**当前桶（FUN-15）。
+ */
+function listBucketsFor(role, overrideId) {
+  const { buckets, activeBucketId } = listBuckets();
+  const isAdmin = role !== 'user';
+  // FUN-15：会话级当前桶优先。管理员也要生效（管理员切桶同样不该影响他人），
+  // 只是其可见性过滤规则不同。
+  const sessionId = overrideId !== undefined ? overrideId : sessionActiveBucketId();
+  const preferred = sessionId || activeBucketId;
+  if (isAdmin) {
+    // 管理员：会话桶必须真实存在且未停用，否则回退全局默认
+    const hit = buckets.find((b) => b.id === preferred && b.enabled !== false);
+    return { buckets, activeBucketId: hit ? hit.id : activeBucketId };
+  }
+  const visible = buckets.filter((b) => b.visibleToUsers !== false && b.enabled !== false);
+  let activeId = preferred;
+  if (!visible.some((b) => b.id === activeId)) {
+    activeId = visible.length ? visible[0].id : '';
+  }
+  return { buckets: visible, activeBucketId: activeId };
+}
+
+/**
+ * 批量设置桶对普通用户的可见性。
+ * @param {string[]} visibleIds 对普通用户可见的桶 id 集合（不在集合内的桶一律设为不可见）
+ * @returns {{ ok: boolean, visibleCount: number }}
+ */
+function setBucketsVisibility(visibleIds) {
+  const cfg = requireStore();
+  const set = new Set(Array.isArray(visibleIds) ? visibleIds : []);
+  let visibleCount = 0;
+  for (const b of cfg.buckets) {
+    b.visibleToUsers = set.has(b.id);
+    if (b.visibleToUsers) visibleCount++;
+  }
+  persist(cfg);
+  return { ok: true, visibleCount };
+}
+
+function addBucket({ provider, bucket, region, remark, quotaBytes, credentialId, visibleToUsers, enabled, blockOverseasIP, speedLimit }) {
+  const cfg = requireStore();
+  const now = new Date().toISOString();
+  // 服务商推导：绑定密钥的 provider 优先（桶必须与密钥同厂商，否则用错 SDK）；
+  // 未绑定时用入参 provider（须是已注册厂商），最后回退默认（腾讯云）。
+  let pid = '';
+  if (credentialId) {
+    const cred = cfg.credentials.find((c) => c.id === String(credentialId));
+    if (cred && providers.get(cred.provider)) pid = cred.provider;
+  }
+  // 只有「入参 provider 是已注册厂商」才算**显式指定**，用于区分
+  // 「调用方明确要设成某厂商」与「只是回退到默认厂商」（见下方 SEC-01）。
+  const explicitProvider = providers.get(provider) ? provider : '';
+  if (!pid) pid = explicitProvider || providers.DEFAULT_PROVIDER_ID;
+  // 同名桶视为更新
+  const exist = cfg.buckets.find((b) => b.bucket === bucket);
+  if (exist) {
+    // SEC-01：**仅当厂商被显式指定（或由绑定密钥推导）时才改写 provider**。
+    // 旧实现在此无条件 `exist.provider = pid`，而未显式指定时 pid 会回退成默认厂商，
+    // 于是任意普通用户只要提交一个**已存在的桶名**，就能把该桶的 provider 改成腾讯云
+    // → activeCredential() 错配密钥、该桶对全体用户（含管理员）立即不可用。
+    // 未显式指定时保持原厂商不变。
+    if (credentialId || explicitProvider) exist.provider = pid;
+    if (region) exist.region = region;
+    if (remark !== undefined) exist.remark = String(remark || '');
+    if (quotaBytes !== undefined) exist.quotaBytes = Number(quotaBytes) || 0;
+    if (credentialId !== undefined) exist.credentialId = String(credentialId || '');
+    if (visibleToUsers !== undefined) exist.visibleToUsers = visibleToUsers !== false;
+    if (enabled !== undefined) exist.enabled = enabled !== false;
+    if (blockOverseasIP !== undefined) exist.blockOverseasIP = blockOverseasIP === true;
+    if (speedLimit !== undefined) exist.speedLimit = normalizeSpeedLimit(speedLimit); // R37
+    // FUN-06：不再顺手改写全局 activeBucketId。
+    //
+    // FUN-15 已把「当前桶」变成会话级状态，setActiveBucket() 会区分
+    // 「写会话」与「写全局（仅管理员）」。而这里是无条件写全局 ——
+    // 于是任何普通用户只要 POST /api/buckets/local 提交一个已存在的桶名，
+    // 就能改变系统默认桶（影响管理员界面、WebDAV、分享链接回退）。
+    // 需要切换请走 setActiveBucket(id, { token, role })。
+    persist(cfg);
+    return bucketView(exist);
+  }
+  const b = {
+    id: newId(),
+    provider: pid,
+    bucket,
+    region,
+    remark: String(remark || ''),
+    quotaBytes: Number(quotaBytes) || 0,
+    credentialId: String(credentialId || ''),
+    visibleToUsers: visibleToUsers !== false, // 默认对普通用户可见
+    enabled: true, // 启用/停用（默认启用）
+    blockOverseasIP: blockOverseasIP === true, // 按桶屏蔽海外 IP（默认关闭）
+    speedLimit: normalizeSpeedLimit(speedLimit), // R37：桶级下载限速（0 = 不限）
+    createdAt: now,
+  };
+  cfg.buckets.push(b);
+  // FUN-06：同上，新增桶不再自动设为当前桶。
+  // 首个桶不受影响 —— activeBucket() 在 activeBucketId 为空时会回退到第一个未停用桶。
+  persist(cfg);
+  return bucketView(b);
+}
+
+function updateBucket(id, patch) {
+  const cfg = requireStore();
+  const b = cfg.buckets.find((x) => x.id === id);
+  if (!b) return false;
+  // SEC-01：**禁止通过通用更新接口修改 provider**。
+  // 厂商必须由绑定的密钥推导（见 addBucket），否则可被用来把桶指向错误的厂商/SDK，
+  // 破坏全体用户的数据面。region 同理属数据面字段，由路由层限制为管理员专属。
+  if (patch.region !== undefined && patch.region) b.region = String(patch.region).trim();
+  if (patch.remark !== undefined) b.remark = String(patch.remark || '');
+  if (patch.quotaBytes !== undefined) b.quotaBytes = Number(patch.quotaBytes) || 0;
+  if (patch.credentialId !== undefined) b.credentialId = String(patch.credentialId || '');
+  if (patch.visibleToUsers !== undefined) b.visibleToUsers = patch.visibleToUsers !== false;
+  if (patch.blockOverseasIP !== undefined) b.blockOverseasIP = patch.blockOverseasIP === true;
+  // R37：桶级下载限速（0 = 不限速）。未传即保持 —— 与配额/备注同款约定，
+  // 否则「只改备注」的请求会把限额悄悄清零。
+  if (patch.speedLimit !== undefined) b.speedLimit = normalizeSpeedLimit(patch.speedLimit);
+  if (patch.enabled !== undefined) {
+    b.enabled = patch.enabled !== false;
+    // 停用时自动设为对普通用户不可见（与密钥停用一致）
+    if (!b.enabled) b.visibleToUsers = false;
+  }
+  persist(cfg);
+  return true;
+}
+
+/** 查询指定桶是否开启「屏蔽海外 IP」（桶不存在返回 false） */
+function bucketBlockOverseas(cfg, bucketId) {
+  if (!cfg || !bucketId) return false;
+  const b = (cfg.buckets || []).find((x) => x.id === bucketId);
+  return !!(b && b.blockOverseasIP === true);
+}
+
+/** 统计已启用的桶数量（用于停用保护：至少保留一个启用桶） */
+function enabledBucketCount(cfg) {
+  return (cfg.buckets || []).filter((b) => b.enabled !== false).length;
+}
+
+function removeBucket(id) {
+  const cfg = requireStore();
+  const idx = cfg.buckets.findIndex((b) => b.id === id);
+  if (idx < 0) return false;
+  cfg.buckets.splice(idx, 1);
+  if (cfg.activeBucketId === id) cfg.activeBucketId = (cfg.buckets[0] || {}).id || '';
+  persist(cfg);
+  return true;
+}
+
+/**
+ * 切换当前桶（FUN-15：**会话级**）
+ *
+ * 旧实现无条件改写 `cfg.activeBucketId`。由于该字段是全局单值，普通用户切桶会
+ * 连带改变管理员界面、`/api/fs/*`、`/api/stats/*`、WebDAV 与分享链接所使用的桶 ——
+ * 多人同时使用时表现为"我的桶自己变了"。
+ *
+ * 现在的语义：
+ *   - 有会话时：**只写会话**（`authSession.setSessionBucket`），绝不改写全局；
+ *   - 仅管理员**额外**更新全局默认桶 —— 全局值的语义已降级为「系统默认桶」，
+ *     供无会话场景（WebDAV、分享链接、启动自检）与首次登录回退使用。
+ *
+ * @param {string} id 目标桶 id
+ * @param {{ token?: string, role?: string }} [opts] 省略时从请求上下文推断
+ * @returns {boolean}
+ */
+function setActiveBucket(id, opts) {
+  const cfg = requireStore();
+  const b = cfg.buckets.find((x) => x.id === id);
+  if (!b) return false;
+  if (b.enabled === false) return false; // 不能激活已停用的桶
+
+  let ctx = null;
+  try { ctx = require('./request-context'); } catch (e) { /* 无上下文时按无会话处理 */ }
+  const o = opts || {};
+  const token = o.token || (ctx ? ctx.token() : '');
+  const role = o.role || (ctx ? ctx.role() : '') || 'admin';
+  const isAdmin = role !== 'user';
+  // 普通用户不得激活对其不可见的桶。路由层（PUT /buckets/local/:id/active）虽已拦截，
+  // 但这里必须再兜一层：否则其他调用点写进会话后，读端会静默回退到可见桶，
+  // 表现为「界面显示已切换、实际仍在原桶」——既误导用户，也掩盖越权路径。
+  if (!isAdmin && b.visibleToUsers === false) return false;
+
+  // ① 会话级：这是「当前桶」的权威来源
+  if (token) {
+    let authSession = null;
+    try { authSession = require('./auth-session'); } catch (e) { /* ignore */ }
+    if (authSession && !authSession.setSessionBucket(token, id)) return false;
+    if (ctx) ctx.setActiveBucketId(id); // 让本次请求后续逻辑立即生效
+  }
+
+  // ② 全局默认：只有管理员能改。普通用户走到这里会被跳过 —— 这正是本修复的核心。
+  if (isAdmin) {
+    cfg.activeBucketId = id;
+    // 桶绑定了密钥时，同步切换默认密钥
+    if (b.credentialId && cfg.credentials.some((c) => c.id === b.credentialId)) {
+      cfg.activeCredentialId = b.credentialId;
+    }
+    persist(cfg);
+  }
+  return true;
+}
+
+/* ============================ 安全视图（供前端） ============================ */
+
+function safeView(role) {
+  const cfg = load();
+  const isAdmin = role !== 'user'; // 缺省（undefined）按管理员/内部逻辑处理
+  const creds = listCredentialsFor(isAdmin ? 'admin' : 'user');
+  // FUN-13：桶过滤**复用 listBucketsFor()**，不要内联一份只有 visibleToUsers 的副本
+  // —— 内联版本漏掉了 enabled，与列表接口口径分叉（历史上靠"停用自动隐藏"掩盖）。
+  // 复用同一函数可从结构上消除口径漂移。
+  const { buckets, activeBucketId } = listBucketsFor(isAdmin ? 'admin' : role);
+  if (!cfg) {
+    return {
+      configured: false,
+      corrupted,
+      secretIdMasked: '',
+      hasSecret: false,
+      bucket: '', region: '', quotaBytes: 0, bucketRemark: '',
+      domains: { primary: '', backup: '' },
+      uploadExcludes: getUploadExcludes(),
+      concurrency: getConcurrency(),
+      smtp: smtpView(cfg), // R53：发信设置（口令只回 hasPassword 布尔值）
+      site: siteView(cfg), // R54：站点设置（站点名称 / 公开注册 / 新用户身份）
+      credentials: creds.credentials, activeCredentialId: creds.activeCredentialId,
+      buckets, activeBucketId,
+      updatedAt: '',
+    };
+  }
+  // FUN-15：生效桶按「会话级当前桶 → 全局默认」解析，并统一做可见性/启用校验。
+  // 旧实现管理员走全局、普通用户走角色过滤，两条口径容易漂移；现在收敛为同一个函数。
+  let effBucket = resolveEffectiveBucket(cfg, isAdmin);
+  if (effBucket && !isAdmin && (effBucket.visibleToUsers === false || effBucket.enabled === false)) {
+    effBucket = null; // 普通用户不可见 → 视为未选桶，由前端引导切换
+  }
+  if (!effBucket && !isAdmin) {
+    // 回退：角色可见的第一个启用桶（与 listBucketsFor 的口径一致）
+    effBucket = (buckets || []).length
+      ? (cfg.buckets.find((b) => b.id === activeBucketId && b.enabled !== false) || null)
+      : null;
+  }
+  const c = activeCredential(cfg, effBucket);
+  // 普通用户若当前生效密钥不可见或已停用，回退到可见且启用的密钥
+  let effCredential = c;
+  if (!isAdmin && c && (c.visibleToUsers === false || c.enabled === false)) {
+    effCredential = cfg.credentials.find((x) => x.visibleToUsers !== false && x.enabled !== false) || null;
+  }
+  return {
+    configured: Boolean(effCredential && effCredential.secretId && effCredential.secretKey),
+    corrupted,
+    provider: (effBucket && effBucket.provider) || (effCredential && effCredential.provider) || providers.DEFAULT_PROVIDER_ID,
+    providerName: providers.nameOf((effBucket && effBucket.provider) || (effCredential && effCredential.provider)),
+    secretIdMasked: effCredential ? maskSecretId(effCredential.secretId) : '',
+    hasSecret: Boolean(effCredential && effCredential.secretKey),
+    bucket: effBucket ? effBucket.bucket : '',
+    region: effBucket ? effBucket.region : '',
+    bucketRemark: effBucket ? effBucket.remark || '' : '',
+    quotaBytes: effBucket ? (Number.isFinite(Number(effBucket.quotaBytes)) ? Number(effBucket.quotaBytes) : 0) : 0,
+    domains: cfg.domains,
+    uploadExcludes: getUploadExcludes(),
+    concurrency: getConcurrency(),
+    smtp: smtpView(cfg), // R53：发信设置（口令只回 hasPassword 布尔值）
+    site: siteView(cfg), // R54：站点设置（站点名称 / 公开注册 / 新用户身份）
+    credentials: creds.credentials,
+    activeCredentialId: creds.activeCredentialId,
+    buckets,
+    activeBucketId,
+    updatedAt: cfg.updatedAt,
+  };
+}
+
+/** 使用独立密钥材料进行一次性加密解密验证（用于“测试连接”前自检） */
+function selfTest() {
+  try {
+    const probe = { t: Date.now(), nonce: crypto.randomBytes(8).toString('hex') };
+    const b64 = encrypt(probe);
+    const out = decrypt(b64);
+    return out.nonce === probe.nonce;
+  } catch (e) {
+    return false;
+  }
+}
+
+function isCorrupted() {
+  load();
+  return corrupted;
+}
+
+/* ============================ 服务商 ============================ */
+
+/** 返回全部服务商元数据（供前端呈现厂商选择器与文案） */
+function listProviders() {
+  return providers.list();
+}
+
+/* ============================ 用户偏好 ============================ */
+
+function getPrefs() {
+  const cfg = load();
+  return cfg ? cfg.prefs : { aclReminderDisabled: false };
+}
+
+function setPrefs(patch) {
+  const cfg = requireStore();
+  cfg.prefs = Object.assign({}, cfg.prefs, patch || {});
+  persist(cfg);
+  return cfg.prefs;
+}
+
+/* ============================ 上传排除设置 ============================ */
+
+function getUploadExcludes() {
+  const cfg = load();
+  return Object.assign({}, DEFAULT_UPLOAD_EXCLUDES, (cfg && cfg.uploadExcludes) || {});
+}
+
+function setUploadExcludes(patch) {
+  const cfg = requireStore();
+  cfg.uploadExcludes = Object.assign(getUploadExcludes(), patch || {});
+  persist(cfg);
+  return Object.assign({}, cfg.uploadExcludes);
+}
+
+/* ============================ 线程并发设置（R48） ============================ */
+
+/**
+ * 读取线程并发设置。
+ *
+ * 返回 `{ files }`：**同时上传 / 加密的文件数**上限（最小 1）。两个消费方
+ * 读的是同一个值：前端 `upload.js` 的 `uploadPlan()`（同时传几个文件 + 由此反推的
+ * 每文件分片并发）与服务端 `enc-pool.js` 的线程池大小（同时并行加密的处理单元数）。
+ *
+ * 值随 `safeView()` 下发给**所有登录用户**（不是管理员专属）—— 普通用户也要上传，
+ * 前端的调度必须知道上限；只有「改」是管理员的事（`PUT /concurrency`）。
+ * 这样也避免了「读」再开一个接口而形成第二个读取口径。
+ */
+function getConcurrency() {
+  const cfg = load();
+  return { files: normalizeConcurrencyFiles(cfg && cfg.concurrency && cfg.concurrency.files) };
+}
+
+function setConcurrency(patch) {
+  const cfg = requireStore();
+  const merged = Object.assign(getConcurrency(), patch || {});
+  cfg.concurrency = { files: normalizeConcurrencyFiles(merged.files) };
+  persist(cfg);
+  return { files: cfg.concurrency.files };
+}
+
+/* ============================ 发信设置 / SMTP（R53） ============================ */
+
+/**
+ * 读取发信设置（**服务端内部**使用，含明文口令）。
+ *
+ * 与 `getCaptcha()` 同款约束：任何路由都不得把它直接回传前端 ——
+ * 对外只经 `smtpView()` 裁剪（口令退化为 `hasPassword` 布尔值）。
+ *
+ * 返回值**永远是结构完整**的对象（归一化在 `normalizeSmtpInto()` 里统一做），
+ * 调用方不需要再判空：磁盘上没有这段配置时得到的是「关闭 + 默认端口」。
+ */
+function getSmtp() {
+  const cfg = load();
+  const shadow = { smtp: cfg ? cfg.smtp : undefined };
+  normalizeSmtpInto(shadow);
+  return shadow.smtp;
+}
+
+/**
+ * 保存发信设置（部分更新）。
+ *
+ * 口令是**三态**的，与验证码 `secretKey` 完全一致（见 `saveCaptcha()`）：
+ *   - 省略（`undefined`）或空串 `''` → **保持不变**
+ *     （界面上「密码框留空」是常态，不该一保存就把口令清空）；
+ *   - `null` → **显式清除**；
+ *   - 其它字符串 → 设为新值（不 trim，首尾空格可能是口令的一部分）。
+ *
+ * 其余字段：`undefined` = 保持不变；布尔字段按真值归一。
+ */
+function saveSmtp(patch) {
+  const cfg = requireStore();
+  const prev = getSmtp();
+  const p = patch || {};
+  const shadow = {
+    smtp: {
+      enabled: p.enabled !== undefined ? p.enabled === true : prev.enabled,
+      host: p.host !== undefined ? p.host : prev.host,
+      port: p.port !== undefined ? p.port : prev.port,
+      secure: p.secure !== undefined ? p.secure === true : prev.secure,
+      user: p.user !== undefined ? p.user : prev.user,
+      password: p.password === null ? '' : ((p.password !== undefined && p.password !== '') ? p.password : prev.password),
+      from: p.from !== undefined ? p.from : prev.from,
+      fromName: p.fromName !== undefined ? p.fromName : prev.fromName,
+      updatedAt: new Date().toISOString(),
+    },
+  };
+  normalizeSmtpInto(shadow);
+  cfg.smtp = shadow.smtp;
+  persist(cfg);
+  return getSmtp();
+}
+
+/**
+ * 「现在能不能发信」的最小判据（**唯一实现点**）。
+ *
+ * 无认证的中继也是合法配置，因此只要求**有主机 + 有发件人**，不要求填了口令。
+ *
+ * 抽成纯函数是因为它有两个使用者：`smtpView().configured`（界面 / 路由的闸门）
+ * 与 `smtpSendConfig().configured`（真正发信前的那道闸门，见 `email-code.js`
+ * 与 `routes/auth.js` 的 `/auth/forgot`）。两处各写一遍 `host && from` 的话，
+ * 哪天语义一改就会分叉 —— 而分叉的表现是「路由放行、发信端却抛 503」，
+ * 或者反过来「界面上说能发、实际一封也发不出去」。
+ */
+function smtpConfigured(s) {
+  return Boolean(s && s.host && s.from);
+}
+
+/**
+ * 发信设置的**对外视图**（唯一实现点）—— 与 `providersView()` 同一套规矩：
+ * 明文口令**永不出服务端**，只回 `hasPassword` 布尔值。
+ *
+ * 前端据此区分「尚未设置口令」与「已设置、留空表示不改」两种状态。
+ *
+ * ⚠️ 这个对象**只能用来「问」**（配没配 / 有没有口令），**绝不能拿去发信** ——
+ * 它没有 `password` 字段。发信一律走 `smtpSendConfig()`。
+ */
+function smtpView(cfg) {
+  const shadow = { smtp: (cfg && cfg.smtp) || undefined };
+  normalizeSmtpInto(shadow);
+  const s = shadow.smtp;
+  return {
+    enabled: s.enabled,
+    host: s.host,
+    port: s.port,
+    secure: s.secure,
+    user: s.user,
+    hasPassword: Boolean(s.password),
+    from: s.from,
+    fromName: s.fromName,
+    configured: smtpConfigured(s),
+    updatedAt: s.updatedAt,
+  };
+}
+
+/**
+ * **发信路径唯一**的取配置入口（服务端内部）：`getSmtp()` 的全部字段（含明文口令）
+ * ＋ `configured` 判据，一次读盘给全。
+ *
+ * ⚠️ 为什么必须另开一个函数，而不是让调用方自己决定用 `getSmtp()` 还是 `smtpView()`：
+ * 这两者的差别**恰好只差口令**，而「少一个口令」在 SMTP 会话里表现为
+ * `smtp.validateForSend()` 的 400「已填写登录用户名但密码为空」——只要管理员
+ * 填了登录用户名（真实 SMTP 服务器几乎都要求认证），系统邮件就**一封也发不出去**；
+ * 与此同时管理员手点的「发送测试邮件」走的是含口令的内部读、**照样成功**。
+ * 两个入口表现相反，是最难从现象反推根因的一类故障，故把「发信只能用这个」
+ * 收敛成一个有名字的调用点。
+ */
+function smtpSendConfig() {
+  const s = getSmtp();
+  return Object.assign({}, s, { configured: smtpConfigured(s) });
+}
+
+/* ============================ 站点设置（R54） ============================ */
+
+/**
+ * 读取站点设置（**服务端内部**使用）。
+ *
+ * 返回值**永远是结构完整**的对象（归一化在 `normalizeSiteInto()` 里统一做），
+ * 磁盘上没有这一段时得到的是「默认站点名 + 关闭注册 + 普通用户」——
+ * 与升级前的行为逐字一致。
+ */
+function getSite() {
+  const cfg = load();
+  const shadow = { site: cfg ? cfg.site : undefined };
+  normalizeSiteInto(shadow);
+  return shadow.site;
+}
+
+/**
+ * 保存站点设置（部分更新，**严格 PATCH**：未给出的字段保持原值）。
+ *
+ * 三个字段都可改：
+ *  - `siteName`：空串合法，落盘归一时会换成默认站点名（界面上「留空恢复默认」）；
+ *  - `registration` / `defaultRole`：非法值由路由层先挡在 400，这里只做兜底归一。
+ */
+function saveSite(patch) {
+  const cfg = requireStore();
+  const prev = getSite();
+  const p = patch || {};
+  const shadow = {
+    site: {
+      siteName: p.siteName !== undefined ? p.siteName : prev.siteName,
+      registration: p.registration !== undefined ? p.registration : prev.registration,
+      defaultRole: p.defaultRole !== undefined ? p.defaultRole : prev.defaultRole,
+      updatedAt: new Date().toISOString(),
+    },
+  };
+  normalizeSiteInto(shadow);
+  cfg.site = shadow.site;
+  persist(cfg);
+  return getSite();
+}
+
+/**
+ * 站点设置的**对外视图**（唯一实现点）。
+ *
+ * 站点设置里没有任何机密，故整段原样下发；单独抽一个函数的理由是
+ * 「哪些字段对外可见」这件事只允许有一处答案 —— 否则新增一个字段时，
+ * 有的出口带它、有的不带，前端就会时而读到 `undefined`。
+ */
+function siteView(cfg) {
+  const shadow = { site: (cfg && cfg.site) || undefined };
+  normalizeSiteInto(shadow);
+  const s = shadow.site;
+  return {
+    siteName: s.siteName,
+    registration: s.registration,
+    defaultRole: s.defaultRole,
+    updatedAt: s.updatedAt,
+  };
+}
+
+/* ============================ 登录人机验证配置 ============================ */
+
+/**
+ * 读取验证码配置（服务端内部使用，含 secretKey）。
+ * 绝不会被 routes 直接回传前端——对外由 captcha.publicConfig() 裁剪。
+ *
+ * 返回的 `siteKey` / `secretKey` 是**当前选中服务商**那一套的派生视图（向后兼容旧调用方）；
+ * 两套完整凭证在 `providers` 里。
+ */
+function getCaptcha() {
+  const cfg = load();
+  const c = (cfg && cfg.captcha) || {};
+  const provider = CAPTCHA_PROVIDERS.includes(c.provider) ? c.provider : 'recaptcha';
+  const providersMap = captchaProvidersOf(c);
+  const sel = providersMap[provider];
+  return {
+    enabled: !!c.enabled,
+    provider,
+    providers: providersMap,
+    siteKey: sel.siteKey,
+    secretKey: sel.secretKey,
+    timeoutMs: Number.isFinite(Number(c.timeoutMs)) && c.timeoutMs > 0 ? Number(c.timeoutMs) : 5000,
+    onError: c.onError === 'degrade' ? 'degrade' : 'block',
+  };
+}
+
+/**
+ * 保存验证码配置 —— 两种服务商的凭证**各自独立**保存（R41）。
+ *
+ * `providers` 里每个服务商支持部分字段：
+ *  - `siteKey`    省略 = 保持不变
+ *  - `secretKey`  省略或空串 = 保持不变（避免界面保存时误清空密钥）；`null` = 显式清除
+ * 顶层扁平 `siteKey` / `secretKey` 仍被接受（旧前端 / 旧脚本），落到 `provider` 指向的那一套。
+ */
+function saveCaptcha(patch) {
+  const cfg = requireStore();
+  const prev = getCaptcha();
+  const p = patch || {};
+  const provider = CAPTCHA_PROVIDERS.includes(p.provider) ? p.provider : prev.provider;
+  const providersMap = captchaProvidersOf({ providers: prev.providers });
+
+  // 逐服务商应用本次提交（只改本次真正带上的字段）
+  const incoming = (p.providers && typeof p.providers === 'object') ? p.providers : {};
+  for (const name of CAPTCHA_PROVIDERS) {
+    const e = incoming[name];
+    if (!e || typeof e !== 'object') continue;
+    const cur = providersMap[name];
+    if (e.siteKey !== undefined) cur.siteKey = String(e.siteKey || '');
+    if (e.secretKey === null) cur.secretKey = '';                  // 显式清除
+    else if (e.secretKey !== undefined && e.secretKey !== '') cur.secretKey = String(e.secretKey);
+  }
+  // 兼容旧的扁平形态：落到选中服务商那一套
+  if (p.siteKey !== undefined && incoming[provider] === undefined) providersMap[provider].siteKey = String(p.siteKey || '');
+  if (p.secretKey !== undefined && incoming[provider] === undefined) {
+    if (p.secretKey === null) providersMap[provider].secretKey = '';
+    else if (p.secretKey !== '') providersMap[provider].secretKey = String(p.secretKey);
+  }
+
+  cfg.captcha = {
+    enabled: p.enabled !== undefined ? !!p.enabled : prev.enabled,
+    provider,
+    providers: providersMap,
+    timeoutMs: p.timeoutMs !== undefined && Number.isFinite(Number(p.timeoutMs)) && Number(p.timeoutMs) > 0 ? Number(p.timeoutMs) : prev.timeoutMs,
+    onError: p.onError !== undefined && p.onError === 'degrade' ? 'degrade' : 'block',
+  };
+  persist(cfg);
+  return getCaptcha();
+}
+
+/* ============================ 支付平台凭证 ============================ */
+
+/**
+ * 读取支付配置（服务端内部使用，含明文密钥）。
+ * 绝不会被路由直接回传前端 —— 对外由 paymentProviders.publicView() 裁剪为「值 + 是否已配置」。
+ * @returns {{enabled: boolean, platforms: object, updatedAt: string}}
+ */
+function getPayment() {
+  const cfg = load();
+  const p = (cfg && cfg.payment) || {};
+  const src = p.platforms && typeof p.platforms === 'object' ? p.platforms : {};
+  const platforms = {};
+  // 只保留注册表中已知平台，避免历史脏数据被一路带下去
+  for (const id of Object.keys(src)) {
+    if (!paymentProviders.isKnown(id)) continue;
+    if (!src[id] || typeof src[id] !== 'object') continue;
+    platforms[id] = Object.assign({}, src[id]);
+  }
+  return {
+    enabled: p.enabled === true,
+    platforms,
+    // 站点对外地址：支付网关要往这里回调、支付完成后要跳回这里。
+    // 本机回环地址收不到公网回调，故必须可由管理员显式指定（留空则按请求 Host 兜底）。
+    siteUrl: typeof p.siteUrl === 'string' ? p.siteUrl : '',
+    updatedAt: p.updatedAt || '',
+  };
+}
+
+function nowIso() {
+  return new Date().toISOString();
+}
+
+/**
+ * 写入某一支付平台的凭证。
+ * 合并策略（"留空保持不变"等）由 paymentProviders.applySave() 在路由层完成，
+ * 本函数只负责持久化 + 打时间戳，保持存储层语义单一。
+ * `enabled`（渠道开关）不属于凭证，这里只做**保留**，改它请用 setChannelEnabled()。
+ */
+function savePayment(platformId, values) {
+  const cfg = requireStore();
+  const cur = getPayment();
+  const platforms = Object.assign({}, cur.platforms);
+  if (values && Object.keys(values).length) {
+    const prev = platforms[platformId] || {};
+    platforms[platformId] = Object.assign({}, prev, values, { updatedAt: nowIso() });
+  } else {
+    delete platforms[platformId];
+  }
+  cfg.payment = { enabled: cur.enabled, platforms, siteUrl: cur.siteUrl, updatedAt: nowIso() };
+  persist(cfg);
+  return getPayment();
+}
+
+/** 总开关：启用 / 停用支付功能（不影响任何已保存的渠道与凭证配置） */
+function setPaymentEnabled(on) {
+  const cfg = requireStore();
+  const cur = getPayment();
+  cfg.payment = { enabled: !!on, platforms: cur.platforms, siteUrl: cur.siteUrl, updatedAt: nowIso() };
+  persist(cfg);
+  return getPayment();
+}
+
+/** 渠道开关：启用 / 停用某一支付渠道（约束校验在路由层，由 payment-rules 判定） */
+function setChannelEnabled(platformId, on) {
+  const cfg = requireStore();
+  const cur = getPayment();
+  const platforms = Object.assign({}, cur.platforms);
+  const prev = platforms[platformId] || {};
+  platforms[platformId] = Object.assign({}, prev, { enabled: !!on, updatedAt: nowIso() });
+  cfg.payment = { enabled: cur.enabled, platforms, siteUrl: cur.siteUrl, updatedAt: nowIso() };
+  persist(cfg);
+  return getPayment();
+}
+
+/**
+ * 站点对外地址（支付网关回调与支付完成回跳的目标）。
+ * 传空串表示清除，回退为「按请求 Host 兜底」。
+ */
+function setPaymentSiteUrl(url) {
+  const cfg = requireStore();
+  const cur = getPayment();
+  const v = String(url == null ? '' : url).trim().replace(/\/+$/, ''); // 去掉结尾斜杠，拼接时统一处理
+  cfg.payment = { enabled: cur.enabled, platforms: cur.platforms, siteUrl: v, updatedAt: nowIso() };
+  persist(cfg);
+  return getPayment();
+}
+
+/** 清除某一支付平台的全部凭证（开关状态一并复位为关闭） */
+function clearPayment(platformId) {
+  return savePayment(platformId, {});
+}
+
+/* ============================ WebDAV 服务 ============================ */
+
+// 密码字段级加密（外层 config.enc 已整包加密，此处为账户口令再加一层 GCM 保护）
+function sealPassword(plain) {
+  return encrypt({ v: 1, pw: String(plain == null ? '' : plain) });
+}
+function openPassword(sealed) {
+  if (!sealed) return '';
+  try {
+    const o = decrypt(sealed);
+    return o && typeof o === 'object' ? String(o.pw || '') : '';
+  } catch (e) {
+    return '';
+  }
+}
+
+function normalizeAccountInput(b) {
+  const appName = String((b && b.appName) || '').trim();
+  const username = String((b && b.username) || '').trim();
+  if (!appName) throw Object.assign(new Error('应用名称不能为空'), { status: 400 });
+  if (!username) throw Object.assign(new Error('用户名不能为空'), { status: 400 });
+  if (appName.length > 64) throw Object.assign(new Error('应用名称最长 64 个字符'), { status: 400 });
+  if (username.length > 64) throw Object.assign(new Error('用户名最长 64 个字符'), { status: 400 });
+  return { appName, username };
+}
+
+/** 账户安全视图（默认不回传明文密码；showPassword=true 时附带 password） */
+function accountView(a, showPassword) {
+  return {
+    id: a.id,
+    appName: a.appName,
+    username: a.username,
+    hasPassword: Boolean(a.passwordSealed),
+    createdAt: a.createdAt || '',
+    updatedAt: a.updatedAt || '',
+    password: showPassword ? openPassword(a.passwordSealed) : undefined,
+  };
+}
+
+function getWebdav() {
+  const cfg = load() || requireStore();
+  const w = cfg.webdav || { enabled: false, accounts: [] };
+  return {
+    enabled: !!w.enabled,
+    accounts: (w.accounts || []).map((a) => accountView(a, false)),
+  };
+}
+
+function setWebdavEnabled(enabled) {
+  const cfg = requireStore();
+  cfg.webdav = cfg.webdav || { enabled: false, accounts: [] };
+  cfg.webdav.enabled = !!enabled;
+  persist(cfg);
+  return getWebdav();
+}
+
+function addWebdavAccount(b) {
+  const { appName, username } = normalizeAccountInput(b);
+  const password = String((b && b.password) || '');
+  if (!password) throw Object.assign(new Error('密码不能为空'), { status: 400 });
+  if (password.length > 128) throw Object.assign(new Error('密码最长 128 个字符'), { status: 400 });
+  const cfg = requireStore();
+  cfg.webdav = cfg.webdav || { enabled: false, accounts: [] };
+  if (cfg.webdav.accounts.some((a) => a.appName === appName)) {
+    throw Object.assign(new Error('同名应用账户已存在，请使用编辑功能修改'), { status: 409 });
+  }
+  const now = new Date().toISOString();
+  const acc = { id: newId(), appName, username, passwordSealed: sealPassword(password), createdAt: now, updatedAt: now };
+  cfg.webdav.accounts.push(acc);
+  persist(cfg);
+  return accountView(acc, false);
+}
+
+function updateWebdavAccount(id, b) {
+  const cfg = requireStore();
+  cfg.webdav = cfg.webdav || { enabled: false, accounts: [] };
+  const acc = cfg.webdav.accounts.find((a) => a.id === id);
+  if (!acc) throw Object.assign(new Error('账户不存在'), { status: 404 });
+  if (b.appName !== undefined || b.username !== undefined) {
+    const merged = { appName: b.appName !== undefined ? b.appName : acc.appName, username: b.username !== undefined ? b.username : acc.username };
+    const { appName, username } = normalizeAccountInput(merged);
+    if (cfg.webdav.accounts.some((a) => a.id !== id && a.appName === appName)) {
+      throw Object.assign(new Error('同名应用账户已存在'), { status: 409 });
+    }
+    acc.appName = appName;
+    acc.username = username;
+  }
+  if (b.password !== undefined) {
+    const password = String(b.password || '');
+    if (!password) throw Object.assign(new Error('密码不能为空'), { status: 400 });
+    if (password.length > 128) throw Object.assign(new Error('密码最长 128 个字符'), { status: 400 });
+    acc.passwordSealed = sealPassword(password);
+  }
+  acc.updatedAt = new Date().toISOString();
+  persist(cfg);
+  return accountView(acc, false);
+}
+
+function removeWebdavAccount(id) {
+  const cfg = requireStore();
+  cfg.webdav = cfg.webdav || { enabled: false, accounts: [] };
+  const idx = cfg.webdav.accounts.findIndex((a) => a.id === id);
+  if (idx < 0) return false;
+  cfg.webdav.accounts.splice(idx, 1);
+  persist(cfg);
+  return true;
+}
+
+/** 取出指定账户明文密码（账户列表展示密码 / WebDAV Basic 认证使用） */
+function revealWebdavPassword(id) {
+  const cfg = load();
+  const acc = cfg && cfg.webdav && cfg.webdav.accounts.find((a) => a.id === id);
+  if (!acc) return null;
+  return accountView(acc, true);
+}
+
+/**
+ * 恒定时间字符串比较（S7）：各自取 SHA-256 摘要（定长 32 字节）后再 timingSafeEqual，
+ * 既不泄露长度差异，也避免自写逐字节循环的潜在优化风险。
+ */
+function constTimeEquals(a, b) {
+  const ha = crypto.createHash('sha256').update(String(a == null ? '' : a), 'utf8').digest();
+  const hb = crypto.createHash('sha256').update(String(b == null ? '' : b), 'utf8').digest();
+  return crypto.timingSafeEqual(ha, hb);
+}
+
+/**
+ * 空转哈希：账户不存在/未启用时执行，保持与成功路径相近耗时，避免用户名枚举（S7）。
+ * SEC-05：同样走**异步** scrypt（旧版 scryptSync 在 WebDAV 随机用户名爆破下会阻塞主线程）。
+ */
+function dummyHash(password) {
+  return new Promise((resolve) => {
+    crypto.scrypt(String(password == null ? '' : password), Buffer.from('00'.repeat(16), 'hex'), 32, () => resolve());
+  });
+}
+
+/** WebDAV 认证：按用户名匹配账户，返回 { ok, account? }（SEC-05：async） */
+async function authenticateWebdav(username, password) {
+  const cfg = load();
+  if (!cfg || !cfg.webdav || !cfg.webdav.enabled) { await dummyHash(password); return { ok: false }; }
+  const acc = cfg.webdav.accounts.find((a) => a.username === String(username || ''));
+  if (!acc) { await dummyHash(password); return { ok: false }; }
+  const plain = openPassword(acc.passwordSealed);
+  // R14-07：口令错误时**也必须跑一次 dummyHash**。真实路径只做 AES-GCM 解密 + 两次
+  // SHA-256（微秒级），而「用户名不存在」分支要跑一次完整 scrypt（约 50ms）——
+  // 不补这一行的话，侧信道恰好**反向放大**：有效用户名是「快」的那个，
+  // 单次请求即可枚举出全部 WebDAV 账户名，再配合 webdavAuthLimiter 做定向爆破。
+  // 同文件的 `authenticateUser` 无论用户名是否存在都走 scrypt，此处此前与它口径不一致。
+  if (!constTimeEquals(password, plain)) { await dummyHash(password); return { ok: false }; }
+  return { ok: true, account: { id: acc.id, appName: acc.appName, username: acc.username } };
+}
+
+/* ============================ 用户管理（登录鉴权） ============================ */
+
+/**
+ * ⚠️ SEC-05：口令哈希**必须用异步 scrypt**，禁止再引入 `scryptSync`。
+ *
+ * `crypto.scryptSync` 的执行无法被事件循环切分（N=16384 约 16MB 内存 + 数十毫秒 CPU），
+ * 几十个并发请求就能把单线程事件循环压满 —— 全站（含正在进行的下载与 WebDAV）一起卡死。
+ * 异步版本在 libuv 线程池中执行，代价是调用链必须 `await`：
+ * 因此 `addUser` / `updateUser` / `authenticateUser` / `verifyUserPassword` /
+ * `authenticateWebdav` 全部改为 async。
+ */
+function scryptHex(pw, saltHex) {
+  return new Promise((resolve, reject) => {
+    crypto.scrypt(String(pw), Buffer.from(saltHex, 'hex'), 32, (err, key) => {
+      if (err) reject(err); else resolve(key.toString('hex'));
+    });
+  });
+}
+
+function generateSalt() {
+  return crypto.randomBytes(16).toString('hex');
+}
+
+/** 生成口令哈希（异步）→ { salt, hash } */
+async function hashPassword(password) {
+  const salt = generateSalt();
+  return { salt, hash: await scryptHex(password, salt) };
+}
+
+/** 时序安全比较（异步），避免时序侧信道猜测密码 */
+async function verifyPassword(password, hash, salt) {
+  if (!hash || !salt) return false;
+  try {
+    const a = Buffer.from(await scryptHex(password, salt), 'hex');
+    const b = Buffer.from(hash, 'hex');
+    if (a.length !== b.length) return false;
+    return crypto.timingSafeEqual(a, b);
+  } catch (e) {
+    return false;
+  }
+}
+
+/** 用户名合法性校验 */
+function normalizeUsername(username) {
+  const name = String(username || '').trim();
+  if (!name) throw Object.assign(new Error('用户名不能为空'), { status: 400 });
+  if (!/^[a-zA-Z0-9_\u4e00-\u9fa5@.-]{2,32}$/.test(name)) {
+    throw Object.assign(new Error('用户名仅支持 2-32 位中文、字母、数字及 _ @ . - 字符'), { status: 400 });
+  }
+  return name;
+}
+
+/** 密码强度校验（新增用户/修改密码时使用） */
+function assertPasswordPolicy(password) {
+  if (typeof password !== 'string' || password.length < 6) {
+    throw Object.assign(new Error('密码长度至少 6 位'), { status: 400 });
+  }
+  if (password.length > 128) {
+    throw Object.assign(new Error('密码最长 128 个字符'), { status: 400 });
+  }
+}
+
+function normalizeRole(role) {
+  return ['admin', 'user'].includes(role) ? role : 'user';
+}
+
+function normalizePermissions(p) {
+  if (!p || typeof p !== 'object' || Array.isArray(p)) return {};
+  return p;
+}
+
+/* ============================ Windows Hello（WebAuthn）凭据 ============================ */
+
+/**
+ * 归一化用户上的 WebAuthn 凭据。
+ *
+ * 设计：**凭据完整才视为启用**。`enabled` 只是用户意愿开关，真正的判定必须
+ * 同时具备 credentialId 与 publicKey —— 缺任一即回落到未启用，避免"开关是开的
+ * 但无法验证"导致登录被永久卡死（那种情况下用户只能改配置文件自救）。
+ */
+function normalizeWebauthn(w) {
+  const empty = { enabled: false, credentialId: '', publicKey: '', signCount: 0, aaguid: '', fmt: '', createdAt: '', lastUsedAt: '' };
+  if (!w || typeof w !== 'object' || Array.isArray(w)) return empty;
+  const credentialId = typeof w.credentialId === 'string' ? w.credentialId : '';
+  const publicKey = typeof w.publicKey === 'string' ? w.publicKey : '';
+  const complete = Boolean(credentialId && publicKey);
+  return {
+    enabled: Boolean(w.enabled) && complete,
+    credentialId,
+    publicKey,
+    signCount: Number.isFinite(Number(w.signCount)) ? Number(w.signCount) : 0,
+    aaguid: typeof w.aaguid === 'string' ? w.aaguid : '',
+    fmt: typeof w.fmt === 'string' ? w.fmt : '',
+    createdAt: typeof w.createdAt === 'string' ? w.createdAt : '',
+    lastUsedAt: typeof w.lastUsedAt === 'string' ? w.lastUsedAt : '',
+  };
+}
+
+/** 该用户是否已启用并可用的 Windows Hello */
+function isWebauthnEnabled(user) {
+  const w = normalizeWebauthn(user && user.webauthn);
+  return w.enabled;
+}
+
+/** 读取用户的 WebAuthn 凭据（归一化后的副本） */
+function getWebauthn(user) {
+  return normalizeWebauthn(user && user.webauthn);
+}
+
+/** 保存用户的注册结果并启用 Windows Hello */
+function setUserWebauthn(id, { credentialId, publicKey, signCount, aaguid, fmt }) {
+  const cfg = requireStore();
+  const user = cfg.users.find((u) => u.id === id);
+  if (!user) throw Object.assign(new Error('用户不存在'), { status: 404 });
+  if (!credentialId || !publicKey) throw Object.assign(new Error('Windows Hello 凭据信息不完整'), { status: 400 });
+  const now = new Date().toISOString();
+  user.webauthn = normalizeWebauthn({
+    enabled: true,
+    credentialId,
+    publicKey,
+    signCount: Number(signCount) || 0,
+    aaguid: aaguid || '',
+    fmt: fmt || '',
+    createdAt: now,
+    lastUsedAt: '',
+  });
+  user.updatedAt = now;
+  persist(cfg);
+  return userView(user);
+}
+
+/** 关闭 Windows Hello 并清除凭据（保守起见一并清空密钥材料） */
+function clearUserWebauthn(id) {
+  const cfg = requireStore();
+  const user = cfg.users.find((u) => u.id === id);
+  if (!user) throw Object.assign(new Error('用户不存在'), { status: 404 });
+  user.webauthn = normalizeWebauthn(null);
+  user.updatedAt = new Date().toISOString();
+  persist(cfg);
+  return userView(user);
+}
+
+/** 登录成功后更新签名计数与使用时间 */
+function touchWebauthn(id, signCount) {
+  const cfg = requireStore();
+  const user = cfg.users.find((u) => u.id === id);
+  if (!user) return null;
+  const w = normalizeWebauthn(user.webauthn);
+  w.signCount = Number(signCount) || 0;
+  w.lastUsedAt = new Date().toISOString();
+  user.webauthn = w;
+  persist(cfg);
+  return userView(user);
+}
+
+/* ======================================================================== *
+ * 账户封禁（R33）
+ *
+ * 需求：管理员可封禁其他用户 —— 指定**到期时间**与**封禁原因**，可随时手动解封；
+ * 被封禁者登录时能看到封禁原因与解封时间。
+ *
+ * 存储：`user.ban = { active, reason, until }`，`until` 一律是 ISO 8601 字符串
+ * （`''` = 永久封禁）。时间点存**绝对时刻**而非「本地时间字符串」，是因为前端
+ * `<input type="datetime-local">` 产出的是**不带时区**的裸时间（`2026-10-05T12:00`），
+ * 服务端按自己的时区去解析必然在跨时区部署下错位 —— 因此由前端换算成 epoch 毫秒
+ * 再提交，这里统一转成 ISO 存储（见 `parseBanUntil` / `banInfo`）。
+ * ======================================================================== */
+
+/** 封禁原因的字符上限（超出直接拒绝：日志、登录提示、表格 title 都要塞它） */
+const BAN_REASON_MAX = 200;
+
+/** 归一化用户上的封禁标记（结构不合法一律回落到"未封禁"） */
+function normalizeBan(b) {
+  const empty = { active: false, reason: '', until: '' };
+  if (!b || typeof b !== 'object' || Array.isArray(b)) return empty;
+  return {
+    active: Boolean(b.active),
+    reason: typeof b.reason === 'string' ? b.reason : '',
+    until: typeof b.until === 'string' ? b.until : '',
+  };
+}
+
+/**
+ * 归一化「封禁到期时间」的输入。
+ *
+ * 接受三种形态：`null` / `''` / `undefined`（= 永久封禁）；epoch 毫秒（数值或
+ * 纯数字串，前端 `new Date(localValue).getTime()` 的产出）；可被 `Date.parse`
+ * 识别的 ISO 字符串。
+ *
+ * @returns {string|null} ISO 8601 字符串（`''` = 永久）；**null 表示输入非法**
+ */
+function parseBanUntil(v) {
+  if (v === undefined || v === null || v === '') return '';
+  if (typeof v === 'number' || (typeof v === 'string' && /^\d+$/.test(v.trim()))) {
+    const n = Number(v);
+    if (!Number.isFinite(n)) return null;
+    const d = new Date(n);
+    return Number.isNaN(d.getTime()) ? null : d.toISOString();
+  }
+  if (typeof v !== 'string') return null;
+  const t = Date.parse(v.trim());
+  return Number.isFinite(t) ? new Date(t).toISOString() : null;
+}
+
+/**
+ * 封禁的**唯一判据**：该用户此刻是否处于生效中的封禁状态。
+ *
+ * ⚠️ 绝不能拿 `user.ban.active` 直接当结论 —— 它只表示"管理员设过封禁"，而
+ * 封禁可能是**已到期**的。所有需要判断"现在能不能放行"的地方（登录、用户列表
+ * 的状态列）都必须走这里，否则两处判定一旦分叉，就会出现「列表显示已解封、
+ * 登录仍被拒」这类只能靠翻代码才能解释的现象。
+ *
+ * 到期判定刻意选 **fail-closed**：`until` 缺失**或解析不出时间**一律按**永久封禁**
+ * 处理。这与 WebAuthn 的「凭据不完整即视为未启用」（fail-open，防止用户被永久
+ * 锁死在登录页）方向相反，因为两者的代价不对称 —— 误判为封禁可由管理员一键解封，
+ * 而「封禁标记因数据瑕疵被静默忽略」是安全缺陷。
+ *
+ * @param {object} user 原始用户记录（非 userView）
+ * @param {number} [now] 判定时刻（便于测试注入）
+ * @returns {{state: 'none'|'active'|'expired', active: boolean, reason: string, until: string}}
+ */
+function banInfo(user, now) {
+  const b = normalizeBan(user && user.ban);
+  const at = now === undefined ? Date.now() : now;
+  const t = b.until ? Date.parse(b.until) : NaN;
+  const permanent = !b.until || !Number.isFinite(t);
+  const active = Boolean(b.active) && (permanent || t > at);
+  return {
+    // none = 从未封禁 / active = 封禁生效中 / expired = 封禁已到期（自动失效）
+    state: !b.active ? 'none' : (active ? 'active' : 'expired'),
+    active,
+    reason: b.reason,
+    until: b.until,
+  };
+}
+
+/**
+ * 封禁用户（管理员操作）。
+ *
+ * 原因必填：需求要求「用户登录时能看到封禁原因」，允许空原因会让那条提示变成
+ * 一句没有信息量的"你被封了"。长度上限见 `BAN_REASON_MAX`。
+ * `until` 留空 = 永久封禁（需管理员手动解封）。
+ */
+function setUserBan(id, { reason, until } = {}) {
+  const cfg = requireStore();
+  const user = cfg.users.find((u) => u.id === id);
+  if (!user) throw Object.assign(new Error('用户不存在'), { status: 404 });
+  const text = String(reason == null ? '' : reason).trim();
+  if (!text) throw Object.assign(new Error('请填写封禁原因'), { status: 400 });
+  if (text.length > BAN_REASON_MAX) {
+    throw Object.assign(new Error(`封禁原因最多 ${BAN_REASON_MAX} 个字符`), { status: 400 });
+  }
+  const iso = parseBanUntil(until);
+  if (iso === null) {
+    throw Object.assign(new Error('封禁到期时间格式不正确'), { status: 400 });
+  }
+  /**
+   * 到期时间已过 ⇒ 这条封禁**写下来就已经失效**（`banInfo()` 会判 `active=false`），
+   * 而接口却回 `ok:true`、界面还弹「已封禁」—— 典型的假成功。必须在写入前拒绝。
+   *
+   * 这条规则只在这里实现（前端那个 format 检查只是提前反馈）：否则两条规则迟早
+   * 会出现「界面放行、服务端另有一套」的分叉。
+   */
+  if (iso && Date.parse(iso) <= Date.now()) {
+    throw Object.assign(new Error('封禁到期时间必须晚于当前时间'), { status: 400 });
+  }
+  user.ban = { active: true, reason: text, until: iso };
+  user.updatedAt = new Date().toISOString();
+  persist(cfg);
+  return userView(user);
+}
+
+/** 解除封禁（管理员操作）：立即恢复登录，无需等到期时间 */
+function clearUserBan(id) {
+  const cfg = requireStore();
+  const user = cfg.users.find((u) => u.id === id);
+  if (!user) throw Object.assign(new Error('用户不存在'), { status: 404 });
+  user.ban = normalizeBan(null);
+  user.updatedAt = new Date().toISOString();
+  persist(cfg);
+  return userView(user);
+}
+
+/** 用户安全视图：绝不回传密码哈希/盐，也不回传 WebAuthn 公钥（仅回传是否启用） */
+function userView(u) {
+  const w = normalizeWebauthn(u.webauthn);
+  return {
+    id: u.id,
+    username: u.username,
+    role: u.role || 'user',
+    permissions: u.permissions || {},
+    // Windows Hello：仅暴露"是否启用"与注册时间，公钥/凭据 ID 一律不出服务端
+    webauthnEnabled: w.enabled,
+    webauthnCreatedAt: w.enabled ? w.createdAt : '',
+    // 封禁状态：只暴露判定结果与展示所需字段，`normalizeBan` 的内部结构不外泄
+    ban: banInfo(u),
+    // R37：用户级下载限速（0 = 不限）。放在这里是因为「用户管理」卡片要按它显示限速按钮状态
+    speedLimit: normalizeSpeedLimit(u.speedLimit),
+    /**
+     * R54②：邮箱。
+     *
+     * **非空即视为「已验证」**，故这里没有 `emailVerified` 之类的第二个字段 ——
+     * 它不是「状态」，而是「这个地址是怎么进来的」的推论：
+     *  - 用户自助设置 / 修改 ⇒ 必须通过发到该邮箱的验证码（见 `routes/auth.js`）；
+     *  - 管理员设置 / 修改 ⇒ 管理员本来就能直接重置任何人的密码，不构成新增风险，
+     *    且若标记为未验证会形成死锁（用户既收不到验证邮件、又因忘记密码登不进来，
+     *    永远无法完成验证）。两种来源都成立 ⇒ 加一个恒为真的布尔字段只是噪音。
+     */
+    email: normalizeEmail(u.email),
+    createdAt: u.createdAt || '',
+    updatedAt: u.updatedAt || '',
+  };
+}
+
+function listUsers() {
+  const cfg = load();
+  if (!cfg) return [];
+  return cfg.users.map(userView);
+}
+
+function getUserById(id) {
+  const cfg = load();
+  if (!cfg) return null;
+  return cfg.users.find((u) => u.id === id) || null;
+}
+
+/** 管理员数量统计（用于保护最后一个管理员） */
+function adminCount(cfg) {
+  return (cfg.users || []).filter((u) => u.role === 'admin').length;
+}
+
+/**
+ * R54②：邮箱唯一性的**唯一实现点**。
+ *
+ * 为什么必须唯一：邮箱是「重置密码」的收件地址。同一个邮箱绑在两个账户上时，
+ * 「给这个邮箱发一封重置码」就对应两个账户 —— 那时只按邮箱找用户的做法会
+ * 静默命中错误的那一个（按列表顺序），而用户完全无从察觉。
+ *
+ * 空串不参与判据（= 尚未绑定，可以有任意多个人没有邮箱）。
+ */
+function assertEmailFree(cfg, email, excludeId) {
+  if (!email) return;
+  const hit = (cfg.users || []).find((u) => u.id !== excludeId && normalizeEmail(u.email) === email);
+  if (hit) throw Object.assign(new Error('该邮箱已被其他账户使用'), { status: 409 });
+}
+
+async function addUser({ username, password, role, permissions, speedLimit, email }) {
+  const name = normalizeUsername(username);
+  assertPasswordPolicy(password);
+  // R14-04：先把异步工作做完（scrypt 约 50~100ms），再取 store 并**同步**完成全部修改。
+  //
+  // 旧实现是「先取 cfg → await → 改 cfg → persist(cfg)」。await 期间若 60 秒 TTL 到期，
+  // `load()` 会把 `cached` 换成**新对象**（`cached = cfg`），手上的 cfg 就此脱钩；
+  // 随后的 `persist(cfg)` 又把 `cached` 指回旧对象，于是这段时间内别人的写入被
+  // **整体覆盖** —— 双方都收到成功响应，一方的变更却静默消失（丢的若是角色/权限，
+  // 就表现为「降权不生效」）。把 await 提到取 store 之前，异步间隙即不复存在。
+  const { salt, hash } = await hashPassword(password);
+  const cfg = requireStore();
+  if (cfg.users.some((u) => u.username.toLowerCase() === name.toLowerCase())) {
+    throw Object.assign(new Error('用户名已存在'), { status: 409 });
+  }
+  // R54②：邮箱唯一性（空串不参与）—— 与「用户名已存在」同一处、同一时机判定
+  const mail = normalizeEmail(email);
+  assertEmailFree(cfg, mail, '');
+  const now = new Date().toISOString();
+  const user = {
+    id: newId(),
+    username: name,
+    passwordSalt: salt,
+    passwordHash: hash,
+    role: normalizeRole(role),
+    permissions: normalizePermissions(permissions),
+    // 新用户默认未启用 Windows Hello；启用须走"注册并验证凭据"的完整流程
+    webauthn: normalizeWebauthn(null),
+    speedLimit: normalizeSpeedLimit(speedLimit), // R37：用户级下载限速（0 = 不限）
+    email: mail, // R54②：邮箱（管理员添加时可直接设置；空串 = 未绑定）
+    createdAt: now,
+    updatedAt: now,
+  };
+  cfg.users.push(user);
+  persist(cfg);
+  return userView(user);
+}
+
+async function updateUser(id, patch) {
+  const now = new Date().toISOString();
+  // 同 `addUser`（R14-04）：把唯一一处 await 提到取 store **之前**。
+  // 否则这一段 scrypt 期间一旦 TTL 到期换了 cached 对象，后面所有 `user.xxx = …`
+  // 都会写进脱钩的旧对象，最终 `persist(cfg)` 覆盖掉别人的写入。
+  let cred = null;
+  if (patch.password !== undefined && patch.password !== '') {
+    assertPasswordPolicy(patch.password);
+    cred = await hashPassword(patch.password);
+  }
+  const cfg = requireStore();
+  const user = cfg.users.find((u) => u.id === id);
+  if (!user) throw Object.assign(new Error('用户不存在'), { status: 404 });
+
+  if (patch.username !== undefined && String(patch.username).trim() !== user.username) {
+    const name = normalizeUsername(patch.username);
+    if (cfg.users.some((u) => u.id !== id && u.username.toLowerCase() === name.toLowerCase())) {
+      throw Object.assign(new Error('用户名已存在'), { status: 409 });
+    }
+    user.username = name;
+  }
+  if (cred) {
+    user.passwordSalt = cred.salt;
+    user.passwordHash = cred.hash;
+  }
+  if (patch.role !== undefined) {
+    const role = normalizeRole(patch.role);
+    if (user.role === 'admin' && role !== 'admin' && adminCount(cfg) <= 1) {
+      throw Object.assign(new Error('至少保留一个管理员账户'), { status: 400 });
+    }
+    user.role = role;
+  }
+  if (patch.permissions !== undefined) {
+    user.permissions = normalizePermissions(patch.permissions);
+  }
+  /**
+   * R54②：邮箱。`''` 是**合法值**（= 解绑邮箱），故判据是 `!== undefined` 而不是真值判断 ——
+   * 用 `if (patch.email)` 的话「解绑」会静默失效，而界面上会显示成功。
+   */
+  if (patch.email !== undefined) {
+    const mail = normalizeEmail(patch.email);
+    assertEmailFree(cfg, mail, id);
+    user.email = mail;
+  }
+  if (patch.speedLimit !== undefined) user.speedLimit = normalizeSpeedLimit(patch.speedLimit); // R37：未传即保持
+  user.updatedAt = now;
+  persist(cfg);
+  return userView(user);
+}
+
+function removeUser(id) {
+  const cfg = requireStore();
+  const idx = cfg.users.findIndex((u) => u.id === id);
+  if (idx < 0) return false;
+  const target = cfg.users[idx];
+  if (target.role === 'admin' && adminCount(cfg) <= 1) {
+    throw Object.assign(new Error('至少保留一个管理员账户'), { status: 400 });
+  }
+  cfg.users.splice(idx, 1);
+  persist(cfg);
+  return true;
+}
+
+/** 登录认证：按用户名匹配，返回用户安全视图或 null（SEC-05：async） */
+async function authenticateUser(username, password) {
+  const cfg = load();
+  if (!cfg) return null;
+  const name = String(username || '').trim();
+  const user = cfg.users.find((u) => u.username.toLowerCase() === name.toLowerCase());
+  // 用户不存在也做一次等价耗时的空转哈希，避免通过响应时间枚举用户名
+  if (!user) { await dummyHash(password); return null; }
+  if (!(await verifyPassword(String(password == null ? '' : password), user.passwordHash, user.passwordSalt))) {
+    return null;
+  }
+  return userView(user);
+}
+
+/**
+ * 按用户名读取原始用户记录（含 WebAuthn 凭据等敏感字段）。
+ *
+ * 仅供登录流程在服务端**内部**使用（需要 publicKey 做签名校验）；
+ * 任何路由都不得把本函数的返回值直接回传前端。
+ */
+function findUserRaw(username) {
+  const cfg = load();
+  if (!cfg) return null;
+  const name = String(username || '').trim();
+  if (!name) return null;
+  return cfg.users.find((u) => u.username.toLowerCase() === name.toLowerCase()) || null;
+}
+
+/** 按 id 读取原始用户记录（同上，仅限服务端内部使用） */
+function findUserRawById(id) {
+  const cfg = load();
+  if (!cfg) return null;
+  return cfg.users.find((u) => u.id === id) || null;
+}
+
+/**
+ * R54②：按「用户名 **或** 邮箱」读取原始用户记录（「忘记密码」的入口用）。
+ *
+ * 先按用户名匹配、再按邮箱匹配 —— 顺序固定，避免同一个输入同时命中两个账户时
+ * 结果随 `cfg.users` 的顺序漂移。用户名不可能含 `@`（`normalizeUsername` 的白名单里没有它），
+ * 所以两种输入天然互斥，「先用户名」不会把邮箱当用户名误判。
+ */
+function findUserByIdentifier(identifier) {
+  const cfg = load();
+  if (!cfg) return null;
+  const s = String(identifier == null ? '' : identifier).trim();
+  if (!s) return null;
+  const byName = cfg.users.find((u) => u.username.toLowerCase() === s.toLowerCase());
+  if (byName) return byName;
+  const mail = normalizeEmail(s);
+  if (!mail) return null;
+  return cfg.users.find((u) => normalizeEmail(u.email) === mail) || null;
+}
+
+/** 校验密码是否正确（不返回用户对象，供两步登录的第一步单独使用）（SEC-05：async） */
+async function verifyUserPassword(id, password) {
+  const user = findUserRawById(id);
+  if (!user) return false;
+  return verifyPassword(String(password == null ? '' : password), user.passwordHash, user.passwordSalt);
+}
+
+module.exports = {
+  load, save, get, flush, flushPending, getLastWriteError, getMasterKey,
+  effective, effectiveForBucket, safeView, selfTest, isCorrupted,
+  encrypt, decrypt, // 供 secure-store 复用同一主密钥与格式（S4）
+  unwritableError, // 供 enc-store 等复用「备份 + 拒绝覆盖」语义（FUN-03 / FUN-04）
+  DEFAULT_CONFIG, DEFAULT_QUOTA, normalizeQuotaBytes,
+  listCredentials, listCredentialsFor, addCredential, removeCredential, setActiveCredential, updateCredentialRemark, updateCredential, setCredentialsVisibility,
+  listProviders,
+  listBuckets, listBucketsFor, addBucket, updateBucket, removeBucket, setActiveBucket, setBucketsVisibility, bucketBlockOverseas, credentialIdForBucket,
+  getPrefs, setPrefs,
+  getUploadExcludes, setUploadExcludes,
+  // R48：线程并发（同时上传 / 加密的文件数）—— 前端 upload.js 与服务端 enc-pool 同源读取
+  getConcurrency, setConcurrency, DEFAULT_CONCURRENCY_FILES,
+  // R53：发信设置（SMTP）—— getSmtp 含明文口令，仅供服务端内部；对外走 smtpView
+  // ⚠️ 发信（验证码 / 重置密码 / 测试邮件）一律走 smtpSendConfig()：smtpView 里没有口令
+  getSmtp, saveSmtp, smtpView, smtpSendConfig, smtpConfigured,
+  // R54：站点设置（站点名称 / 公开注册 / 新用户身份）—— 无机密，siteView 整段下发
+  getSite, saveSite, siteView,
+  getCaptcha, saveCaptcha,
+  // 支付平台凭证（仅基础配置与合法性校验）
+  getPayment, savePayment, clearPayment, setPaymentEnabled, setChannelEnabled, setPaymentSiteUrl,
+  getWebdav, setWebdavEnabled, addWebdavAccount, updateWebdavAccount, removeWebdavAccount,
+  revealWebdavPassword, authenticateWebdav,
+  listUsers, getUserById, userView, addUser, updateUser, removeUser, authenticateUser,
+  // R54②：用户邮箱（唯一性判据 + 「用户名或邮箱」查用户）
+  assertEmailFree, findUserByIdentifier,
+  // Windows Hello（WebAuthn）
+  isWebauthnEnabled, getWebauthn, setUserWebauthn, clearUserWebauthn, touchWebauthn,
+  // R41：验证码两套独立凭证
+  CAPTCHA_PROVIDERS, captchaProvidersOf,
+  // R33：账户封禁
+  BAN_REASON_MAX, banInfo, setUserBan, clearUserBan,
+  findUserRaw, findUserRawById, verifyUserPassword,
+};

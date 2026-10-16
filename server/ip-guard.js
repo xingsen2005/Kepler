@@ -1,0 +1,1055 @@
+/**
+ * IP 访问守卫 —— 黑名单规则 + 国内白名单（仅放行中国大陆 IP）
+ *
+ *  - 规则存储：data/ipguard.json（{ rules: [...] }）
+ *  - 每条规则：{ id, target(单 IP 或 CIDR), remark, methods: []（空=全部方法）,
+ *               bucketIds: []（空=全局，作用于所有存储桶；否则仅作用于列出的桶，支持多个）, enabled, createdAt, hits }
+ *               （历史字段 bucketId 单值在 load() 时自动迁移为 bucketIds）
+ *  - 作用范围与优先级：黑名单叠加语义——回环放行后，先判定「桶级规则」（仅当请求目标为该桶时参与），
+ *    再判定「全局规则」，最后判定「按桶屏蔽海外 IP」；任一级别命中即屏蔽，全部未命中才放行。
+ *  - 中间件：回环地址（127.0.0.1 / ::1）永远放行，保证本机管理界面不会被锁死。
+ *    R17-01：该豁免**只对 socket 对端地址成立** —— 经反向代理时 IP 取自
+ *    `X-Forwarded-For`（请求方可控），若照样享受豁免，任何请求头都能把自己写成「本机」。
+ *  - 按桶屏蔽海外 IP：存储桶的 blockOverseasIP = true 时，访问该桶的请求仅放行国内 IP
+ *    （server/china-ips.txt 白名单）与内网/回环地址，其余全部屏蔽。
+ *    该开关随存储桶保存（见 config-store.js），因此可针对单个桶独立启用，互不影响。
+ *    历史版本曾使用全局 chinaMode，load() 时会一次性迁移到当时的全部存储桶并移除该字段。
+ */
+const crypto = require('crypto');
+const fs = require('fs');
+const path = require('path');
+const configStore = require('./config-store');
+const shareStore = require('./share-store');
+const secureStore = require('./secure-store');
+// R17-01：取客户端 IP 的唯一实现点（含 X-Forwarded-For 解析与「值是否来自转发头」）
+const security = require('./security');
+
+// 数据目录：与 stats-store / payment-orders / enc-store / share-store 同走 data-dir.js
+// 的唯一实现点（`S3_DATA_DIR`）—— 未设置时落到项目 data/，测试进程可指向临时目录
+// （否则用例会写真实 ipguard.json）。
+const DATA_DIR = require('./data-dir').dataDir();
+const GUARD_FILE = path.join(DATA_DIR, 'ipguard.json');
+const CHINA_LIST_FILE = path.join(__dirname, 'china-ips.txt');
+
+const ALLOWED_METHODS = ['GET', 'POST', 'PUT', 'DELETE', 'HEAD'];
+
+/* ------------------------- IP 解析与 CIDR 匹配（IPv4） ------------------------- */
+
+/** 点分十进制 → 32 位整数；非法返回 null */
+function ipv4ToInt(ip) {
+  const m = /^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(String(ip || '').trim());
+  if (!m) return null;
+  let v = 0;
+  for (let i = 1; i <= 4; i++) {
+    const n = Number(m[i]);
+    if (n > 255) return null;
+    v = v * 256 + n;
+  }
+  return v >>> 0;
+}
+
+/**
+ * IPv6 文本 → 16 字节 Buffer（支持 :: 简写与内嵌 IPv4，如 ::ffff:192.168.1.1）。非法返回 null
+ */
+function ipv6ToBytes(ip) {
+  let s = String(ip || '').trim();
+  if (!s || !s.includes(':')) return null;
+  s = s.replace(/^\[/, '').replace(/\].*$/, '').replace(/%.*$/, ''); // 去方括号与 zone id
+  // 内嵌 IPv4（如 ::ffff:192.168.1.5）先折算为两个十六进制组，保证 8 组结构正确
+  const v4In = /(?:^|:)(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})$/.exec(s);
+  if (v4In) {
+    const v = ipv4ToInt(v4In[1]);
+    if (v === null) return null;
+    s = s.slice(0, v4In.index) + ':' + (((v >>> 16) & 0xffff).toString(16)) + ':' + ((v & 0xffff).toString(16));
+  }
+  const d = s.indexOf('::');
+  let groups;
+  if (d >= 0) {
+    const head = s.slice(0, d) ? s.slice(0, d).split(':') : [];
+    const tail = s.slice(d + 2) ? s.slice(d + 2).split(':') : [];
+    const fill = 8 - head.length - tail.length;
+    if (fill < 0) return null;
+    groups = head.concat(new Array(fill).fill('0'), tail);
+  } else {
+    groups = s.split(':');
+  }
+  if (groups.length !== 8) return null;
+  const out = Buffer.alloc(16);
+  for (let i = 0; i < 8; i++) {
+    const g = groups[i];
+    if (g.indexOf('.') >= 0) { // 内嵌 IPv4（仅允许位于最后 32 位）
+      if (i !== 7) return null;
+      const v = ipv4ToInt(g);
+      if (v === null) return null;
+      out.writeUInt32BE(v >>> 0, 12);
+      continue;
+    }
+    const v = parseInt(g, 16);
+    if (!Number.isFinite(v) || v < 0 || v > 0xffff) return null;
+    out[i * 2] = (v >> 8) & 0xff;
+    out[i * 2 + 1] = v & 0xff;
+  }
+  return out;
+}
+
+/** 16 字节 → RFC 5952 规范文本（小写、无前导零、最长零段压缩为 `::`，同长取最左） */
+function ipv6ToString(b) {
+  const groups = [];
+  for (let i = 0; i < 8; i++) groups.push(((b[i * 2] << 8) | b[i * 2 + 1]).toString(16));
+  let bestStart = -1;
+  let bestLen = 0;
+  for (let i = 0; i < 8;) {
+    if (groups[i] !== '0') { i++; continue; }
+    let j = i;
+    while (j < 8 && groups[j] === '0') j++;
+    if (j - i > bestLen) { bestLen = j - i; bestStart = i; }
+    i = j;
+  }
+  if (bestLen < 2) return groups.join(':');
+  const head = groups.slice(0, bestStart).join(':');
+  const tail = groups.slice(bestStart + bestLen).join(':');
+  return `${head}::${tail}`;
+}
+
+/**
+ * R27-07：任意 IP 字面量 → **规范文本**；非法返回 `null`。
+ *
+ * 为什么需要「规范化」而不只是「校验」：`X-Forwarded-For` 在 `TRUST_PROXY=1` 下是
+ * **请求方可控输入**，而它在限流与失败锁定里直接充当键（`ip`、`ip|username`）。
+ * 只要同一个地址存在多种拼写，攻击者就能靠改写拼写轮换键预算 —— 实测旧实现下
+ * `1.2.3.4` / `01.2.3.4` / `001.2.3.4` … 可得到 81 个互不相干的键；
+ * `::A` 与 `::a`、`::ffff:0102:0304` 与 `::ffff:1.2.3.4` 同理。规范化后同一地址
+ * 只有一种键。
+ *
+ * 同时收紧**合法性**：旧实现的 IPv6 分支是「含 `::` 且字符集合法即算 IP」，
+ * 于是 `1::2::3`、`:::::` 这类**解析不出**的串被 `isIpLiteral` 放行，而
+ * `ip-guard.evaluate()` 对解析失败的地址会跳过**全部**规则（见该函数），
+ * 等于「发一个畸形 IP 即可绕过黑名单与屏蔽海外」。
+ *
+ * 规则：
+ *  - IPv4：四段十进制且**不得有前导零**（`01.2.3.4` 与 `1.2.3.4` 是同一地址）；
+ *  - IPv6：字符集 + 结构都要能真正解析成 16 字节；
+ *  - IPv4-mapped（`::ffff:a.b.c.d`）统一折算为点分十进制（与 `security.normalizeIp`
+ *    的历史行为一致）。
+ */
+function canonicalIpLiteral(ip) {
+  let s = String(ip == null ? '' : ip).trim();
+  if (!s || s.length > 45) return null;
+  if (s.startsWith('[')) s = s.replace(/^\[/, '').replace(/\].*$/, ''); // 容忍 [::1] 写法
+  if (!s.includes(':')) {
+    if (!/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.test(s)) return null;
+    if (/(^|\.)0\d/.test(s)) return null; // 前导零：同一地址的第二种拼写
+    const v = ipv4ToInt(s);
+    if (v === null) return null;
+    return `${(v >>> 24) & 255}.${(v >>> 16) & 255}.${(v >>> 8) & 255}.${v & 255}`;
+  }
+  // `parseInt('1g', 16)` 会返回 1，故字符集必须先卡一遍（否则 '1g::' 会被当成合法地址）
+  if (!/^[0-9a-fA-F:.]+$/.test(s)) return null;
+  const b = ipv6ToBytes(s);
+  if (!b) return null;
+  const mapped = b.subarray(0, 10).every((x) => x === 0) && b[10] === 0xff && b[11] === 0xff;
+  if (mapped) return `${b[12]}.${b[13]}.${b[14]}.${b[15]}`;
+  return ipv6ToString(b);
+}
+
+/** 规范化目标：IPv4（1.2.3.4 / 10.0.0.0/8）或 IPv6（2001:db8::1 / 2001:db8::/32）。非法返回 null */
+function parseTarget(target) {
+  const s = String(target || '').trim();
+  if (!s) return null;
+  const slash = s.indexOf('/');
+  const ipPart = (slash === -1 ? s : s.slice(0, slash)).trim();
+  const prefixPart = slash === -1 ? null : s.slice(slash + 1).trim();
+  if (ipPart.includes(':')) {
+    const bytes = ipv6ToBytes(ipPart);
+    if (!bytes) return null;
+    if (prefixPart !== null && prefixPart === '') return null; // R27-09：`/` 不得退化成 `/0`
+    const prefix = prefixPart === null ? 128 : Number(prefixPart);
+    if (!Number.isInteger(prefix) || prefix < 0 || prefix > 128) return null;
+    return { v6: true, bytes, prefix, text: prefixPart === null ? ipPart : `${ipPart}/${prefix}` };
+  }
+  const ip = ipv4ToInt(ipPart);
+  if (ip === null) return null;
+  /**
+   * R27-09：**尾斜杠**不得退化成 `/0`。
+   *
+   * `prefixPart === ''`（即写成 `1.2.3.4/`）时 `Number('') === 0` —— 于是一个
+   * 「末尾多打了一个斜杠」的规则会变成 `1.2.3.4/0`：匹配**所有** IPv4 客户端。
+   * 该规则由全局中间件执行，后果是除回环外全网 403（一条笔误把站点关停）。
+   * 空串必须按非法处理，`/0` 只能由显式写出的 `0.0.0.0/0` 产生。
+   */
+  if (prefixPart !== null && prefixPart === '') return null;
+  const prefix = prefixPart === null ? 32 : Number(prefixPart);
+  if (!Number.isInteger(prefix) || prefix < 0 || prefix > 32) return null;
+  return { v6: false, ip, prefix, text: prefixPart === null ? ipPart : `${ipPart}/${prefix}` };
+}
+
+/** 判断 ipInt 是否落在 { ip, prefix } 网段内（IPv4） */
+function cidrContains(ipInt, cidr) {
+  if (cidr.prefix === 0) return true;
+  const mask = (0xFFFFFFFF << (32 - cidr.prefix)) >>> 0;
+  return ((ipInt & mask) >>> 0) === ((cidr.ip & mask) >>> 0);
+}
+
+/** 判断 IPv6 地址（16 字节）是否落在网段内 */
+function cidrContainsV6(bytes, cidr) {
+  if (!bytes || !cidr || !cidr.bytes) return false;
+  const fullBytes = cidr.prefix >> 3;
+  const remBits = cidr.prefix & 7;
+  for (let i = 0; i < fullBytes; i++) if (bytes[i] !== cidr.bytes[i]) return false;
+  if (remBits) {
+    const mask = (0xff << (8 - remBits)) & 0xff;
+    if ((bytes[fullBytes] & mask) !== (cidr.bytes[fullBytes] & mask)) return false;
+  }
+  return true;
+}
+
+/** 解析客户端 IP 为统一结构：{ v6, ip } 或 { v6, bytes }；非法返回 null */
+function parseIpInfo(ip) {
+  const s = String(ip || '').trim();
+  if (s.includes(':')) {
+    const bytes = ipv6ToBytes(s);
+    return bytes ? { v6: true, bytes } : null;
+  }
+  const v = ipv4ToInt(s);
+  return v === null ? null : { v6: false, ip: v };
+}
+
+/** 统一 CIDR 匹配：IP 版本与目标网段版本必须一致（v4 规则不会命中 v6 地址，反之亦然） */
+function cidrMatch(ipInfo, cidr) {
+  if (!ipInfo || !cidr) return false;
+  if (!!ipInfo.v6 !== !!cidr.v6) return false;
+  return ipInfo.v6 ? cidrContainsV6(ipInfo.bytes, cidr) : cidrContains(ipInfo.ip, cidr);
+}
+
+/* ------------------------- 国内 IP 白名单 ------------------------- */
+
+let chinaRanges = null; // [{ ip, prefix }] —— 原始 CIDR（供其它逻辑复用）
+let chinaIntervals = null; // [{ start, end }] —— 归一化后的不相交区间（isChinaIP 使用）
+let chinaLoaded = false;
+
+function loadChinaList() {
+  if (chinaLoaded) return chinaRanges;
+  chinaLoaded = true;
+  chinaRanges = [];
+  try {
+    const text = fs.readFileSync(CHINA_LIST_FILE, 'utf8');
+    for (const line of text.split(/\r?\n/)) {
+      const s = line.trim();
+      if (!s || s.startsWith('#')) continue;
+      const c = parseTarget(s);
+      if (c) chinaRanges.push(c);
+    }
+    // P5：按起始 IP 升序排列，便于二分查找（替代 6000+ 段线性扫描）
+    chinaRanges.sort((a, b) => a.ip - b.ip);
+    // FUN-08：把 CIDR 折叠为**互不相交**的闭区间数组。
+    // 见 chinaIntervals 的说明 —— 折叠后二分定位到的区间是唯一候选，无需回溯窗口。
+    chinaIntervals = buildIntervals(chinaRanges);
+  } catch (e) {
+    console.warn('[ip-guard] 国内 IP 白名单加载失败：', e.message);
+    chinaRanges = [];
+    chinaIntervals = [];
+  }
+  return chinaRanges;
+}
+
+/**
+ * 把 CIDR 列表归一化为升序、互不相交的闭区间数组（FUN-08）
+ *
+ * ## 为什么必须归一化
+ *
+ * 二分查找只能定位「最后一个 start ≤ 目标」的段。若白名单里存在**重叠或被完全包含**
+ * 的网段（例如既收录了 1.0.0.0/8 又收录了 1.2.0.0/16，或若干同起点的条目），
+ * 真正命中的那条可能排在更靠前的位置 —— 那时无论回溯窗口取多大都可能漏判。
+ * 旧实现固定回溯 8 条，正是用一个 magic number 掩盖了这个结构性问题。
+ *
+ * 归一化为「不相交且按 start 升序」之后：命中与否由**唯一**的那个候选区间决定，
+ * 判定退化为一次 O(log n) 二分 + 一次比较，既正确又无需任何魔法数字。
+ *
+ * @param {Array<{ip:number, prefix:number}>} cidrs
+ * @returns {Array<{start:number, end:number}>}
+ */
+function buildIntervals(cidrs) {
+  const raw = [];
+  for (const c of cidrs) {
+    if (c.v6) continue; // 白名单当前仅处理 IPv4
+    const mask = c.prefix === 0 ? 0 : ((0xFFFFFFFF << (32 - c.prefix)) >>> 0);
+    const start = (c.ip & mask) >>> 0;
+    const span = (~mask >>> 0);
+    const end = Math.min(0xFFFFFFFF, start + span);
+    raw.push({ start, end });
+  }
+  raw.sort((a, b) => a.start - b.start || a.end - b.end);
+  const merged = [];
+  for (const it of raw) {
+    const last = merged[merged.length - 1];
+    // 「end + 1」表示相邻区间也可合并：1.0.0.0-1.255.255.255 与 2.0.0.0-… 本就连续
+    if (last && it.start <= last.end + 1) {
+      if (it.end > last.end) last.end = it.end;
+    } else {
+      merged.push({ start: it.start, end: it.end });
+    }
+  }
+  return merged;
+}
+
+/**
+ * 是否国内 IP（白名单为 IPv4 列表，IPv6 一律返回 false → chinaMode 下按海外处理）
+ * 说明：如需放行 IPv6，请在规则中显式添加放行规则或关闭国内白名单模式。
+ */
+function isChinaIP(ip) {
+  if (String(ip || '').includes(':')) return false;
+  const v = ipv4ToInt(ip);
+  if (v === null) return false;
+  loadChinaList();
+  const segs = chinaIntervals || [];
+  if (!segs.length) return false;
+  // FUN-08：区间已归一化为「不相交 + 升序」，二分定位到的候选是唯一的：
+  // 只要目标 ≤ 该区间的 end 就必然命中，否则必然不命中 —— 无需任何回溯窗口。
+  let lo = 0;
+  let hi = segs.length - 1;
+  let idx = -1;
+  while (lo <= hi) {
+    const mid = (lo + hi) >> 1;
+    if (segs[mid].start <= v) { idx = mid; lo = mid + 1; } else { hi = mid - 1; }
+  }
+  if (idx < 0) return false;
+  return v <= segs[idx].end;
+}
+
+/** 内网 / 回环 / 链路本地等保留地址（chinaMode 下同样放行，避免把局域网设备挡掉） */
+function isPrivateIP(ip) {
+  const s = String(ip || '');
+  if (s.includes(':')) return isPrivateIPv6(s);
+  const v = ipv4ToInt(ip);
+  if (v === null) return true; // 解析不了的地址不按公网处理
+  const a = (v >>> 24) & 0xff, b = (v >>> 16) & 0xff;
+  if (a === 10 || a === 127) return true;                    // 10/8, 127/8
+  if (a === 172 && b >= 16 && b <= 31) return true;          // 172.16/12
+  if (a === 192 && b === 168) return true;                   // 192.168/16
+  if (a === 169 && b === 254) return true;                   // 链路本地
+  /**
+   * R27-25：补两个**保留段** —— 它们不是公网地址，却被旧实现判成公网。
+   *
+   *  - `100.64.0.0/10`（RFC 6598，运营商级 NAT / 云厂商内网）：`METADATA_HOSTS`
+   *    里那个 `100.100.100.200`（阿里云内网元数据）正落在此段，说明代码作者本就
+   *    把它当内网看待，只是判定函数漏了这一段 —— 于是 `https://100.64.0.1` 这类
+   *    端点能过守卫，而同一段里的邻居地址是可 TLS 访问的。
+   *  - `198.18.0.0/15`（RFC 2544，基准测试保留段）：同理，不应作为公网端点。
+   */
+  if (a === 100 && b >= 64 && b <= 127) return true;         // 100.64/10
+  if (a === 198 && (b === 18 || b === 19)) return true;      // 198.18/15
+  if (a === 0 || a >= 224) return true;                      // 0/8 与组播/保留段
+  return false;
+}
+
+/** IPv6 私有/保留地址判定（S10）：回环、ULA、链路本地、组播与未指定地址视为内网 */
+function isPrivateIPv6(ip) {
+  const b = ipv6ToBytes(ip);
+  if (!b) return true; // 解析失败按非公网处理，避免误伤
+  if (b.every((x) => x === 0)) return true;                 // :: 未指定
+  const loopback = ipv6ToBytes('::1');
+  if (loopback && b.equals(loopback)) return true;           // ::1 回环
+  if ((b[0] & 0xfe) === 0xfc) return true;                   // fc00::/7 唯一本地地址
+  if (b[0] === 0xfe && (b[1] & 0xc0) === 0x80) return true;  // fe80::/10 链路本地
+  if (b[0] === 0xff) return true;                            // 组播
+  // IPv4-mapped（::ffff:a.b.c.d）→ 按内嵌 IPv4 规则判定
+  let mapped = true;
+  for (let i = 0; i < 10; i++) if (b[i] !== 0) { mapped = false; break; }
+  if (mapped && b[10] === 0xff && b[11] === 0xff) {
+    return isPrivateIP(`${b[12]}.${b[13]}.${b[14]}.${b[15]}`);
+  }
+  return false;
+}
+
+/* ------------------------- 规则存储 ------------------------- */
+
+let guard = null; // { rules: [], updatedAt }
+
+/**
+ * 单条规则的归一化 —— **唯一实现点**（读盘 / 导入共用）。
+ *
+ * 三件事缺一不可，且历史上每一条都各自踩过坑：
+ *  ① `bucketId` → `bucketIds` 数组迁移（旧版单桶字段）；
+ *  ② `kind` / `speedLimit` 显式补默认值（R37：历史规则全是「拦截」，缺省即 block。
+ *     靠 `undefined !== 'speed'` 隐式成立很脆 —— 有人写成 `r.kind === 'block'`
+ *     就会把历史规则整批放行）；
+ *  ③ 预解析 `target` → `_parsed`（性能），**且判据不能只看 `text`**：
+ *     R28-01 的坏缓存（IPv6 的 `bytes` 被 JSON 退化成 `{type:'Buffer',data:[…]}`）
+ *     其 `text` 与 target 一字不差，旧判据会一直沿用坏缓存 ⇒ 规则静默失效。
+ */
+function normalizeRule(r) {
+  const o = Object.assign({}, r);
+  if (!Array.isArray(o.bucketIds)) {
+    const legacy = String(o.bucketId || '').trim();
+    o.bucketIds = legacy ? [legacy] : [];
+  }
+  o.bucketIds = o.bucketIds.map((x) => String(x || '').trim()).filter(Boolean);
+  delete o.bucketId;
+  o.kind = normalizeKind(o.kind);
+  o.speedLimit = coerceSpeedLimit(o.speedLimit);
+  const cached = o._parsed;
+  const stale = !cached || cached.text !== String(o.target || '').trim();
+  const corrupt = Boolean(cached && cached.v6 && !Buffer.isBuffer(cached.bytes));
+  if (stale || corrupt) o._parsed = parseTarget(o.target);
+  return o;
+}
+
+function load() {
+  if (guard) return guard;
+  // S4：加密存储（兼容历史明文文件）
+  // SEC-09：readJson 现在区分「文件不存在」与「存在但损坏」——后者抛错。
+  // 这里捕获后降级为空规则集继续运行（不阻断服务），但 secure-store 已锁定该文件写入，
+  // 因此磁盘上那份损坏文件不会被空规则集覆盖。
+  let j = null;
+  try {
+    j = secureStore.readJson(GUARD_FILE, null);
+  } catch (e) {
+    console.error('[ip-guard] IP 屏蔽规则文件损坏，已降级为空规则并锁定写入：', e.message);
+  }
+  guard = (j && typeof j === 'object')
+    ? { rules: Array.isArray(j.rules) ? j.rules : [], updatedAt: j.updatedAt || '' }
+    : { rules: [], updatedAt: '' };
+  // 归一化走**唯一实现点** `normalizeRule()`：读盘与「配置备份导入」
+  // （`replaceAllRules`）必须得到完全一致的规则对象，否则导入进来的规则会缺
+  // kind / bucketIds 迁移或 _parsed 预解析，表现为「导入成功但规则不生效」。
+  guard = { rules: guard.rules.map(normalizeRule), updatedAt: guard.updatedAt };
+  // 迁移历史全局 chinaMode → 按桶 blockOverseasIP（幂等；仅执行一次）
+  // 语义等价：原先全局生效，迁移后等价于「当时存在的每个桶都开启」
+  if (j && typeof j === 'object' && j.chinaMode !== undefined) {
+    if (j.chinaMode) {
+      try {
+        const cfg = configStore.load();
+        if (cfg && Array.isArray(cfg.buckets)) {
+          for (const b of cfg.buckets) configStore.updateBucket(b.id, { blockOverseasIP: true });
+        }
+      } catch (e) { /* 迁移失败不影响守卫可用性 */ }
+    }
+    delete guard.chinaMode;
+    persist();
+  }
+  return guard;
+}
+
+/**
+ * R28-01：落盘视图 —— **剥掉派生缓存 `_parsed`**。
+ *
+ * `_parsed` 是 `parseTarget()` 的预解析结果，纯属性能缓存，**不该被持久化**：
+ * IPv6 目标的 `bytes` 是一个 `Buffer`，JSON 往返后会变成 `{type:'Buffer',data:[…]}`，
+ * 而 `load()` 的复用判据只看 `text` 字段（它一字不差）→ 坏缓存被原样带进判定，
+ * `cidrContainsV6()` 逐字节比较时 `cidr.bytes[i]` 恒为 `undefined` → **规则永远不命中
+ * 且不报错**（实测：写一条 IPv6 屏蔽规则 → 落盘 → 重启 → 该 IP 直接被放行）。
+ *
+ * 修法取「源头不写」+「读时兜底」两条：本函数保证此后不再把缓存写进磁盘；
+ * `load()` 里的类型校验负责把**已经**带着坏缓存的历史文件纠正过来。
+ */
+function persistView(g) {
+  return Object.assign({}, g, {
+    rules: (g.rules || []).map((r) => {
+      const copy = Object.assign({}, r);
+      delete copy._parsed;
+      return copy;
+    }),
+  });
+}
+
+function persist() {
+  if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
+  guard.updatedAt = new Date().toISOString();
+  secureStore.writeJson(GUARD_FILE, persistView(guard));
+}
+
+/**
+ * R38：**整批替换**规则集 —— 「配置备份」导入的唯一落点。
+ *
+ * 为什么不让导入方循环调 `addRule()`：那样会丢掉每条规则的 `id` / `enabled` / `hits`，
+ * 于是「备份时停用的规则，还原后变成启用」—— 一条被刻意停用的屏蔽规则悄悄生效，
+ * 用户只会觉得「导入把配置弄坏了」。这里保留原记录（缺 id 才补一个），
+ * 归一化复用 `normalizeRule()`，与读盘路径**同一口径**。
+ *
+ * 说明：导入是**覆盖**语义（需求原话「导入配置后，原有设置项将被直接覆盖」），
+ * 因此这里不做合并；调用方（`server/backup.js`）负责保证只在「全新实例」窗口内被调用。
+ */
+function replaceAllRules(rules) {
+  load();
+  guard.rules = (Array.isArray(rules) ? rules : []).map((r) => {
+    const o = normalizeRule(r);
+    if (!o.id) o.id = newId();
+    return o;
+  });
+  persist();
+  return listRules();
+}
+
+/**
+ * 规则 ID（SEC-14）
+ *
+ * 旧实现用 `Date.now() + Math.random()` —— 非密码学安全随机源，且与项目
+ * 「统一 `crypto.randomBytes()` 作为实体 ID」的约定不一致。改用 CSPRNG 后
+ * 与其它实体（用户 / 密钥 / 桶 / 分享链接）实现统一。
+ */
+function newId() {
+  return crypto.randomBytes(16).toString('hex');
+}
+
+/**
+ * 对外视图：与 `persistView()` 同一口径 —— **不回传派生缓存 `_parsed`**。
+ * R28-01：它没有任何界面用途，却会把 IPv6 规则的 16 字节数组（乃至坏缓存里的
+ * `{type:'Buffer',data:[…]}`）一并回显给前端。
+ */
+function listRules() { return load().rules.map((r) => { const c = { ...r }; delete c._parsed; return c; }); }
+
+/**
+ * 校验并规范化作用范围（多桶）：返回去重后的桶 id 数组；空数组 = 全局。
+ * 兼容传入单值（字符串）：视为单元素数组。
+ */
+function normalizeBucketIds(bucketIds) {
+  const arr = Array.isArray(bucketIds)
+    ? bucketIds.map((x) => String(x || '').trim()).filter(Boolean)
+    : (bucketIds && String(bucketIds).trim() ? [String(bucketIds).trim()] : []);
+  const known = new Set(configStore.listBuckets().buckets.map((b) => b.id));
+  for (const id of arr) {
+    if (!known.has(id)) { const e = new Error('指定的存储桶不存在（可能已被解绑）'); e.status = 400; throw e; }
+  }
+  return [...new Set(arr)];
+}
+
+/** 作用范围签名（用于去重比较）：'' = 全局；'id1,id2,…' = 桶集合 */
+function scopeKey(ids) { return [...(ids || [])].sort().join(','); }
+
+/**
+ * 规则的两种用途（R37）：
+ *  - `'block'`（缺省，历史规则全是它）→ 命中即**拦截**；
+ *  - `'speed'`                      → 命中即**限速**（不拦截）。
+ *
+ * ⚠️ 两者共用同一张规则表、同一套 CIDR / 作用域 / 方法语义，但**判定必须互斥**：
+ * `matchRules()` 只认 `block`，`speedLimitFor()` 只认 `speed`。若 `matchRules` 忘了
+ * 过滤，一条「限速规则」会顺带把流量**拦死**——限速功能的误用形态里最严重的一种。
+ */
+const RULE_KINDS = ['block', 'speed'];
+
+function normalizeKind(k) {
+  return RULE_KINDS.includes(String(k)) ? String(k) : 'block';
+}
+
+/**
+ * 限速值的**粗存**：非数字一律归 0（0 = 不限速）。
+ *
+ * 这里刻意只做「粗存」，真正的判据（有限正数 → 向下取整，其余归 0）收敛在
+ * `server/throttle.js` 的 `normalizeSpeedLimit()` —— 它在限速生效的**唯一出口**
+ * （`pickEffective()`）上再归一化一次，因此本文件存进来的任何脏值都造不出
+ * 一个非法的生效速率。ip-guard 不能 require throttle（throttle 反过来 require
+ * 本模块，会成环），故这里不做完整归一化。
+ */
+function coerceSpeedLimit(v) {
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : 0;
+}
+
+function addRule({ target, remark, methods, bucketIds, kind, speedLimit }) {
+  const t = parseTarget(target);
+  if (!t) { const e = new Error('IP 或 CIDR 格式不正确（示例：1.2.3.4 或 10.0.0.0/8）'); e.status = 400; throw e; }
+  const bids = normalizeBucketIds(bucketIds);
+  const g = load();
+  // 同一作用范围内不允许重复目标；不同范围（全局 vs 某桶集合）允许同名目标共存
+  if (g.rules.some((r) => r.target === t.text && scopeKey(r.bucketIds) === scopeKey(bids))) {
+    const e = new Error('该 IP / IP 段在此作用范围内已存在屏蔽规则'); e.status = 409; throw e;
+  }
+  const rule = {
+    id: newId(), target: t.text, _parsed: t,
+    remark: String(remark || '').slice(0, 100),
+    kind: normalizeKind(kind),
+    speedLimit: coerceSpeedLimit(speedLimit),
+    methods: normalizeMethods(methods), bucketIds: bids, enabled: true,
+    createdAt: new Date().toISOString(), hits: 0,
+  };
+  g.rules.push(rule);
+  persist();
+  return { ...rule };
+}
+
+function normalizeMethods(methods) {
+  if (!Array.isArray(methods) || !methods.length) return []; // 空 = 屏蔽全部方法
+  return [...new Set(methods.map((m) => String(m).toUpperCase()))]
+    .filter((m) => ALLOWED_METHODS.includes(m));
+}
+
+function updateRule(id, { target, remark, methods, bucketIds, kind, speedLimit }) {
+  const g = load();
+  const r = g.rules.find((x) => x.id === id);
+  if (!r) { const e = new Error('规则不存在'); e.status = 404; throw e; }
+  if (bucketIds !== undefined) r.bucketIds = normalizeBucketIds(bucketIds);
+  if (kind !== undefined) r.kind = normalizeKind(kind);
+  if (speedLimit !== undefined) r.speedLimit = coerceSpeedLimit(speedLimit);
+  if (target !== undefined) {
+    const t = parseTarget(target);
+    if (!t) { const e = new Error('IP 或 CIDR 格式不正确'); e.status = 400; throw e; }
+    if (g.rules.some((x) => x.id !== id && x.target === t.text && scopeKey(x.bucketIds) === scopeKey(r.bucketIds))) {
+      const e = new Error('该 IP / IP 段在此作用范围内已存在屏蔽规则'); e.status = 409; throw e;
+    }
+    r.target = t.text;
+    r._parsed = t; // 更新预解析缓存（性能 #1）
+  }
+  if (remark !== undefined) r.remark = String(remark).slice(0, 100);
+  if (methods !== undefined) r.methods = normalizeMethods(methods);
+  persist();
+  return { ...r };
+}
+
+/**
+ * 桶被解绑 / 彻底删除时同步清理规则引用，返回受影响规则条数：
+ *  - 仅作用于该桶的规则 → 整条删除
+ *  - 作用于多桶的规则   → 从 bucketIds 中移除该桶（范围缩小）
+ */
+function removeRulesForBucket(bucketId) {
+  const g = load();
+  let affected = 0;
+  const kept = [];
+  for (const r of g.rules) {
+    const bids = Array.isArray(r.bucketIds) ? r.bucketIds : [];
+    if (!bids.includes(bucketId)) { kept.push(r); continue; }
+    affected++;
+    const rest = bids.filter((x) => x !== bucketId);
+    if (!rest.length) continue; // 只剩该桶 → 整条删除（避免退化为全局而意外扩大范围）
+    r.bucketIds = rest;
+    kept.push(r);
+  }
+  g.rules = kept;
+  if (affected) persist();
+  return affected;
+}
+
+function removeRule(id) {
+  const g = load();
+  const i = g.rules.findIndex((x) => x.id === id);
+  if (i === -1) { const e = new Error('规则不存在'); e.status = 404; throw e; }
+  const [removed] = g.rules.splice(i, 1);
+  persist();
+  return removed;
+}
+
+function setRuleEnabled(id, enabled) {
+  const g = load();
+  const r = g.rules.find((x) => x.id === id);
+  if (!r) { const e = new Error('规则不存在'); e.status = 404; throw e; }
+  r.enabled = !!enabled;
+  persist();
+  return { ...r };
+}
+
+/**
+ * 设置指定存储桶是否屏蔽海外 IP（写入存储桶配置，非本模块文件）。
+ * @returns {{ ok: boolean, bucketId: string, blockOverseasIP: boolean, chinaRangeCount: number }}
+ */
+function setBucketOverseas(bucketId, enabled) {
+  const cfg = configStore.load();
+  if (!cfg || !(cfg.buckets || []).some((b) => b.id === bucketId)) {
+    const e = new Error('存储桶不存在'); e.status = 404; throw e;
+  }
+  configStore.updateBucket(bucketId, { blockOverseasIP: !!enabled });
+  return { ok: true, bucketId, blockOverseasIP: !!enabled, chinaRangeCount: loadChinaList().length };
+}
+
+/**
+ * 解析某桶是否开启海外屏蔽（带缓存：同一桶 5 秒内不重复读配置，避免高频请求反复解密配置）
+ */
+const overseasCache = new Map(); // bucketId -> { v, at }
+const OVERSEAS_CACHE_TTL_MS = 5000;
+/** FUN-12：桶 id 数量本就有界，但这里仍设上限 —— 无界 Map 是这个项目反复出现的形态 */
+const OVERSEAS_CACHE_MAX = 500;
+function bucketBlocksOverseas(bucketId) {
+  if (!bucketId) return false;
+  const hit = overseasCache.get(bucketId);
+  const now = Date.now();
+  if (hit && now - hit.at < OVERSEAS_CACHE_TTL_MS) return hit.v;
+  let v = false;
+  try { v = configStore.bucketBlockOverseas(configStore.load(), bucketId); } catch (e) { v = false; }
+  // FUN-12：写入时顺带清掉过期项（旧实现只判 TTL 从不删除，条目只增不减）
+  for (const [k, e] of overseasCache) {
+    if (now - e.at > OVERSEAS_CACHE_TTL_MS) overseasCache.delete(k);
+  }
+  while (overseasCache.size >= OVERSEAS_CACHE_MAX) {
+    const oldest = overseasCache.keys().next();
+    if (oldest.done) break;
+    overseasCache.delete(oldest.value);
+  }
+  overseasCache.set(bucketId, { v, at: now });
+  return v;
+}
+
+/** 清除海外屏蔽判定缓存（桶开关变更后立即生效） */
+function invalidateOverseasCache(bucketId) {
+  if (bucketId) overseasCache.delete(bucketId);
+  else overseasCache.clear();
+}
+
+/* ------------------------- 判定与中间件 ------------------------- */
+
+/**
+ * 客户端 IPv4（兼容既有调用方：WebDAV 的 403 提示页用它回显 IP）。
+ *
+ * R17-01：**必须复用 `security.clientIpInfo()`——全库唯一的取 IP 实现**。
+ *
+ * 此前这里自带一份「只看 `socket.remoteAddress`、没有任何 X-Forwarded-For 分支」的
+ * 私有实现，而 `deploy.sh` 的默认部署恰好是「Nginx 反代（`proxy_pass
+ * http://127.0.0.1:$APP_PORT`）+ `TRUST_PROXY=1`」，于是守卫恒看到 `127.0.0.1`：
+ * `evaluate()` 第一条「本机永远放行」直接把请求放出去，**桶级规则 / 全局规则 /
+ * 按桶屏蔽海外 IP 一条都不会被求值** —— 界面里配得好好的屏蔽规则全是摆设，
+ * 而管理员会据此产生错误的安全假设。WebDAV（`/dav`）复用同一入口，同样失效。
+ *
+ * 同一进程里两条取 IP 路径还会分叉：限流 / 失败锁定 / 分享冻结（`security.clientIp`）
+ * 拿到真实 IP，IP 守卫拿到回环 —— 日志与审计口径也对不齐。
+ */
+function clientIp(req) {
+  return security.clientIpInfo(req).ip;
+}
+
+/**
+ * 解析本次请求所属会话的「当前桶」与角色（FUN-07）
+ *
+ * ip-guard 必须挂在鉴权中间件**之前**（不然被屏蔽的请求会先走一遍业务逻辑），
+ * 因此执行到这里时 AsyncLocalStorage 里还没有会话上下文，只能自己解析一次 token。
+ *
+ * 这一步的存在意义：桶级 IP 规则要作用在**请求的真实目标桶**上。若这里读
+ * 全局 `cfg.activeBucketId`，那么普通用户切桶后 —— 界面打的是自己的桶、操作层
+ * 打的是自己的桶，唯独 IP 守卫按全局默认桶判定 —— 于是「对 A 桶生效的封禁」
+ * 在用户切到 B 桶时失效，反之 A 桶用户的合法请求可能撞上 B 桶的封禁。
+ * 与 FUN-15 同源：目标桶只能是会话级解析结果。
+ *
+ * @returns {{bucketId: string, role: string}} 无会话/无上下文时返回空桶 id 与 'admin'
+ */
+function sessionBucketOf(req) {
+  let authSession;
+  try {
+    authSession = require('./auth-session');
+  } catch (e) {
+    return { bucketId: '', role: 'admin' };
+  }
+  let ctx = null;
+  try { ctx = require('./request-context'); } catch (e) { /* 上下文不可用时按无会话处理 */ }
+  const direct = ctx ? ctx.activeBucketId() : '';
+  if (direct) return { bucketId: direct, role: (ctx.role() || 'admin') };
+  const token = (ctx && ctx.token()) || authSession.parseToken(req);
+  if (!token) return { bucketId: '', role: 'admin' };
+  const s = authSession.getSession(token);
+  if (!s) return { bucketId: '', role: 'admin' };
+  // 与鉴权中间件一致：角色取**实时用户记录**，不用会话里的快照
+  let role = (s.user && s.user.role) || 'user';
+  try {
+    const live = configStore.findUserRawById(s.user && s.user.id);
+    if (live && live.role) role = live.role;
+    else if (live === null || live === undefined) role = (s.user && s.user.role) || 'user';
+  } catch (e) { /* 配置不可读时退回会话快照 */ }
+  return { bucketId: s.activeBucketId || '', role };
+}
+
+/**
+ * 解析本次请求的目标存储桶（本地绑定 id）
+ *  - /api/buckets/local/:id/...  → URL 中的桶 id
+ *  - /s/:id（分享页/下载）       → 分享链接快照桶名 → 本地绑定 id
+ *  - /api/fs/... 、/api/stats/... → 本次会话生效的桶（与操作层同源，见 sessionBucketOf）
+ *  - /dav/...（WebDAV）          → 全局激活桶（WebDAV 无会话，操作的就是它，见下）
+ *  - 其余（配置管理、IP 规则管理、静态页面等）→ null（仅全局规则参与判定）
+ */
+function resolveBucketId(req) {
+  const p = (req && req.path) || '';
+  let m = /^\/api\/buckets\/local\/([^/?]+)/.exec(p);
+  /**
+   * R27-10：`decodeURIComponent` 对畸形百分号编码（`%E0%A4%A`、`%ZZ`）会抛
+   * `URIError`，而本中间件挂在**鉴权之前**、且这段代码在回环豁免之前执行 ——
+   * 于是**匿名**请求即可让服务端返回 500 并把整段调用栈打进日志（刷屏 + 噪音）。
+   * 这里按「无法解析出桶 id」处理：桶级规则不参与判定，请求继续走全局规则。
+   */
+  if (m) {
+    try {
+      return decodeURIComponent(m[1]);
+    } catch (e) {
+      return null;
+    }
+  }
+  m = /^\/s\/([A-Za-z0-9_-]+)/.exec(p);
+  if (m) {
+    try {
+      const link = shareStore.get(m[1]);
+      if (link && link.bucket) {
+        const cfg = configStore.load();
+        const b = cfg && cfg.buckets.find((x) => x.bucket === link.bucket);
+        return b ? b.id : null;
+      }
+    } catch (e) { /* ignore */ }
+    return null;
+  }
+  // R7-04：WebDAV 跑在**独立端口**上（`webdav-server.js`，挂载点 `/dav`），请求路径形如
+  // `/dav/dir/file.txt`。此前这里不认 `/dav/*` → 一律返回 null → 桶级 IP 规则与
+  // 「一键屏蔽海外 IP」对 WebDAV 客户端形同虚设（SEC-07 只补上了「全局」这一半）。
+  //
+  // WebDAV 没有会话上下文，它的读写走 fs-gateway → configStore.get()，操作对象就是
+  // **全局激活桶** —— 因此这里也必须取全局激活桶，才能与操作层同源。
+  if (p === '/dav' || p.indexOf('/dav/') === 0) {
+    try {
+      const cfg = configStore.load();
+      if (!cfg || !cfg.buckets || !cfg.buckets.length) return null;
+      const b = cfg.buckets.find((x) => x.id === cfg.activeBucketId) || cfg.buckets[0];
+      return b ? b.id : null;
+    } catch (e) { return null; }
+  }
+  if (/^\/api\/(fs|stats)\//.test(p)) {
+    const cfg = configStore.load();
+    if (!cfg || !cfg.buckets.length) return null;
+    // FUN-07：与「当前桶」的其它读端同源 —— 走 listBucketsFor（可见性 + 会话优先），
+    // 而不是直接读全局 cfg.activeBucketId。
+    const { bucketId, role } = sessionBucketOf(req);
+    try {
+      const { activeBucketId } = configStore.listBucketsFor(role === 'admin' ? 'admin' : 'user', bucketId);
+      return activeBucketId || null;
+    } catch (e) {
+      const b = cfg.buckets.find((x) => x.id === cfg.activeBucketId) || cfg.buckets[0];
+      return b.id;
+    }
+  }
+  return null;
+}
+
+/** 在指定规则集合中查找命中项（命中方法才拦截；方法为空 = 全部方法） */
+function matchRules(rules, ipInfo, method) {
+  if (!ipInfo) return null;
+  for (const r of rules) {
+    if (!r.enabled) continue;
+    // R37：**限速规则绝不拦截**。两条判据必须互斥（见 RULE_KINDS 注释）：
+    // 少了这一行，「IP 地址限速」一加就把命中的 IP 直接挡在门外。
+    if (r.kind === 'speed') continue;
+    // 用预解析缓存（load 或 addRule/updateRule 时计算），未缓存则惰性解析
+    const t = r._parsed || parseTarget(r.target);
+    if (!t || !cidrMatch(ipInfo, t)) continue;
+    if (r.methods.length && !r.methods.includes(method)) continue; // 不涉及本次请求方法 → 放行
+    return r;
+  }
+  return null;
+}
+
+/**
+ * 找出对 `ip` 生效的**限速**规则（R37），返回最严的一条。
+ *
+ * 与 `matchRules` 的分工：本函数只认 `kind === 'speed'` 且 `speedLimit > 0`，
+ * 不参与拦截判定。作用域语义与屏蔽规则一致：桶级规则只在 `bucketId` 命中时
+ * 参与，全局规则对所有请求生效。
+ *
+ * 多段同时命中时取**最小速率**（最严）—— 与五层之间「取最小值」同一口径：
+ * 一条宽网段给 10MB/s、其中又有一条 /32 给 1MB/s，来自那个 /32 的请求应当按 1 走。
+ *
+ * ⚠️ 入参与同文件的 {@link evaluate} 一致：**原始 IP 字符串**（内部自己
+ * `parseIpInfo`），不是 `security.clientIpInfo(req)` 那个 `{ip, fromForwarded}` 包装。
+ * 传错形状不会抛错 —— `cidrMatch` 读到 `undefined` 的 `ip`/`bytes` 只会恒不命中，
+ * 于是「IP 限速静默失效」。这正是本项目最忌讳的「改一处漏一处却全绿」，
+ * 故形状与同类函数**保持一致**，并对不可解析的地址返回 `null`（限速**放行**：
+ * 它是资源管理手段，不是安全边界，不该因为一个畸形地址把所有人限住）。
+ *
+ * @param {string} ip 客户端 IP（来自 `security.clientIp(req)`）
+ * @returns {{target: string, bytesPerSec: number}|null}
+ */
+function speedLimitFor(ip, method, bucketId) {
+  const info = parseIpInfo(ip);
+  if (!info) return null;
+  const m = String(method || 'GET').toUpperCase();
+  const g = load();
+  let best = null;
+  for (const r of g.rules) {
+    if (!r.enabled) continue;
+    if (r.kind !== 'speed') continue;                 // 屏蔽规则不参与限速
+    if (!(Number(r.speedLimit) > 0)) continue;        // 未填速率 = 这条规则不起作用
+    const t = r._parsed || parseTarget(r.target);
+    if (!t || !cidrMatch(info, t)) continue;
+    if (r.methods.length && !r.methods.includes(m)) continue;
+    const bids = Array.isArray(r.bucketIds) ? r.bucketIds : [];
+    if (bids.length && !(bucketId && bids.includes(bucketId))) continue; // 桶级规则只在目标桶命中时生效
+    const rate = Number(r.speedLimit);
+    if (!best || rate < best.bytesPerSec) best = { target: r.target, bytesPerSec: rate };
+  }
+  return best;
+}
+
+/**
+ * 判定一次请求是否放行
+ * @param {string} ip 客户端 IPv4
+ * @param {string} method HTTP 方法
+ * @param {string|null} bucketId 请求的目标存储桶（本地绑定 id）；null/'' 表示无桶上下文
+ * @param {{fromForwarded?: boolean}} [opts] `fromForwarded=true` 表示 `ip` 取自
+ *        `X-Forwarded-For`（请求方可控输入，见下）；省略 = 视为 socket 对端地址
+ * @returns {ok: boolean, reason?: 'rule'|'overseas', rule?: object, ip: string, bucketId: string|null}
+ *
+ * 优先级与生效逻辑（黑名单叠加）：
+ *   回环放行 → 桶级规则（仅作用于目标桶的请求）→ 全局规则（作用于所有请求）→ 按桶屏蔽海外 IP。
+ *   任一级别命中即屏蔽；桶级规则与全局规则同时存在时互不覆盖、各自独立生效。
+ *
+ * 海外屏蔽为「按桶生效」：仅当请求能解析出目标桶（bucketId 非空）且该桶开启了
+ * blockOverseasIP 时才参与判定。无法解析目标桶的请求（配置管理、IP 规则管理、静态页面、
+ * 全局分享页等）不受任何海外屏蔽影响 —— 避免误伤管理界面导致自己被锁在门外。
+ *
+ * R17-01：「本机永远放行」这条豁免**只对 socket 对端地址成立**。`TRUST_PROXY=1` 时
+ * IP 取自 `X-Forwarded-For`，任何人都能写一个 `127.0.0.1` 把自己变成「本机」；
+ * 若豁免照样生效，则「屏蔽规则在反代下生效」这一修复会被一个请求头整条抵消
+ * （等价于没修）。因此来自转发头的 `127.0.0.1` 按**普通 IP** 参与判定：
+ * 它仍受自己配的规则约束，而正常的本机直连（socket 即回环）不受影响。
+ */
+function evaluate(ip, method, bucketId, opts) {
+  const m = String(method || 'GET').toUpperCase();
+  const g = load();
+  const fromForwarded = Boolean(opts && opts.fromForwarded);
+
+  if (!fromForwarded && (ip === '127.0.0.1' || ip === '::1')) {
+    return { ok: true, ip, bucketId: bucketId || null }; // 本机永远放行（仅 socket 对端）
+  }
+
+  const info = parseIpInfo(ip); // IPv4 / IPv6 统一结构（S10）
+  /**
+   * R27-07：**解析不出来的地址一律按「拒绝」处理（fail-closed）**。
+   *
+   * 旧实现是 `if (info) { …规则… }` —— 解析失败时**整块规则与「屏蔽海外」一起被跳过**，
+   * 直接放行。于是「发一个畸形 IP 就能绕过全部黑名单」：`TRUST_PROXY=1` 下只要
+   * 前置代理是追加式（`$proxy_add_x_forwarded_for`）或自建，攻击者送
+   * `X-Forwarded-For: 1::2::3` 即可（该串能过旧的 `isIpLiteral`，但解析不出结构）。
+   * 现在的分工是：`security.isIpLiteral` 已经把这类串挡在取值处，本函数再做一层
+   * 「即使拿到了不可解析的值，也绝不静默放行」的兜底 —— 两层都不依赖对方。
+   */
+  if (!info) {
+    return { ok: false, reason: 'unparsable', ip, bucketId: bucketId || null };
+  }
+  {
+    // 1) 桶级规则（更具体，优先判定）
+    if (bucketId) {
+      const hit = matchRules(g.rules.filter((r) => (r.bucketIds || []).includes(bucketId)), info, m);
+      if (hit) return { ok: false, reason: 'rule', rule: { ...hit }, ip, bucketId };
+    }
+    // 2) 全局规则（bucketIds 为空 = 全局）
+    const hit = matchRules(g.rules.filter((r) => !(r.bucketIds || []).length), info, m);
+    if (hit) return { ok: false, reason: 'rule', rule: { ...hit }, ip, bucketId: bucketId || null };
+  }
+
+  // 3) 按桶屏蔽海外 IP：仅放行国内 IP 与内网/回环地址（仅对该桶生效）
+  if (bucketId && bucketBlocksOverseas(bucketId) && !isChinaIP(ip) && !isPrivateIP(ip)) {
+    return { ok: false, reason: 'overseas', ip, bucketId };
+  }
+  return { ok: true, ip, bucketId: bucketId || null };
+}
+
+let dirty = false;
+function markHit(ruleId) {
+  const g = load();
+  const r = g.rules.find((x) => x.id === ruleId);
+  if (r) { r.hits = (r.hits || 0) + 1; dirty = true; }
+}
+let overseasHits = 0;
+function markOverseasHit() { overseasHits++; dirty = true; }
+
+// 命中计数节流落盘（3 秒）
+setInterval(() => {
+  if (dirty) { dirty = false; persist(); }
+}, 3000).unref();
+
+/**
+ * 判定一次请求是否放行，并记账（命中次数 / 海外命中）。
+ *
+ * 抽出来是为了让 **WebDAV 服务（:8443）复用同一套判定**（SEC-07）——
+ * 它此前完全不受 IP 屏蔽约束，等于给屏蔽规则开了一个旁门。
+ * 响应形态（JSON / HTML / 纯文本）由各调用方自行决定。
+ */
+function guardRequest(req) {
+  const info = security.clientIpInfo(req);
+  const v = evaluate(info.ip, req.method, resolveBucketId(req), { fromForwarded: info.fromForwarded });
+  if (!v.ok) {
+    // R27-07：只有「规则命中」与「海外命中」各自计数；`unparsable` 既不是规则命中
+    // 也不是海外命中，混进 overseasHits 会让界面的命中统计说谎。
+    if (v.reason === 'rule') markHit(v.rule.id);
+    else if (v.reason === 'overseas') markOverseasHit();
+  }
+  return v;
+}
+
+/** HTML 转义（403 提示页要回显客户端 IP，开启 TRUST_PROXY 后它是请求方可控输入） */
+function escapeHtml(s) {
+  return String(s).replace(/[&<>"']/g, (c) => (
+    { '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]
+  ));
+}
+
+/** R28-06：拒绝原因 → 人话文案（**两个分支共用**，见 `middleware`） */
+function blockTip(reason) {
+  if (reason === 'overseas') return '该服务仅对中国大陆 IP 开放访问';
+  if (reason === 'unparsable') return '无法识别您的来源地址（反代未按模板转发 X-Forwarded-For，或该值非法），已拒绝访问';
+  return '您的 IP 已被管理员屏蔽';
+}
+
+/** Express 中间件 */
+function middleware(req, res, next) {
+  const v = guardRequest(req);
+  if (v.ok) return next();
+  /**
+   * R28-06：`unparsable` 是 R27-07 新增的拒绝原因，但当时只更新了 HTML 分支的文案 ——
+   * `/api/**` 仍回「IP 已被屏蔽」，而管理员的规则列表里**根本没有那条规则**，
+   * 排查会被引向"谁封了我"，实际成因是反代没按模板转发 X-Forwarded-For。
+   * 这里把文案收敛到 `blockTip()` 一处，并把机器可读的 `reason` 一并下发。
+   */
+  const tip = blockTip(v.reason);
+  if (req.path.startsWith('/api/')) {
+    return res.status(403).json({ error: tip, blocked: true, reason: v.reason || 'rule', ip: v.ip });
+  }
+  // HTML 提示页（分享页 / 前端页面）
+  //
+  // 注意：这里只能用 `v.ip`（guardRequest 的返回值），`middleware()` 作用域内
+  // 并没有 `ip` 变量 —— 曾经写成 `${ip}` 导致页面类请求恒抛 ReferenceError，
+  // 被 Express 错误处理器吞成 500，屏蔽功能对分享页完全失效（FUN-01 高危）。
+  // 开启 TRUST_PROXY 后 IP 取自 X-Forwarded-For 头，属请求方可控输入，必须转义
+  const ipText = escapeHtml(String(v.ip || ''));
+  res.status(403).type('html').send(
+    `<!DOCTYPE html><html lang="zh-CN"><head><meta charset="utf-8"><title>403 - 禁止访问</title></head>` +
+    `<body style="font-family:'Segoe UI','Microsoft YaHei',sans-serif;background:#f6f7f9;display:flex;align-items:center;justify-content:center;min-height:100vh;margin:0">` +
+    `<div style="text-align:center;color:#595959"><div style="font-size:48px">🚫</div>` +
+    `<h2 style="margin:12px 0 6px;color:#1b1b1b">403 禁止访问</h2>` +
+    `<p>${tip}（IP: ${ipText}）</p></div></body></html>`
+  );
+}
+
+function view() {
+  const g = load();
+  return {
+    // R28-01：与 persistView()/listRules() 同一口径（不回传派生缓存）
+    rules: g.rules.map((r) => { const c = { ...r }; delete c._parsed; return c; }),
+    chinaRangeCount: loadChinaList().length,
+    overseasHits,
+    updatedAt: g.updatedAt,
+    ipv6: {
+      supported: true,
+      // 提示前端：国内白名单仅覆盖 IPv4；某桶开启海外屏蔽时公网 IPv6 访问会被视为海外
+      overseasNote: '国内 IP 白名单仅包含 IPv4 段；若某存储桶开启「屏蔽海外 IP」，访问该桶的公网 IPv6 请求将被拦截。',
+    },
+  };
+}
+
+module.exports = {
+  middleware, guardRequest, clientIp, evaluate, view, resolveBucketId,
+  // R28-06：拒绝原因 → 文案的唯一实现点（WebDAV 分支也用它，避免两处文案再次分叉）
+  blockTip,
+  listRules, addRule, updateRule, removeRule, setRuleEnabled, setBucketOverseas, removeRulesForBucket,
+  // R38：整批替换（配置备份导入）+ 单条归一化的唯一实现点
+  replaceAllRules, normalizeRule,
+  invalidateOverseasCache,
+  // R37：IP 地址限速（kind='speed' 的规则）—— 只参与限速判定，绝不参与拦截
+  speedLimitFor, RULE_KINDS, normalizeKind,
+  isChinaIP, isPrivateIP, isPrivateIPv6, parseTarget, parseIpInfo,
+  ipv4ToInt, ipv6ToBytes, ipv6ToString, canonicalIpLiteral, cidrContains, cidrContainsV6, cidrMatch,
+  buildIntervals, normalizeRanges,     // FUN-08：可在测试中直接验证归一化性质
+  ALLOWED_METHODS,
+};
+
+/**
+ * 测试钩子：注入归一化后的白名单区间，使 isChinaIP 无需依赖 china-ips.txt 文件。
+ * 仅用于单测/验证，生产路径从不调用。
+ */
+function __setChinaIntervalsForTest(segs) {
+  chinaRanges = null;
+  chinaIntervals = segs || [];
+  chinaLoaded = true;
+}
+module.exports.__setChinaIntervalsForTest = __setChinaIntervalsForTest;
+
+/** 统一称呼：`normalizeRanges` 是 `buildIntervals` 的语义别名（对外强调归一化意图） */
+function normalizeRanges(cidrs) { return buildIntervals(cidrs); }

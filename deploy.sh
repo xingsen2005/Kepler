@@ -1,0 +1,4052 @@
+#!/usr/bin/env bash
+# ==============================================================================
+# deploy.sh —— Kepler 对象存储管理系统 · 一键部署脚本
+#
+# 目标：在一台全新的 Linux 服务器上，只执行一条命令即可完成部署：
+#   curl -fLo /tmp/kepler-deploy.sh https://raw.githubusercontent.com/xingsen2005/Kepler/main/deploy.sh \
+#     && sudo bash /tmp/kepler-deploy.sh --domain cos.example.com
+#
+#   这里刻意用「先落盘、校验通过再执行」而不是 `curl … | sudo bash`：不带 -f 时 curl 收到
+#   404 仍返回 0，会把 14 字节的 "404: Not Found" 原样存成脚本，执行时报
+#   `./deploy.sh: line 1: 404:: command not found`；而纯管道写法连失败都测不出来
+#   （$? 取到的是右侧 bash 的 0）。地址/分支/仓库名任一写错都会走到这一条。
+#
+# 脚本会依次完成：
+#   1) 自动识别包管理器并安装 git、curl、ca-certificates、tar 等基础工具
+#   2) 自动拉取 https://github.com/xingsen2005/Kepler.git 源码
+#   3) 安装运行时（Node.js ≥ 18）与依赖（npm 生产依赖）
+#   4) 安装并配置 Nginx 反向代理
+#   5) 生成 .env 环境变量文件并注册进程守护
+#   6) HTTPS：自动向 ACME 证书颁发机构（CA）签发（默认 Let's Encrypt，可换 ZeroSSL / LiteSSL；
+#      失败即中断并提示改用自备证书）
+#   7) 注册全局 kepler 管理命令、保存部署状态并执行健康检查
+#
+# 设计约束：
+#   - 幂等：可反复执行。已存在且内容一致的文件不重写；配置变更会先备份旧文件。
+#   - 只问最基础的信息：域名（必填）、对外 HTTPS 端口、部署方式；其余全部取默认值。
+#   - 非交互：所有交互项都可用命令行参数或环境变量传入（见 usage）。
+#   - 失败可读：任何失败都给出「原因判断 + 可敲的修复命令 + 手动装完用哪个跳过参数重跑」，
+#     而不是只甩一段日志。装不了的东西（Node/Nginx/依赖）都能用 --skip-* 跳过。
+#
+# 用法：
+#   curl -fLo /tmp/kepler-deploy.sh https://raw.githubusercontent.com/xingsen2005/Kepler/main/deploy.sh \
+#     && sudo bash /tmp/kepler-deploy.sh --domain cos.example.com
+#   sudo bash deploy.sh --domain cos.example.com [选项]
+#   kepler                    # 安装完成后的交互式管理菜单
+#
+# 选项：
+#   --domain <域名|IP>      部署域名或服务器 IP（必填；IP 签不下 ACME 证书，需 --tls file 自备证书或 --tls none）
+#   --port <端口>           应用内部监听端口（默认 3000，由 Nginx 反代，不对外暴露）
+#   --https-port <端口>     Nginx 对外 HTTPS 端口（默认 443）
+#   --http-port <端口>      Nginx 对外 HTTP 端口（默认 80，用于跳转与 ACME 校验）
+#   --dir <路径>            安装目录（默认 /opt/kepler）
+#   --data-dir <路径>       数据目录（默认 <安装目录>/data；含密钥，务必备份）
+#   --mode <systemd|docker> 进程守护方式（默认 systemd）
+#   --tls <auto|acme|file|none>  证书方式（默认 auto；acme 处也可直接写 CA 名，如 --tls litessl）
+#   --ca <zerossl|letsencrypt|litessl> ACME 证书颁发机构（默认 zerossl，可自动换取 EAB）
+#   --eab-kid <KID>         该 CA 的 EAB Key ID（litessl 必需；zerossl 可省略）
+#   --eab-hmac-key <密钥>   该 CA 的 EAB HMAC 密钥（litessl 必需；不写入部署状态文件）
+#   --email <邮箱>          ACME 账户注册 / 通知邮箱（默认 admin@<域名>）
+#   --path <路径>           服务路径前缀（默认 /，推荐根路径；子路径为尽力而为模式）
+#   --repo <git-url>        脚本独立运行时用于拉取源码的仓库地址
+#   --node-version <版本>   指定 Node.js 版本（默认解析最新的 20.x LTS）
+#   --mirror <auto|cn|official> 下载镜像：cn 走 npmmirror 加速；auto 先走官方源，失败自动改走国内
+#   --staging               使用 Let's Encrypt 测试环境（仅在 CA 为 letsencrypt 时生效）
+#   --force-cert            强制重新申请 HTTPS 证书（默认：已有可用证书则跳过申请）
+#   --skip-node             跳过 Node.js 安装（只校验版本；适合用 nvm/自建运行时的人）
+#   --skip-deps             跳过 npm 依赖安装
+#   --skip-nginx            跳过 Nginx 安装与反代配置（自行用 Caddy/Nginx 反代）
+#   --skip-service          跳过 systemd/docker 服务创建（自行用 pm2/supervisor 守护）
+#   -y, --yes               非交互模式：全部使用默认值（域名仍需提供）
+#   --verbose               显示子命令的完整输出（默认只写日志文件）
+#   --reinstall             按已保存配置重新拉取源码并安装（保留数据）
+#   --manage                打开交互式管理菜单（通常直接执行 kepler）
+#   --uninstall             卸载服务、应用、数据、证书与全局命令
+#   -h, --help              显示帮助
+#
+# 安装后的全局命令：
+#   kepler                   编号菜单：重装、改管理员用户名/密码、改端口、卸载、退出
+#   kepler <编号>            直接执行菜单项（如 kepler 4 改端口 / kepler 5 卸载 / kepler 0 退出）
+#
+# 环境变量（与命令行参数等价，参数优先级更高）：
+#   DOMAIN APP_PORT HTTPS_PORT HTTP_PORT INSTALL_DIR DATA_DIR MODE TLS_MODE
+#   EMAIL SUB_PATH REPO_URL NODE_VERSION MIRROR STAGING ASSUME_YES VERBOSE
+#   CA_PROVIDER EAB_KID EAB_HMAC_KEY FORCE_CERT
+# ==============================================================================
+
+set -Eeuo pipefail
+
+# ------------------------------------------------------------------------------
+# 0. 基础设置与日志工具
+# ------------------------------------------------------------------------------
+readonly SCRIPT_NAME="deploy.sh"
+readonly SERVICE_NAME="kepler"
+readonly RUN_USER="kepler"
+readonly LOG_FILE="/var/log/${SERVICE_NAME}-deploy.log"
+readonly WEBROOT="/var/www/html"
+readonly LOCK_FILE="/var/lock/${SERVICE_NAME}-deploy.lock"
+readonly STATE_DIR="/etc/${SERVICE_NAME}"
+readonly STATE_FILE="${STATE_DIR}/deploy.conf"
+readonly GLOBAL_COMMAND="/usr/local/bin/${SERVICE_NAME}"
+readonly DEFAULT_REPO_URL="https://github.com/xingsen2005/Kepler.git"
+# WebDAV 独立 HTTPS 端口：应用侧同名环境变量，这里作为唯一事实来源，
+# .env 与 Nginx 上游都用它 —— 两边写死两份 8443 迟早会漂移成「界面有地址、反代不通」。
+WEBDAV_PORT="${WEBDAV_PORT:-8443}"
+
+STEP_NO=0
+VERBOSE="${VERBOSE:-0}"
+ASSUME_YES="${ASSUME_YES:-0}"
+ORIG_ARGS="$*"          # 保存原始命令行，失败提示里给出「原样重跑」命令
+ORIGINAL_ARGV=("$@")
+INIT_SYSTEM=""
+NGINX_CONF=""
+NGINX_LINK=""
+SKIP_NODE="${SKIP_NODE:-0}"       # 跳过 Node.js 安装（用户自行管理运行时）
+SKIP_DEPS="${SKIP_DEPS:-0}"       # 跳过 npm 依赖安装
+SKIP_NGINX="${SKIP_NGINX:-0}"     # 跳过 Nginx 安装与反代配置（用户自建反代）
+SKIP_SERVICE="${SKIP_SERVICE:-0}" # 跳过服务创建（用户用 pm2/supervisor 等自行守护）
+FORCE_CERT="${FORCE_CERT:-0}"     # 强制重签证书（默认：已有可用证书就跳过申请）
+SERVICE_READY=0            # 健康检查：本地应用是否就绪
+EXT_OK=0                   # 健康检查：外网访问是否通过
+NGINX_OK=1                 # Nginx 是否已配置成功
+MANAGE=0                   # 打开 kepler 管理菜单
+MANAGE_ACTION=""           # kepler <编号>：直接执行某个菜单项（与菜单编号一致）
+REINSTALL=0                # 强制从远程仓库重新获取源码
+STATE_LOADED=0
+
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then
+  C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'
+  C_RED=$'\033[31m'; C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'
+  C_BLUE=$'\033[34m'; C_CYAN=$'\033[36m'
+else
+  C_RESET=""; C_BOLD=""; C_DIM=""; C_RED=""; C_GREEN=""; C_YELLOW=""; C_BLUE=""; C_CYAN=""
+fi
+
+log()  { printf '%s\n' "$*"; }
+info() { printf '%s[信息]%s %s\n' "$C_CYAN" "$C_RESET" "$*"; }
+ok()   { printf '%s[完成]%s %s\n' "$C_GREEN" "$C_RESET" "$*"; }
+warn() { printf '%s[警告]%s %s\n' "$C_YELLOW" "$C_RESET" "$*" >&2; }
+err()  { printf '%s[错误]%s %s\n' "$C_RED" "$C_RESET" "$*" >&2; }
+die()  { err "$*"; err "部署中断。详细日志：${LOG_FILE}"; exit 1; }
+step() { STEP_NO=$((STEP_NO + 1)); printf '\n%s[%s/%s]%s %s%s%s\n' "$C_BLUE" "$STEP_NO" "$TOTAL_STEPS" "$C_RESET" "$C_BOLD" "$*" "$C_RESET"; }
+
+# 抹掉命令行里的敏感值，避免在回显/提示/日志里泄出。
+# 目前只有 EAB 的 HMAC 密钥（--eab-hmac-key）属于机密：KID 是公开标识，不用抹。
+redact_args() {
+  local -a parts=()
+  local tok skip=0 out=""
+  read -r -a parts <<<"${1:-}" || true
+  for tok in "${parts[@]}"; do
+    if ((skip == 1)); then skip=0; out+=" ***"; continue; fi
+    case "$tok" in
+      --eab-hmac-key) out+=" --eab-hmac-key"; skip=1 ;;
+      --eab-hmac-key=*) out+=" --eab-hmac-key=***" ;;
+      *) out+=" $tok" ;;
+    esac
+  done
+  printf '%s' "${out# }"
+}
+
+# 执行子命令：正常输出写日志，失败时回显尾部日志并返回真实退出码
+run() { _run_impl "" "$@"; }
+
+# 同 run，但把「调用方明确允许」的退出码当作正常结果（不打印错误块）。
+# 目前唯一的使用者：acme.sh --issue 的 RENEW_SKIP(2) —— 那是「证书还在有效期内、
+# 无需续期」，属于成功语义。若照旧在 run 里打成 `[错误] 命令执行失败（退出码 2）`，
+# 用户会以为证书出了问题（这正是现场那次误判的来源）。
+run_allow_rc() { local allow="$1"; shift; _run_impl "$allow" "$@"; }
+
+_run_impl() {
+  local allow="$1"; shift
+  local rc=0
+  mkdir -p "$(dirname "$LOG_FILE")" 2>/dev/null || true
+  if [[ "$VERBOSE" == "1" ]]; then
+    "$@" 2>&1 | tee -a "$LOG_FILE" || rc=${PIPESTATUS[0]}
+  else
+    "$@" >>"$LOG_FILE" 2>&1 || rc=$?
+  fi
+  if ((rc != 0)); then
+    local tolerated=0 code
+    for code in $allow; do
+      if [[ "$rc" == "$code" ]]; then tolerated=1; break; fi
+    done
+    if ((tolerated == 0)); then
+      # 回显命令行时必须过一遍脱敏：acme.sh 的 EAB HMAC 密钥是从命令行传进去的
+      err "命令执行失败（退出码 ${rc}）：$(redact_args "$*")"
+      err "—— 本次操作的日志（完整日志：${LOG_FILE}）——"
+      log_since_mark | tail -n 30 >&2 || true
+    fi
+  fi
+  return "$rc"
+}
+
+# 执行子命令：允许失败（返回码被忽略），输出写日志
+run_soft() {
+  if [[ "$VERBOSE" == "1" ]]; then
+    "$@" 2>&1 | tee -a "$LOG_FILE" || true
+  else
+    "$@" >>"$LOG_FILE" 2>&1 || true
+  fi
+}
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# 版本比较：version_ge 20.19.0 18 → 0（真）。纯 bash 实现，不依赖 sort -V
+version_ge() {
+  local a="$1" b="$2" i x y
+  local -a A B
+  IFS='.' read -r -a A <<<"$a"
+  IFS='.' read -r -a B <<<"$b"
+  for i in 0 1 2; do
+    x="${A[i]:-0}"; y="${B[i]:-0}"
+    [[ "$x" =~ ^[0-9]+$ ]] || x=0
+    [[ "$y" =~ ^[0-9]+$ ]] || y=0
+    ((10#$x > 10#$y)) && return 0
+    ((10#$x < 10#$y)) && return 1
+  done
+  return 0
+}
+
+# 写文件（内容相同则跳过，已存在且不同则先备份）——保证幂等
+write_file() {
+  local path="$1" content="$2" mode="${3:-0644}"
+  local dir; dir="$(dirname "$path")"
+  mkdir -p "$dir"
+  if [[ -f "$path" ]] && [[ "$(cat "$path")" == "$content" ]]; then
+    info "配置未变化，跳过写入：$path"
+    chmod "$mode" "$path"
+    return 0
+  fi
+  if [[ -f "$path" ]]; then
+    local bak="${path}.bak.$(date +%Y%m%d%H%M%S)"
+    cp -a "$path" "$bak"
+    info "已备份旧配置 → $bak"
+  fi
+  printf '%s\n' "$content" > "$path"
+  chmod "$mode" "$path"
+  ok "已写入：$path"
+}
+
+# ------------------------------------------------------------------------------
+# 0.1 失败诊断与「可操作」提示
+#
+# 原则：任何失败都不能只甩一段日志就退出。必须回答三件事——
+#   ① 大概是哪种原因（从日志关键字自动判断）
+#   ② 具体可以敲哪些命令修复
+#   ③ 想自己装的话，装完用哪个跳过参数重跑
+# ------------------------------------------------------------------------------
+
+# 提示正文（走 stderr，保证与错误行顺序一致，不被 stdout 缓冲打乱）
+plain() { printf '%s\n' "$*" >&2; }
+
+# LOG_MARK：关键操作前记下日志行数，诊断时只看「本次」新增的日志，避免串台
+LOG_MARK=0
+mark_log() {
+  if [[ -f "$LOG_FILE" ]] && have wc; then
+    LOG_MARK=$(( $(wc -l <"$LOG_FILE" 2>/dev/null || echo 0) + 1 ))
+  else
+    LOG_MARK=0
+  fi
+}
+
+# 取「本次操作以来」的日志
+log_since_mark() {
+  have tail || return 0
+  if ((LOG_MARK > 1)); then
+    tail -n "+${LOG_MARK}" "$LOG_FILE" 2>/dev/null || true
+  else
+    tail -n 60 "$LOG_FILE" 2>/dev/null || true
+  fi
+}
+
+# 从日志里抽取最可能有用的错误行（去空、最多 n 行）
+log_key_lines() {
+  local n="${1:-6}"
+  log_since_mark \
+    | grep -iE 'error|failed|fatal|denied|refused|unable|no space|E: |W: |Err' \
+    | grep -viE '^\s*$' | tail -n "$n" || true
+}
+
+# 打印「日志关键行」小节
+show_log_key_lines() {
+  local lines; lines="$(log_key_lines 6)"
+  if [[ -n "$lines" ]]; then
+    plain "  日志里的关键行："
+    while IFS= read -r l; do plain "    | ${l}"; done <<<"$lines"
+  else
+    plain "  完整日志：tail -n 60 ${LOG_FILE}"
+  fi
+}
+
+# 交互环境下询问「是否已手动处理并继续」，非交互直接返回 1（退出）
+confirm_continue() {
+  local ans=""
+  if [[ "$ASSUME_YES" == "1" || ! -t 0 ]]; then return 1; fi
+  read -r -p "$(printf '%s  ↳ 若你已手工处理完，可直接继续 [y/N]: %s' "$C_YELLOW" "$C_RESET")" ans || true
+  # 显式返回：不要用 `[[ ... ]]` 作为函数最后一条语句（条件为假时返回 1，
+  # 若哪天被裸调用就会被 set -e 的 ERR trap 当成脚本失败）
+  if [[ "${ans,,}" == "y" || "${ans,,}" == "yes" ]]; then return 0; fi
+  return 1
+}
+
+# 重跑命令（保留用户原本传的全部参数，再追加跳过的开关）
+rerun_cmd() {
+  local extra="$*" self="$SCRIPT_NAME" orig
+  [[ -f "${0:-}" ]] && self="$0"      # 脚本在本地就给出可复制的真实路径
+  orig="$(redact_args "$ORIG_ARGS")"  # 原样重跑，但不把 EAB 密钥回显出来
+  if [[ -n "$orig" ]]; then
+    printf 'bash %s %s%s' "$self" "$orig" "${extra:+ $extra}"
+  else
+    printf 'bash %s --domain %s%s' "$self" "${DOMAIN:-<域名>}" "${extra:+ $extra}"
+  fi
+}
+
+# 统一的失败出口：die_with_hint <标题> <提示行...>
+die_with_hint() {
+  local title="$1"; shift
+  plain ""
+  err "$title"
+  plain ""
+  local line
+  for line in "$@"; do plain "  $line"; done
+  plain ""
+  plain "  完整日志：${LOG_FILE}"
+  plain "  修复后重跑（脚本幂等，已完成的步骤不会重复执行）："
+  plain "    $(rerun_cmd)"
+  plain ""
+  exit 1
+}
+
+# 非致命失败：warn_with_hint <标题> <提示行...>
+warn_with_hint() {
+  local title="$1"; shift
+  warn "$title"
+  local line
+  for line in "$@"; do plain "  $line"; done
+}
+
+on_error() {
+  local rc=$1 line=$2
+  LOG_MARK=0   # 意外失败时看完整上下文，而不是上一次 mark 之后的部分
+  plain ""
+  err "脚本在第 ${line} 行意外失败（退出码 ${rc}）。"
+  plain ""
+  show_log_key_lines
+  plain ""
+  plain "  详细日志：${LOG_FILE}"
+  plain "  修复后可原样重跑（幂等）：$(rerun_cmd)"
+  plain ""
+  exit "$rc"
+}
+trap 'on_error "$?" "$LINENO"' ERR
+
+# ------------------------------------------------------------------------------
+# 1. 参数、持久化状态与默认值
+# ------------------------------------------------------------------------------
+# 先保存调用者显式提供的环境变量；部署状态随后加载，但显式环境变量与命令行仍优先。
+ENV_DOMAIN="${DOMAIN-}"
+ENV_APP_PORT="${APP_PORT-}"
+ENV_HTTPS_PORT="${HTTPS_PORT-}"
+ENV_HTTP_PORT="${HTTP_PORT-}"
+ENV_INSTALL_DIR="${INSTALL_DIR-}"
+ENV_DATA_DIR="${DATA_DIR-}"
+ENV_MODE="${MODE-}"
+ENV_TLS_MODE="${TLS_MODE-}"
+ENV_EMAIL="${EMAIL-}"
+ENV_SUB_PATH="${SUB_PATH-}"
+ENV_REPO_URL="${REPO_URL-}"
+ENV_NODE_VERSION="${NODE_VERSION-}"
+ENV_MIRROR="${MIRROR-}"
+ENV_STAGING="${STAGING-}"
+ENV_CA_PROVIDER="${CA_PROVIDER-}"
+ENV_EAB_KID="${EAB_KID-}"
+ENV_EAB_HMAC_KEY="${EAB_HMAC_KEY-}"
+ENV_ACME_HOME="${ACME_HOME-}"
+
+DOMAIN=""
+APP_PORT="3000"
+HTTPS_PORT="443"
+HTTP_PORT="80"
+INSTALL_DIR="/opt/kepler"
+DATA_DIR=""
+MODE="systemd"
+TLS_MODE="auto"
+EMAIL=""
+SUB_PATH="/"
+REPO_URL="$DEFAULT_REPO_URL"
+NODE_VERSION=""
+MIRROR="auto"
+STAGING="0"
+# ACME 证书颁发机构（见 §8.0 CA 注册表）。默认 ZeroSSL —— 它走 HTTP-01、支持面广，
+# 且 acme.sh 能用 --email **自动换取 EAB**（零手工）；Let's Encrypt 虽免 EAB，但其
+# 「注册域名/公共后缀」7 天配额是所有人共享的，公共后缀（如 l.cd / github.io 等）下
+# 极易被限流（rateLimited/429），反复签不下来。国内服务器或公共后缀域名请自觉用
+# zerossl / litessl。
+CA_PROVIDER="zerossl"
+# EAB（外部账户绑定）凭据：zerossl 通常由 acme.sh 用邮箱自动换取，litessl 必须手工提供。
+# EAB_HMAC_KEY 是密钥，**只进内存与 acme.sh 自己的账户目录，绝不写进状态文件**。
+EAB_KID=""
+EAB_HMAC_KEY=""
+# acme.sh 的家目录。可用 ACME_HOME 覆盖（测试里把脚本指到临时目录，避免读到真实账户）——
+# 因此 acme.sh 可执行文件路径一律现算 "${ACME_HOME}/acme.sh"，不要在加载期缓存成常量。
+ACME_HOME="/root/.acme.sh"
+UNINSTALL=0
+SRC_DIR=""          # 源码来源目录（自动探测）
+SRC_TMP_DIR=""      # 若源码来自临时克隆，复制完成后清理
+APP_VERSION="1.0.0"
+NODE_BIN=""
+CERT_FULLCHAIN=""
+CERT_KEY=""
+# 是否在本轮由用户显式指定了 CA（命令行 --ca/--tls 或环境变量 ENV_CA_PROVIDER）。
+# 用于区分「用户就是要用 LE」与「状态文件里残留了上一轮的 letsencrypt」两种情况，
+# 后者要主动提醒换 CA（LE 在公共后缀域名上容易被 rateLimited 限流）。
+CA_EXPLICIT=0
+
+usage() {
+  local source="${BASH_SOURCE[0]:-$0}"
+  if [[ -r "$source" ]]; then
+    # 打印脚本头部的注释块（到第一个非注释行前为止）。不再写死行号：
+    # 头注释一改行数，写死的 `sed -n '2,60p'` 就会把帮助文本截断。
+    awk 'NR>1 { if ($0 !~ /^#/) exit; print }' "$source" | sed 's/^# \{0,1\}//' | sed '$d'
+  else
+    log "Kepler 一键部署：请使用 --domain <域名>，安装后执行 kepler 管理。"
+  fi
+  exit 0
+}
+
+function load_state() {
+  [[ -r "$STATE_FILE" ]] || return 0
+  local key value
+  while IFS='=' read -r key value || [[ -n "$key" ]]; do
+    [[ -n "$key" && "$key" != \#* ]] || continue
+    case "$key" in
+      DOMAIN) DOMAIN="$value" ;;
+      APP_PORT) APP_PORT="$value" ;;
+      HTTPS_PORT) HTTPS_PORT="$value" ;;
+      HTTP_PORT) HTTP_PORT="$value" ;;
+      INSTALL_DIR) INSTALL_DIR="$value" ;;
+      DATA_DIR) DATA_DIR="$value" ;;
+      MODE) MODE="$value" ;;
+      TLS_MODE) TLS_MODE="$value" ;;
+      EMAIL) EMAIL="$value" ;;
+      SUB_PATH) SUB_PATH="$value" ;;
+      REPO_URL) REPO_URL="$value" ;;
+      NODE_VERSION) NODE_VERSION="$value" ;;
+      MIRROR) MIRROR="$value" ;;
+      STAGING) STAGING="$value" ;;
+      SKIP_NODE) SKIP_NODE="$value" ;;
+      SKIP_DEPS) SKIP_DEPS="$value" ;;
+      SKIP_NGINX) SKIP_NGINX="$value" ;;
+      SKIP_SERVICE) SKIP_SERVICE="$value" ;;
+      NODE_BIN) NODE_BIN="$value" ;;
+      NGINX_CONF) NGINX_CONF="$value" ;;
+      NGINX_LINK) NGINX_LINK="$value" ;;
+      CERT_FULLCHAIN) CERT_FULLCHAIN="$value" ;;
+      CERT_KEY) CERT_KEY="$value" ;;
+      # 注意：只回读 CA 与 EAB KID。**EAB_HMAC_KEY 刻意不落盘** —— 它是密钥，
+      # acme.sh 自己会在 ~/.acme.sh/ca/<CA 主机>/ 里保存账户，重装时直接复用，
+      # 不需要（也不应该）让部署状态再做一份密钥副本。
+      CA_PROVIDER) CA_PROVIDER="$value" ;;
+      EAB_KID) EAB_KID="$value" ;;
+    esac
+  done < "$STATE_FILE"
+  STATE_LOADED=1
+  return 0
+}
+
+function apply_env_overrides() {
+  # 注意：这里必须用 if 而不是 `[[ ... ]] && ...` 的简写 —— 简写形式在条件为假时
+  # 整条语句返回 1，若它恰好是函数最后一条语句，就会被 set -e 的 ERR trap 当成
+  # 「脚本意外失败」（未设置任何环境变量时正是这种情况，实测必现）。
+  if [[ -n "$ENV_DOMAIN" ]]; then DOMAIN="$ENV_DOMAIN"; fi
+  if [[ -n "$ENV_APP_PORT" ]]; then APP_PORT="$ENV_APP_PORT"; fi
+  if [[ -n "$ENV_HTTPS_PORT" ]]; then HTTPS_PORT="$ENV_HTTPS_PORT"; fi
+  if [[ -n "$ENV_HTTP_PORT" ]]; then HTTP_PORT="$ENV_HTTP_PORT"; fi
+  if [[ -n "$ENV_INSTALL_DIR" ]]; then INSTALL_DIR="$ENV_INSTALL_DIR"; fi
+  if [[ -n "$ENV_DATA_DIR" ]]; then DATA_DIR="$ENV_DATA_DIR"; fi
+  if [[ -n "$ENV_MODE" ]]; then MODE="$ENV_MODE"; fi
+  if [[ -n "$ENV_TLS_MODE" ]]; then TLS_MODE="$ENV_TLS_MODE"; fi
+  if [[ -n "$ENV_EMAIL" ]]; then EMAIL="$ENV_EMAIL"; fi
+  if [[ -n "$ENV_SUB_PATH" ]]; then SUB_PATH="$ENV_SUB_PATH"; fi
+  if [[ -n "$ENV_REPO_URL" ]]; then REPO_URL="$ENV_REPO_URL"; fi
+  if [[ -n "$ENV_NODE_VERSION" ]]; then NODE_VERSION="$ENV_NODE_VERSION"; fi
+  if [[ -n "$ENV_MIRROR" ]]; then MIRROR="$ENV_MIRROR"; fi
+  if [[ -n "$ENV_STAGING" ]]; then STAGING="$ENV_STAGING"; fi
+  if [[ -n "$ENV_CA_PROVIDER" ]]; then CA_PROVIDER="$ENV_CA_PROVIDER"; CA_EXPLICIT=1; fi
+  if [[ -n "$ENV_EAB_KID" ]]; then EAB_KID="$ENV_EAB_KID"; fi
+  if [[ -n "$ENV_EAB_HMAC_KEY" ]]; then EAB_HMAC_KEY="$ENV_EAB_HMAC_KEY"; fi
+  if [[ -n "$ENV_ACME_HOME" ]]; then ACME_HOME="$ENV_ACME_HOME"; fi
+  return 0
+}
+
+function save_state() {
+  local value
+  for value in "$DOMAIN" "$APP_PORT" "$HTTPS_PORT" "$HTTP_PORT" "$INSTALL_DIR" "$DATA_DIR" "$MODE" "$TLS_MODE" "$EMAIL" "$SUB_PATH" "$REPO_URL" "$NODE_VERSION" "$MIRROR" "$NODE_BIN" "$NGINX_CONF" "$NGINX_LINK" "$CERT_FULLCHAIN" "$CERT_KEY" "$CA_PROVIDER" "$EAB_KID"; do
+    [[ "$value" != *$'\n'* && "$value" != *$'\r'* ]] || die "部署配置包含非法换行，拒绝保存状态。"
+  done
+  local content="# Kepler 部署状态（由 ${SCRIPT_NAME} 管理，请勿手工写入密钥）
+STATE_VERSION=1
+DOMAIN=${DOMAIN}
+APP_PORT=${APP_PORT}
+HTTPS_PORT=${HTTPS_PORT}
+HTTP_PORT=${HTTP_PORT}
+INSTALL_DIR=${INSTALL_DIR}
+DATA_DIR=${DATA_DIR}
+MODE=${MODE}
+TLS_MODE=${TLS_MODE}
+EMAIL=${EMAIL}
+SUB_PATH=${SUB_PATH}
+REPO_URL=${REPO_URL}
+NODE_VERSION=${NODE_VERSION}
+MIRROR=${MIRROR}
+STAGING=${STAGING}
+SKIP_NODE=${SKIP_NODE}
+SKIP_DEPS=${SKIP_DEPS}
+SKIP_NGINX=${SKIP_NGINX}
+SKIP_SERVICE=${SKIP_SERVICE}
+NODE_BIN=${NODE_BIN}
+NGINX_CONF=${NGINX_CONF}
+NGINX_LINK=${NGINX_LINK}
+CERT_FULLCHAIN=${CERT_FULLCHAIN}
+CERT_KEY=${CERT_KEY}
+CA_PROVIDER=${CA_PROVIDER}
+EAB_KID=${EAB_KID}"
+  mkdir -p "$STATE_DIR"
+  write_file "$STATE_FILE" "$content" 0600
+  return 0
+}
+
+parse_args() {
+  while [[ $# -gt 0 ]]; do
+    case "$1" in
+      # —— 取值型参数：统一在这里校验「确实给了值」——
+      # 不能写成 `X="${2:-}"; shift 2`：只给选项不给值时 shift 越界返回 1，
+      # 会被 set -e 的 ERR trap 当成「脚本在第 N 行意外失败」，用户看到的是崩溃
+      # 而不是「你少给了一个值」。十几个选项同一个坑，所以合并成一个分支处理。
+      --domain|--port|--https-port|--http-port|--dir|--data-dir|--mode|--tls|--email|--path|--repo|--node-version|--mirror|--ca|--eab-kid|--eab-hmac-key)
+        if [[ $# -lt 2 || -z "${2-}" ]]; then
+          die "参数 $1 缺少取值（示例：bash ${SCRIPT_NAME} $1 <值>；完整用法见 --help）"
+        fi
+        case "$1" in
+          --domain)       DOMAIN="$2" ;;
+          --port)         APP_PORT="$2" ;;
+          --https-port)   HTTPS_PORT="$2" ;;
+          --http-port)    HTTP_PORT="$2" ;;
+          --dir)          INSTALL_DIR="$2" ;;
+          --data-dir)     DATA_DIR="$2" ;;
+          --mode)         MODE="$2" ;;
+          --tls)
+            # 便利写法：--tls 直接给 CA 名等价于 --tls acme --ca <CA 名>
+            if ca_is_valid "$2"; then CA_PROVIDER="$2"; TLS_MODE="acme"; CA_EXPLICIT=1; else TLS_MODE="$2"; fi ;;
+          --email)        EMAIL="$2" ;;
+          --path)         SUB_PATH="$2" ;;
+          --repo)         REPO_URL="$2" ;;
+          --node-version) NODE_VERSION="$2" ;;
+          --mirror)       MIRROR="$2" ;;
+          --ca)           CA_PROVIDER="$2"; CA_EXPLICIT=1 ;;
+          --eab-kid)      EAB_KID="$2" ;;
+          --eab-hmac-key) EAB_HMAC_KEY="$2" ;;
+        esac
+        shift 2 ;;
+      --staging)      STAGING=1; shift ;;
+      --force-cert)   FORCE_CERT=1; shift ;;
+      --skip-node)    SKIP_NODE=1; shift ;;
+      --skip-deps)    SKIP_DEPS=1; shift ;;
+      --skip-nginx)   SKIP_NGINX=1; shift ;;
+      --skip-service) SKIP_SERVICE=1; shift ;;
+      --reinstall)    REINSTALL=1; ASSUME_YES=1; shift ;;
+      --manage)       MANAGE=1; shift ;;
+      # kepler <编号> / deploy.sh <编号>：与菜单编号一致，直接执行对应管理动作
+      [0-9])          MANAGE=1; MANAGE_ACTION="$1"; shift ;;
+      -y|--yes)       ASSUME_YES=1; shift ;;
+      --verbose)      VERBOSE=1; shift ;;
+      --uninstall)    UNINSTALL=1; shift ;;
+      -h|--help)      usage ;;
+      *)              die "未知参数：$1（使用 --help 查看用法）" ;;
+    esac
+  done
+}
+
+# 优先级：内置默认值 < 已保存部署状态 < 显式环境变量 < 命令行参数。
+# 被 source 时（自检 / 复用函数）不解析调用方的参数，也不自动执行部署。
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  load_state
+  apply_env_overrides
+  parse_args "$@"
+fi
+
+# ------------------------------------------------------------------------------
+# 2. 前置检查：root、锁、必要命令、操作系统与包管理器
+# ------------------------------------------------------------------------------
+detect_env() {
+  [[ "$(id -u)" -eq 0 ]] || die "请以 root 身份运行：sudo bash ${SCRIPT_NAME} --domain <域名>"
+
+  mkdir -p "$(dirname "$LOG_FILE")"
+  : >>"$LOG_FILE" || die "无法写入日志文件 ${LOG_FILE}"
+  chmod 0600 "$LOG_FILE"
+  info "详细日志：${LOG_FILE}"
+
+  # 单实例锁，避免并发执行互相踩踏。
+  # 注意：`kepler 1`（重装）用 exec 把自己换成新进程，而 exec 不会触发 EXIT trap，
+  # 锁文件会留在磁盘上 —— 新进程一进来就会误判成「另一个部署进程正在运行」。
+  # 所以重装通过 KEPLER_LOCK_HELD 把锁**交接**给新进程，仍由新进程负责清理。
+  mkdir -p "$(dirname "$LOCK_FILE")"
+  if [[ "${KEPLER_LOCK_HELD:-}" == "$LOCK_FILE" ]]; then
+    info "沿用父进程持有的部署锁：${LOCK_FILE}"
+  elif ! (set -o noclobber; printf '%s\n' "$$" > "$LOCK_FILE") 2>/dev/null; then
+    die "检测到另一个部署进程正在运行（锁文件 ${LOCK_FILE}）。若确认已退出，请删除该锁文件后重试。"
+  fi
+  trap 'rm -f "$LOCK_FILE"' EXIT
+
+  # 这里只校验无法通过包管理器可靠补齐的最小系统命令；git/curl/tar 等在下一步自动安装。
+  for cmd in mkdir id chmod uname; do
+    have "$cmd" || die "基础系统缺少必要命令：$cmd（当前镜像过于精简，无法安全启动自动安装）。"
+  done
+
+  OS_ID=""; OS_LIKE=""; OS_NAME="unknown"; PM=""
+  if [[ -r /etc/os-release ]]; then
+    # shellcheck disable=SC1091
+    . /etc/os-release
+    OS_ID="${ID:-}"; OS_LIKE="${ID_LIKE:-}"; OS_NAME="${PRETTY_NAME:-${OS_ID}}"
+  fi
+  if   have apt-get; then PM="apt"
+  elif have dnf;      then PM="dnf"
+  elif have yum;      then PM="yum"
+  elif have apk;      then PM="apk"
+  elif have zypper;   then PM="zypper"
+  fi
+  [[ -n "$PM" ]] || die "未能识别包管理器（未找到 apt-get/dnf/yum/apk/zypper）。本脚本支持 Debian/Ubuntu、RHEL/CentOS/Rocky/Alma、Alpine、openSUSE。"
+
+  ARCH_RAW="$(uname -m)"
+  case "$ARCH_RAW" in
+    x86_64|amd64) NODE_ARCH="x64" ;;
+    aarch64|arm64) NODE_ARCH="arm64" ;;
+    armv7l) NODE_ARCH="armv7l" ;;
+    *) die "不支持的 CPU 架构：${ARCH_RAW}" ;;
+  esac
+
+  INIT_SYSTEM="unknown"
+  if [[ -d /run/systemd/system ]] && have systemctl; then INIT_SYSTEM="systemd"; fi
+
+  ok "操作系统：${OS_NAME}"
+  ok "包管理器：${PM} ｜ 架构：${ARCH_RAW} ｜ 初始化系统：${INIT_SYSTEM}"
+}
+
+# 包管理器的「安装」命令原文（提示里给用户直接复制用）
+pm_install_cmd() {
+  case "$PM" in
+    apt)     printf 'apt-get install -y' ;;
+    dnf|yum) printf '%s install -y' "$PM" ;;
+    apk)     printf 'apk add' ;;
+    *)       printf 'zypper --non-interactive install' ;;
+  esac
+}
+
+# EPEL 直装命令（RHEL 系常用兜底）
+epel_rpm_cmd() {
+  local major="${VERSION_ID:-}"
+  major="${major%%.*}"
+  case "$major" in
+    7|8|9) printf 'rpm -Uvh https://dl.fedoraproject.org/pub/epel/epel-release-latest-%s.noarch.rpm' "$major" ;;
+    *)     printf '%s install -y epel-release' "$PM" ;;
+  esac
+}
+
+# 按包名推断「装不了就跳过」的开关，便于用户自行安装后重跑
+skip_flag_for_pkgs() {
+  local list="$1"
+  case "$list" in
+    *nodejs*|*node*)  printf -- '--skip-node' ;;
+    *nginx*)          printf -- '--skip-nginx' ;;
+    *certbot*)        printf -- '--tls file' ;;
+    *docker*)         printf -- '--mode systemd' ;;
+    *)                printf -- '' ;;
+  esac
+}
+
+# 真正调用包管理器（不做失败处理）
+pkg_run_pm() {
+  local pkgs=("$@")
+  local rc=0
+  mark_log
+  info "安装软件包：${pkgs[*]}"
+  case "$PM" in
+    apt)
+      run_soft bash -c 'DEBIAN_FRONTEND=noninteractive apt-get update -qq'
+      run bash -c "DEBIAN_FRONTEND=noninteractive apt-get install -y -qq ${pkgs[*]}" || rc=$? ;;
+    dnf|yum)
+      run "$PM" install -y "${pkgs[@]}" || rc=$? ;;
+    apk)
+      run_soft apk update
+      run apk add --no-cache "${pkgs[@]}" || rc=$? ;;
+    zypper)
+      run zypper --non-interactive install "${pkgs[@]}" || rc=$? ;;
+  esac
+  return "$rc"
+}
+
+# ------------------------------------------------------------------------------
+# 0.2 包安装失败的「自动修复」
+#
+# 与 0.1 的分工：**能自己修的就自己修，修不了的才把原因和命令交给用户。**
+#
+# 为什么必须有这一层：光有诊断是不够的。识别出原因、却只打印一段让用户去敲的
+# module reset，等于把「最基础的一步」又推回给人 —— 用户的原话是
+# 「脚本自动安装 git 失败。这种最基础的操作不应该出问题。」
+# CentOS/RHEL 8 上 git 装不上十有八九是 perl 模块流状态与仓库不一致
+# （git → perl-Git → perl-libs 被 modular filtering 过滤），而这件事脚本
+# 完全有能力自己修好：reset 模块流、按报错里期望的流重新 enable、再重试。
+#
+# 边界：只对**能确定原因**的失败动手（判据见 pkg_failure_kind），
+# 拿不准就不碰系统，老实走诊断。
+# ------------------------------------------------------------------------------
+
+# 失败原因分类。**唯一实现点** —— on_pkg_failure 用它选诊断分支，
+# pkg_auto_repair 用它决定要不要动手自动修。两边判据必须一致，
+# 否则会出现「诊断说是 A、自动修复却去修 B」这种最难查的错位。
+pkg_failure_kind() {
+  local t="$1"
+  if grep -qiE 'could not resolve|temporary failure resolving|failed to fetch|could not connect|network is unreachable|no route to host|timed out|connection refused|无法连接|超时' <<<"$t"; then
+    printf 'network'; return 0
+  fi
+  if grep -qiE 'filtered out by modular filtering|modular filtering|modulefailsafe|module_hotfixes|requires module\(|conflicts with module\(' <<<"$t"; then
+    printf 'modular'; return 0
+  fi
+  if grep -qiE 'unable to locate package|no package .* available|unable to find a match|no match for argument|nothing provides|not found|没有可用的软件包' <<<"$t"; then
+    printf 'missing'; return 0
+  fi
+  if grep -qiE 'could not get lock|lock held|waiting for|another process|is being used by|占用' <<<"$t"; then
+    printf 'lock'; return 0
+  fi
+  if grep -qiE 'no space left|disk full|空间不足' <<<"$t"; then
+    printf 'space'; return 0
+  fi
+  if grep -qiE 'permission denied|are you root|not permitted' <<<"$t"; then
+    printf 'perm'; return 0
+  fi
+  if grep -qiE 'gpg|NO_PUBKEY|public key|signature' <<<"$t"; then
+    printf 'gpg'; return 0
+  fi
+  printf 'unknown'
+}
+
+# 把包版本收敛成模块「流」号：5.26.3 → 5.26（纯函数，可直接验证）。
+stream_from_version() {
+  local v="$1"
+  [[ -n "$v" ]] || return 0
+  local a b rest
+  IFS='.' read -r a b rest <<<"$v"
+  if [[ -n "${b:-}" ]]; then printf '%s.%s' "$a" "$b"; else printf '%s' "$a"; fi
+}
+
+# 由包名推候选模块名：perl-libs → perl-libs / perl（纯函数）。
+#
+# 报错里给的是**包名**，而 `module reset` 要的是**模块名**；两者常常差一层后缀
+# （包 perl-libs 属于模块 perl）。这里只生成候选，存在与否交给 module_exists
+# 去问 dnf —— 不靠猜（`perl-libs` 不是模块，硬 reset 它只会多刷一行错）。
+module_name_candidates() {
+  local base="$1"
+  printf '%s\n' "$base"
+  while [[ "$base" == *-* ]]; do
+    base="${base%-*}"
+    printf '%s\n' "$base"
+  done
+}
+
+# 从报错日志里找出「被 modular filtering 过滤掉的包」及其期望的流版本。
+# 输出每行：<包名> <流版本或空>。
+#
+# 样例（CentOS 8 的真实报错）：
+#   - package perl-libs-4:5.26.3-420.el8.x86_64 is filtered out by modular filtering
+# → perl-libs 5.26
+modular_suspects() {
+  local log="$1"
+  local line pkg ver
+  while IFS= read -r line; do
+    [[ "$line" == *"filtered out by modular filtering"* ]] || continue
+    pkg="$(sed -nE 's/^.*package[[:space:]]+(.+)-([0-9]+:)?[0-9][0-9.]*-[^[:space:]]+[[:space:]]+is[[:space:]]+filtered out.*/\1/p' <<<"$line")"
+    ver="$(sed -nE 's/^.*package[[:space:]]+.+-([0-9]+:)?([0-9][0-9.]*)-[^[:space:]]+[[:space:]]+is[[:space:]]+filtered out.*/\2/p' <<<"$line")"
+    [[ -n "$pkg" ]] || continue
+    printf '%s %s\n' "$pkg" "$(stream_from_version "$ver")"
+  done <<<"$log"
+}
+
+# 这个名字是不是真正的模块（`module list` 的 Name 列认得它才算）。
+module_exists() {
+  local m="$1"
+  have "$PM" || return 1
+  local out
+  out="$("$PM" module list "$m" 2>/dev/null || true)"
+  # 输出形如（第二行起是 Name/Stream/Profiles/Summary 四列）：
+  #   perl  5.26  common  Practical Extraction and Report Language
+  # 只认**行首那列**：Summary 里偶然提到同名词不算。
+  grep -qE "^[[:space:]]*${m//./\\.}[[:space:]]" <<<"$out"
+}
+
+# 自动修复模块流，然后重试装包。返回 0 = 修好了而且这次装上了。
+pkg_repair_modular_streams() {
+  local -a pkgs=("$@")
+  local suspects; suspects="$(modular_suspects "$(log_since_mark)")"
+  [[ -n "$suspects" ]] || return 1
+
+  local pkg stream mod cand did=0
+  while read -r pkg stream; do
+    [[ -n "$pkg" ]] || continue
+    mod=""
+    while IFS= read -r cand; do
+      [[ -n "$cand" ]] || continue
+      if module_exists "$cand"; then mod="$cand"; break; fi
+    done <<<"$(module_name_candidates "$pkg")"
+    [[ -n "$mod" ]] || continue
+    info "检测到模块流不一致：${pkg} 被 modular filtering 过滤（它属于模块 ${mod}）"
+    info "  自动复位并按报错里期望的流重新启用：${mod}${stream:+:${stream}}"
+    run_soft "$PM" module reset -y "$mod"
+    if [[ -n "$stream" ]]; then run_soft "$PM" module enable -y "${mod}:${stream}"; fi
+    did=1
+  done <<<"$suspects"
+  ((did == 1)) || return 1
+
+  run_soft "$PM" clean all
+  run_soft "$PM" makecache
+  info "模块流已修复，重新尝试安装：${pkgs[*]}"
+  local rc=0
+  pkg_run_pm "${pkgs[@]}" || rc=$?
+  if ((rc == 0)); then ok "模块流修复后安装成功：${pkgs[*]}"; return 0; fi
+  # 模块流修好了仍装不上 —— 这时才轮到 dnf 自己建议的 --nobest（放宽候选版本）。
+  # 特意放在这里而不是无条件先试：**只有确认了 modular 问题**才值得放宽版本选择。
+  # 否则就是在没搞清原因的情况下换一个版本装上，把问题推给下一个环节。
+  if pkg_run_pm_nobest "${pkgs[@]}"; then return 0; fi
+  return 1
+}
+
+# 同 pkg_run_pm，但让 dnf 放宽「最佳候选」的选择。
+#
+# 这是 dnf 自己在求解失败时给出的建议（报错尾部的
+# "(try to add '--skip-broken' … or '--nobest' …)"）。
+# **绝不用 --skip-broken**：它会「跳过装不上的包」却仍返回 0 —— pkg_install
+# 于是以为装好了，而 `have git` 依旧是假。错误被吞进返回码里，是本项目最忌讳的
+# 一种假成功。--nobest 只是允许选非最佳版本，装不上仍会如实返回非零。
+pkg_run_pm_nobest() {
+  local pkgs=("$@")
+  [[ ${#pkgs[@]} -gt 0 ]] || return 0
+  case "$PM" in
+    dnf|yum)
+      local rc=0
+      mark_log
+      info "安装软件包（--nobest：放宽候选版本；装不上仍会如实失败）：${pkgs[*]}"
+      run "$PM" install -y --nobest "${pkgs[@]}" || rc=$?
+      return "$rc" ;;
+    *) return 1 ;;
+  esac
+}
+
+# 绕过 RHEL/CentOS 8 的模块过滤，直接把包装上。
+#
+# 这是 dnf 官方给出的处理方式（`module_hotfixes` 表示「该仓库按**包级**视图参与求解，
+# 不套模块过滤」）——它只影响**本次事务**，不写任何持久状态，因此比
+# `module reset/enable`（那是**全局**地改机器上的模块流状态）安全得多。
+#
+# 为什么它必须排在 reset/enable **之前**：RHEL 8 的 module failsafe 会把 perl-libs
+# 这类包屏蔽掉，**即使是全新安装的纯净系统**也一样 —— 此时机器上的模块流状态本来就与
+# 仓库期望一致，`reset` + `enable` 全是空转，只有这一档能过。用户现场（干净 CentOS 8）
+# 正是这种情形：先前那套「复位模块流」在那台机器上永远不会成功。
+#
+# ⚠️ 那个 `*` 的引号必须留：不引起来的话 shell 会把它当通配符，在当前工作目录里做 glob
+# 展开，dnf 收到的是被换成文件名的垃圾参数 —— 而失败信息完全看不出是这个原因。
+pkg_run_pm_hotfixes() {
+  local pkgs=("$@")
+  [[ ${#pkgs[@]} -gt 0 ]] || return 0
+  case "$PM" in
+    dnf|yum)
+      local rc=0
+      mark_log
+      info "安装软件包（module_hotfixes：本次事务绕过模块过滤，不改机器上的模块流状态）：${pkgs[*]}"
+      run "$PM" install -y --setopt='*.module_hotfixes=true' "${pkgs[@]}" || rc=$?
+      return "$rc" ;;
+    *) return 1 ;;
+  esac
+}
+
+# 装包失败后的「自动修复 + 重试」。返回 0 = 修好并且这次装上了。
+PKG_AUTO_REPAIR_TRIED=0
+pkg_auto_repair() {
+  local -a pkgs=("$@")
+  PKG_AUTO_REPAIR_TRIED=1
+  case "$(pkg_failure_kind "$(log_since_mark)")" in
+    modular)
+      case "$PM" in
+        dnf|yum)
+          # 第一档：绕过模块过滤。零副作用（不改机器状态），而且对「纯净系统上的
+          # module failsafe」是**唯一**对症的一档 —— 所以它必须排在最前面。
+          if pkg_run_pm_hotfixes "${pkgs[@]}"; then return 0; fi
+          # 第二档：机器上的模块流**确实**与仓库期望不一致时（例如有人手动 enable 过别的流），
+          # 才需要真的去 reset/enable —— 这一步会改全局模块状态，所以只能排在后面。
+          if pkg_repair_modular_streams "${pkgs[@]}"; then return 0; fi ;;
+      esac ;;
+  esac
+  return 1
+}
+
+# 包安装失败：判断原因 → 给出可敲的修复命令 → 询问/退出
+# 用法：on_pkg_failure <包名列表> <1=可选依赖(仅警告) | 0=必需>
+HINTS=()
+add_hint() { HINTS+=("$1"); }
+
+on_pkg_failure() {
+  local pkg_list="$1" optional="${2:-0}"
+  local tail_log; tail_log="$(log_since_mark)"
+  local kind; kind="$(pkg_failure_kind "$tail_log")"
+
+  HINTS=()
+  add_hint "失败的包：${pkg_list}"
+  add_hint ""
+  local l
+  while IFS= read -r l; do [[ -n "$l" ]] && add_hint "  日志 | ${l}"; done <<<"$(log_key_lines 5)"
+  add_hint ""
+
+  if [[ "$kind" == "network" ]]; then
+    add_hint "【判断】网络 / DNS 不可达，或软件源超时。"
+    case "$PM" in
+      dnf|yum)
+        # mirrorlist.centos.org 已随 CentOS 7 EOL（2024-06-30）正式下线，
+        # 拿它当探针会**恒失败**，把"源不可达"误报成"网络不通"，白折腾一轮。
+        # RHEL 系如今没有统一的公共镜像入口了，只能看用户实际配置的源。
+        add_hint "  1) 检查出网：curl -sI https://mirrors.aliyun.com -m 8 ; echo \$?"
+        add_hint "  2) 看你实际配置的源：grep -rhE '^(baseurl|mirrorlist)=' /etc/yum.repos.d/ | head -n 5"
+        add_hint "  3) CentOS 7/8 均已 EOL，官方镜像站下线 —— 源要改指 vault（旧包不再更新）："
+        add_hint "       sed -i 's/^mirrorlist/#mirrorlist/' /etc/yum.repos.d/CentOS-*.repo"
+        add_hint "       sed -i 's|^#baseurl=http://mirror.centos.org|baseurl=http://vault.centos.org|' /etc/yum.repos.d/CentOS-*.repo"
+        add_hint "       ${PM} clean all && ${PM} makecache"
+        add_hint "  4) 检查 DNS：cat /etc/resolv.conf（可临时换 8.8.8.8 / 223.5.5.5）" ;;
+      *)
+        add_hint "  1) 检查出网：curl -sI https://$(pm_mirror_host) -m 8 ; echo \$?"
+        add_hint "  2) 检查 DNS：cat /etc/resolv.conf（可临时换 8.8.8.8 / 223.5.5.5）"
+        add_hint "  3) 国内服务器建议把软件源换成国内镜像后重试（node/npm 下载可加 --mirror cn）" ;;
+    esac
+  elif [[ "$kind" == "modular" ]]; then
+    # RHEL/CentOS 8 特有：模块化的过滤机制（module failsafe）把依赖包静默屏蔽了，
+    # dnf 只报 "none of the providers can be installed" / "filtered out by modular filtering"。
+    # 最经典的受害者就是 git（它依赖 perl-Git → perl-libs）。CentOS 8 已于 2021-12-31 EOL，
+    # 仓库迁到 vault 之后更常见。
+    # ⚠️ 这**不一定**是「模块流状态与仓库不一致」—— 全新安装的纯净系统同样会中招，
+    # 那时模块流本身是好的，reset/enable 根本修不动它（用户现场就是这种）。
+    add_hint "【判断】RHEL/CentOS 8 的模块过滤（module failsafe）把依赖包屏蔽了：dnf 报 filtered out by modular filtering。"
+    add_hint "  纯净系统上也会发生（模块流状态本身没问题），别只往「模块流不一致」上想。"
+    if ((PKG_AUTO_REPAIR_TRIED)); then
+      add_hint "  脚本已自动依次试过「绕过模块过滤 → 复位模块流并重试 → 放宽候选版本」，仍未成功。"
+    fi
+    case "$PM" in
+      dnf|yum)
+        # 手工命令按**解析出来的**包与流版本来写，绝不硬编码 perl：
+        # 换成别的被过滤包（nodejs 等）时，写死的提示会直接把人带偏。
+        local sp="" sv=""
+        # `|| true` 必须写在**替换内部**：pipefail 下 `modular_suspects | head -n 1`
+        # 里任何一环返回非零（head 提前关闭管道时上游会吃到 SIGPIPE）都会让整条赋值返回 1，
+        # 被 ERR trap 当成脚本失败。外层的 `|| true` 只管 `read` 在空输入上返回 1 这一种情况，
+        # 拦不住管道那一半 —— 只写外层正是本项目已经栽过的那个坑。
+        read -r sp sv <<<"$(modular_suspects "$tail_log" | head -n 1 || true)" || true
+        add_hint "  1) 首选：本次事务绕过模块过滤 —— 不改机器上的模块流状态，无副作用："
+        add_hint "       ${PM} install -y --setopt='*.module_hotfixes=true' ${pkg_list}"
+        add_hint "     （那个星号的引号必须留：不引会被 shell 当通配符展开成文件名）"
+        if [[ -n "$sp" ]]; then
+          # perl-libs → perl：与 module_name_candidates 同一套「剥后缀」推导。
+          local m="${sp%%-*}"
+          add_hint "  2) 若上一步不行（机器上的模块流确实与仓库期望不一致），再复位并按期望流重新启用："
+          add_hint "       报错里被过滤的是 ${sp}${sv:+（期望流 ${sv}）}，它属于模块 ${m}"
+          add_hint "       ${PM} module reset -y ${m}${sv:+ && ${PM} module enable -y ${m}:${sv}}"
+          add_hint "  3) 看模块流现状（[e]=已启用 [d]=默认）：${PM} module list ${m}"
+        else
+          add_hint "  2) 若上一步不行，复位出问题的模块再按它需要的流重新启用"
+          add_hint "     （报错里 perl-libs-4:5.26.3 这种写法：模块名是 perl-libs 去掉后缀的 perl，流是 5.26）"
+          add_hint "       ${PM} module reset -y <模块名> && ${PM} module enable -y <模块名>:<流>"
+          add_hint "  3) 看模块流现状（[e]=已启用 [d]=默认）：${PM} module list"
+        fi
+        add_hint "  4) 再重试安装：$(pm_install_cmd) ${pkg_list}" ;;
+      *)
+        add_hint "  1) 刷新索引后重试：$(pm_install_cmd) ${pkg_list}" ;;
+    esac
+  elif [[ "$kind" == "missing" ]]; then
+    add_hint "【判断】当前软件源里没有这个包（索引未更新 / 缺扩展源）。"
+    case "$PM" in
+      apt)
+        add_hint "  1) 刷新索引：apt-get update"
+        add_hint "  2) 查正确包名：apt-cache search ${pkg_list%% *}"
+        add_hint "  3) 源太旧就换源：/etc/apt/sources.list（国内可用 mirrors.aliyun.com / mirrors.tencent.com）" ;;
+      dnf|yum)
+        add_hint "  1) 启用 EPEL：$(epel_rpm_cmd)"
+        add_hint "  2) 刷新索引：${PM} makecache"
+        add_hint "  3) 查正确包名：${PM} search ${pkg_list%% *}"
+        add_hint "  4) nginx 还可走模块：${PM} module list nginx && ${PM} module enable -y nginx:1.24" ;;
+      apk)
+        add_hint "  1) 刷新索引：apk update（确认 /etc/apk/repositories 已启用社区源）" ;;
+      zypper)
+        add_hint "  1) 刷新索引：zypper refresh" ;;
+    esac
+  elif [[ "$kind" == "lock" ]]; then
+    add_hint "【判断】另一个包管理进程正占用锁（常见于系统自动更新）。"
+    add_hint "  1) 等它结束，或确认：ps aux | grep -E 'apt|dpkg|dnf|yum|apk'"
+    add_hint "  2) 等待后重跑本脚本即可（幂等）"
+  elif [[ "$kind" == "space" ]]; then
+    add_hint "【判断】磁盘空间不足：df -h 查看，清理后重试。"
+  elif [[ "$kind" == "perm" ]]; then
+    add_hint "【判断】权限不足：请用 root 或加 sudo 重跑本脚本。"
+  elif [[ "$kind" == "gpg" ]]; then
+    add_hint "【判断】软件源签名/公钥校验失败（源被替换过或密钥过期）。"
+    case "$PM" in
+      apt) add_hint "  修复：apt-get update --allow-insecure-repositories 或重新导入源的公钥" ;;
+      dnf|yum) add_hint "  修复：${PM} clean all && ${PM} makecache（必要时关闭 gpgcheck 仅作临时手段）" ;;
+    esac
+  else
+    add_hint "【判断】未能自动识别原因，请查看日志尾部：tail -n 80 ${LOG_FILE}"
+    add_hint "  手动安装命令：$(pm_install_cmd) ${pkg_list}"
+  fi
+
+  add_hint ""
+  # CentOS 8 上最常见的一类**无害**噪音：repo 文件里留着旧版 yum 的 failovermethod
+  # 选项，dnf（libdnf）不认识它，于是每读一次仓库就打一行 "Invalid configuration value"。
+  # 它**不是**失败原因，但会刷屏、并让人以为这就是出错的地方 —— 必须明说，
+  # 否则用户会顺着它去查错方向（真实故障现场里这几行正是最显眼的）。
+  if grep -qiE 'Invalid configuration value.*failovermethod' <<<"$tail_log"; then
+    add_hint "  · 日志里那几行「Invalid configuration value: failovermethod=…」是无害警告："
+    add_hint "    该选项属于旧版 yum，dnf 不支持，读一次仓库配置就打一行 —— 与本次安装失败无关。"
+    add_hint "    想去掉它：sed -i '/^failovermethod=/d' /etc/yum.repos.d/*.repo"
+  fi
+
+  # git 只是「把源码弄到服务器上」的一种手段，装不上不该把人堵死 —— 手动带源码即可。
+  # 这条逃生口必须在这里给出：CentOS/RHEL 8 的模块流问题会让 git 根本装不上，
+  # 而用户此时最容易以为"部署彻底做不下去了"。
+  case "$pkg_list" in
+    *git*)
+      add_hint "  · git 装不上也能继续：把项目打包上传到服务器，解压后在该目录内执行本脚本"
+      add_hint "    （脚本会识别同目录源码，全程不需要 git）" ;;
+  esac
+
+  local flag; flag="$(skip_flag_for_pkgs "$pkg_list")"
+  add_hint "【或自己装】$(pm_install_cmd) ${pkg_list}"
+  if [[ -n "$flag" ]]; then
+    add_hint "  装完后让脚本跳过这步重跑："
+    add_hint "    $(rerun_cmd "$flag")"
+  fi
+
+  if [[ "$optional" == "1" ]]; then
+    warn_with_hint "可选依赖安装失败（不影响主流程，功能会降级）" "${HINTS[@]}"
+    return 1
+  fi
+  if confirm_continue; then
+    ok "已确认继续（若后续步骤依赖该包，仍可能失败）"
+    return 0
+  fi
+  die_with_hint "软件包安装失败：${pkg_list}" "${HINTS[@]}"
+}
+
+# 一个「外网是否通」的稳定探测目标。
+# 注意：这里曾经给 dnf 返回 mirrorlist.centos.org —— 该域名已随 CentOS 7 EOL
+# （2024-06-30）被官方正式下线，当探针会**恒失败**，把"源不可达"误报成"网络不通"。
+# RHEL 系如今没有统一的公共镜像入口，所以只挑一个确实可达的镜像站即可。
+pm_mirror_host() {
+  case "$PM" in
+    apt) printf 'deb.debian.org' ;;
+    dnf|yum) printf 'mirrors.aliyun.com' ;;
+    apk) printf 'dl-cdn.alpinelinux.org' ;;
+    *) printf 'download.opensuse.org' ;;
+  esac
+}
+
+# 必需依赖：装不上会中止（可交互确认继续）
+pkg_install() {
+  local pkgs=("$@")
+  [[ ${#pkgs[@]} -gt 0 ]] || return 0
+  local rc=0
+  PKG_AUTO_REPAIR_TRIED=0
+  pkg_run_pm "${pkgs[@]}" || rc=$?
+  if ((rc != 0)); then
+    # 先自己修一遍再谈失败：能自动解决的绝不留给人（见 0.2 节）
+    if pkg_auto_repair "${pkgs[@]}"; then return 0; fi
+    on_pkg_failure "${pkgs[*]}" 0
+  fi
+  return 0
+}
+
+# 可选依赖：装不上只警告并降级
+pkg_install_opt() {
+  local pkgs=("$@")
+  [[ ${#pkgs[@]} -gt 0 ]] || return 0
+  local rc=0
+  PKG_AUTO_REPAIR_TRIED=0
+  pkg_run_pm "${pkgs[@]}" || rc=$?
+  if ((rc != 0)); then
+    # git 走的正是这条通道，所以自动修复必须在这里也生效 —— 否则「git 装不上」
+    # 这个最基础的场景仍然只会打印一段提示、不会自己修好，而重装时
+    # prepare_source 会因为拿不到 git 而整个中断。
+    if pkg_auto_repair "${pkgs[@]}"; then return 0; fi
+    # on_pkg_failure 在「可选」分支里 return 1（表示未装上）。这里是**裸调用**，
+    # 返回 1 会被 set -e 的 ERR trap 直接判成「脚本意外失败」，调用点的 `|| true`
+    # 根本来不及生效 —— 明明设计成"装不上就降级"，实际却会中断部署。
+    on_pkg_failure "${pkgs[*]}" 1 || true
+    return 1
+  fi
+  return 0
+}
+
+need_pkgs_base() {
+  local to_install=()
+  have curl || to_install+=(curl)
+  have git || to_install+=(git)
+  have tar || to_install+=(tar)
+  have gzip || to_install+=(gzip)
+  have sed || to_install+=(sed)
+  have awk || { [[ "$PM" == "apt" ]] && to_install+=(gawk) || to_install+=(gawk); }
+  have grep || to_install+=(grep)
+  local core_cmd
+  for core_cmd in mktemp date head tail cp rm seq wc; do
+    if ! have "$core_cmd"; then to_install+=(coreutils); break; fi
+  done
+  [[ -r /etc/ssl/certs/ca-certificates.crt || -r /etc/pki/tls/certs/ca-bundle.crt ]] || to_install+=(ca-certificates)
+
+  if ((${#to_install[@]})); then
+    info "检测到缺少基础工具，将自动安装：${to_install[*]}"
+    # git 单独走「可选」通道，不混进必需包：它只服务于「从仓库拉源码」这一条路径，
+    # 源码已在当前目录时压根用不到。若混在一起装，dnf 一失败就整段中断，
+    # prepare_source 里那段「没有 git 也能装（把源码打包上传）」的提示永远执行不到 ——
+    # 用户只能看到一段 dnf 的原始求解报错（CentOS/RHEL 8 的模块流问题正落在这里）。
+    local -a hard_pkgs=()
+    local p
+    for p in "${to_install[@]}"; do
+      [[ "$p" == git ]] || hard_pkgs+=("$p")
+    done
+    if ((${#hard_pkgs[@]})); then pkg_install "${hard_pkgs[@]}"; fi
+    if ! have git; then pkg_install_opt git || true; fi
+  fi
+
+  local cmd
+  # 这份清单**不含 git**：缺 git 时交给 prepare_source 判断当前场景并给出对症提示
+  # （它知道是本地源码目录还是独立运行），比在这里一刀切 die 有用得多。
+  for cmd in curl tar gzip sed awk grep mktemp date head tail; do
+    have "$cmd" || die_with_hint "基础工具自动安装后仍不可用：${cmd}" \
+      "请检查软件源与系统镜像是否完整。" \
+      "可手工执行：$(pm_install_cmd) curl ca-certificates tar gzip sed gawk grep coreutils"
+  done
+  if have git; then
+    ok "基础工具已就绪：git / curl / tar / ca-certificates"
+  else
+    ok "基础工具已就绪：curl / tar / ca-certificates"
+    warn "未安装 git：仅影响「从仓库拉取源码」这一步；若源码已在当前目录则不受影响。"
+  fi
+}
+
+# ------------------------------------------------------------------------------
+# 3. 交互采集（只在缺少参数且是终端时提问）
+# ------------------------------------------------------------------------------
+ask() {
+  # ask <变量名> <提示> <默认值>
+  local var="$1" prompt="$2" default="${3:-}" answer=""
+  if [[ "$ASSUME_YES" == "1" || ! -t 0 ]]; then
+    printf -v "$var" '%s' "$default"
+    return 0
+  fi
+  read -r -p "$(printf '%s%s%s [%s]: ' "$C_BOLD" "$prompt" "$C_RESET" "$default")" answer || true
+  printf -v "$var" '%s' "${answer:-$default}"
+}
+
+is_ip_addr() {
+  if [[ "$1" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then return 0; fi
+  if [[ "$1" == *:* ]]; then return 0; fi
+  return 1
+}
+
+is_valid_domain() {
+  if [[ "$1" =~ ^[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?(\.[A-Za-z0-9]([A-Za-z0-9-]*[A-Za-z0-9])?)+$ ]]; then return 0; fi
+  return 1
+}
+
+collect_config() {
+  # 域名（必填）
+  if [[ -z "$DOMAIN" ]]; then
+    [[ -t 0 ]] || die "未指定部署域名：非交互环境请用 --domain <域名> 传入（或设置环境变量 DOMAIN）。"
+    while true; do
+      read -r -p "$(printf '%s部署域名或公网 IP（必填，如 cos.example.com）%s: ' "$C_BOLD" "$C_RESET")" DOMAIN \
+        || die "无法读取输入，请用 --domain <域名> 指定。"
+      DOMAIN="${DOMAIN// /}"
+      [[ -n "$DOMAIN" ]] || { warn "域名不能为空，请重新输入。"; continue; }
+      break
+    done
+  fi
+  DOMAIN="${DOMAIN,,}"
+  DOMAIN="${DOMAIN#http://}"; DOMAIN="${DOMAIN#https://}"
+  DOMAIN="${DOMAIN%%/*}"
+  # 把「域名:端口」整段粘进来是很常见的输入。带端口的取值会被 is_ip_addr 当成 IP
+  # 放行（它见到冒号就以为是 IPv6），后果是：这个带端口的串被当成合法域名 + server_name 里带着
+  # 端口让 nginx -t 失败（用户在 nginx 那步看到一堆看不懂的报错）。这里一次说清楚。
+  # 判据取「末尾 :数字」且排除真 IPv6（IPv6 字面量必含 ::），不会误伤 2001:db8::1。
+  if [[ "$DOMAIN" =~ :[0-9]+$ ]] && [[ "$DOMAIN" != *::* ]]; then
+    die "域名里不要带端口：${DOMAIN}（端口请用 --https-port / --http-port 指定，例如：--domain ${DOMAIN%%:*} --https-port ${DOMAIN##*:}）"
+  fi
+
+  if ! is_valid_domain "$DOMAIN" && ! is_ip_addr "$DOMAIN"; then
+    die "域名格式不合法：$DOMAIN"
+  fi
+
+  # 其余项全部使用安全默认值、已保存状态或命令行参数；初次部署只询问域名。
+  info "除域名外均使用自动配置；安装后可执行 kepler 修改端口或重新安装。"
+
+  MODE="${MODE,,}"
+  [[ "$MODE" == "systemd" || "$MODE" == "docker" || "$MODE" == "compose" ]] || die "MODE 只支持 systemd 或 docker，当前：$MODE"
+  [[ "$MODE" == "compose" ]] && MODE="docker"
+  [[ "$INSTALL_DIR" == /* ]] || die "安装目录必须是绝对路径：${INSTALL_DIR}"
+  [[ -z "$DATA_DIR" || "$DATA_DIR" == /* ]] || die "数据目录必须是绝对路径：${DATA_DIR}"
+  [[ -n "$REPO_URL" ]] || die "源码仓库地址不能为空。"
+  for p in "$APP_PORT" "$HTTP_PORT" "$HTTPS_PORT"; do
+    [[ "$p" =~ ^[0-9]+$ ]] && ((p >= 1 && p <= 65535)) || die "端口不合法：$p"
+  done
+  # 内部端口不能与 Nginx 对外端口冲突（否则 Nginx 抢不到端口）
+  if [[ "$APP_PORT" == "$HTTP_PORT" || "$APP_PORT" == "$HTTPS_PORT" ]]; then
+    die "应用内部端口（${APP_PORT}）不能与 Nginx 对外端口（${HTTP_PORT}/${HTTPS_PORT}）相同。"
+  fi
+  # 应用自身还会占用 3443（内置 HTTPS）与 ${WEBDAV_PORT}（WebDAV），端口不要撞上。
+  # 注意：WebDAV 端口只有一个事实来源（本脚本顶部的 WEBDAV_PORT），.env 与 Nginx 上游都用它，
+  # 所以这里的比较必须对着变量来，写死 8443 会在用户覆盖端口后失效。
+  if [[ "$APP_PORT" == "3443" ]]; then
+    die "应用内部端口不能是 3443（应用内置 HTTPS 端口）。"
+  fi
+  if [[ "$APP_PORT" == "$WEBDAV_PORT" ]]; then
+    die "应用内部端口（${APP_PORT}）不能与 WebDAV 端口（${WEBDAV_PORT}）相同（可用 WEBDAV_PORT=<其它端口> 改）。"
+  fi
+  # 对外端口撞 WebDAV 端口：不开 WebDAV 时无碍，一旦开启则应用必然起不来，故只提醒不拦。
+  if [[ "$HTTP_PORT" == "$WEBDAV_PORT" || "$HTTPS_PORT" == "$WEBDAV_PORT" ]]; then
+    warn "对外端口 ${WEBDAV_PORT} 与应用内置 WebDAV 端口相同，开启 WebDAV 后会冲突（可用 WEBDAV_PORT=<其它端口> 环境变量改端口）。"
+  fi
+  [[ "$DATA_DIR" ]] || DATA_DIR="${INSTALL_DIR}/data"
+  [[ "$EMAIL" ]] || EMAIL="admin@${DOMAIN}"
+  # 归一化服务路径：空 → /；其它 → 去掉首尾多余的斜杠
+  SUB_PATH="${SUB_PATH:-/}"
+  if [[ "$SUB_PATH" != "/" ]]; then
+    SUB_PATH="/${SUB_PATH#/}"
+    SUB_PATH="${SUB_PATH%/}"
+    [[ -n "$SUB_PATH" ]] || SUB_PATH="/"
+  fi
+
+  # 证书模式统一叫 acme（原来叫 letsencrypt）：CA 现在有多家，模式名不该等同于其中一家的名字。
+  # letsencrypt / le 作为历史写法继续接受，归一化到 acme。
+  # R49：`selfsigned` 已移除 —— 自签名证书会被浏览器判为不安全，也换不来「安全上下文」
+  # 才开放的功能（WebAuthn / Service Worker / 剪贴板…），等于只买到一个 HTTPS 的错觉。
+  # 取代它的 `file` 表示「使用你自备的真实证书」（放到 ${TLS_DIR}）。
+  TLS_MODE="${TLS_MODE,,}"
+  case "$TLS_MODE" in
+    auto|acme|letsencrypt|le|file|none) : ;;
+    selfsigned|self) die "自签名证书已在本版本移除（它会被浏览器判为不安全，且换不来需要「安全上下文」的功能）。请改用：--tls acme 申请正式证书，或用 --tls file 使用你自备的证书，或 --tls none 只提供 HTTP。" ;;
+    *) die "TLS 方式不合法：$TLS_MODE（可选 auto/acme/file/none，或直接给 CA 名 $(ca_names)）" ;;
+  esac
+  if [[ "$TLS_MODE" == "le" || "$TLS_MODE" == "letsencrypt" ]]; then TLS_MODE="acme"; fi
+
+  # CA 取值与 EAB 约束：**越早失败越好**。证书这一步失败会直接中断部署（不再回退自签名），
+  # 用户很容易把它当成"网络抖动"，其实是参数少给了一对必填凭据 —— 那样他会白折腾好几轮。
+  if ! ca_is_valid "$CA_PROVIDER"; then
+    die "证书颁发机构不合法：${CA_PROVIDER}（可选 $(ca_names)）"
+  fi
+  # 默认已改为 zerossl；这里兜住「旧状态文件残留 letsencrypt / 用户没显式选 CA」的情况：
+  # LE 在公共后缀域名（l.cd、github.io 等）上极易被 rateLimited 限流，反复签不下来。
+  # 若用户本次没显式拍板用 LE，就提醒他换 CA —— 而不是无声地继续撞 LE 的配额墙。
+  if [[ "$CA_PROVIDER" == "letsencrypt" && "$CA_EXPLICIT" != "1" ]] \
+     && [[ "$TLS_MODE" == "auto" || "$TLS_MODE" == "acme" ]]; then
+    warn "当前仍使用 Let's Encrypt（沿用之前保存的部署状态）。LE 按「注册域名/公共后缀」7 天限发证书，"
+    warn "公共后缀下所有人共享配额，极易被 rateLimited 拒签而反复失败。"
+    warn "建议改用一个不易被限流、且 acme.sh 能自动换取 EAB 的 CA（零手工）："
+    warn "    $(rerun_cmd --ca zerossl)"
+    warn "  或 LiteSSL（亚数 TrustAsia，需手工取 EAB）："
+    warn "    $(rerun_cmd --ca litessl --eab-kid KID --eab-hmac-key HMAC)"
+    warn "  若确认就要用 Let's Encrypt，请显式带上 --ca letsencrypt 以跳过本提示。"
+  fi
+  # 只有「真的要签发」时才卡 EAB；已经注册过账户（acme.sh 会把 EAB 存进 ca.conf）就不用再给。
+  if [[ "$TLS_MODE" == "auto" || "$TLS_MODE" == "acme" ]] \
+     && ca_needs_eab "$CA_PROVIDER" && [[ -z "$EAB_KID" || -z "$EAB_HMAC_KEY" ]] \
+     && ! acme_account_exists "$CA_PROVIDER"; then
+    acme_eab_hints
+    die_with_hint "使用 $(ca_label "$CA_PROVIDER") 需要 EAB 凭据（--eab-kid / --eab-hmac-key 未提供）" "${HINTS[@]}"
+  fi
+
+  if is_ip_addr "$DOMAIN" && [[ "$TLS_MODE" == "acme" ]]; then
+    # R49：以前这里退到自签名证书。自签名证书已被移除，而 IP 域名又签不下 ACME 证书，
+    # 所以只剩「不上 HTTPS」这一条路 —— 必须明说，不能悄悄降级成一张浏览器不认的证书。
+    warn "IP 地址无法签发 ACME 域名证书（LiteSSL 明确不支持 IP 证书），已切换为 --tls none：站点只提供 HTTP。"
+    warn "若这站点要暴露在公网，请给它一个域名后用 --tls acme，或用 --tls file 使用你自备的证书（IP 证书 / 内网 CA 证书均可）。"
+    TLS_MODE="none"
+  fi
+
+  log ""
+  log "${C_BOLD}部署参数确认${C_RESET}"
+  log "  域名          : ${DOMAIN}"
+  log "  访问地址      : https://${DOMAIN}$([[ "$HTTPS_PORT" == "443" ]] && echo "" || echo ":$HTTPS_PORT")${SUB_PATH}"
+  log "  部署方式      : ${MODE}"
+  log "  安装目录      : ${INSTALL_DIR}"
+  log "  数据目录      : ${DATA_DIR}"
+  log "  内部端口      : ${APP_PORT}"
+  log "  证书方式      : ${TLS_MODE}$([[ "$TLS_MODE" == "auto" || "$TLS_MODE" == "acme" ]] && echo "（$(ca_label "$CA_PROVIDER")，签不下来会直接报错，不再回退自签名）")$([[ "$TLS_MODE" == "file" ]] && echo "（使用 ${TLS_DIR} 下自备的 fullchain.pem / privkey.pem）")"
+  log ""
+}
+
+# ------------------------------------------------------------------------------
+# 4. 安装 Node.js
+# ------------------------------------------------------------------------------
+resolve_node_version() {
+  if [[ -n "$NODE_VERSION" ]]; then printf '%s' "${NODE_VERSION#v}"; return 0; fi
+  local v=""
+  v="$(curl -fsSL --max-time 15 https://nodejs.org/dist/index.json 2>/dev/null \
+        | grep -o '"version":"v20\.[0-9.]*"' | head -n1 | sed 's/.*:"v//;s/"//' || true)"
+  [[ -n "$v" ]] && { printf '%s' "$v"; return 0; }
+  printf '%s' "20.19.0"   # 兜底：确定存在的 LTS 版本
+}
+
+node_tarball_base() {
+  if [[ "$MIRROR" == "cn" ]]; then printf '%s' "https://registry.npmmirror.com/-/binary/node"; else printf '%s' "https://nodejs.org/dist"; fi
+}
+
+# Node.js 手动安装指引（自动安装失败 / --skip-node 版本不足时给出）
+node_manual_hints() {
+  local arch="${NODE_ARCH:-x64}"
+  HINTS=()
+  add_hint "本机需要 Node.js ≥ v18（项目 package.json 的 engines 要求）。任选一种装法："
+  add_hint ""
+  case "$PM" in
+    apt)
+      add_hint "  【A】NodeSource（Debian/Ubuntu —— 与本机匹配）"
+      add_hint "    curl -fsSL https://deb.nodesource.com/setup_20.x | bash -"
+      add_hint "    apt-get install -y nodejs" ;;
+    dnf|yum)
+      add_hint "  【A】NodeSource（RHEL/CentOS/Rocky/Alma —— 与本机匹配）"
+      add_hint "    curl -fsSL https://rpm.nodesource.com/setup_20.x | bash -"
+      add_hint "    ${PM} install -y nodejs --allowerasing" ;;
+    *)
+      add_hint "  【A】发行版源：$(pm_install_cmd) nodejs npm" ;;
+  esac
+  add_hint "  【B】其它发行版参考"
+  add_hint "    Debian/Ubuntu: curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && apt-get install -y nodejs"
+  add_hint "    RHEL/CentOS  : curl -fsSL https://rpm.nodesource.com/setup_20.x | bash - && dnf install -y nodejs --allowerasing"
+  add_hint "  【C】官方二进制包（任何发行版通用，装进 /usr/local）"
+  add_hint "    curl -fsSL https://nodejs.org/dist/v20.19.0/node-v20.19.0-linux-${arch}.tar.gz \\"
+  add_hint "      | tar -xz -C /usr/local --strip-components=1"
+  add_hint "  【D】国内服务器可用 npmmirror 镜像（替换【C】的下载地址）"
+  add_hint "    https://registry.npmmirror.com/-/binary/node/v20.19.0/node-v20.19.0-linux-${arch}.tar.gz"
+  add_hint "  【E】用 nvm 自行管理多版本：https://github.com/nvm-sh/nvm"
+  add_hint ""
+  add_hint "装完确认：node -v（应显示 v18/v20/v22 等 ≥ v18 的版本）"
+  add_hint "然后让脚本跳过安装、只做校验："
+  add_hint "    $(rerun_cmd --skip-node)"
+}
+
+# 是否命中「机器上已有的 nodejs 包与新版本互斥」。
+# 判据取自用户真实日志（CentOS Linux 8 装 NodeSource 20 时）：
+#   cannot install both nodejs-2:20.20.2-1nodesource.x86_64 and
+#                      nodejs-1:16.13.1-3.module_el8.5.0+1059+1852da12.x86_64
+# 注意 `is already installed` 这句 dnf 也会在**装成功**之后打印
+# （"Package nodejs-1:16.13.1… is already installed."），单独拿它当判据会误报，
+# 所以必须要求同时出现 "cannot install both" 这类**冲突**措辞。
+node_conflict_detected() {
+  log_since_mark | grep -qiE 'cannot install both|conflicts? with|obsoletes?|--allowerasing'
+}
+
+# 命中冲突后，把「先卸掉系统那份」的可敲命令追加进 HINTS。
+# 只在 install_node 的失败出口调用，此时 HINTS 已由 node_manual_hints 填好。
+node_conflict_hints() {
+  add_hint ""
+  add_hint "  【首要原因】这台机器上已经装着一份 nodejs（日志里的 cannot install both …），"
+  add_hint "  新版本与它互斥，所以 NodeSource 一定装不上、node 会一直停在旧版本。按下面顺序来："
+  case "$PM" in
+    dnf|yum)
+      add_hint "    1) ${PM} install -y nodejs --allowerasing   # 先试这条：让 dnf 直接替换掉冲突的旧模块包"
+      add_hint "    2) ${PM} module reset nodejs"
+      add_hint "    3) ${PM} remove -y nodejs npm nodejs-full-i18n nodejs-libs nodejs-devel"
+      add_hint "    4) curl -fsSL https://rpm.nodesource.com/setup_20.x | bash - && ${PM} install -y nodejs --allowerasing" ;;
+    apt)
+      add_hint "    1) apt-get remove -y nodejs npm && apt-get autoremove -y"
+      add_hint "    2) curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && apt-get install -y nodejs" ;;
+    *)
+      add_hint "    1) 先卸掉发行版自带的 nodejs/npm，再重新安装" ;;
+  esac
+  add_hint "    （若第 2 步卸不掉：说明有别的包依赖它，看 ${PM} repoquery --whatrequires nodejs）"
+  add_hint "    · 不想动系统包就用下面【C】的官方二进制包：它装进 /usr/local，"
+  add_hint "      完全不经过包管理器，与系统里那份 nodejs 互不冲突 —— 最省事的一条路。"
+}
+
+# RPM 系装 nodejs 时**额外要带的参数**（唯一实现点）。
+#
+# R40：EL8（RockyLinux 8 / CentOS Stream 8 等）的 AppStream 自带 nodejs 模块流，
+# 预装了 nodejs:16，模块包（nodejs-full-i18n / nodejs-libs / nodejs-devel）把版本
+# 钉在 16 上，与 NodeSource 的 nodejs20 直接互斥 —— dnf 会回
+#     cannot install both nodejs-2:20.20.2-1nodesource.x86_64 and
+#                        nodejs-1:16.13.1-3.module_el8.5.0+1059+1852da12.x86_64
+# 事务连第一步都进不去，于是 node 一直停在旧版本。
+# `--allowerasing` 是 dnf 官方给出的解法：允许它**替换掉**冲突的旧包来完成本次事务。
+# 只在 dnf 下给出 —— 走到 yum 说明本机没有 dnf（EL7 一类的旧 yum），它不认这个选项，
+# 传进去会直接报 `no such option`。返回值刻意**不加引号**地展开：空串应当展开成
+# 「没有参数」，而不是一个空字符串参数。
+node_pm_extra_args() {
+  if [[ "${PM:-}" == "dnf" ]]; then printf '%s' "--allowerasing"; fi
+  return 0
+}
+
+install_node() {
+  local required="18"
+  NODE_BIN="$(command -v node || true)"
+  if [[ -n "$NODE_BIN" ]]; then
+    local cur; cur="$("$NODE_BIN" -v | sed 's/^v//' || true)"
+    if version_ge "$cur" "$required"; then
+      ok "Node.js 已安装：v${cur}（$NODE_BIN）"
+      return 0
+    fi
+    if [[ "$SKIP_NODE" == "1" ]]; then
+      node_manual_hints
+      die_with_hint "已指定 --skip-node，但本机 Node.js 为 v${cur}，低于要求的 v${required}" "${HINTS[@]}"
+    fi
+    info "已安装 Node.js v${cur}，低于要求 v${required}，将尝试升级。"
+  fi
+
+  if [[ "$SKIP_NODE" == "1" ]]; then
+    node_manual_hints
+    die_with_hint "已指定 --skip-node，但本机未找到 node 命令" "${HINTS[@]}"
+  fi
+
+  # 4.1 优先尝试系统包（失败不致命，继续尝试下一级）
+  info "尝试通过 ${PM} 安装 Node.js…"
+  # 记下日志行数：下面要判断「这次安装是不是撞上了已有的 nodejs 包」
+  mark_log
+  case "$PM" in
+    apt) run_soft bash -c 'DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nodejs npm' ;;
+    # R40：这条原本是 `"$PM" install -y nodejs npm`，在 EL8 上必然失败（原因见
+    # node_pm_extra_args 的注释）。两处一起改：不再显式装 npm（npm 由 nodejs 包自带，
+    # 单独 install npm 会把 AppStream 的模块包整串拉回来，正好又撞上同一个冲突）。
+    dnf|yum) run_soft "$PM" install -y nodejs $(node_pm_extra_args) ;;
+    apk) run_soft apk add --no-cache nodejs npm ;;
+    zypper) run_soft zypper --non-interactive install nodejs npm ;;
+  esac
+  NODE_BIN="$(command -v node || true)"
+  if [[ -n "$NODE_BIN" ]] && version_ge "$("$NODE_BIN" -v | sed 's/^v//' || true)" "$required"; then
+    ok "Node.js 安装完成：$("$NODE_BIN" -v)"
+    return 0
+  fi
+  warn "系统源里的 Node.js 不满足要求（或源里没有），继续尝试 NodeSource 仓库。"
+
+  # 4.2 NodeSource 仓库（Debian / RHEL 系）
+  if [[ "$PM" == "apt" || "$PM" == "dnf" || "$PM" == "yum" ]]; then
+    local major="$NODE_VERSION"; [[ -n "$major" ]] || major="20"
+    major="${major%%.*}"
+    info "尝试 NodeSource 仓库（Node ${major}.x）…"
+    if [[ "$PM" == "apt" ]]; then
+      run_soft bash -c "curl -fsSL https://deb.nodesource.com/setup_${major}.x | bash -" \
+        && run_soft bash -c 'DEBIAN_FRONTEND=noninteractive apt-get install -y -qq nodejs'
+    else
+      run_soft bash -c "curl -fsSL https://rpm.nodesource.com/setup_${major}.x | bash -" \
+        && run_soft "$PM" install -y nodejs $(node_pm_extra_args)
+    fi
+    NODE_BIN="$(command -v node || true)"
+    if [[ -n "$NODE_BIN" ]] && version_ge "$("$NODE_BIN" -v | sed 's/^v//' || true)" "$required"; then
+      ok "Node.js 安装完成（NodeSource）：$("$NODE_BIN" -v)"
+      return 0
+    fi
+    warn "NodeSource 仓库安装未成功（常见于已 EOL 的发行版或网络受限），继续尝试官方二进制包。"
+  fi
+
+  # 到这里「系统包 + NodeSource」都试过了。若日志里出现「已有 nodejs 与新版本互斥」，
+  # 卡点就是系统里那份 nodejs（RHEL/CentOS 8 上多为 AppStream 的 nodejs:16 模块包）——
+  # 不卸掉它，走包管理器的两条路都必然失败。
+  # 但**不能就此中断**：下面的官方二进制包（4.3）装进 /usr/local、不经过包管理器，
+  # 通常仍能成功。所以这里只记下事实，等真正失败时再把原因放到提示最前面。
+  local node_conflict=0
+  if node_conflict_detected; then
+    node_conflict=1
+    warn "检测到已有 nodejs 包与新版本互斥（cannot install both …），稍后会给出处理指引。"
+  fi
+
+  # 4.3 官方二进制包（通用兜底，支持 cn 镜像）
+  local ver base url tmp
+  ver="$(resolve_node_version)"
+  base="$(node_tarball_base)"
+  # 用 .tar.gz 而非 .tar.xz：gzip 是标配，部分精简镜像的 tar 不带 xz 支持
+  url="${base}/v${ver}/node-v${ver}-linux-${NODE_ARCH}.tar.gz"
+  info "下载 Node.js v${ver}（${url}）…"
+  tmp="$(mktemp -d)"
+  local rc=0
+  run curl -fsSL --retry 3 --retry-delay 2 --max-time 300 -o "${tmp}/node.tar.gz" "$url" || rc=$?
+  if ((rc != 0)) && [[ "$MIRROR" != "cn" ]]; then
+    warn "官方源下载失败，改用国内镜像重试…"
+    url="https://registry.npmmirror.com/-/binary/node/v${ver}/node-v${ver}-linux-${NODE_ARCH}.tar.gz"
+    rc=0
+    run curl -fsSL --retry 3 --retry-delay 2 --max-time 300 -o "${tmp}/node.tar.gz" "$url" || rc=$?
+  fi
+  if ((rc != 0)); then
+    rm -rf "$tmp"
+    node_manual_hints
+    if ((node_conflict)); then node_conflict_hints; fi
+    HINTS+=("" "下载失败的地址：${url}" "  检查连通性：curl -sI ${url} -m 8 ; echo \$?")
+    die_with_hint "Node.js 二进制包下载失败" "${HINTS[@]}"
+  fi
+  rc=0
+  run tar -xzf "${tmp}/node.tar.gz" -C /usr/local --strip-components=1 || rc=$?
+  rm -rf "$tmp"
+  if ((rc != 0)); then
+    HINTS=()
+    add_hint "解压失败，可手工解压（以 v${ver} / ${NODE_ARCH} 为例）："
+    add_hint "  curl -fsSL -o /tmp/node.tar.gz ${url}"
+    add_hint "  tar -xzf /tmp/node.tar.gz -C /usr/local --strip-components=1"
+    add_hint "  常见原因：/usr/local 不可写、tar 不支持 gzip、下载的其实是 HTML 错误页（用 file /tmp/node.tar.gz 看看）"
+    die_with_hint "Node.js 解压到 /usr/local 失败" "${HINTS[@]}"
+  fi
+  if have ldconfig; then run_soft ldconfig; fi
+  NODE_BIN="$(command -v node || true)"
+  if [[ -z "$NODE_BIN" ]] || ! version_ge "$("$NODE_BIN" -v | sed 's/^v//' || true)" "$required"; then
+    node_manual_hints
+    if ((node_conflict)); then node_conflict_hints; fi
+    die_with_hint "Node.js 自动安装失败（三种方式都没装上 v${required}+）" "${HINTS[@]}"
+  fi
+  ok "Node.js 安装完成（二进制包）：$("$NODE_BIN" -v) → ${NODE_BIN}"
+}
+
+npm_registry_args() {
+  if [[ "$MIRROR" == "cn" ]]; then printf '%s' "--registry=https://registry.npmmirror.com"; fi
+}
+
+# 网络预检：只探测、只提示，不中断。离线/半离线环境下提前把话说清楚
+preflight_network() {
+  local -a targets=()
+  if [[ "$MIRROR" == "cn" ]]; then
+    targets=("https://registry.npmmirror.com/-/binary/node/" "https://registry.npmmirror.com/-/ping")
+  else
+    targets=("https://nodejs.org/dist/index.json" "https://registry.npmjs.org/-/ping")
+  fi
+  local t bad=0
+  for t in "${targets[@]}"; do
+    if ! curl -fsS -m 8 -o /dev/null "$t" >/dev/null 2>&1; then
+      warn "网络探测失败：$t"
+      bad=1
+    fi
+  done
+  if ((bad == 0)); then
+    ok "网络探测正常（Node 源与 npm registry 可达）"
+    return 0
+  fi
+  warn "  · 国内服务器访问境外源慢/不通时，加 --mirror cn 重跑：$(rerun_cmd --mirror cn)"
+  warn "  · 完全离线的机器：自行装好 Node 与依赖后，用跳过参数继续：$(rerun_cmd --skip-node --skip-deps)"
+  return 0
+}
+
+# ------------------------------------------------------------------------------
+# 5. 部署源码
+# ------------------------------------------------------------------------------
+prepare_source() {
+  local script_dir; script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+  if [[ "$REINSTALL" != "1" && -f "${script_dir}/package.json" && -d "${script_dir}/server" ]]; then
+    SRC_DIR="$script_dir"
+    info "检测到本地源码目录：${SRC_DIR}"
+    return 0
+  fi
+  # 独立运行（如 curl ... | bash）：克隆仓库
+  if ! have git; then
+    pkg_install_opt git || true
+    if ! have git; then
+      HINTS=()
+      add_hint "本脚本需要 git 才能拉取源码（仓库：${REPO_URL}）。"
+      add_hint "  1) 手动安装：$(pm_install_cmd) git"
+      add_hint "  2) 或不用 git：把项目打包上传到服务器，解压后在该目录内执行本脚本 ——"
+      add_hint "     tar -czf kepler.tgz . && scp kepler.tgz root@<服务器>:/tmp/ "
+      add_hint "     （服务器端）mkdir -p /opt/src && tar -xzf /tmp/kepler.tgz -C /opt/src && cd /opt/src && bash deploy.sh --domain <域名>"
+      die_with_hint "git 不可用且自动安装失败" "${HINTS[@]}"
+    fi
+  fi
+  local tmp; tmp="$(mktemp -d)"
+  info "未发现本地源码，从仓库拉取：${REPO_URL}"
+  if ! run git clone --depth 1 "$REPO_URL" "${tmp}/src"; then
+    rm -rf "$tmp"
+    HINTS=()
+    local l
+    while IFS= read -r l; do [[ -n "$l" ]] && add_hint "  日志 | ${l}"; done <<<"$(log_key_lines 5)"
+    add_hint ""
+    add_hint "  1) 换可访问的仓库：--repo <git 地址>"
+    add_hint "  2) 或先把项目上传/解压到服务器，再在该目录内执行本脚本（脚本会自动识别同目录源码）"
+    add_hint "  3) 检查网络：curl -sI https://github.com -m 8 ; echo \$?"
+    die_with_hint "源码拉取失败（${REPO_URL}）" "${HINTS[@]}"
+  fi
+  SRC_DIR="${tmp}/src"
+  SRC_TMP_DIR="$tmp"   # 复制完成后清理
+}
+
+install_app() {
+  mkdir -p "$INSTALL_DIR" "$DATA_DIR"
+  # R39：源码目录**就是**安装目录时不做同步 —— 自我交接后的第二趟正是这种形态
+  # （prepare_source 发现脚本自己在 INSTALL_DIR 里，就把它当成「本地源码目录」）。
+  # 此时 `tar -cf - . | tar -xf - -C 同一目录` 是一边读一边覆盖自己：徒劳无功，
+  # 而且理论上可能把正在读的文件截断。直接跳过。
+  local src_real="" dst_real=""
+  src_real="$(readlink -f "$SRC_DIR" 2>/dev/null || true)"
+  dst_real="$(readlink -f "$INSTALL_DIR" 2>/dev/null || true)"
+  if [[ -n "$src_real" && "$src_real" == "$dst_real" ]]; then
+    info "源码目录即安装目录，无需同步：${INSTALL_DIR}"
+  else
+    info "同步源码 → ${INSTALL_DIR}（排除 data/node_modules/.git，绝不覆盖数据目录）"
+    # tar 管道复制：每次覆盖同名文件，保持幂等（重复执行即升级）
+    if ! run bash -c "cd '$SRC_DIR' && tar --exclude=./data --exclude=./node_modules --exclude=./.git --exclude=./.deploy.conf -cf - . | tar -xf - -C '$INSTALL_DIR'"; then
+      warn "tar 同步失败（可能是 busybox tar 不支持 --exclude），改用逐项复制…"
+      for item in package.json package-lock.json server public scripts Dockerfile; do
+        [[ -e "${SRC_DIR}/${item}" ]] || continue
+        run cp -a "${SRC_DIR}/${item}" "${INSTALL_DIR}/"
+      done
+    fi
+  fi
+  if [[ -f "${INSTALL_DIR}/package.json" ]]; then
+    # 取不到就回落默认值，绝不因 grep/sed 的返回码让部署中断（pipefail 下会）
+    APP_VERSION="$(grep -m1 '"version"' "${INSTALL_DIR}/package.json" 2>/dev/null | sed 's/.*: *"//;s/".*//' || true)"
+    [[ -n "$APP_VERSION" ]] || APP_VERSION="1.0.0"
+  else
+    warn "安装目录中未找到 package.json，请确认源码同步是否完整。"
+  fi
+  if [[ -n "$SRC_TMP_DIR" ]]; then rm -rf "$SRC_TMP_DIR"; fi
+  cd "$INSTALL_DIR"
+  chmod 0755 "${INSTALL_DIR}/deploy.sh" 2>/dev/null || true
+  ok "源码已部署并进入项目目录：${INSTALL_DIR}（版本 ${APP_VERSION}）"
+}
+
+npm_install_deps() {
+  if [[ "$SKIP_DEPS" == "1" ]]; then
+    if [[ -d "${INSTALL_DIR}/node_modules" ]]; then
+      info "已按 --skip-deps 跳过依赖安装（保留现有 node_modules）"
+    else
+      warn "已按 --skip-deps 跳过依赖安装，但 ${INSTALL_DIR}/node_modules 不存在 —— 服务将无法启动。"
+      warn "  请自行执行：cd ${INSTALL_DIR} && npm ci --omit=dev"
+    fi
+    return 0
+  fi
+
+  info "安装生产依赖（npm ci --omit=dev）…"
+  local rc=0
+  mark_log
+  run bash -c "cd '$INSTALL_DIR' && npm ci --omit=dev --no-audit --no-fund $(npm_registry_args)" || rc=$?
+  if ((rc != 0)); then
+    warn "npm ci 失败（可能缺 package-lock.json 或网络受限），改用 npm install 重试…"
+    rc=0
+    run bash -c "cd '$INSTALL_DIR' && npm install --omit=dev --no-audit --no-fund $(npm_registry_args)" || rc=$?
+  fi
+  if ((rc != 0)) && [[ "$MIRROR" != "cn" ]]; then
+    warn "默认 registry 安装失败，改用国内镜像重试…"
+    rc=0
+    run bash -c "cd '$INSTALL_DIR' && npm install --omit=dev --no-audit --no-fund --registry=https://registry.npmmirror.com" || rc=$?
+  fi
+  if ((rc != 0)); then
+    HINTS=()
+    add_hint "安装目录：${INSTALL_DIR}"
+    add_hint ""
+    local l
+    while IFS= read -r l; do [[ -n "$l" ]] && add_hint "  日志 | ${l}"; done <<<"$(log_key_lines 5)"
+    add_hint ""
+    add_hint "常见原因：registry 不可达 / 代理未配置 / 磁盘空间不足 / 缺编译型依赖的系统库。"
+    add_hint "  1) 手动安装：cd ${INSTALL_DIR} && npm ci --omit=dev"
+    add_hint "  2) 走国内镜像：cd ${INSTALL_DIR} && npm ci --omit=dev --registry=https://registry.npmmirror.com"
+    add_hint "  3) 重跑并指定镜像：$(rerun_cmd --mirror cn)"
+    add_hint "  4) 自己装完后跳过这步：$(rerun_cmd --skip-deps)"
+    die_with_hint "npm 依赖安装失败（已尝试 npm ci / npm install / 国内镜像）" "${HINTS[@]}"
+  fi
+  ok "依赖安装完成"
+}
+
+# ------------------------------------------------------------------------------
+# 5.1 版本对齐：把控制权交回刚同步进安装目录的脚本（R39）
+# ------------------------------------------------------------------------------
+# ⚠️ 这里修的是一个**只在升级时出现、且完全静默**的坑 —— 用户报的
+# 「按报告修完，重新部署后还是同样的错」就是它：
+#
+#   install_app() 把源码树整体同步进 INSTALL_DIR，**deploy.sh 自己也在源码树里**。
+#   而最常见的维护入口恰恰就是安装目录里的那一份：
+#     · 终端里敲 `kepler` → 菜单 1「重新安装」→ reinstall_now() 直接
+#       `exec bash ${INSTALL_DIR}/deploy.sh --reinstall`；
+#     · 或者当初跑的就是被同步进安装目录的那份脚本。
+#   于是**正在执行的这个文件会在运行中被新版本覆盖**。
+#
+#   bash 是边读边执行、函数定义在解析时就固化下来的：**已解析过的定义不会被替换**。
+#   因此后面每一步都还在跑上一版的逻辑，而应用已经是新代码：
+#     · 旧 gen_env_file() 不认识新版本才引入的环境变量 —— R38 的 `SITE_DOMAIN`
+#       就是这么丢的（部署报「成功」，Windows Hello 却仍然 403）；
+#     · 更糟的是旧逻辑的产物与磁盘上已有的 .env **逐字节相同**，
+#       write_file() 于是打印「配置未变化，跳过写入」—— 全程没有任何异常迹象。
+#   症状因此极具误导性：**报错文案是新的（应用已是新代码），失败原因却是旧的
+#   （环境变量还是旧脚本写的）**，顺着提示往应用侧查永远查不出来。
+#
+#   修法：同步完源码后，把控制权交回 ${INSTALL_DIR}/deploy.sh —— 它此刻与刚装进去
+#   的应用**同源同版本**，从它往下跑就能保证「环境变量 / 守护单元 / Nginx 配置」与
+#   「应用代码」始终处于同一版本。这不是自我重启的死循环：第二趟拿到的脚本内容与
+#   本脚本一致，判据立即返回「无需交接」；外层还有 KEPLER_SELF_HANDOFF 兜底防环。
+
+# 目标文件是否「确实是一份可用的 bash 脚本」。
+#   · shebang 检查 —— 拦「内容根本不是脚本」：下载到的 `404: Not Found` 响应体在
+#     bash 眼里是一条**语法合法**的命令（`bash -n` 会放行），只有首行不是 shebang 能识破；
+#   · bash -n —— 拦「是脚本但被截断/改坏」：首行 shebang 还在、后面引号没闭合。
+# 两者互补，缺一不可（与 reinstall_now 的预检同源）。
+script_is_sane() {
+  local f="$1"
+  if [[ -z "$f" || ! -f "$f" || ! -r "$f" ]]; then return 1; fi
+  if ! head -n1 "$f" | grep -qE '^#!.*(bash|sh)\b'; then return 1; fi
+  if ! bash -n "$f" 2>/dev/null; then return 1; fi
+  return 0
+}
+
+# 文件内容指纹 —— **仅**用于回答「这两份脚本是不是同一个版本」，不参与任何安全判据。
+# 取不到（命令缺失 / 不可读 / 不是普通文件）一律回空串，调用方按「无法自证」处理。
+script_content_hash() {
+  local f="$1" out=""
+  if [[ -z "$f" || ! -f "$f" || ! -r "$f" ]]; then printf '%s' ""; return 0; fi
+  if have sha256sum; then
+    out="$(sha256sum "$f" 2>/dev/null | awk '{print $1}' || true)"
+  elif have md5sum; then
+    out="$(md5sum "$f" 2>/dev/null | awk '{print $1}' || true)"
+  fi
+  # coreutils 遇到「文件名里有反斜杠」会给整行**加一个转义前缀**（例如 git-bash 的
+  # mktemp 返回 `C:\Users\...`，`$1` 就成了 `\e8b2…`）。指纹只可能是十六进制，
+  # 因此把非十六进制字符一律剥掉 —— 免得同一份内容仅因为路径写法不同而算出两个指纹，
+  # 把「无需交接」误判成「需要交接」。
+  out="${out//[^0-9a-fA-F]/}"
+  printf '%s' "$out"
+}
+
+# 是否需要交回安装目录里的脚本。**纯判据**：不改状态、不 exec ——
+# 拆出来是为了能在测试里直接构造「两处脚本相同 / 不同」来验证判据本身。
+handoff_needed() {
+  local target="${INSTALL_DIR}/deploy.sh"
+  # 已交接过一次 → 永不二次交接（防环兜底：万一判据被环境怪癖顶成恒真）
+  if [[ "${KEPLER_SELF_HANDOFF:-0}" == "1" ]]; then return 1; fi
+  if [[ -z "${INSTALL_DIR:-}" ]]; then return 1; fi
+  if [[ ! -f "$target" || ! -r "$target" ]]; then return 1; fi
+  local th=""
+  th="$(script_content_hash "$target")"
+  # 算不出目标指纹 → 不冒险交接（宁可照旧跑完，也不能 exec 一个来路不明的文件）
+  if [[ -z "$th" ]]; then return 1; fi
+  # 自证不了（脚本来自管道 / 非普通文件）→ 交给目标：它刚被 install_app 写成与应用同版本
+  if [[ -z "${SELF_SCRIPT_HASH:-}" ]]; then return 0; fi
+  # 自己就是它（同版本，例如从安装目录直接执行）→ 无需交接
+  if [[ "$th" == "$SELF_SCRIPT_HASH" ]]; then return 1; fi
+  return 0
+}
+
+handoff_to_installed_script() {
+  if ! handoff_needed; then return 0; fi
+  local target="${INSTALL_DIR}/deploy.sh"
+  if ! script_is_sane "$target"; then
+    warn "安装目录里的部署脚本疑似损坏：${target}（本次不做版本交接，以免部署中断）"
+    warn "  建议用最新脚本重跑：bash ${SCRIPT_NAME} --domain <域名>"
+    return 0
+  fi
+  info "本脚本与刚同步进安装目录的版本不一致 —— 交回最新脚本继续执行（环境变量与代码保持同版本）"
+  plain "    运行中的脚本：${SELF_SCRIPT_FILE:-<无法读取>}"
+  plain "    最新脚本    ：${target}"
+  # exec 不会触发 EXIT trap，所以显式把单实例锁交接给新进程（与 reinstall_now 同法），
+  # 否则新进程一启动就会撞上自己留下的锁、直接判「另一个部署进程正在运行」。
+  # 已解析好的域名也随环境带过去：否则第二趟会在终端里**再问一次**域名
+  # （collect_config 只在 $DOMAIN 为空时提问），非交互场景下更是直接判失败。
+  # 原始命令行一并原样转发（ORIGINAL_ARGV 在参数解析前就存好了），保住 --skip-* 等开关。
+  trap - EXIT
+  if ((${#ORIGINAL_ARGV[@]} > 0)); then
+    exec env KEPLER_LOCK_HELD="$LOCK_FILE" KEPLER_SELF_HANDOFF=1 DOMAIN="$DOMAIN" \
+      bash "$target" "${ORIGINAL_ARGV[@]}"
+  fi
+  exec env KEPLER_LOCK_HELD="$LOCK_FILE" KEPLER_SELF_HANDOFF=1 DOMAIN="$DOMAIN" \
+    bash "$target"
+}
+
+# ------------------------------------------------------------------------------
+# 6. 运行用户与环境变量文件
+# ------------------------------------------------------------------------------
+create_user() {
+  if id -u "$RUN_USER" >/dev/null 2>&1; then
+    info "系统用户 ${RUN_USER} 已存在，跳过创建"
+  else
+    if have useradd; then
+      run useradd --system --home-dir "$INSTALL_DIR" --shell /usr/sbin/nologin "$RUN_USER"
+    else
+      run adduser -S -D -H -s /sbin/nologin "$RUN_USER"
+    fi
+    ok "已创建系统用户：${RUN_USER}"
+  fi
+}
+
+gen_env_file() {
+  local env_path="${INSTALL_DIR}/.env"
+  local port="$APP_PORT" data_dir="$DATA_DIR"
+  if [[ "$MODE" == "docker" ]]; then
+    port=3000          # 容器内固定监听 3000，宿主机端口由 compose 映射
+    data_dir="/app/data"
+  fi
+  # WebDAV 对外基地址（不含 /dav/）。
+  # 只有脚本确实配了 Nginx 反代时才写死：那样 /dav/ 一定被转发到应用，
+  # 界面显示的地址就是客户端该填的地址，也不会因为管理员从内网 IP 打开面板而变样。
+  # --skip-nginx（用户自建反代）时留空，让应用按「用户此刻访问的域名」自行推断 ——
+  # 写死一个本站点没配反代的地址反而会指向 404。
+  local webdav_public=""
+  if [[ "$SKIP_NGINX" != "1" ]]; then
+    local wd_scheme="https" wd_port=""
+    # R49：WebDAV 强制 HTTPS（Basic 凭据等同明文口令），没有证书时服务根本不会启动，
+    # 因此这里不再有「http://」这一分支 —— 那会给出一个永远不通的地址。
+    # TLS_MODE=none 时干脆留空，让界面显示「已启用但无法启动：缺证书」而不是一个假地址。
+    [[ "$TLS_MODE" == "none" ]] && wd_scheme=""
+    if [[ "$wd_scheme" == "https" && "$HTTPS_PORT" != "443" ]]; then wd_port=":${HTTPS_PORT}"; fi
+    if [[ -n "$wd_scheme" ]]; then webdav_public="${wd_scheme}://${DOMAIN}${wd_port}"; fi
+  fi
+  # R49：应用侧要用的证书路径。两种方式的落点不同，且**都不要**写自签名相关的东西：
+  #   · acme（含 auto）→ acme.sh 把证书安装到 ${ACME_CERT_DIR}
+  #   · file           → 运维自备，放在 ${TLS_DIR}
+  # none / 其它 → 不写这两行，应用只提供 HTTP（并在日志里说明缺哪个文件）。
+  # 注意本函数在 setup_tls **之前**执行，此刻证书文件可能还没落盘 —— 这是允许的：
+  # 应用启动时读不到就只跑 HTTP 并打日志，不会因此启动失败。
+  local tls_cert="" tls_key=""
+  case "$TLS_MODE" in
+    auto|acme) tls_cert="${ACME_CERT_DIR}/fullchain.pem"; tls_key="${ACME_CERT_DIR}/privkey.pem" ;;
+    file)      tls_cert="${TLS_DIR}/fullchain.pem"; tls_key="${TLS_DIR}/privkey.pem" ;;
+  esac
+  local tls_lines=""
+  if [[ -n "$tls_cert" ]]; then
+    tls_lines="# TLS 证书（R49）：应用只加载**自备的真实证书**，不再自己生成自签名证书 ——
+# 自签名会被浏览器判为不安全，也换不来 WebAuthn / Service Worker 等需要「安全上下文」的功能。
+# 这两个文件缺失或不可用时，应用只提供 HTTP（内置 HTTPS 与 WebDAV 都不会启动），日志里会说明。
+TLS_CERT_FILE=${tls_cert}
+TLS_KEY_FILE=${tls_key}
+"
+  fi
+  local content
+  # 注：本文件内容不含时间戳 —— 保证重复执行时判定为「未变化」，不产生无意义备份
+  content="# Kepler 运行环境（由 ${SCRIPT_NAME} 生成）
+# 修改后执行：systemctl restart ${SERVICE_NAME}（docker 方式：docker compose restart）
+NODE_ENV=production
+HOST=0.0.0.0
+# R38：「本站对外域名」—— 应用据此回答「这个请求是不是本站」（Windows Hello 的 rpId
+# 白名单、HTTPS 跳转目标）。必须是下面 nginx server_name 用的那个域名本身。
+# 为什么不靠 HOST：HOST 是**监听地址**，部署时必须写 0.0.0.0 才能被外部访问，而
+# 0.0.0.0 永远不可能出现在请求的 Host 头里 —— 只认它会把「用真实域名访问本站」
+# 判成「访问了外站」，Windows Hello 直接 403。
+SITE_DOMAIN=${DOMAIN}
+PORT=${port}
+WEBDAV_PORT=${WEBDAV_PORT}
+# R49：**不再**写死 HTTPS_PORT=3443。内置 HTTPS 现在只在提供了证书时才监听，
+# 而明文请求的 301 跳转目标是**对外**端口（Nginx 的 --https-port，默认 443），
+# 两者不是一回事 —— 旧写法把 301 指向内置的 3443，等于把访客送给一张自签名证书。
+PUBLIC_HTTPS_PORT=${HTTPS_PORT}
+${tls_lines}# 数据目录：保存加密主密钥、账户、配置与统计，务必定期备份
+# R49：开关更名为 S3_DATA_DIR（旧名 COS_DATA_DIR 仍兼容）；它只是状态目录，与厂商无关。
+S3_DATA_DIR=${data_dir}
+# 位于 Nginx 之后：信任 X-Forwarded-*，使「部署模式」下的 HTTPS 判定正确
+TRUST_PROXY=1
+# WebDAV 对外基地址（不含 /dav/，应用会自动补上）：界面「服务器地址」按它显示。
+# 留空则由应用按访问请求推断（自建反代时请留空，或在 Nginx 里自己加 /dav/ 转发）。
+WEBDAV_PUBLIC_URL=${webdav_public}
+# 注：应用遇到未捕获异常会主动退出，由进程管理器（systemd Restart=always /
+# docker restart: unless-stopped）负责拉起，无需额外配置。"
+  write_file "$env_path" "$content" 0640
+  if [[ "$MODE" == "systemd" ]]; then
+    chown "root:${RUN_USER}" "$env_path" 2>/dev/null || true
+  fi
+}
+
+# ------------------------------------------------------------------------------
+# 7. Nginx
+# ------------------------------------------------------------------------------
+# 找「不是系统包装的 nginx」：宝塔/AMH/编译版/官方二进制常常不在 PATH 里。
+# 找到就把所在目录临时加进 PATH，后续 nginx / nginx -t / nginx -s reload 都能用对这一份。
+locate_nginx() {
+  if have nginx; then NGINX_BIN="$(command -v nginx)"; return 0; fi
+  local -a paths=(
+    /www/server/nginx/sbin/nginx            # 宝塔面板
+    /usr/local/nginx/sbin/nginx             # 编译安装
+    /usr/local/openresty/nginx/sbin/nginx   # OpenResty
+    /opt/nginx/sbin/nginx
+    /usr/sbin/nginx
+    /usr/local/sbin/nginx
+  )
+  local p
+  for p in "${paths[@]}"; do
+    if [[ -x "$p" ]]; then
+      export PATH="$(dirname "$p"):$PATH"
+      NGINX_BIN="$p"
+      ok "发现非系统包安装的 Nginx：${p}（已临时加入 PATH）"
+      return 0
+    fi
+  done
+  return 1
+}
+
+install_nginx() {
+  if [[ "$SKIP_NGINX" == "1" ]]; then
+    warn "已按 --skip-nginx 跳过 Nginx 安装与反代配置。"
+    warn "  请自行把 ${APP_PORT} 端口反代出去，并务必转发 X-Forwarded-Proto: https（应用已设 TRUST_PROXY=1）。"
+    return 1
+  fi
+  if ! have nginx; then locate_nginx; fi
+  if have nginx; then
+    ok "Nginx 已安装：$(nginx -v 2>&1 | sed 's/.*nginx\///' || true)"
+  else
+    info "安装 Nginx…"
+    # 这里用 pkg_run_pm（失败只给退出码、不中断）而不是 pkg_install：
+    #   ① RHEL 系的 nginx 在 EPEL 源里，第一枪打不中是常态，得先补源再打第二枪。
+    #      若走 pkg_install，第一次失败就已经 die 了 —— 下面的 EPEL 兜底和整段
+    #      「对症」提示（含 --skip-nginx 逃生口）永远轮不到执行，用户只看到
+    #      「软件包安装失败：nginx」。
+    #   ② 失败原因与修法统一交给下面的提示层，信息比通用诊断更具体。
+    mark_log
+    pkg_run_pm nginx || true
+    if ! have nginx && [[ "$PM" == "dnf" || "$PM" == "yum" ]]; then
+      # RHEL 系的 nginx 在 EPEL 源里
+      info "未找到 nginx，尝试启用 EPEL 源后重试…"
+      run_soft "$PM" install -y epel-release
+      if ! have nginx; then pkg_run_pm nginx || true; fi
+    fi
+    # 系统包装不上，再找一遍面板/编译版（很多机器其实已经有 nginx，只是没进 PATH）
+    if ! have nginx; then locate_nginx; fi
+    if ! have nginx; then
+      HINTS=()
+      add_hint "Nginx 是外网访问的入口（TLS 终结 + 反向代理）。可这样修："
+      add_hint ""
+      add_hint "  已尝试：$(pm_install_cmd) nginx"
+      if [[ "$PM" == "dnf" || "$PM" == "yum" ]]; then
+        add_hint "  已尝试：启用 EPEL 源（$(epel_rpm_cmd)）后再装"
+      fi
+      local l
+      while IFS= read -r l; do [[ -n "$l" ]] && add_hint "  日志 | ${l}"; done <<<"$(log_key_lines 4)"
+      add_hint ""
+      case "$PM" in
+        apt)
+          add_hint "  apt-get update && apt-get install -y nginx" ;;
+        dnf|yum)
+          add_hint "  1) 启用 EPEL：$(epel_rpm_cmd)"
+          add_hint "  2) 或启用官方模块：${PM} module reset -y nginx && ${PM} module enable -y nginx:1.24 && $(pm_install_cmd) nginx"
+          add_hint "  3) 确认源里有包：${PM} search nginx ; ${PM} module list nginx" ;;
+        apk)
+          add_hint "  apk update && apk add nginx（确认 /etc/apk/repositories 已启用社区源）" ;;
+        *)
+          add_hint "  zypper refresh && zypper --non-interactive install nginx" ;;
+      esac
+      if grep -qiE 'exclude filtering|filtered out by exclude' <<<"$(log_since_mark)"; then
+        add_hint ""
+        add_hint "  【补充判断】包管理器把 nginx 排除掉了（exclude=nginx）—— 面板/自建环境的典型做法，"
+        add_hint "  说明这台机器本来就有 Nginx，只是没进 PATH。确认一下："
+        add_hint "    grep -rn '^exclude' /etc/yum.conf /etc/dnf/dnf.conf /etc/yum.repos.d/ 2>/dev/null"
+        add_hint "    ls -l /www/server/nginx/sbin/nginx /usr/local/nginx/sbin/nginx 2>/dev/null"
+        add_hint "  找到后加进 PATH 再重跑（脚本会自动识别）：export PATH=\$PATH:<nginx 所在目录>"
+        if [[ "$PM" == "dnf" || "$PM" == "yum" ]]; then
+          add_hint ""
+          add_hint "  确实没有现成 Nginx、就要用包管理器装的话，可以临时无视 exclude："
+          add_hint "    ${PM} install -y --disableexcludes=all nginx"
+          add_hint "  注意：这会**再装一份** nginx，容易和面板/自编译那份抢 80/443 端口，"
+          add_hint "  装完先确认 systemctl status nginx 与 80/443 的监听者，别把原来的站点打挂。"
+        fi
+      fi
+      add_hint "  4) 查看包管理器报错：tail -n 80 ${LOG_FILE}"
+      add_hint ""
+      add_hint "装好后重跑：$(rerun_cmd)"
+      add_hint "或用现成的 Caddy / 已有 Nginx 自己反代，让脚本不碰这步："
+      add_hint "    $(rerun_cmd --skip-nginx)"
+      add_hint "    反代要点：proxy_pass http://127.0.0.1:${APP_PORT}; 并带 X-Forwarded-Proto \$scheme"
+      die_with_hint "Nginx 安装失败" "${HINTS[@]}"
+    fi
+    ok "Nginx 安装完成"
+  fi
+  mkdir -p "$WEBROOT/.well-known/acme-challenge"
+  nginx_detect_layout || true
+}
+
+# 主配置里「http{} 第一层」的 include 通配目录。
+#
+# 为什么必须认上下文，而不是「主配置里任意一个通配 include 目录」：
+# Debian/Ubuntu 的 /etc/nginx/nginx.conf 顶层（http{} 之外）就有
+#   include /etc/nginx/modules-enabled/*.conf;
+# 而 /etc/nginx/modules-enabled 在装了 nginx 的 Debian/Ubuntu 上必然存在 ——
+# 只挑「第一个存在的通配 include 目录」，就会把站点配置写进那里，于是 server{}
+# 落在 main 上下文里，nginx -t 直接报
+#   "server" directive is not allowed here
+# 部署就在这里断掉（Debian/Ubuntu 是最常见的部署目标）。
+# 站点配置只能落在 http 上下文，所以只采信 http{} 直接内部的 include（嵌套在
+# server{} 里的 include 如 /etc/nginx/default.d 也排除）。
+nginx_http_include_dirs() {
+  local conf="$1"
+  [[ -r "$conf" ]] || return 0
+  awk '
+    BEGIN { depth = 0; inside = 0; http_depth = 0 }
+    {
+      code = $0
+      sub(/#.*/, "", code)                                   # 去掉行内注释
+      is_http_open = (!inside && code ~ /^[[:space:]]*http[[:space:]]*\{/)
+      if (inside && !is_http_open && depth == http_depth && match(code, /include[[:space:]]+[^;]+;/)) {
+        d = substr(code, RSTART, RLENGTH)
+        sub(/^include[[:space:]]+/, "", d)
+        sub(/;$/, "", d)
+        gsub(/"/, "", d)
+        if (d ~ /\*/) { sub(/\/[^\/]*$/, "", d); if (d != "") print d }
+      }
+      depth += gsub(/\{/, "{", code) - gsub(/\}/, "}", code)
+      if (is_http_open) { inside = 1; http_depth = depth }
+      else if (inside && depth < http_depth) inside = 0
+    }
+  ' "$conf" 2>/dev/null || true
+}
+
+# 探测 Nginx 的真实配置体系。
+# 很多机器（宝塔/AMH/自建编译/官方镜像）的 nginx 并不用 /etc/nginx/conf.d：
+# 直接照抄 Debian/RHEL 惯例写过去，配置根本不会被 include，站点也就不会生效。
+# 这里从「nginx -V 的 --conf-path」拿到主配置，再从主配置的 include 规则里挑真实目录。
+nginx_detect_layout() {
+  NGINX_BIN="$(command -v nginx || true)"
+  NGINX_CONF_PATH=""
+  NGINX_CONF_DIR=""
+  NGINX_LINK=""
+  if [[ -z "$NGINX_BIN" ]]; then
+    NGINX_CONF="/etc/nginx/conf.d/${SERVICE_NAME}.conf"
+    return 1
+  fi
+  NGINX_CONF_PATH="$("$NGINX_BIN" -V 2>&1 | tr ' ' '\n' | grep -m1 -- '--conf-path=' | cut -d= -f2- || true)"
+  [[ -n "$NGINX_CONF_PATH" ]] || NGINX_CONF_PATH="/etc/nginx/nginx.conf"
+  local main_dir; main_dir="$(dirname "$NGINX_CONF_PATH")"
+
+  # 候选目录：① 主配置 http{} 内的通配 include 目录（最可信）
+  #           ② 主配置同级 conf.d ③ 面板常见 vhost 目录 ④ 发行版惯例目录
+  local -a cands=()
+  local d
+  while IFS= read -r d; do
+    [[ -n "$d" ]] || continue
+    [[ "$d" == /* ]] || d="${main_dir}/${d}"    # 相对路径按主配置目录拼接
+    cands+=("$d")
+  done < <(nginx_http_include_dirs "$NGINX_CONF_PATH")
+  cands+=("${main_dir}/conf.d" "/www/server/panel/vhost/nginx" "/etc/nginx/conf.d" "/etc/nginx/sites-enabled")
+
+  local c
+  for c in "${cands[@]}"; do
+    [[ -n "$c" && -d "$c" ]] || continue
+    NGINX_CONF_DIR="$c"
+    break
+  done
+  [[ -n "$NGINX_CONF_DIR" ]] || NGINX_CONF_DIR="/etc/nginx/conf.d"
+
+  # Debian 惯例：配置放 sites-available，靠 sites-enabled 软链启用
+  if [[ "$NGINX_CONF_DIR" == "/etc/nginx/sites-enabled" ]]; then
+    NGINX_CONF="/etc/nginx/sites-available/${SERVICE_NAME}.conf"
+    NGINX_LINK="/etc/nginx/sites-enabled/${SERVICE_NAME}.conf"
+  else
+    NGINX_CONF="${NGINX_CONF_DIR}/${SERVICE_NAME}.conf"
+    NGINX_LINK=""
+  fi
+  ok "Nginx 配置布局：主配置 ${NGINX_CONF_PATH}"
+  ok "              站点配置 ${NGINX_CONF}"
+  if [[ "$NGINX_CONF_PATH" != /etc/nginx/* && -n "$NGINX_CONF_PATH" ]]; then
+    info "注意：这台机器的 Nginx 不是发行版默认布局（可能由面板/编译安装），脚本已按它的实际 include 规则写入配置。"
+  fi
+  return 0
+}
+
+# 写完后确认这份配置真的被主配置加载了（nginx -T 会打印全部生效配置）
+verify_conf_loaded() {
+  [[ -n "${NGINX_BIN:-}" ]] || return 0
+  local dumped
+  dumped="$(nginx -T 2>/dev/null || true)"
+  [[ -n "$dumped" ]] || return 0     # 老版本不支持 -T 就跳过
+  # nginx -T 会以「# configuration file <路径>:」的形式打印每个被加载的文件，匹配文件名即可
+  if ! grep -qF "$(basename "${NGINX_CONF}")" <<<"$dumped"; then
+    warn "站点配置似乎没有被 Nginx 主配置加载：${NGINX_CONF}"
+    warn "  1) 看主配置的 include 规则：grep -n include ${NGINX_CONF_PATH}"
+    warn "  2) 在 ${NGINX_CONF_PATH} 的 http{} 内补一行：include ${NGINX_CONF_DIR}/*.conf;"
+    warn "  3) 然后 nginx -t && nginx -s reload"
+    return 1
+  fi
+  return 0
+}
+
+nginx_http2_directive() {
+  # nginx ≥ 1.25.1 使用独立指令 http2 on; 旧版本写在 listen 行内
+  local v; v="$(nginx -v 2>&1 | grep -o '[0-9]\+\.[0-9]\+\.[0-9]\+' | head -n1 || true)"
+  if [[ -n "$v" ]] && version_ge "$v" "1.25.1"; then printf 'http2 on;'; else printf ''; fi
+}
+
+write_nginx_conf() {
+  local with_tls="$1" cert_fullchain="$2" cert_key="$3"
+  # HTTP/2 写法随版本不同：≥1.25.1 用独立指令，旧版本写在 listen 行内
+  local h2; h2="$(nginx_http2_directive)"
+  local listen_tls
+  if [[ -n "$h2" ]]; then listen_tls="listen ${HTTPS_PORT} ssl;"; else listen_tls="listen ${HTTPS_PORT} ssl http2;"; fi
+  local ipv6=""
+  if [[ -f /proc/net/if_inet6 ]]; then
+    if [[ -n "$h2" ]]; then ipv6="listen [::]:${HTTPS_PORT} ssl;"; else ipv6="listen [::]:${HTTPS_PORT} ssl http2;"; fi
+  fi
+
+  # —— HSTS 策略：只对「本脚本亲自通过 ACME 签发」的证书发长期值 ——
+  # R49：判据从「证书是不是自签名」改成「证书是不是 ACME 签的」。自签名证书已移除，
+  # 而 `--tls file` 用的是运维自备的证书，**脚本无从确认浏览器是否信任它**（很可能是
+  # 内网 CA 或自建 CA）。长期 HSTS 一旦被浏览器记下，此后该域名的证书错误就**不再提供
+  # 「继续访问」入口**（Chrome：「您目前无法访问 … 因为此网站使用了 HSTS」），
+  # 站点会彻底进不去、且普通用户没有回退手段 —— 这正是本条想避免的失败形态。
+  local hsts_header
+  if [[ "$cert_fullchain" == "${ACME_CERT_DIR}/"* ]]; then
+    hsts_header='    add_header Strict-Transport-Security "max-age=31536000; includeSubDomains" always;'
+  else
+    hsts_header='    add_header Strict-Transport-Security "max-age=0" always;'
+  fi
+
+  # —— 反代片段：所有 location 共用 ——
+  local proxy_snippet
+  proxy_snippet="        proxy_http_version 1.1;
+        proxy_set_header Host \$host;
+        proxy_set_header X-Real-IP \$remote_addr;
+        # R22-02：**重写**而非追加。追加语义（proxy_add_x_forwarded_for）下该头的
+        # 首段就是请求方原样送进来的值 —— 任何人都能写一个内网或不可解析地址把自己
+        # 伪装成可信来源，黑名单、海外屏蔽与全部按 IP 限流会被一起按伪造值判定。
+        # 本文件与 Develop_Document.md 都要求「最外层代理会重写而非追加该头」。
+        # 注意：若本机 Nginx 之前还有 CDN，请改用 realip 模块还原客户端地址，
+        #       否则应用侧只会看到 CDN 的 IP（X-Real-IP 同步受此影响）。
+        proxy_set_header X-Forwarded-For \$remote_addr;
+        proxy_set_header X-Forwarded-Proto \$scheme;
+        proxy_set_header X-Forwarded-Host \$host;
+        # 浏览器实际连接的端口：Nginx 的 \$host 已被去掉端口，非 443/80 部署时
+        # 应用侧只能靠这个头还原出对外地址（WebDAV「服务器地址」用得到）
+        proxy_set_header X-Forwarded-Port \$server_port;
+        proxy_set_header X-Requested-With \$http_x_requested_with;
+        proxy_connect_timeout 60s;
+        proxy_send_timeout 3600s;
+        proxy_read_timeout 3600s;
+        proxy_buffering off;            # 大文件下载/上传必须关闭缓冲，避免整文件落内存
+        proxy_request_buffering off;
+        proxy_hide_header Strict-Transport-Security;"
+
+  local acme_block="    location ^~ /.well-known/acme-challenge/ {
+        root ${WEBROOT};
+        default_type \"text/plain\";
+    }"
+
+  # —— WebDAV 反代（默认开启）——
+  # 应用内开启 WebDAV 后，客户端（Windows 资源管理器 / macOS Finder）访问的就是这一个入口。
+  # 这里**必须默认写进配置**，不能像旧版那样留一段注释让人手动取消注释：
+  # 界面会把 https://<域名>/dav/ 当作「服务器地址」给出去，用户照着填却撞上 404 ——
+  # 因为没有任何人把 /dav/ 转发到应用内置的 WebDAV 端口。表现就是「配置全对但用不了」，
+  # 且从界面上完全看不出差在哪一步。
+  # 上游是应用自己起的 HTTPS WebDAV 服务，用的是应用侧自备的证书（TLS_CERT_FILE / data/tls）；
+  # 回环地址与证书里的域名对不上，所以必须 proxy_ssl_verify off；
+  # 未开启 WebDAV 时上游端口没人监听，Nginx 只对 /dav* 返回 502，不影响面板其它路径。
+  local webdav_block="    # WebDAV 反向代理（应用内开启后立即生效）
+    location ^~ /dav {
+        proxy_pass https://127.0.0.1:${WEBDAV_PORT};
+        proxy_ssl_verify off;
+        proxy_set_header Authorization \$http_authorization;
+${proxy_snippet}
+    }"
+
+  local http_server="server {
+    listen ${HTTP_PORT};
+    server_name __DOMAIN__;
+
+${acme_block}
+
+    # 未启用 HTTPS 时直接提供反代；启用后改为 301 跳转
+__HTTP_LOCATION__
+}"
+
+  local http_location
+  if [[ "$with_tls" == "1" ]]; then
+    # 未启用 HTTPS 时这里直接反代（含 /dav，见下）；启用后统一 301 到 https，
+    # /dav/ 也跟着跳到 https，无需在这段里重复一遍 WebDAV 反代。
+    http_location="    location / { return 301 https://\$host__EXT_PORT__\$request_uri; }"
+  else
+    http_location="    location / {
+        proxy_pass http://127.0.0.1:__APP_PORT__;
+${proxy_snippet}
+    }
+${webdav_block}"
+  fi
+
+  local content="$http_server"
+
+  if [[ "$with_tls" == "1" ]]; then
+    local root_loc
+    if [[ "$SUB_PATH" == "/" ]]; then
+      root_loc="    location / {
+        proxy_pass http://127.0.0.1:__APP_PORT__;
+${proxy_snippet}
+    }"
+    else
+      # 子路径（尽力而为）：前端资源相对路径可用，但前端对 /api、/s 使用绝对路径，
+      # 因此额外在根路径上补这两段反代；分享链接仍会以根路径生成，建议尽量用独立域名。
+      root_loc="    location = / { return 302 https://\$host__EXT_PORT____SUB_PATH__/; }
+    location ^~ /api/ {
+        proxy_pass http://127.0.0.1:__APP_PORT__;
+${proxy_snippet}
+    }
+    location ^~ /s/ {
+        proxy_pass http://127.0.0.1:__APP_PORT__;
+${proxy_snippet}
+    }
+    location __SUB_PATH__/ {
+        proxy_pass http://127.0.0.1:__APP_PORT__/;
+${proxy_snippet}
+    }"
+    fi
+
+    content="${content}
+
+server {
+    ${listen_tls}
+    ${ipv6}
+    ${h2}
+    server_name __DOMAIN__;
+
+    ssl_certificate     ${cert_fullchain};
+    ssl_certificate_key ${cert_key};
+    ssl_protocols       TLSv1.2 TLSv1.3;
+    ssl_ciphers         ECDHE-ECDSA-AES128-GCM-SHA256:ECDHE-RSA-AES128-GCM-SHA256:ECDHE-ECDSA-AES256-GCM-SHA384:ECDHE-RSA-AES256-GCM-SHA384:ECDHE-ECDSA-CHACHA20-POLY1305:ECDHE-RSA-CHACHA20-POLY1305;
+    ssl_prefer_server_ciphers off;
+    ssl_session_cache   shared:KeplerSSL:10m;
+    ssl_session_timeout 1d;
+
+${hsts_header}
+    add_header X-Content-Type-Options nosniff always;
+
+    # 上传大文件：交由应用自身分片，此处不做体积限制
+    client_max_body_size 0;
+    # 反代超时放宽，避免大文件列举/打包下载被中途掐断
+    keepalive_timeout 65s;
+
+${acme_block}
+
+${webdav_block}
+
+${root_loc}
+}"
+  fi
+
+  content="${content//__HTTP_LOCATION__/$http_location}"
+  local ext_port=""; [[ "$HTTPS_PORT" == "443" ]] || ext_port=":${HTTPS_PORT}"
+  content="${content//__DOMAIN__/$DOMAIN}"
+  content="${content//__APP_PORT__/$APP_PORT}"
+  content="${content//__EXT_PORT__/$ext_port}"
+  content="${content//__SUB_PATH__/$SUB_PATH}"
+
+  write_file "$NGINX_CONF" "$content" 0644
+  if [[ -n "$NGINX_LINK" && ! -e "$NGINX_LINK" ]]; then
+    ln -s "$NGINX_CONF" "$NGINX_LINK"
+    ok "已启用站点：${NGINX_LINK}"
+  fi
+}
+
+nginx_is_running() {
+  pgrep -x nginx >/dev/null 2>&1 && return 0
+  # 有些环境主进程名带路径前缀，退一步看监听端口
+  port_in_use "${HTTP_PORT}" && return 0
+  return 1
+}
+
+# Nginx 启停失败的针对性指引（宝塔/面板/端口占用都能覆盖）
+nginx_ctl_failure_hints() {
+  HINTS=()
+  add_hint "站点配置已写入：${NGINX_CONF}"
+  add_hint ""
+  add_hint "  1) 看状态：systemctl status nginx --no-pager"
+  add_hint "  2) 看 systemd 日志：journalctl -xeu nginx --no-pager"
+  add_hint "  3) 看 Nginx 自身错误日志：tail -n 50 $(nginx_err_log)"
+  add_hint "  4) 端口被谁占用：ss -ltnp | grep -E ':${HTTP_PORT}|:${HTTPS_PORT}'"
+  if [[ -d /www/server/nginx ]]; then
+    add_hint ""
+    add_hint "  【检测到宝塔/面板环境】面板装的 Nginx 通常是 sysv 服务，systemd 包装经常起不来，改用下面任一方式："
+    add_hint "    nginx -t && nginx -s reload"
+    add_hint "    /etc/init.d/nginx restart"
+    add_hint "    或宝塔面板 → 软件商店 → Nginx → 重启/重载配置"
+    add_hint "  若面板已有站点占用 ${HTTP_PORT}/${HTTPS_PORT}：停用冲突站点，或用 --http-port/--https-port 换端口"
+  elif [[ -x /etc/init.d/nginx ]]; then
+    add_hint ""
+    add_hint "  本机有 sysv 启动脚本，可直接：/etc/init.d/nginx restart"
+  fi
+  add_hint ""
+  add_hint "  处理好后重跑：$(rerun_cmd)"
+  add_hint "  或让脚本不再管 Nginx：$(rerun_cmd --skip-nginx)"
+}
+
+# 猜 Nginx 错误日志路径（用于提示）
+nginx_err_log() {
+  local p=""
+  p="$(nginx -V 2>&1 | tr ' ' '\n' | grep -m1 -- '--error-log-path=' | cut -d= -f2- || true)"
+  [[ -n "$p" ]] || p="/var/log/nginx/error.log"
+  printf '%s' "$p"
+}
+
+# 同名站点冲突：面板里若已给这个域名建过站点，请求可能命中旧的那一个
+check_server_name_conflict() {
+  [[ -n "${NGINX_BIN:-}" ]] || return 0
+  local dumped; dumped="$(nginx -T 2>/dev/null || true)"
+  [[ -n "$dumped" ]] || return 0
+  # 只统计「不同配置文件」里出现该域名的次数 —— 我们自己的配置里
+  # 本来就有 80 跳转 + 443 两个 server 块用同一个域名，不能算冲突。
+  # nginx -T 会以 "# configuration file <路径>:" 标出每段归属的文件。
+  local files
+  files="$(awk -v d="${DOMAIN}" '
+      /^# configuration file / { f = $4; sub(/:$/, "", f) }
+      index($0, "server_name") && index($0, d) { if (f != "") print f }
+    ' <<<"$dumped" | sort -u | wc -l || true)"
+  files="${files//[[:space:]]/}"
+  if [[ "${files:-0}" =~ ^[0-9]+$ ]] && ((files > 1)); then
+    warn "Nginx 里有 ${files} 个配置文件都用到了域名 ${DOMAIN}（可能在面板里已建过同名站点）"
+    warn "  请求可能命中旧站点。请停用/删除旧站点，或在面板里把该域名的反代指向 http://127.0.0.1:${APP_PORT}"
+    return 1
+  fi
+  return 0
+}
+
+# 让新配置生效：能 reload 就 reload，没在跑才 start；多种控制方式依次兜底
+nginx_ctl() {
+  local rc=0
+  if nginx_is_running; then
+    info "Nginx 已在运行，重载配置…"
+    run nginx -s reload || rc=$?
+    if ((rc != 0)) && [[ "$INIT_SYSTEM" == "systemd" ]]; then
+      rc=0; run systemctl reload nginx || rc=$?
+    fi
+    if ((rc != 0)) && [[ -x /etc/init.d/nginx ]]; then
+      rc=0; run /etc/init.d/nginx reload || rc=$?
+    fi
+  else
+    info "Nginx 未运行，尝试启动…"
+    if [[ "$INIT_SYSTEM" == "systemd" ]]; then
+      run systemctl start nginx || rc=$?
+    else
+      rc=1
+    fi
+    if ((rc != 0)) && [[ -x /etc/init.d/nginx ]]; then
+      rc=0; run /etc/init.d/nginx start || rc=$?
+    fi
+    if ((rc != 0)) && [[ -n "${NGINX_BIN:-}" ]]; then
+      # 直接拉起二进制（nginx 默认 daemon 模式，会自行转后台）
+      rc=0; run "$NGINX_BIN" || rc=$?
+    fi
+  fi
+  return "$rc"
+}
+
+nginx_apply() {
+  mark_log
+  if ! nginx -t >>"$LOG_FILE" 2>&1; then
+    HINTS=()
+    add_hint "配置文件：${NGINX_CONF}（主配置 ${NGINX_CONF_PATH:-未知}）"
+    add_hint ""
+    local l
+    while IFS= read -r l; do [[ -n "$l" ]] && add_hint "  日志 | ${l}"; done <<<"$(log_key_lines 6)"
+    add_hint ""
+    add_hint "  手工校验看完整报错：nginx -t"
+    add_hint "  常见原因：${HTTP_PORT}/${HTTPS_PORT} 上已有 default_server 冲突、证书路径不存在、include 目录不对"
+    die_with_hint "Nginx 配置校验失败（nginx -t 未通过）" "${HINTS[@]}"
+  fi
+
+  # 开机自启：sysv/面板环境下这一步常报「not a native service」，失败无所谓
+  if [[ "$INIT_SYSTEM" == "systemd" ]]; then
+    run_soft systemctl enable nginx
+  fi
+
+  local rc=0
+  nginx_ctl || rc=$?
+  if ((rc != 0)); then
+    nginx_ctl_failure_hints
+    warn_with_hint "Nginx 未能启动/重载（部署继续，但站点需要你手动拉起 Nginx）" "${HINTS[@]}"
+    # 只警告不向上抛失败：配置文件已落盘，用户手动 reload 即可生效
+    return 0
+  fi
+  verify_conf_loaded || true
+  check_server_name_conflict || true
+  ok "Nginx 已应用配置并运行"
+  return 0
+}
+
+# ------------------------------------------------------------------------------
+# 8. HTTPS 证书
+# ------------------------------------------------------------------------------
+TLS_DIR="/etc/${SERVICE_NAME}/ssl"
+ACME_CERT_DIR="${TLS_DIR}/acme"     # acme.sh 签发的证书安装到固定路径（与 --tls file 的自备证书分开存，便于切换）
+CERT_FULLCHAIN="${CERT_FULLCHAIN:-}"
+CERT_KEY="${CERT_KEY:-}"
+
+# 重装/重跑时「证书还够新，不必再申请」的天数阈值。
+# 分工：**续期归 acme.sh 的每日 cron**（它在到期前 60 天自己续），本脚本只负责「首次签发」
+# 与「证书缺失/临近到期时的补签」。故阈值不必等于 60 —— 取 30 天：既不会在证书快到期时
+# 盲目跳过，也不会因为阈值过大而白白多发一次 ACME 请求（每次请求都算 CA 的速率配额）。
+CERT_REUSE_MIN_DAYS=30
+
+# ------------------------------------------------------------------------------
+# 8.0 ACME 证书颁发机构（CA）注册表
+#
+# 为什么要有多家：Let's Encrypt 的 API 在境外，国内服务器经常**连不上**
+# （宝塔官方对同类问题的回复就是「服务器无法连接到 Let's Encrypt 的海外 API 服务器」）。
+# 可选项里除了 LE，其余都要求 EAB（外部账户绑定）—— 这是**协议层**要求，不是网络问题：
+# 实测 https://acme.litessl.com/acme/v2/directory 的 meta 里写着
+#   "externalAccountRequired": true, "caaIdentities": ["trustasia.com"]
+#   https://acme.zerossl.com/v2/DV90/directory 同样是 externalAccountRequired: true
+# 所以「换个 --server 就行」是错的，必须先拿到一对 EAB 凭据（KID + HMAC KEY）。
+#   · zerossl —— acme.sh 能用注册邮箱**自动换取** EAB；拿不到时（"Can not resolve _eab_id"）
+#                才需要去 https://app.zerossl.com/developer 手工取
+#   · litessl —— 亚数 TrustAsia（中国 CA）的免费 DV 证书，**必须**去 litessl.com 注册后
+#                手工取 EAB。宝塔面板之所以能申请成功，就是它替你保管了这份凭据。
+#
+# 引擎选择：非 LE 一律走 acme.sh。原因是 CentOS 8 的 certbot 是 1.22（Python 3.6），
+# **不支持 --eab-kid/--eab-hmac-key**，用 certbot 接 EAB 类 CA 必然失败；acme.sh 支持
+# EAB，且对 ZeroSSL 有自动换取 EAB 的特化处理。
+# ------------------------------------------------------------------------------
+ca_names() { printf 'zerossl | letsencrypt | litessl'; }
+
+ca_is_valid() {
+  case "${1:-}" in
+    letsencrypt|zerossl|litessl) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# ACME directory（RFC 8555）地址
+ca_server() {
+  case "${1:-}" in
+    letsencrypt) printf 'https://acme-v02.api.letsencrypt.org/directory' ;;
+    zerossl)     printf 'https://acme.zerossl.com/v2/DV90' ;;
+    litessl)     printf 'https://acme.litessl.com/acme/v2/directory' ;;
+    *)           printf '' ;;
+  esac
+}
+
+ca_label() {
+  case "${1:-}" in
+    letsencrypt) printf "Let's Encrypt" ;;
+    zerossl)     printf 'ZeroSSL' ;;
+    litessl)     printf 'LiteSSL（亚数 TrustAsia）' ;;
+    *)           printf '%s' "${1:-}" ;;
+  esac
+}
+
+# acme.sh 里给这家 CA 取 EAB 的入口（没有就打印空）
+ca_eab_page() {
+  case "${1:-}" in
+    zerossl) printf 'https://app.zerossl.com/developer' ;;
+    litessl) printf 'https://www.litessl.com' ;;
+    *)       printf '' ;;
+  esac
+}
+
+# 是否「必须」手工提供 EAB（zerossl 可由 acme.sh 用邮箱自动换取，故不算必须）
+# 注意：必须显式 return —— 末条语句写成 `[[ ... ]]` 时条件为假会返回 1，
+# 裸调用点会被 set -e 的 ERR trap 当成「脚本意外失败」（本项目已踩过多次）。
+ca_needs_eab() {
+  if [[ "${1:-}" == "litessl" ]]; then return 0; fi
+  return 1
+}
+
+# acme.sh 存放某家 CA 账户密钥的目录。
+# **不能靠 glob 猜**：acme.sh 的规则是 CA_DIR="$CA_HOME/<host>/<path>"，也就是
+#   letsencrypt -> ca/acme-v02.api.letsencrypt.org/directory/
+#   zerossl     -> ca/acme.zerossl.com/v2/DV90/
+#   litessl     -> ca/acme.litessl.com/acme/v2/directory/
+# 账户密钥在**最里层**的目录里。写成 `ca/*<host>*/account.key` 只会命中外层父目录，
+# 永远判定「没注册过」—— 那就会在重跑时强行索要 EAB，而 acme.sh 其实早存好了。
+# 这里按 acme.sh 的算法原样推导（用 bash 参数展开，不依赖 cut/tr）。
+acme_ca_dir() {
+  local url rest host path
+  url="$(ca_server "${1:-}")"
+  if [[ -z "$url" ]]; then return 1; fi
+  rest="${url#*://}"          # 去掉 scheme
+  host="${rest%%/*}"          # 域名
+  path="${rest#*/}"           # directory 路径
+  if [[ -z "$host" || "$path" == "$rest" ]]; then return 1; fi
+  printf '%s/ca/%s/%s' "$ACME_HOME" "$host" "$path"
+}
+
+# acme.sh 是否已经为这家 CA 注册过账户。已注册则重装/续期**不再需要** EAB ——
+# acme.sh 会把 EAB 存进该 CA 的 ca.conf（CA_EAB_KEY_ID / CA_EAB_HMAC_KEY），注册时读回来；
+# 这既解释了「重装不该因为没带 EAB 就失败」，也让本脚本不必把 HMAC 密钥落盘。
+acme_account_exists() {
+  local ca_dir
+  ca_dir="$(acme_ca_dir "${1:-}")" || return 1
+  if [[ -s "${ca_dir}/account.key" ]]; then return 0; fi
+  return 1
+}
+
+# reload Nginx 的命令：certbot 的 --deploy-hook 与 acme.sh 的 --reloadcmd 共用一份。
+# **优先 `nginx -s reload`**（本脚本已把正确的 nginx 二进制加进 PATH，含宝塔 /www/server/nginx/sbin/nginx）
+# 再依次兜底 systemctl / init.d。不能只按 INIT_SYSTEM 二分：宝塔/自编译的 nginx 不是 systemd
+# native service（systemctl reload 会报 "is not active, cannot reload"），但机器本身又是 systemd 的。
+nginx_reload_cmd() {
+  printf 'nginx -s reload || systemctl reload nginx 2>/dev/null || /etc/init.d/nginx reload 2>/dev/null'
+}
+
+# acme.sh 可执行文件路径。现算而不缓存常量：ACME_HOME 允许被环境变量覆盖，
+# 在加载期缓存成常量会拿到覆盖前的旧值（表现为「明明指到临时目录，却读了真实账户」）。
+acme_bin() { printf '%s/acme.sh' "$ACME_HOME"; }
+
+# 证书是否「还够新」：够新就跳过申请，直接复用。
+#
+# 为什么需要一个判据而不是每次都去签发：重装/升级时把没坏的东西重做一遍，除了浪费一次
+# ACME 请求（占 CA 的速率配额），更糟的是**它可能失败**——acme.sh 在证书未到续期时间时
+# 会以退出码 2 收场（见 acme_issue_skipped），旧实现把它当失败就回退自签名，于是「重装」
+# 反而把好好的正式证书降级了（2026-09 现场故障）。
+#
+# ------------------------------------------------------------------------------
+# 「这份证书到底能不能用」——**唯一实现点**（签发安装、复用判断、自备证书校验三处共用）。
+#
+# 只判 `-s`（文件非空）会漏掉两类**已经踩到**的坏证书：
+#   ① 文件里有字节、也能被 openssl 解析，但 subject / issuer **是空的**——
+#      `openssl req -x509 -subj "/"` 实测就产出这样一份「合法但字段全空白」的证书，
+#      `nginx -t` 照样通过。装上去浏览器里点开证书信息**所有字段都是空白**、
+#      一律判「不安全」。这正是「脚本说签发成功、浏览器却说证书空白」的机制。
+#   ② 证书与私钥不是一对（acme.sh 续期只换证书、不换 key 的中间态）。
+#
+# 所以判据必须是**内容级**的：能解析出 subject 与 issuer 且都**有实值**，且公钥与私钥配对。
+cert_file_ok() {
+  local crt="$1" key="$2"
+  [[ -s "$crt" && -s "$key" ]] || return 1
+  have openssl || return 1
+  local s i
+  s="$(openssl x509 -in "$crt" -noout -subject 2>/dev/null || true)"
+  i="$(openssl x509 -in "$crt" -noout -issuer  2>/dev/null || true)"
+  # openssl 输出形如 `subject=CN = example.com`（1.0.2 上是 `subject=/CN=...`）；
+  # 等号后面为空 = 证书字段全空白，必须判为不可用。
+  [[ "$s" == subject=* && -n "${s#subject=}" ]] || return 1
+  [[ "$i" == issuer=*  && -n "${i#issuer=}"  ]] || return 1
+  # 公钥配对：先 pkey（ECC/RSA 通吃），老 OpenSSL 上再退到 rsa。
+  # 要求两段文本都真的是 PUBLIC KEY 块 —— 否则「两边都解析失败」会变成空==空的假通过。
+  local pc pk
+  pc="$(openssl x509 -in "$crt" -noout -pubkey 2>/dev/null || true)"
+  pk="$(openssl pkey -in "$key" -pubout 2>/dev/null || openssl rsa -in "$key" -pubout 2>/dev/null || true)"
+  [[ "$pc" == *"-----BEGIN PUBLIC KEY-----"* && "$pk" == *"-----BEGIN PUBLIC KEY-----"* ]] || return 1
+  pc="${pc//$'\n'/}"; pk="${pk//$'\n'/}"
+  # 显式 return：函数**不得**以裸 `[[ ... ]]` 结尾 —— 条件为假时函数返回 1，
+  # 裸调用处会被 ERR trap 当成脚本失败（本仓有一条全局护栏专门扫这个写法）。
+  if [[ "$pc" != "$pk" ]]; then return 1; fi
+  return 0
+}
+
+# 判据只用 openssl 的 -checkend：它直接回答「未来 N 天内会不会过期」，
+# 不必解析 notAfter 文本（BSD 与 GNU 的 date 语法不同，解析一换机器就翻车）。
+# 拿不到结论时返回 1 —— 那就照旧去申请，退化成原有流程，不冒险跳过。
+tls_cert_reusable() {
+  local dir="$1"
+  [[ -s "${dir}/fullchain.pem" && -s "${dir}/privkey.pem" ]] || return 1
+  have openssl || return 1
+  # 先过内容关。一份「没过期、但浏览器根本用不了」的证书若不在这里拦下，就会被
+  # **每次重装永久复用**（每次都判「可复用 → 跳过申请」），表现为「怎么重装它都还是
+  # 那个不安全的证书」—— 与「可复用来源只认 ACME_CERT_DIR」是同一类教训：
+  # 复用判据必须能回答「它现在还好不好用」，而不只是「它在不在」。
+  cert_file_ok "${dir}/fullchain.pem" "${dir}/privkey.pem" || return 1
+  openssl x509 -in "${dir}/fullchain.pem" -noout \
+    -checkend $((CERT_REUSE_MIN_DAYS * 86400)) >/dev/null 2>&1
+}
+
+# 证书到期时间（仅用于打印；取不到就打印「未知」，不参与任何判断）
+cert_not_after() {
+  local crt="$1"
+  have openssl || { printf '未知'; return 0; }
+  # 剥 `notAfter=` 前缀用参数展开而不是 `| sed`：命令替换里的管道在 pipefail 下
+  # 无匹配即返回 1，会被 ERR trap 当脚本失败（本仓已有一条全局护栏扫这个写法）。
+  local v; v="$(openssl x509 -in "$crt" -noout -enddate 2>/dev/null || true)"
+  v="${v#notAfter=}"
+  printf '%s' "${v:-未知}"
+}
+
+# acme.sh 的「跳过续期」退出码判据。
+#
+# acme.sh 源码（acme.sh 第 93 行）里 `RENEW_SKIP=2`；`issue()` 在证书未到 Le_NextRenewTime
+# 时打印 "Domains not changed." / "Skipping. Next renewal time is: …" /
+# "Add '--force' to force renewal." 之后 `return $RENEW_SKIP`。
+# **这是正常跳过，不是失败** —— 但它的退出码是 2，旧实现把非零码一律当「签发失败」，
+# 于是「重装 → 账户已存在（跳过注册）→ --issue 退出 2 → 判失败 → 回退自签名」，
+# 现场表现为「选重新安装后 SSL 又变成自签名」。
+# 除退出码外再认一次措辞：退出码可能被包装层改写，措辞才是 acme.sh 的直接证据。
+acme_issue_skipped() {
+  local rc="${1:-}"
+  if ((rc == 2)); then return 0; fi
+  local tail_log; tail_log="$(log_since_mark)"
+  grep -qiE 'next renewal time is|domains not changed|to force renew' <<<"$tail_log"
+}
+
+# EAB 缺失/不可用时的指引（凭据要从 CA 控制台取，脚本变不出来）。
+# 拆成「只追加」与「重置后追加」两个入口：签发失败诊断路径已经在 HINTS 里写好了抬头，
+# 直接调 acme_eab_hints() 会把抬头冲掉（HINTS=() 是清空，不是清屏）。
+acme_eab_lines() {
+  local page; page="$(ca_eab_page "$CA_PROVIDER")"
+  add_hint "  $(ca_label "$CA_PROVIDER") 的 ACME 接口要求 EAB（外部账户绑定）："
+  add_hint "    接口 meta 里写着 externalAccountRequired: true —— 这是协议层要求，不是网络问题，"
+  add_hint "    也不是「换个 --server 就行」；必须先在该 CA 注册、拿到一对凭据才能签发："
+  add_hint "      EAB KID（公开标识）+ EAB HMAC KEY（机密，相当于签发密码）"
+  add_hint ""
+  if [[ -n "$page" ]]; then
+    add_hint "  1) 打开 ${page} 注册账号并生成 EAB，复制这两个值"
+    add_hint "  2) 带上它们重跑（HMAC 只经命令行交给 acme.sh；本脚本的状态文件里不保存它）："
+    add_hint "       $(rerun_cmd --ca "${CA_PROVIDER}" --eab-kid KID --eab-hmac-key HMAC)"
+    add_hint "     ※ 注册成功后 acme.sh 会把 EAB 存进它自己的 ca.conf，之后续期/重跑不必再带。"
+  else
+    add_hint "  1) 到该 CA 的控制台生成 EAB，再用 --eab-kid / --eab-hmac-key 重跑"
+  fi
+  add_hint ""
+  if [[ "$CA_PROVIDER" != "letsencrypt" ]]; then
+    add_hint "  不想再注册一家账号？用默认的 Let's Encrypt（免 EAB；前提是这台机器能连上它的境外 API）："
+    add_hint "    $(rerun_cmd --ca letsencrypt)"
+  fi
+  if [[ "$CA_PROVIDER" != "zerossl" ]]; then
+    add_hint "  或用 ZeroSSL：acme.sh 能用 --email 自动换取 EAB，不用手工填 ——"
+    add_hint "    $(rerun_cmd --ca zerossl)"
+  fi
+}
+
+acme_eab_hints() {
+  HINTS=()
+  acme_eab_lines
+}
+
+# ------------------------------------------------------------------------------
+# R49：自签名证书已移除。
+#
+# 旧实现（gen_self_signed）会用 `openssl req -x509` 现场签一张自签名证书顶上。它被删掉
+# 的原因是「自签名证书没有意义」：浏览器照样判定不安全（必须人工点「继续访问」），而
+# **安全上下文并不成立** —— WebAuthn（Windows Hello 登录）、Service Worker、剪贴板、
+# 摄像头/麦克风、通知等都以「证书有效」为前提，所以那些「必须有 HTTPS 才能用」的功能
+# 一个也换不来；剩下的只是「看起来像 HTTPS」的错觉，以及一份要长期维护的私钥。
+#
+# 取代它的是「使用你自备的真实证书」：把 fullchain.pem / privkey.pem 放进
+# ${TLS_DIR} 即可。下面的函数只**校验并认领**这两个文件，不生成任何证书。
+# ------------------------------------------------------------------------------
+use_provided_cert() {
+  mkdir -p "$TLS_DIR"
+  local key="${TLS_DIR}/privkey.pem" crt="${TLS_DIR}/fullchain.pem"
+  # 判据必须过 cert_file_ok（subject/issuer 非空 + 与私钥配对，唯一实现点）：
+  # 只判「文件存在且非空」会放过字段全空白的坏证书 —— openssl 能读、nginx -t 也通过，
+  # 偏偏浏览器里证书信息是一片空白。
+  if ! cert_file_ok "$crt" "$key"; then
+    HINTS=()
+    add_hint "  --tls file 需要你自己准备好**证书链 + 对应私钥**两个文件："
+    add_hint "    证书：${crt}"
+    add_hint "    私钥：${key}"
+    add_hint "  照抄 CA 下发的文件即可（fullchain / privkey 是标准命名）："
+    add_hint "    install -m 0644 /path/to/fullchain.pem ${crt}"
+    add_hint "    install -m 0600 /path/to/privkey.pem   ${key}"
+    add_hint "  自检（subject / issuer 有实值才算可用）：openssl x509 -in ${crt} -noout -subject -issuer -dates"
+    add_hint "  暂时没有证书、只想先把站点跑起来（仅 HTTP，不建议用于公网）：$(rerun_cmd --tls none)"
+    die_with_hint "自备证书不可用（缺失，或内容是空白的 / 与私钥不配对）" "${HINTS[@]}"
+  fi
+  chmod 0600 "$key"; chmod 0644 "$crt"
+  CERT_FULLCHAIN="$crt"; CERT_KEY="$key"
+  # 刻意**不**在这里判有效期：证书何时到期、怎么续期是运维自己（或其 CA 客户端）的事，
+  # 本脚本不越权去动别人的证书文件 —— 这也是与 ACME 模式最大的区别。
+  ok "已启用自备证书：${crt}"
+  info "到期时间：$(cert_not_after "$crt" 2>/dev/null || echo '（读取失败，请自行确认）')"
+  info "续期由你的 CA 客户端负责（如 certbot renew / acme.sh 的每日任务），续期后请重跑本脚本或重启服务。"
+  return 0
+}
+
+ensure_certbot() {
+  if have certbot; then ok "certbot 已安装：$(certbot --version 2>/dev/null | head -n1 || true)"; return 0; fi
+  info "安装 certbot…"
+  case "$PM" in
+    apt) run_soft bash -c 'DEBIAN_FRONTEND=noninteractive apt-get install -y -qq certbot' ;;
+    dnf|yum)
+      run_soft "$PM" install -y epel-release
+      run_soft "$PM" install -y certbot ;;
+    apk) run_soft apk add --no-cache certbot ;;
+    zypper) run_soft zypper --non-interactive install certbot ;;
+  esac
+  if ! have certbot && have snap; then
+    run_soft snap install --classic certbot
+    [[ -e /usr/bin/certbot ]] || ln -sf /snap/bin/certbot /usr/bin/certbot 2>/dev/null || true
+  fi
+  have certbot
+}
+
+domain_resolves_here() {
+  local ip="" pub=""
+  # 这几条解析命令在「域名没解析 / 没装 dig」时都会返回非 0；pipefail 下必须显式兜底，
+  # 否则还没轮到签发证书，脚本就被 ERR trap 打断了。
+  if have getent; then ip="$(getent hosts "$DOMAIN" 2>/dev/null | awk '{print $1}' | head -n1 || true)"; fi
+  [[ -z "$ip" ]] && have dig && ip="$(dig +short A "$DOMAIN" 2>/dev/null | head -n1 || true)"
+  [[ -z "$ip" ]] && have nslookup && ip="$(nslookup "$DOMAIN" 2>/dev/null | awk '/^Address: /{print $2}' | tail -n1 || true)"
+  [[ -z "$ip" ]] && return 2                     # 无法解析（未知）
+  pub="$(curl -fsS --max-time 8 https://api.ipify.org 2>/dev/null || true)"
+  [[ -z "$pub" ]] && pub="$(curl -fsS --max-time 8 http://ifconfig.me 2>/dev/null || true)"
+  if [[ -n "$pub" && "$ip" != "$pub" ]]; then
+    warn "域名 ${DOMAIN} 解析到 ${ip}，但本机公网 IP 为 ${pub}，ACME 的 HTTP-01 校验可能失败（当前 CA：$(ca_label "$CA_PROVIDER")）。"
+    return 1
+  fi
+  return 0
+}
+
+# 域名解析检测失败时的措辞（原来是写死 Let's Encrypt 的）
+domain_resolve_warn() {
+  warn "域名解析检测未通过，仍会尝试签发（HTTP-01 需要 80 端口可被外网访问）。"
+}
+
+# 正式证书签发失败的针对性指引（R49 起是**致命**错误：不再回退自签名证书）。
+# 按 CA 泛化 —— 日志里的报错形态与「境外 CA 连不上」「EAB 没给」都区分开了。
+acme_failure_hints() {
+  local tail_log; tail_log="$(log_since_mark)"
+  HINTS=()
+  add_hint "站点证书没签下来，本站**不会**再回退自签名证书 —— 自签名证书会被浏览器判为不安全"
+  add_hint "（必须人工点「继续访问」），也换不来 WebAuthn / Service Worker / 剪贴板这些需要"
+  add_hint "「安全上下文」的功能，等于只买到一个 HTTPS 的错觉。两条出路："
+  add_hint "  ① 用你自备的证书（商业证书 / 内网 CA / IP 证书都行）："
+  add_hint "       把 fullchain.pem 与 privkey.pem 放进 ${TLS_DIR}，然后 $(rerun_cmd --tls file)"
+  add_hint "  ② 暂时只提供 HTTP（仅内网或临时验证可用）：$(rerun_cmd --tls none)"
+  add_hint ""
+  add_hint "想继续走 ACME 的话，按下面的诊断对症处理："
+  add_hint "  本次 CA ：$(ca_label "$CA_PROVIDER")"
+  add_hint "  接口    ：$(ca_server "$CA_PROVIDER")"
+  add_hint ""
+  if grep -qiE 'eab|external ?account|_eab_id' <<<"$tail_log"; then
+    add_hint "  【判断】这家 CA 要求 EAB（外部账户绑定）凭据，当前缺失或不被接受。"
+    acme_eab_lines
+  elif grep -qiE 'acme\.sh 安装失败|下载到的 (文件|acme\.sh)' <<<"$tail_log"; then
+    add_hint "  【判断】acme.sh 本体没装上（官方源在 GitHub，官方安装器就是从那儿取文件）。"
+    add_hint "  脚本已自动尝试 gitee 镜像仍失败 —— 多半是这台机器的出口对两个源都不通。"
+    add_hint "  手工装好后再重跑（二选一）："
+    add_hint "    ① gitee 克隆：git clone https://gitee.com/neilpang/acme.sh.git /root/acme-sh-src && cd /root/acme-sh-src && ./acme.sh --install -m ${EMAIL}"
+    add_hint "    ② 任何能上网的机器下载后传到服务器：https://gitee.com/neilpang/acme.sh/raw/master/acme.sh → 放到 ${ACME_HOME}/acme.sh（chmod 0700）"
+    add_hint "  装好后重跑：$(rerun_cmd --tls "${CA_PROVIDER}")"
+  elif grep -qiE 'rate ?limit|ratelimited|too many|exceeded|Le_OrderFinalize|429|retry after' <<<"$tail_log"; then
+    add_hint "  【判断】触发 CA 的速率限制（rateLimited / 429）：不是账户坏了，也不是网络不通。"
+    add_hint "    · Let's Encrypt 等按「注册域名」（公共后缀一级，如 l.cd / example.com）7 天限发约 50 张证书，"
+    add_hint "      同一后缀下所有人共享配额 —— 你看到的「已存在 ACME 账户」是账户本身有效，受限的是域名配额。"
+    add_hint "    1) 立刻换 CA 避开配额（照样走 HTTP-01，无需改域名解析）："
+    add_hint "         $(rerun_cmd --ca litessl --eab-kid KID --eab-hmac-key HMAC)   # 或 --ca zerossl 自动换 EAB"
+    add_hint "    2) 想留在这家 CA 就等日志里 retry-after 时间过后重跑；急着上线可先用自备证书（--tls file）"
+    add_hint "       或 --tls none 只跑 HTTP，之后再换回 ACME"
+  elif grep -qiE 'cannot connect|connection (refused|reset|error)|failed to connect|could not connect|timed out|timeout|unreachable|no route|temporary failure in name resolution|ssl: ' <<<"$tail_log"; then
+    add_hint "  【判断】连不上 ACME 服务器。注意这**多半不是** 80 端口的问题 —— 国内服务器连"
+    add_hint "  境外 CA 的 API 超时是最常见的原因（站点能正常访问，证书就是签不下来）。"
+    add_hint "  先在服务器上实测这个接口通不通（返回 200 才算通；超时/000 就是连不上 CA）："
+    add_hint "    curl -s -o /dev/null -m 10 -w '%{http_code} %{time_total}\n' $(ca_server "$CA_PROVIDER")"
+    add_hint ""
+    add_hint "  a) 连不上 → 换一家能连上的 CA。换 --server 不够：非 LE 的 CA 都要 EAB 凭据，"
+    add_hint "     优先用国内节点（到 litessl.com 取 EAB 后重跑）："
+    add_hint "       $(rerun_cmd --ca litessl --eab-kid KID --eab-hmac-key HMAC)"
+    add_hint "     或 ZeroSSL（acme.sh 能用 --email 自动换取 EAB，免手工）："
+    add_hint "       $(rerun_cmd --ca zerossl)"
+    add_hint "  b) 能连上 → 那就是 HTTP-01 校验失败，继续按下面排查 80 端口："
+    add_hint "       1) 云厂商安全组放行 80/443；本机防火墙：ufw allow 80,443/tcp 或 firewall-cmd --add-service=http --add-service=https --permanent && firewall-cmd --reload"
+    add_hint "       2) 确认 Nginx 在监听：ss -ltnp | grep ':80'"
+  elif grep -qiE 'unauthorized|invalid response|403|404' <<<"$tail_log"; then
+    add_hint "  【判断】域名解析到的机器不是本机，或请求被 CDN 拦截。"
+    add_hint "    1) 核对解析：dig +short ${DOMAIN} 应等于本机公网 IP（curl -s https://api.ipify.org）"
+    add_hint "    2) 走 Cloudflare 等 CDN 时先临时关闭代理（灰云），或改用 DNS-01 校验"
+  elif grep -qiE 'nxdomain|no valid ip|dns problem|dns-01' <<<"$tail_log"; then
+    add_hint "  【判断】域名解析异常。先在 DNS 控制台加 A 记录指向本机公网 IP，等生效后重试。"
+  else
+    add_hint "  【判断】未能自动识别原因，查看日志：tail -n 60 ${LOG_FILE}"
+  fi
+  add_hint "  日志关键行："
+  local l
+  while IFS= read -r l; do [[ -n "$l" ]] && add_hint "    | ${l}"; done <<<"$(log_key_lines 4)"
+  add_hint ""
+  add_hint "处理好后重跑即可自动换成正式证书（不会重复建站，只换证书）："
+  add_hint "    $(rerun_cmd --tls "${CA_PROVIDER}")"
+  warn_with_hint "$(ca_label "$CA_PROVIDER") 证书签发失败" "${HINTS[@]}"
+}
+
+# 用 certbot 签发（只走 Let's Encrypt 路径：CentOS 8 的 certbot 1.22 / Python 3.6
+# 不支持 --eab-kid/--eab-hmac-key，接 EAB 类 CA 必然失败）。失败只返回 1，由调用方出提示。
+issue_via_certbot() {
+  local args=(certonly --webroot -w "$WEBROOT" -d "$DOMAIN" --non-interactive --agree-tos
+              -m "$EMAIL" --keep-until-expiring --cert-name "$DOMAIN")
+  [[ "$STAGING" == "1" ]] && args+=(--staging)
+  args+=(--deploy-hook "$(nginx_reload_cmd)")
+
+  mark_log
+  if ! run certbot "${args[@]}" </dev/null; then return 1; fi
+  local live="/etc/letsencrypt/live/${DOMAIN}"
+  if [[ ! -s "${live}/fullchain.pem" || ! -s "${live}/privkey.pem" ]]; then return 1; fi
+  CERT_FULLCHAIN="${live}/fullchain.pem"; CERT_KEY="${live}/privkey.pem"
+
+  # 自动续期：certbot 包通常自带 timer/cron，这里显式确认一次
+  if [[ "$INIT_SYSTEM" == "systemd" ]] && systemctl list-unit-files 2>/dev/null | grep -q 'certbot.timer'; then
+    run_soft systemctl enable --now certbot.timer
+    ok "已启用 certbot.timer 自动续期"
+  elif ! grep -rq 'certbot' /etc/crontab /etc/cron.d 2>/dev/null; then
+    printf '0 3 * * * root certbot renew --quiet --deploy-hook "%s" >/dev/null 2>&1\n' "$(nginx_reload_cmd)" \
+      > "/etc/cron.d/${SERVICE_NAME}-certbot"
+    chmod 0644 "/etc/cron.d/${SERVICE_NAME}-certbot"
+    ok "已添加每日续期定时任务：/etc/cron.d/${SERVICE_NAME}-certbot"
+  fi
+  ok "Let's Encrypt 证书签发成功（certbot）：${CERT_FULLCHAIN}"
+  return 0
+}
+
+# 统一入口：按 CA 选引擎，失败只返回 1（R49 起失败即中断，由 setup_tls 决定）
+issue_cert() {
+  info "准备通过 $(ca_label "$CA_PROVIDER") 签发证书…"
+  info "  ACME 接口：$(ca_server "$CA_PROVIDER")　校验方式：HTTP-01 / webroot（${WEBROOT}）"
+  domain_resolves_here || domain_resolve_warn
+
+  if [[ "$CA_PROVIDER" != "letsencrypt" ]]; then
+    # 非 LE 一律 acme.sh：certbot 的 EAB 参数在 CentOS 8 那代根本不认
+    info "  使用 acme.sh 引擎（certbot 不支持 EAB 参数）"
+    if issue_acme_sh; then return 0; fi
+    acme_failure_hints
+    return 1
+  fi
+
+  if ensure_certbot; then
+    if issue_via_certbot; then return 0; fi
+    warn "certbot 签发 Let's Encrypt 证书失败，改用 acme.sh 再试一次…"
+  else
+    warn "certbot 不可用（RHEL 系通常在 EPEL 源里：$(epel_rpm_cmd)），改用 acme.sh 申请证书…"
+  fi
+  if issue_acme_sh; then return 0; fi
+  acme_failure_hints
+  return 1
+}
+
+# 把签发好的证书安装到固定路径（Nginx 只认这两个文件），并把 reloadcmd 一并登记到
+# acme.sh 的域名配置里 —— 这样**后续自动续期**也会同步覆盖这两个文件并重载 Nginx。
+acme_install_cert() {
+  local dir="$1"
+  mkdir -p "$dir"
+  local args=(--install-cert --home "$ACME_HOME" -d "$DOMAIN"
+              --key-file "${dir}/privkey.pem"
+              --fullchain-file "${dir}/fullchain.pem"
+              --reloadcmd "$(nginx_reload_cmd)")
+  # 成功判据是「证书文件是否落盘」，不是 run 的返回码：acme.sh 的 --install-cert 会先把
+  # key/fullchain 写进指定路径，**之后**才跑 --reloadcmd；若 reload 命令失败（宝塔/自编译
+  # nginx 下 systemctl reload 报 "is not active"），acme.sh 返回非零并打 "Reload error"，
+  # 但证书其实已经装好了。这里不能据此判「安装失败」 —— reload 稍后由
+  # setup_tls 末尾的 nginx_apply 统一兜底（它已经 reload 过一次）。
+  if ! run "$(acme_bin)" "${args[@]}" </dev/null; then
+    warn "acme.sh --install-cert 返回非零（多半是 --reloadcmd 那步失败）；证书可能已落盘，继续核对文件。"
+  fi
+  chmod 0600 "${dir}/privkey.pem" 2>/dev/null || true
+  chmod 0644 "${dir}/fullchain.pem" 2>/dev/null || true
+  if [[ ! -s "${dir}/privkey.pem" || ! -s "${dir}/fullchain.pem" ]]; then
+    warn "证书文件未正确落盘：${dir}/privkey.pem 或 fullchain.pem 缺失/为空。"
+    return 1
+  fi
+  # 落盘 ≠ 可用。只判「非空」时，一份 subject/issuer 全空白（或与私钥不配对）的证书
+  # 会被一路当成「签发成功」送到浏览器 —— 用户看到的就是「提示成功、证书字段全空白、
+  # 显示不安全」。这里必须当场拒绝，并把它到底是什么打出来，别让下一个人再去猜。
+  if ! cert_file_ok "${dir}/fullchain.pem" "${dir}/privkey.pem"; then
+    warn "证书文件已落盘，但**内容不可用**（字段全空白 / 不是证书 / 与私钥不配对）：${dir}"
+    warn "  文件开头（前 3 行）：$(head -n 3 "${dir}/fullchain.pem" 2>/dev/null | tr '\n' ' ' || true)"
+    warn "  字段自检：openssl x509 -in ${dir}/fullchain.pem -noout -subject -issuer -dates"
+    warn "  私钥自检：openssl pkey -in ${dir}/privkey.pem -noout 2>&1 | head -n1"
+    warn "  已**不**把它记为「签发成功」。重签：$(rerun_cmd --force-cert)"
+    return 1
+  fi
+  ok "证书内容校验通过：$(openssl x509 -in "${dir}/fullchain.pem" -noout -subject 2>/dev/null || true)"
+  return 0
+}
+
+# 安装 acme.sh 本体（不含账户注册）。
+# 官方安装器（get.acme.sh）实际从 raw.githubusercontent.com 取文件 —— 国内服务器
+# 经常连不上 GitHub，装不上 acme.sh 就等于所有需要 EAB 的 CA 全军覆没（certbot 又
+# 不支持 EAB 参数），最后必然签不到证书。所以这里：
+#   1) 不用 `curl … | sh`：管道会把左侧下载失败吞掉（$? 取到右侧 sh 的 0），
+#      404/错误页也可能被当成脚本执行 —— 与 D1-06 同一条教训；
+#   2) 官方源失败自动改走 gitee 镜像（acme.sh 官方 wiki《Install in China》给的地址）；
+#   3) 落盘后双检：首行 shebang（拦「内容不是脚本」）+ bash -n（拦「是脚本但被截断」）。
+install_acme_sh() {
+  if [[ -s "$(acme_bin)" ]]; then return 0; fi
+  have curl || { warn "缺少 curl，无法安装 acme.sh。"; return 1; }
+  mkdir -p "$ACME_HOME"
+  local tmp; tmp="$(mktemp "${ACME_HOME}/.acme.sh.download.XXXXXX")"
+  local src=""
+  if run curl -fsSL --connect-timeout 15 -o "$tmp" \
+       https://raw.githubusercontent.com/acmesh-official/acme.sh/master/acme.sh; then
+    src="官方源（GitHub）"
+  else
+    warn "从官方源（raw.githubusercontent.com）下载 acme.sh 失败（国内服务器常见），改用 gitee 镜像…"
+    if run curl -fsSL --connect-timeout 15 -o "$tmp" \
+         https://gitee.com/neilpang/acme.sh/raw/master/acme.sh; then
+      src="gitee 镜像"
+    else
+      rm -f "$tmp"
+      warn "acme.sh 安装失败：官方源与 gitee 镜像都连不上。"
+      return 1
+    fi
+  fi
+  # 双检（缺一不可）：shebang 拦「镜像返回了错误页」，bash -n 拦「脚本被截断」
+  if [[ "$(head -c 2 "$tmp")" != '#!' ]]; then
+    rm -f "$tmp"
+    warn "下载到的文件不是脚本（首行不是 shebang），已丢弃：${src}"
+    return 1
+  fi
+  if ! bash -n "$tmp"; then
+    rm -f "$tmp"
+    warn "下载到的 acme.sh 语法检查不过（可能被截断），已丢弃：${src}"
+    return 1
+  fi
+  mv -f "$tmp" "$(acme_bin)"
+  chmod 0700 "$(acme_bin)"
+  # 续期定时任务：官方 --install 会写 root 的 crontab，这里改成 cron.d（与 certbot 同一风格），
+  # 幂等：已存在同样的行就不重写。
+  local cron="/etc/cron.d/${SERVICE_NAME}-acme"
+  if ! grep -q 'acme\.sh --cron' /etc/crontab /etc/cron.d 2>/dev/null; then
+    printf '17 3 * * * root %s --cron --home %s >/dev/null 2>&1\n' "$(acme_bin)" "$ACME_HOME" > "$cron"
+    chmod 0644 "$cron"
+    ok "已添加 acme.sh 每日续期任务：${cron}"
+  fi
+  ok "acme.sh 已就位（${src}）：$(acme_bin)"
+  return 0
+}
+
+# 用 acme.sh 签发。支持任意 ACME CA（含需要 EAB 的 ZeroSSL / LiteSSL）。
+#
+# 三处都是照 acme.sh 源码确认过的，不是凭印象：
+#   · EAB 只能由命令行传（--eab-kid / --eab-hmac-key），acme.sh **没有**对应的环境变量；
+#   · 注册成功后 EAB 会被写进 ~/.acme.sh/ca/<CA 主机>/<path>/ca.conf，之后续期/重跑不必再给；
+#   · --staging 只改默认 CA，一旦同时给了 --server 就以 --server 为准（不会把 LiteSSL 打回 LE 测试环境）。
+# 另：所有调用都显式 --home —— acme.sh 的默认家目录是「当前用户的 ~/.acme.sh」，
+# 与脚本变量 ACME_HOME 一致（root），但显式传才能在 ACME_HOME 被覆盖时保持一致。
+issue_acme_sh() {
+  install_acme_sh || return 1
+
+  local server; server="$(ca_server "$CA_PROVIDER")"
+  if [[ -z "$server" ]]; then warn "未知的证书颁发机构：${CA_PROVIDER}"; return 1; fi
+
+  # 1) 注册 ACME 账户（EAB 只有这一步用得上）
+  if acme_account_exists "$CA_PROVIDER"; then
+    info "已存在 $(ca_label "$CA_PROVIDER") 的 ACME 账户，跳过注册（无需再次提供 EAB）。"
+  else
+    local reg=(--register-account --home "$ACME_HOME" --server "$server" -m "$EMAIL")
+    if ca_needs_eab "$CA_PROVIDER"; then
+      if [[ -z "$EAB_KID" || -z "$EAB_HMAC_KEY" ]]; then
+        warn "$(ca_label "$CA_PROVIDER") 需要 EAB 凭据（--eab-kid / --eab-hmac-key 未提供）。"
+        return 1
+      fi
+      reg+=(--eab-kid "$EAB_KID" --eab-hmac-key "$EAB_HMAC_KEY")
+    fi
+    mark_log
+    if ! run "$(acme_bin)" "${reg[@]}" </dev/null; then
+      warn "在 $(ca_label "$CA_PROVIDER") 注册 ACME 账户失败。"
+      return 1
+    fi
+  fi
+
+  # 2) 签发（HTTP-01 / webroot：需要外网能访问 80 端口下的 .well-known/acme-challenge/）
+  local args=(--issue --home "$ACME_HOME" --server "$server" -d "$DOMAIN" --webroot "$WEBROOT" --keylength 2048)
+  [[ "$STAGING" == "1" ]] && args+=(--staging)
+  mark_log
+  local rc=0
+  run_allow_rc 2 "$(acme_bin)" "${args[@]}" </dev/null || rc=$?
+  # 退出码 2 = acme.sh 的 RENEW_SKIP（证书仍在有效期内，无需续期），**不是失败**。
+  # 判据见 acme_issue_skipped：把 2 当失败会让「重装」必然判定签发失败并中断。
+  if ((rc != 0)); then
+    if acme_issue_skipped "$rc"; then
+      info "acme.sh 判定证书仍在有效期内、无需续期（退出码 ${rc} = 跳过续期，不是失败）。"
+      info "  复用 acme.sh 里已存的证书（下次续期由它的每日任务负责）。"
+    else
+      warn "acme.sh 在 $(ca_label "$CA_PROVIDER") 签发失败。"
+      return 1
+    fi
+  fi
+  if ! acme_install_cert "$ACME_CERT_DIR"; then
+    warn "证书安装到 ${ACME_CERT_DIR} 失败。"
+    return 1
+  fi
+  CERT_FULLCHAIN="${ACME_CERT_DIR}/fullchain.pem"
+  CERT_KEY="${ACME_CERT_DIR}/privkey.pem"
+  ok "$(ca_label "$CA_PROVIDER") 证书签发成功（acme.sh 已注册自动续期任务）：${CERT_FULLCHAIN}"
+  return 0
+}
+
+# ------------------------------------------------------------------------------
+# 「本机 443 上**实际**提供的是哪份证书」—— 这是本次修复的另一半。
+#
+# 为什么必须有这一步：`nginx -t` 只能证明**我们写的那份配置能被解析**，它证明不了
+# 「浏览器连上来时看到的就是这份证书」。下面任一情况都会让浏览器拿到**另一份**证书：
+#   · 访问的域名与 server_name 不一致（比如用 www. 访问、却只配了主域）→ Nginx 退回
+#     443 上的 default_server，而面板/旧站点常在那里放一份**字段全空白**的自签证书；
+#   · 面板或旧站点自己在 443 上占了 default_server；
+#   · 前面还有 CDN / 反向代理在终结 TLS（证书要在那边配）。
+# 现场表现就是「脚本说 ZeroSSL 签发成功，浏览器却说不安全、证书字段全空白」。
+# 这里把「实际提供的是谁」与本地文件按指纹比对并打印出来，把不可见的错配变成一行事实。
+tls_probe_served() {
+  have openssl || return 0
+  [[ -n "${CERT_FULLCHAIN:-}" && -s "$CERT_FULLCHAIN" ]] || return 0
+  local port="${HTTPS_PORT:-443}"
+  local pulled fp_file fp_served
+  pulled="$(openssl s_client -connect "127.0.0.1:${port}" -servername "$DOMAIN" </dev/null 2>/dev/null || true)"
+  fp_file="$(openssl x509 -in "$CERT_FULLCHAIN" -noout -fingerprint -sha256 2>/dev/null || true)"
+  fp_served="$(printf '%s\n' "$pulled" | openssl x509 -noout -fingerprint -sha256 2>/dev/null || true)"
+  if [[ -z "$fp_served" ]]; then
+    warn "读不到本机 ${port} 端口上的证书（Nginx 未监听该端口？），跳过「实际提供证书」比对。"
+    return 1
+  fi
+  local s i nd
+  s="$(openssl x509 -in "$CERT_FULLCHAIN" -noout -subject 2>/dev/null || true)"
+  i="$(openssl x509 -in "$CERT_FULLCHAIN" -noout -issuer  2>/dev/null || true)"
+  nd="$(cert_not_after "$CERT_FULLCHAIN")"
+  if [[ "$fp_file" == "$fp_served" ]]; then
+    ok "HTTPS 已就绪，浏览器里应能看到这份证书（字段不会是空的）："
+    info "  颁发给：${s#subject=}"
+    info "  颁发者：${i#issuer=}"
+    info "  到期  ：${nd}"
+    info "  指纹  ：${fp_served#*=}"
+    return 0
+  fi
+  # 不一致：这是「脚本说成功、浏览器说不安全」的真正落点，必须说清楚。
+  warn "⚠ 本机 ${port} 端口实际提供的证书，与我们刚安装的**不是同一份**！"
+  warn "  我们安装的：${CERT_FULLCHAIN}（${s#subject=}）"
+  warn "  实际提供的：$(printf '%s\n' "$pulled" | openssl x509 -noout -subject -issuer 2>/dev/null || true)"
+  warn "  → 浏览器看到的是**后面这一份**，所以判定不安全、证书信息可能是空白的。"
+  # 注意 `mine` 必须单独算在一行上：管道那条赋值里若出现嵌套的 `$(...)`，
+  # 逐行扫描「命令替换里的管道必须有 || true」的护栏会在同一行上把嵌套 `$(`
+  # 里面的 `)` 当成收尾，从而误判这条赋值缺兜底（本仓既有护栏的行为，实测踩到）。
+  local def_files="" mine
+  mine="$(basename "${NGINX_CONF}")"
+  if [[ -n "${NGINX_BIN:-}" ]]; then
+    def_files="$(nginx -T 2>/dev/null | awk -v mine="$mine" '
+        /^# configuration file / { f = $4; sub(/:$/, "", f); sub(/^.*\//, "", f) }
+        index($0, "listen") && index($0, "443") && index($0, "default_server") { if (f != "" && f != mine) print f }
+      ' | sort -u | tr '\n' ' ' || true)"
+  fi
+  if [[ -n "${def_files// /}" ]]; then
+    warn "  443 上的 default_server 还出现在这些配置文件里：${def_files}"
+  fi
+  warn "  按顺序排查："
+  warn "    1) 你用浏览器访问的域名要和 ${DOMAIN} **完全一致**（含 www. 前缀）："
+  warn "       curl -vkI https://${DOMAIN}/ 2>&1 | grep -E 'subject|issuer'"
+  warn "    2) 停用面板/旧站点在 443 上的默认站点，或把该域名的反代指向 http://127.0.0.1:${APP_PORT}"
+  warn "    3) 若前面挂了 CDN/反向代理，证书要在那边配置（回源证书不影响浏览器看到的）"
+  return 1
+}
+
+setup_tls() {
+  case "$TLS_MODE" in
+    none)
+      warn "已指定 --tls none：不启用 HTTPS，Nginx 直接以 HTTP 反代（不建议用于公网）。"
+      write_nginx_conf 0 "" ""
+      nginx_apply
+      return 0 ;;
+    file)
+      # R49：使用运维自备的真实证书（取代原来的自签名分支）
+      use_provided_cert ;;
+    auto|acme)
+      # 幂等：已经装好可用的正式证书就**直接跳过申请**。
+      # 重装/升级时这一步最贵的不是那几秒，而是「本来没坏的东西被重做一遍」——
+      # 旧实现每次重装都去 --issue，而 acme.sh 在证书未到续期时间时以退出码 2 收场
+      # （见 acme_issue_skipped），一旦判失败就回退自签名，把正式证书降级成了自签名
+      # （2026-09 现场故障：用户点「重新安装」，SSL 反而掉了）。
+      # 注意 ACME 证书与自备证书**分开存**（ACME_CERT_DIR / TLS_DIR），
+      # 这里只认 ACME_CERT_DIR：运维手放在 ${TLS_DIR} 的自备证书不会被误当
+      # 成「acme.sh 签的证书」而复用（renew 命令、续期说明都会张冠李戴）。
+      if [[ "$FORCE_CERT" != "1" ]] && tls_cert_reusable "$ACME_CERT_DIR"; then
+        ok "检测到已安装的正式证书且仍在有效期内，跳过证书申请（重装不再重签）。"
+        info "  证书：${ACME_CERT_DIR}/fullchain.pem"
+        info "  到期：$(cert_not_after "${ACME_CERT_DIR}/fullchain.pem")"
+        info "  续期：acme.sh 的每日任务会在到期前自动续期并重载 Nginx，无需在这里重签"
+        info "  要强制重签：$(rerun_cmd --force-cert)"
+        CERT_FULLCHAIN="${ACME_CERT_DIR}/fullchain.pem"
+        CERT_KEY="${ACME_CERT_DIR}/privkey.pem"
+      else
+        if [[ "$FORCE_CERT" == "1" ]]; then
+          info "已指定 --force-cert：无论如何都重新申请证书。"
+        fi
+        # 先写入「仅 HTTP」配置并启动 Nginx，让 ACME 的 HTTP-01 校验能通过
+        write_nginx_conf 0 "" ""
+        nginx_apply
+        if ! issue_cert; then
+          # R49：不再回退自签名证书。理由见 use_provided_cert 上方的说明 —— 自签名证书
+          # 只是「看起来像 HTTPS」：浏览器照样判不安全，需要「安全上下文」的功能
+          # （WebAuthn / Service Worker / 剪贴板…）也一个都换不来。
+          # 所以这里**直接停下**，而不是把站点悄悄降级成一张浏览器不认的证书 ——
+          # 后者会让用户以为 TLS 已经配好了。
+          # 提示语（含两条出路）由 acme_failure_hints 在上面的 issue_cert 里填好，
+          # 这里只负责把它连同标题一起打印并中断。
+          die_with_hint "ACME 证书申请失败（已不再回退自签名证书）" "${HINTS[@]}"
+        fi
+      fi ;;
+  esac
+  write_nginx_conf 1 "$CERT_FULLCHAIN" "$CERT_KEY"
+  nginx_apply
+  # 收尾自检：把「实际对外提供的那份证书」打出来并与本地文件比对指纹。
+  # 只在「不一致」时才跳出来 —— 此时才说明浏览器看到的不是我们装的这份。
+  tls_probe_served || true
+}
+
+# ------------------------------------------------------------------------------
+# 9. 进程守护：systemd / docker compose
+# ------------------------------------------------------------------------------
+# 端口占用探测：返回 0 表示已被占用（ss/netstat/lsof 任一可用即可）
+port_in_use() {
+  local port="$1"
+  if have ss; then ss -ltn 2>/dev/null | grep -qE ":${port}\b" && return 0; fi
+  if have netstat; then netstat -ltn 2>/dev/null | grep -qE ":${port}\b" && return 0; fi
+  if have lsof; then lsof -nP -iTCP:"${port}" -sTCP:LISTEN >/dev/null 2>&1 && return 0; fi
+  return 1
+}
+
+# 建议的「换一个端口」值：避开对外端口与应用内置端口（3443 / WEBDAV_PORT），并注意 65535 上界
+next_port() {
+  local p=$((APP_PORT + 1))
+  if ((p > 65535)); then p=$((APP_PORT - 1)); fi
+  while [[ "$p" == "$HTTP_PORT" || "$p" == "$HTTPS_PORT" || "$p" == "3443" || "$p" == "$WEBDAV_PORT" ]]; do
+    p=$((p + 1))
+  done
+  if ((p < 1 || p > 65535)); then p=3000; fi
+  printf '%s' "$p"
+}
+
+# 服务起不来时的排查指引（非致命，交给 wait_for_service 兜底）
+service_failure_hints() {
+  local kind="$1"
+  HINTS=()
+  add_hint ""
+  if [[ "$kind" == "systemd" ]]; then
+    add_hint "  1) 看日志：journalctl -u ${SERVICE_NAME} -n 100 --no-pager"
+    add_hint "  2) 看状态：systemctl status ${SERVICE_NAME} --no-pager"
+    add_hint "  3) 端口被占：ss -ltnp | grep ':${APP_PORT}'（换端口重跑：--port 3001）"
+    add_hint "  4) 单实例锁：本应用只能跑一个实例，检查是否已有进程在跑 ——"
+    add_hint "     ps aux | grep -E 'server/index.js' | grep -v grep"
+    add_hint "  5) 依赖缺失：ls ${INSTALL_DIR}/node_modules | head（为空则没装依赖）"
+    add_hint "  6) 手工前台跑一次看报错：cd ${INSTALL_DIR} && env \$(grep -v '^#' .env | xargs) ${NODE_BIN} server/index.js"
+    add_hint "  7) 不想让脚本管进程（用 pm2/supervisor 自己起）：$(rerun_cmd --skip-service)"
+  else
+    add_hint "  1) 看日志：cd ${INSTALL_DIR} && docker compose logs --tail=100"
+    add_hint "  2) 看状态：cd ${INSTALL_DIR} && docker compose ps"
+    add_hint "  3) 端口被占：ss -ltnp | grep ':${APP_PORT}'"
+    add_hint "  4) 重新构建：cd ${INSTALL_DIR} && docker compose up -d --build --force-recreate"
+    add_hint "  5) 或改用 systemd 直接跑（更省事）：$(rerun_cmd --mode systemd)"
+  fi
+}
+
+# 启动前的端口预检：端口被别人占着就先说清楚，避免服务反复重启
+check_port_free() {
+  if port_in_use "$APP_PORT"; then
+    local owner=""
+    if have ss; then owner="$(ss -ltnp 2>/dev/null | grep -E ":${APP_PORT}\b" | head -n1 || true)"; fi
+    warn "端口 ${APP_PORT} 已被占用：${owner:-（未能识别进程）}"
+    warn "  · 若占用者就是本服务的旧实例，脚本会重启它，无需处理；"
+    warn "  · 若是其它程序，请用 --port <其它端口> 重跑，例如：$(rerun_cmd --port "$(next_port)")"
+  fi
+}
+
+setup_systemd_service() {
+  if [[ "$SKIP_SERVICE" == "1" ]]; then
+    warn "已按 --skip-service 跳过服务创建（脚本不会创建/重启 systemd 单元）。"
+    plain "  自行启动示例："
+    plain "    cd ${INSTALL_DIR} && env \$(grep -v '^#' .env | xargs) ${NODE_BIN} server/index.js"
+    plain "    或用 pm2：npm i -g pm2 && cd ${INSTALL_DIR} && pm2 start server/index.js --name ${SERVICE_NAME} --env production && pm2 save && pm2 startup"
+    return 1
+  fi
+  [[ "$INIT_SYSTEM" == "systemd" ]] || die_with_hint "本机不是 systemd 环境，无法创建 systemd 服务" \
+    "  · 容器/无 systemd 的环境请改用：$(rerun_cmd --mode docker)" \
+    "  · 或自己用 pm2/supervisor 守护，让脚本跳过这步：$(rerun_cmd --skip-service)" \
+    "  · 服务启动命令：cd ${INSTALL_DIR} && ${NODE_BIN} server/index.js"
+  check_port_free
+  chown -R "${RUN_USER}:${RUN_USER}" "$INSTALL_DIR" "$DATA_DIR" 2>/dev/null || true
+  chmod 0750 "$DATA_DIR" || true
+
+  local unit="/etc/systemd/system/${SERVICE_NAME}.service"
+  # 若安装目录/数据目录位于家目录下，ProtectHome 会把它们变成只读，需要关掉
+  local protect_home="ProtectHome=true"
+  case "${INSTALL_DIR}${DATA_DIR}" in
+    /home/*|/root/*) protect_home="# ProtectHome=true（安装目录位于家目录下，已关闭）" ;;
+  esac
+  local content="[Unit]
+Description=Kepler 对象存储管理系统
+Documentation=https://github.com/xingsen2005/Kepler
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=${RUN_USER}
+Group=${RUN_USER}
+WorkingDirectory=${INSTALL_DIR}
+EnvironmentFile=${INSTALL_DIR}/.env
+ExecStart=${NODE_BIN} ${INSTALL_DIR}/server/index.js
+Restart=always
+RestartSec=5
+TimeoutStopSec=30
+KillSignal=SIGTERM
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=${SERVICE_NAME}
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+${protect_home}
+ReadWritePaths=${DATA_DIR} ${INSTALL_DIR}
+
+[Install]
+WantedBy=multi-user.target"
+  write_file "$unit" "$content" 0644
+  run systemctl daemon-reload
+  run systemctl enable "$SERVICE_NAME"
+  local rc=0
+  if systemctl is-active --quiet "$SERVICE_NAME"; then
+    run systemctl restart "$SERVICE_NAME" || rc=$?
+  else
+    run systemctl start "$SERVICE_NAME" || rc=$?
+  fi
+  if ((rc != 0)) || ! systemctl is-active --quiet "$SERVICE_NAME"; then
+    service_failure_hints systemd
+    warn_with_hint "systemd 服务未能启动（部署继续，但应用可能没起来）" "${HINTS[@]}"
+    return 1
+  fi
+  ok "systemd 服务已启动：${SERVICE_NAME}.service"
+}
+
+ensure_docker() {
+  if have docker && docker compose version >/dev/null 2>&1; then
+    ok "docker 与 compose 插件已就绪"
+    return 0
+  fi
+  if ! have docker; then
+    info "安装 Docker…"
+    case "$PM" in
+      apt) run_soft bash -c 'DEBIAN_FRONTEND=noninteractive apt-get install -y -qq docker.io docker-compose-plugin' ;;
+      dnf|yum) run_soft "$PM" install -y docker docker-compose-plugin ;;
+      apk) run_soft apk add --no-cache docker docker-cli-compose ;;
+      zypper) run_soft zypper --non-interactive install docker docker-compose ;;
+    esac
+    if ! have docker; then
+      info "使用官方脚本安装 Docker…"
+      have curl || pkg_install curl
+      if [[ "$MIRROR" == "cn" ]]; then
+        run_soft bash -c 'curl -fsSL https://get.docker.com | sh -s -- --mirror Aliyun'
+      else
+        run_soft bash -c 'curl -fsSL https://get.docker.com | sh'
+      fi
+    fi
+  fi
+  if ! have docker; then
+    HINTS=()
+    add_hint "本机没有可用 docker。可这样修："
+    add_hint "  1) 官方脚本：curl -fsSL https://get.docker.com | sh"
+    add_hint "  2) 国内加速：curl -fsSL https://get.docker.com | sh -s -- --mirror Aliyun"
+    add_hint "  3) 发行版包：apt-get install -y docker.io docker-compose-plugin / $(pm_install_cmd) docker docker-compose-plugin"
+    add_hint "  4) 装完启动：systemctl enable --now docker"
+    add_hint ""
+    add_hint "也可以干脆不用容器（更省事，推荐）："
+    add_hint "    $(rerun_cmd --mode systemd)"
+    add_hint "    或先只装依赖、服务自己用 pm2/supervisor 管：$(rerun_cmd --mode systemd --skip-service)"
+    die_with_hint "Docker 安装失败" "${HINTS[@]}"
+  fi
+  if ! docker compose version >/dev/null 2>&1; then
+    info "安装 docker compose 插件…"
+    run_soft "$PM" install -y docker-compose-plugin
+    if ! docker compose version >/dev/null 2>&1; then
+      local plugin_dir="/usr/local/lib/docker/cli-plugins"
+      mkdir -p "$plugin_dir"
+      run_soft curl -fsSL --retry 3 --max-time 300 \
+        -o "${plugin_dir}/docker-compose" \
+        "https://github.com/docker/compose/releases/latest/download/docker-compose-linux-${ARCH_RAW}"
+      chmod +x "${plugin_dir}/docker-compose" 2>/dev/null || true
+    fi
+  fi
+  if [[ "$INIT_SYSTEM" == "systemd" ]]; then
+    run_soft systemctl enable --now docker
+  else
+    run_soft bash -c 'service docker start || true'
+  fi
+  if ! docker compose version >/dev/null 2>&1; then
+    HINTS=()
+    add_hint "docker 已安装但缺少 compose 插件。可这样修："
+    add_hint "  1) 发行版包：apt-get install -y docker-compose-plugin / $(pm_install_cmd) docker-compose-plugin"
+    add_hint "  2) 手工放插件：mkdir -p /usr/local/lib/docker/cli-plugins && curl -fsSL -o /usr/local/lib/docker/cli-plugins/docker-compose https://github.com/docker/compose/releases/latest/download/docker-compose-linux-${ARCH_RAW} && chmod +x /usr/local/lib/docker/cli-plugins/docker-compose"
+    add_hint "  3) 或直接换 systemd 方式：$(rerun_cmd --mode systemd)"
+    die_with_hint "docker compose 不可用" "${HINTS[@]}"
+  fi
+  ok "Docker 环境就绪：$(docker compose version --short 2>/dev/null || echo compose)"
+}
+
+write_docker_compose() {
+  local compose_file="${INSTALL_DIR}/docker-compose.yml"
+  # R49：证书目录要一起挂进容器。
+  #
+  # 应用读的是 `.env` 里的 `TLS_CERT_FILE` / `TLS_KEY_FILE`（宿主路径），而容器里
+  # 只有 `/app/data` 被挂载 —— 不把 ${TLS_DIR} 也挂进去，容器内的路径就是
+  # 「文件不存在」，表现为「明明配了证书却只跑 HTTP」。挂载点与宿主同路径，
+  # 免得两套路径（宿主 / 容器）在排查时互相打岔。
+  local tls_mount=""
+  if [[ "$TLS_MODE" != "none" ]]; then
+    tls_mount="      # 自备证书目录（只读）：应用在容器内按 .env 里的 TLS_CERT_FILE / TLS_KEY_FILE 读取
+      - ${TLS_DIR}:${TLS_DIR}:ro"
+  fi
+  local content="# 由 ${SCRIPT_NAME} 生成 —— 数据目录挂载保存密钥与配置，切勿删除
+services:
+  ${SERVICE_NAME}:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ${SERVICE_NAME}:${APP_VERSION}
+    container_name: ${SERVICE_NAME}
+    restart: unless-stopped
+    env_file:
+      - .env
+    volumes:
+      # 宿主数据目录 → 容器内 /app/data（密钥与配置所在，切勿删除）
+      - ${DATA_DIR}:/app/data
+${tls_mount}
+    ports:
+      # 只绑定回环地址，外部访问一律经 Nginx 反代
+      - \"127.0.0.1:${APP_PORT}:3000\"
+    logging:
+      driver: json-file
+      options:
+        max-size: \"20m\"
+        max-file: \"5\""
+  write_file "$compose_file" "$content" 0644
+}
+
+setup_docker_service() {
+  check_port_free
+  write_docker_compose
+
+  # 容器内以 uid/gid 1000（node 用户）运行，宿主数据目录需对齐权限，否则无法写入
+  mkdir -p "$DATA_DIR"
+  run_soft chown -R 1000:1000 "$DATA_DIR"
+  chmod 0770 "$DATA_DIR" || true
+
+  if [[ "$SKIP_SERVICE" == "1" ]]; then
+    warn "已按 --skip-service 跳过容器创建（docker-compose.yml 与 .env 已生成）。"
+    plain "  自行启动：cd ${INSTALL_DIR} && docker compose up -d"
+    return 1
+  fi
+  ensure_docker
+
+  info "构建镜像并启动容器（首次稍慢）…"
+  if ! run bash -c "cd '$INSTALL_DIR' && docker compose up -d --build"; then
+    service_failure_hints docker
+    die_with_hint "容器启动失败" "${HINTS[@]}"
+  fi
+
+  # 开机自启：docker 自带 restart 策略，再用 systemd 兜底拉起 compose
+  if [[ "$INIT_SYSTEM" == "systemd" ]]; then
+    local unit="/etc/systemd/system/${SERVICE_NAME}-docker.service"
+    write_file "$unit" "[Unit]
+Description=Kepler (docker compose)
+Requires=docker.service
+After=docker.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=${INSTALL_DIR}
+ExecStart=$(command -v docker) compose up -d
+ExecStop=$(command -v docker) compose down
+TimeoutStartSec=600
+
+[Install]
+WantedBy=multi-user.target" 0644
+    run systemctl daemon-reload
+    run systemctl enable "${SERVICE_NAME}-docker"
+  fi
+  ok "docker compose 已启动：${INSTALL_DIR}/docker-compose.yml"
+}
+
+# ------------------------------------------------------------------------------
+# 10. 防火墙（尽力而为，失败不影响部署）
+# ------------------------------------------------------------------------------
+setup_firewall() {
+  if have ufw && ufw status 2>/dev/null | grep -qi '^Status: active'; then
+    run_soft ufw allow "${HTTP_PORT}/tcp"
+    run_soft ufw allow "${HTTPS_PORT}/tcp"
+    ok "ufw 已放行 ${HTTP_PORT}/${HTTPS_PORT}"
+  elif have firewall-cmd && firewall-cmd --state >/dev/null 2>&1; then
+    run_soft firewall-cmd --permanent --add-port="${HTTP_PORT}/tcp"
+    run_soft firewall-cmd --permanent --add-port="${HTTPS_PORT}/tcp"
+    run_soft firewall-cmd --reload
+    ok "firewalld 已放行 ${HTTP_PORT}/${HTTPS_PORT}"
+  else
+    info "未发现启用中的 ufw/firewalld，请自行确认云安全组已放行 ${HTTP_PORT}、${HTTPS_PORT} 端口。"
+  fi
+}
+
+# ------------------------------------------------------------------------------
+# 11. 健康检查
+# ------------------------------------------------------------------------------
+# 服务没起来时：自动抓日志 → 按证据给结论，而不是让用户自己瞎猜
+diagnose_service() {
+  HINTS=()
+  local st="" j=""
+  if [[ "$MODE" == "docker" ]]; then
+    j="$(cd "$INSTALL_DIR" && docker compose logs --tail=60 2>/dev/null || true)"
+    local cst; cst="$(cd "$INSTALL_DIR" && docker compose ps --format '{{.State}}' 2>/dev/null | head -n1 || true)"
+    add_hint "容器状态：${cst:-未知}"
+  elif [[ "$INIT_SYSTEM" == "systemd" ]]; then
+    st="$(systemctl is-active "${SERVICE_NAME}" 2>/dev/null || true)"
+    add_hint "systemd 状态：${st:-未知}"
+    j="$(journalctl -u "${SERVICE_NAME}" -n 60 --no-pager 2>/dev/null || true)"
+  fi
+
+  if [[ -n "$j" ]]; then
+    add_hint ""
+    add_hint "服务日志最后几行："
+    local l
+    while IFS= read -r l; do [[ -n "$l" ]] && add_hint "    | ${l}"; done \
+      <<<"$(printf '%s\n' "$j" | grep -viE '^\s*$' | tail -n 12 || true)"
+  else
+    add_hint ""
+    add_hint "（没读到服务日志，可能服务从未真正启动过）"
+  fi
+  add_hint ""
+
+  if grep -qiE 'EADDRINUSE|address already in use' <<<"$j"; then
+    add_hint "【结论】端口 ${APP_PORT} 已被占用。"
+    add_hint "  · ss -ltnp | grep ':${APP_PORT}'      # 看是谁占着"
+    add_hint "  · ps aux | grep 'server/index.js' | grep -v grep   # 本应用只允许一个实例"
+    add_hint "  · 换端口重跑：$(rerun_cmd --port "$(next_port)")"
+  elif grep -qiE 'Cannot find module|MODULE_NOT_FOUND' <<<"$j"; then
+    add_hint "【结论】依赖缺失：node_modules 不完整。"
+    add_hint "  · cd ${INSTALL_DIR} && npm ci --omit=dev"
+    add_hint "  · 或重跑让脚本重装：$(rerun_cmd)"
+  elif grep -qiE 'EACCES|permission denied|EPERM' <<<"$j"; then
+    add_hint "【结论】权限不足：${RUN_USER} 无法读写数据/安装目录。"
+    add_hint "  · chown -R ${RUN_USER}:${RUN_USER} ${INSTALL_DIR} ${DATA_DIR} && chmod 0750 ${DATA_DIR}"
+    add_hint "  · systemctl restart ${SERVICE_NAME}"
+    add_hint "  · RHEL 系还要看 SELinux：getenforce（Enforcing 时打标签或临时 setenforce 0 验证）"
+  elif grep -qiE 'instance|lock|already running' <<<"$j"; then
+    add_hint "【结论】单实例锁：同一 data 目录只允许一个进程。"
+    add_hint "  · ps aux | grep 'server/index.js' | grep -v grep"
+    add_hint "  · 确认没有残留进程后：systemctl restart ${SERVICE_NAME}"
+    add_hint "  · 仍不行就检查 ${DATA_DIR} 下的锁文件残留"
+  elif grep -qiE 'SyntaxError|Unexpected token|not supported|ERR_REQUIRE_ESM' <<<"$j"; then
+    add_hint "【结论】Node 版本与代码不兼容（需要 ≥ v18）。"
+    add_hint "  · ${NODE_BIN:-node} -v"
+    add_hint "  · 升级后用 $(rerun_cmd --skip-node) 重跑"
+  elif [[ -n "$st" && "$st" != "active" ]]; then
+    add_hint "【结论】服务状态是 ${st}，日志里没有匹配到已知错误模式。"
+    add_hint "  · 完整日志：journalctl -u ${SERVICE_NAME} -n 200 --no-pager"
+    add_hint "  · 若 systemd 里看不到日志，直接前台跑一次：cd ${INSTALL_DIR} && env \$(grep -v '^#' .env | xargs) ${NODE_BIN:-node} server/index.js"
+  else
+    add_hint "【结论】未能自动定位，按顺序排查："
+    add_hint "  1) journalctl -u ${SERVICE_NAME} -n 100 --no-pager"
+    add_hint "  2) ss -ltnp | grep ':${APP_PORT}'"
+    add_hint "  3) ls ${INSTALL_DIR}/node_modules | head"
+    add_hint "  4) 前台跑一次看真实报错：cd ${INSTALL_DIR} && env \$(grep -v '^#' .env | xargs) ${NODE_BIN:-node} server/index.js"
+  fi
+
+  local who=""
+  # 端口没人监听时 grep 返回 1；开了 pipefail 会让整条赋值语句失败，
+  # 被 ERR trap 当成「脚本意外失败」—— 而这里恰恰是服务没起来时才会走到。
+  if have ss; then who="$(ss -ltnp 2>/dev/null | grep ":${APP_PORT}\b" | head -n1 || true)"; fi
+  [[ -n "$who" ]] && add_hint "  端口现状：${who}"
+  if have pgrep; then
+    local pids; pids="$(pgrep -f 'server/index.js' 2>/dev/null | tr '\n' ' ' || true)"
+    [[ -n "${pids// /}" ]] && add_hint "  已存在进程 PID：${pids}（本应用只允许一个实例）"
+  fi
+  if have runuser; then
+    add_hint ""
+    add_hint "  以服务同账号前台跑（最能还原权限问题）："
+    add_hint "    cd ${INSTALL_DIR} && runuser -u ${RUN_USER} -- env \$(grep -v '^#' .env | xargs) ${NODE_BIN:-node} server/index.js"
+  fi
+  warn_with_hint "本地服务未在 ${APP_PORT} 端口就绪" "${HINTS[@]}"
+}
+
+wait_for_service() {
+  local url="http://127.0.0.1:${APP_PORT}/"
+  local i code
+  for i in $(seq 1 30); do
+    code="$(curl -s -o /dev/null -m 3 -w '%{http_code}' "$url" 2>/dev/null || true)"
+    if [[ "$code" == "200" || "$code" == "302" || "$code" == "301" ]]; then
+      ok "应用已就绪（本地 ${url} 返回 ${code}）"
+      SERVICE_READY=1
+      return 0
+    fi
+    sleep 1
+  done
+  SERVICE_READY=0
+  diagnose_service
+  return 0
+}
+
+# 外网探测：按状态码给不同结论（000 与 502 的排查方向完全不同）
+external_check() {
+  local scheme="https"; [[ "$TLS_MODE" == "none" ]] && scheme="http"
+  local port_part=""; [[ ("$scheme" == "https" && "$HTTPS_PORT" != "443") || ("$scheme" == "http" && "$HTTP_PORT" != "80") ]] \
+    && port_part=":$( [[ "$scheme" == "https" ]] && echo "$HTTPS_PORT" || echo "$HTTP_PORT" )"
+  local url="${scheme}://${DOMAIN}${port_part}${SUB_PATH}"
+  local code
+  # 注意：curl 失败时 -w 已会输出 000，这里不能再追加一个 000（否则出现 000000）
+  code="$(curl -s -o /dev/null -m 10 -w '%{http_code}' -k "$url" 2>/dev/null || true)"
+  [[ -n "$code" ]] || code="000"
+
+  if [[ "$code" == "200" || "$code" == "301" || "$code" == "302" ]]; then
+    ok "外网访问探测成功：${url}（HTTP ${code}）"
+    EXT_OK=1
+    return 0
+  fi
+
+  EXT_OK=0
+  HINTS=()
+  case "$code" in
+    000)
+      add_hint "【结论】从本机访问 ${url} 根本连不上。"
+      if [[ "${NGINX_OK:-1}" == "1" ]]; then
+        add_hint "  1) Nginx 是否在监听：ss -ltnp | grep -E ':${HTTP_PORT}|:${HTTPS_PORT}'"
+        add_hint "  2) 云厂商安全组放行 ${HTTP_PORT}/${HTTPS_PORT}；本机防火墙：firewall-cmd --list-ports 或 ufw status"
+        add_hint "  3) 面板环境：站点配置可能没被主配置加载，或没点「重载配置」——"
+        add_hint "     nginx -T | grep -n ${SERVICE_NAME}    # 看不到就说明没加载"
+      else
+        add_hint "  1) 本次未配置 Nginx，外网自然连不上 —— 需把 ${APP_PORT} 反代出去后才有外网入口"
+      fi
+      add_hint "  4) 本机自检：curl -Ik ${url}" ;;
+    502|503|504)
+      add_hint "【结论】Nginx 通了，但它反代的上游没响应 —— 应用没起来或端口不对。"
+      add_hint "  1) 本地自检：curl -sS -o /dev/null -w '%{http_code}' http://127.0.0.1:${APP_PORT}/"
+      add_hint "  2) 应用日志：journalctl -u ${SERVICE_NAME} -n 100 --no-pager" ;;
+    404)
+      add_hint "【结论】能连上但 404：请求多半命中了别的站点（面板默认站点 / 同名旧站点）。"
+      add_hint "  1) nginx -T | grep -n ${SERVICE_NAME}     # 确认我们的配置被加载"
+      add_hint "  2) 面板里停用同名旧站点，或把它的反代指向 http://127.0.0.1:${APP_PORT}" ;;
+    301|302)
+      add_hint "【结论】返回跳转但探测未就绪，注意别形成重定向循环。"
+      add_hint "  1) 确认 .env 里 TRUST_PROXY=1 且 Nginx 转发了 X-Forwarded-Proto \$scheme"
+      add_hint "  2) curl -IL ${url}" ;;
+    *)
+      add_hint "【结论】返回 HTTP ${code}，看 Nginx 错误日志定位：tail -n 50 $(nginx_err_log)" ;;
+  esac
+  warn_with_hint "外网探测未通过：${url}（HTTP ${code}）" "${HINTS[@]}"
+  return 0
+}
+
+# 注意：改管理员凭据时，值一律**原样**经 stdin 送给 node（见 update_initial_admin）。
+# 不要在这里加任何「转义/编码」步骤：值走的是管道而不是命令行，不需要转义，而多一次
+# 转义就会把反斜杠、引号、制表符变成字面字符写进真实密码 —— 表现为「提示修改成功，
+# 但用原密码登不上」。
+
+# ------------------------------------------------------------------------------
+# 12. 全局管理命令与运行中配置维护
+# ------------------------------------------------------------------------------
+install_global_command() {
+  local target="${INSTALL_DIR}/deploy.sh"
+  local content='#!/usr/bin/env bash
+set -e
+TARGET="__TARGET__"
+if [[ "$#" -eq 0 ]]; then set -- --manage; fi
+if [[ "$(id -u)" -ne 0 ]]; then
+  if command -v sudo >/dev/null 2>&1; then
+    exec sudo -E bash "$TARGET" "$@"
+  fi
+  printf "%s\n" "[错误] kepler 管理操作需要 root 权限，请执行：sudo kepler" >&2
+  exit 1
+fi
+exec bash "$TARGET" "$@"'
+  content="${content/__TARGET__/$target}"
+  write_file "$GLOBAL_COMMAND" "$content" 0755
+  ok "已注册全局管理命令：${GLOBAL_COMMAND}（终端输入 kepler 使用）"
+}
+
+managed_service_stop() {
+  [[ "$SKIP_SERVICE" != "1" ]] || die "当前部署未由脚本管理进程，无法自动停服。"
+  if [[ "$MODE" == "docker" ]]; then
+    have docker || die "未找到 docker，无法维护容器服务。"
+    run bash -c "cd '$INSTALL_DIR' && docker compose down"
+  else
+    [[ "$INIT_SYSTEM" == "systemd" ]] || die "当前环境不可用 systemd。"
+    run systemctl stop "$SERVICE_NAME"
+  fi
+}
+
+managed_service_start() {
+  if [[ "$MODE" == "docker" ]]; then
+    run bash -c "cd '$INSTALL_DIR' && docker compose up -d --no-build"
+  else
+    run systemctl start "$SERVICE_NAME"
+  fi
+}
+
+update_initial_admin() {
+  local field="$1" value="$2" label="密码"
+  [[ "$field" == "username" ]] && label="用户名"
+  [[ -d "$INSTALL_DIR/server" ]] || die "安装目录不完整：${INSTALL_DIR}"
+  [[ -n "$value" ]] || die "新值不能为空。"
+  [[ "$field" == "username" || "$field" == "password" ]] || die "不支持的管理员修改字段：${field}"
+
+  local script
+  script="$(cat <<'NODE'
+const store = require('./server/config-store');
+let input = '';
+process.stdin.setEncoding('utf8');
+process.stdin.on('data', (chunk) => { input += chunk; });
+process.stdin.on('end', () => { main().catch(fail); });
+
+async function main() {
+  const field = process.argv[1];
+  // 值由 deploy.sh 原样经 stdin 送达（systemd / docker 两条分支完全一致）。
+  // 这里刻意不做 JSON 解析：若值恰好长得像 JSON 字符串字面量（比如密码就是
+  // "abc123" 连着引号），JSON.parse 会把引号「解码」掉，用户拿原密码就登不上了。
+  const value = input.replace(/\r?\n$/, '');
+  const admins = store.listUsers()
+    .filter((user) => user.role === 'admin')
+    .sort((a, b) => String(a.createdAt || '').localeCompare(String(b.createdAt || '')));
+  if (!admins.length) throw new Error('尚未创建初始管理员，请先打开网页完成首次初始化');
+  const patch = field === 'username' ? { username: value } : { password: value };
+  const user = await store.updateUser(admins[0].id, patch);
+  await store.flush();
+  process.stdout.write(`updated:${user.username}\n`);
+}
+
+function fail(error) {
+  process.stderr.write(`[管理员配置失败] ${error.message || error}\n`);
+  process.exitCode = 1;
+}
+NODE
+)"
+
+  if [[ "$MODE" != "docker" ]]; then
+    [[ -n "$NODE_BIN" && -x "$NODE_BIN" ]] || NODE_BIN="$(command -v node || true)"
+    [[ -n "$NODE_BIN" ]] || die "未找到 Node.js，无法修改管理员配置。"
+  fi
+  info "将短暂停止服务，以原子方式修改初始管理员${label}（一次性进程更新配置，不打印任何凭据）。"
+  managed_service_stop
+  local rc=0
+  if [[ "$MODE" == "docker" ]]; then
+    # 值经 stdin 原样传入：两条分支必须完全一致，否则会出现「同样的密码在 docker 方式下
+    # 被写错」—— 曾经这里包了一层转义，把反斜杠/引号/制表符写进了真实密码。
+    if (cd "$INSTALL_DIR" && printf '%s' "$value" | docker compose run --rm --no-deps -T --entrypoint node "$SERVICE_NAME" -e "$script" "$field") >>"$LOG_FILE" 2>&1; then
+      :
+    else
+      rc=$?
+    fi
+  else
+    if (cd "$INSTALL_DIR" && printf '%s' "$value" | env NODE_ENV=production S3_DATA_DIR="$DATA_DIR" "$NODE_BIN" -e "$script" "$field") >>"$LOG_FILE" 2>&1; then
+      :
+    else
+      rc=$?
+    fi
+    chown -R "${RUN_USER}:${RUN_USER}" "$DATA_DIR" 2>/dev/null || true
+  fi
+
+  if ! managed_service_start; then
+    die "管理员配置处理后服务未能重新启动，请查看 ${LOG_FILE}。"
+  fi
+  if ((rc != 0)); then
+    err "管理员配置修改失败，服务已恢复启动。"
+    log_key_lines 6 >&2 || true
+    return "$rc"
+  fi
+  ok "初始管理员${label}已修改；旧会话已随服务重启失效。"
+}
+
+prompt_admin_username() {
+  local value=""
+  read -r -p "新的初始管理员用户名（2-32 位，回车取消）: " value || return 0
+  [[ -n "$value" ]] || { log "已取消。"; return 0; }
+  update_initial_admin username "$value"
+}
+
+prompt_admin_password() {
+  local first="" second=""
+  read -r -s -p "新的初始管理员密码（6-128 位，回车取消）: " first || return 0
+  printf '\n'
+  [[ -n "$first" ]] || { log "已取消。"; return 0; }
+  read -r -s -p "再次输入新密码: " second || return 0
+  printf '\n'
+  [[ "$first" == "$second" ]] || { warn "两次输入的密码不一致，未做修改。"; return 0; }
+  update_initial_admin password "$first"
+  first=""; second=""
+}
+
+apply_port_change() {
+  local new_port="$1"
+  [[ "$new_port" =~ ^[0-9]+$ ]] && ((new_port >= 1 && new_port <= 65535)) || die "端口不合法：${new_port}"
+  [[ "$new_port" != "$HTTP_PORT" && "$new_port" != "$HTTPS_PORT" ]] || die "应用端口不能与 Nginx 对外端口相同。"
+  [[ "$new_port" != "3443" && "$new_port" != "$WEBDAV_PORT" ]] || die "应用端口不能使用 3443 或 ${WEBDAV_PORT}（分别为应用内置 HTTPS / WebDAV，已占用）。"
+  [[ "$new_port" != "$APP_PORT" ]] || { info "端口未变化：${APP_PORT}"; return 0; }
+  if port_in_use "$new_port"; then
+    warn "端口 ${new_port} 当前已被占用，修改后可能与其他进程冲突。"
+  fi
+
+  APP_PORT="$new_port"
+  gen_env_file
+  if [[ "$MODE" == "docker" ]]; then write_docker_compose; fi
+  # 先持久化目标状态：即使后续重启失败，下一次 kepler 维护也会基于同一配置继续修复。
+  save_state
+
+  if [[ "$SKIP_SERVICE" != "1" ]]; then
+    if [[ "$MODE" == "docker" ]]; then
+      run bash -c "cd '$INSTALL_DIR' && docker compose up -d --no-build --force-recreate"
+    else
+      run systemctl restart "$SERVICE_NAME"
+    fi
+  fi
+
+  if [[ "$SKIP_NGINX" != "1" ]]; then
+    locate_nginx || die "未找到 Nginx，应用端口已更新为 ${APP_PORT}，请修复 Nginx 后再次执行 kepler。"
+    nginx_detect_layout || true
+    if [[ "$TLS_MODE" == "none" ]]; then
+      write_nginx_conf 0 "" ""
+      nginx_apply
+    elif [[ -s "$CERT_FULLCHAIN" && -s "$CERT_KEY" ]]; then
+      write_nginx_conf 1 "$CERT_FULLCHAIN" "$CERT_KEY"
+      nginx_apply
+    else
+      warn "已保存的证书路径不可用，将重新执行 TLS 配置。"
+      setup_tls
+    fi
+  fi
+  save_state
+  wait_for_service
+  [[ "$SKIP_NGINX" == "1" ]] || external_check
+  ok "应用端口已修改为 ${APP_PORT}，服务与 Nginx 配置均已同步。"
+}
+
+prompt_port_change() {
+  local value=""
+  read -r -p "新的应用内部端口 [${APP_PORT}]: " value || return 0
+  [[ -n "$value" ]] || { log "已取消。"; return 0; }
+  apply_port_change "$value"
+}
+
+# 重装：就地切换到安装目录里的脚本（--reinstall 会复用已保存状态）。
+# exec 不会触发 EXIT trap，所以显式把单实例锁交接给新进程（KEPLER_LOCK_HELD），
+# 否则新进程一启动就会撞上自己留下的锁文件、直接判「另一个部署进程正在运行」。
+reinstall_now() {
+  local target="${INSTALL_DIR}/deploy.sh"
+  [[ -f "$target" ]] || die "未找到安装目录内的部署脚本：${target}（无法重装，请重新执行一键部署）"
+  # 完整性预检：安装目录里的脚本可能已被覆盖成非脚本内容（最典型的是把下载到的
+  # 「404: Not Found」响应体存成了它）。不预检就直接 exec，用户只会看到一句莫名其妙的
+  # 「404: line 1: 404:: command not found」，完全无从下手。
+  # 判据（shebang + bash -n）收敛在 script_is_sane()，与 5.1 的自我交接共用同一份。
+  if ! script_is_sane "$target"; then
+    die "安装目录内的部署脚本不完整或已损坏：${target}（无法重装，请重新执行一键部署）"
+  fi
+  info "将按 ${STATE_FILE} 中的配置重新拉取源码并安装。"
+  plain "  数据目录 ${DATA_DIR} 不会被触碰；重装结束后会重跑健康检查。"
+  trap - EXIT
+  exec env KEPLER_LOCK_HELD="$LOCK_FILE" bash "$target" --reinstall
+}
+
+manage_menu() {
+  [[ "$STATE_LOADED" == "1" ]] || die "未找到部署状态 ${STATE_FILE}，请先执行一键部署。"
+  while true; do
+    log ""
+    log "${C_BOLD}Kepler 管理菜单${C_RESET}"
+    log "  1) 重新安装（保留数据与配置）"
+    log "  2) 修改初始管理员用户名"
+    log "  3) 修改初始管理员密码"
+    log "  4) 修改应用端口"
+    log "  5) 卸载（清理服务、应用与数据）"
+    log "  0) 退出"
+    local choice=""
+    read -r -p "请输入编号并回车: " choice || { log "已退出。"; return 0; }
+    case "$choice" in
+      1) reinstall_now ;;
+      2) prompt_admin_username ;;
+      3) prompt_admin_password ;;
+      4) prompt_port_change ;;
+      5) do_uninstall; return 0 ;;
+      0) log "已退出。"; return 0 ;;
+      *) warn "无效编号：${choice}" ;;
+    esac
+  done
+}
+
+# 命令行直接执行编号：kepler 2（与菜单编号一致）
+manage_action() {
+  case "$1" in
+    1) reinstall_now ;;
+    2) prompt_admin_username ;;
+    3) prompt_admin_password ;;
+    4) prompt_port_change ;;
+    5) do_uninstall ;;
+    0) log "已退出。" ;;
+    *) die "无效编号：$1（可用：1 重新安装 / 2 改用户名 / 3 改密码 / 4 改端口 / 5 卸载 / 0 退出）" ;;
+  esac
+}
+
+# ------------------------------------------------------------------------------
+# 13. 卸载
+# ------------------------------------------------------------------------------
+safe_remove_tree() {
+  local path="$1" label="$2"
+  [[ -n "$path" && "$path" == /* && "$path" != / ]] || [[ "$path" =~ ^[A-Za-z]:[\\/][^\\/] ]] \
+    || die "拒绝删除无效${label}路径（必须是非根的绝对路径）：${path}"
+  case "$path" in
+    /|/bin|/boot|/dev|/etc|/home|/lib|/lib64|/opt|/proc|/root|/run|/sbin|/srv|/sys|/tmp|/usr|/usr/local|/var)
+      die "安全保护：拒绝递归删除系统目录（${label}）：${path}" ;;
+  esac
+  # 家目录本身（/home/<用户>、/Users/<用户>）与个人目录下的任何路径都不动。
+  # 这里刻意不用 /home/* 这类通配：case 的 * 会跨 "/" 匹配，会把
+  # /home/deploy/kepler 这种正常安装目录一起拦掉，导致卸载永远失败。
+  if [[ "$path" =~ ^/(home|Users)/[^/]+/?$ || "$path" =~ /(Desktop|Downloads|Documents)(/|$) ]]; then
+    die "安全保护：拒绝递归删除家目录或个人目录下的${label}路径 ${path}，请人工核对后处理。"
+  fi
+  [[ ${#path} -ge 8 ]] || die "安全保护：${label}路径过短，拒绝删除：${path}"
+  # 先尝试系统 rm；某些环境（如 Git Bash / MSYS2）会拒绝带盘符前缀的路径，
+  # 此时退回到 Node 的递归删除（跨平台语义一致，同样只针对上面校验过的绝对路径）。
+  if rm -rf -- "$path" 2>/dev/null; then
+    ok "已清理${label}：${path}"
+    return 0
+  fi
+  local node_bin="${NODE_BIN:-}"
+  [[ -n "$node_bin" && -x "$node_bin" ]] || node_bin="$(command -v node || true)"
+  if [[ -n "$node_bin" ]] && rm_target="$path" "$node_bin" -e 'require("fs").rmSync(process.env.rm_target, { recursive: true, force: true })' >/dev/null 2>&1; then
+    ok "已清理${label}：${path}"
+    return 0
+  fi
+  die "清理${label}失败：${path}（可手工执行：rm -rf ${path}）"
+}
+
+do_uninstall() {
+  local ans=""
+  local data="${DATA_DIR:-${INSTALL_DIR}/data}"
+  warn "${C_BOLD}⚠️ 此操作非常危险，可能导致不可逆的数据丢失！${C_RESET}"
+  warn "将停止 Kepler，并永久清理："
+  plain "  服务：${SERVICE_NAME} / ${SERVICE_NAME}-docker"
+  plain "  应用：${INSTALL_DIR}"
+  plain "  数据：${data}（含主密钥、账户、云存储配置与统计）"
+  plain "  命令：${GLOBAL_COMMAND}"
+  if [[ "$ASSUME_YES" != "1" && -t 0 ]]; then
+    read -r -p "确认永久卸载？请输入 DELETE 继续: " ans || true
+    [[ "$ans" == "DELETE" ]] || { log "已取消。"; return 0; }
+  fi
+
+  # 必须先优雅停服，让配置存储完成 flush，再删除数据。
+  if [[ "$INIT_SYSTEM" == "systemd" ]]; then
+    run_soft systemctl stop "${SERVICE_NAME}"
+    run_soft systemctl disable "${SERVICE_NAME}"
+    run_soft systemctl stop "${SERVICE_NAME}-docker"
+    run_soft systemctl disable "${SERVICE_NAME}-docker"
+  fi
+  if have docker && [[ -f "${INSTALL_DIR}/docker-compose.yml" ]]; then
+    run_soft bash -c "cd '${INSTALL_DIR}' && docker compose down --remove-orphans --rmi local"
+  fi
+  rm -f "/etc/systemd/system/${SERVICE_NAME}.service" "/etc/systemd/system/${SERVICE_NAME}-docker.service"
+  [[ "$INIT_SYSTEM" == "systemd" ]] && run_soft systemctl daemon-reload
+
+  local conf
+  for conf in "$NGINX_CONF" "$NGINX_LINK" "/etc/nginx/conf.d/${SERVICE_NAME}.conf" "/etc/nginx/sites-enabled/${SERVICE_NAME}.conf" "/etc/nginx/sites-available/${SERVICE_NAME}.conf" "/www/server/panel/vhost/nginx/${SERVICE_NAME}.conf"; do
+    [[ -n "$conf" ]] && rm -f -- "$conf"
+  done
+  if have nginx; then run_soft nginx -t && run_soft nginx -s reload; fi
+
+  if have ufw; then
+    run_soft ufw delete allow "${HTTP_PORT}/tcp"
+    run_soft ufw delete allow "${HTTPS_PORT}/tcp"
+  fi
+  if have firewall-cmd && firewall-cmd --state >/dev/null 2>&1; then
+    run_soft firewall-cmd --permanent --remove-port="${HTTP_PORT}/tcp"
+    run_soft firewall-cmd --permanent --remove-port="${HTTPS_PORT}/tcp"
+    run_soft firewall-cmd --reload
+  fi
+  rm -f "/etc/cron.d/${SERVICE_NAME}-certbot" "/etc/cron.d/${SERVICE_NAME}-acme"
+  if have certbot && [[ "$CERT_FULLCHAIN" == "/etc/letsencrypt/live/${DOMAIN}/"* ]]; then
+    run_soft certbot delete --non-interactive --cert-name "$DOMAIN"
+  fi
+  if [[ -x "$(acme_bin)" ]]; then run_soft "$(acme_bin)" --remove -d "$DOMAIN"; fi
+
+  rm -f -- "$GLOBAL_COMMAND"
+  # 脚本可能正站在安装目录里（install_app 会 cd 进去），先把工作目录挪走，
+  # 否则删掉 CWD 之后任何相对路径都会失效。
+  cd / 2>/dev/null || true
+  if [[ "$data" == "$INSTALL_DIR" || "$data" == "$INSTALL_DIR"/* ]]; then
+    safe_remove_tree "$INSTALL_DIR" "安装目录（含数据）"
+  else
+    safe_remove_tree "$data" "数据目录"
+    safe_remove_tree "$INSTALL_DIR" "安装目录"
+  fi
+  if id -u "$RUN_USER" >/dev/null 2>&1; then
+    if have userdel; then run_soft userdel "$RUN_USER"; elif have deluser; then run_soft deluser "$RUN_USER"; fi
+  fi
+  rm -rf -- "$STATE_DIR"
+  ok "Kepler 已完整卸载：服务、应用、数据、证书配置与全局命令均已清理。"
+}
+
+# ------------------------------------------------------------------------------
+# 14. 主流程
+# ------------------------------------------------------------------------------
+TOTAL_STEPS=10
+
+print_summary() {
+  local scheme="https"; [[ "$TLS_MODE" == "none" ]] && scheme="http"
+  local ext_port="$HTTPS_PORT"; [[ "$scheme" == "http" ]] && ext_port="$HTTP_PORT"
+  local port_part=""; [[ ("$scheme" == "https" && "$ext_port" != "443") || ("$scheme" == "http" && "$ext_port" != "80") ]] && port_part=":${ext_port}"
+  local url="${scheme}://${DOMAIN}${port_part}${SUB_PATH}"
+  # 未配 Nginx 时给出直连地址（仅回环/内网可达）
+  if [[ "${NGINX_OK:-1}" != "1" ]]; then
+    url="http://${DOMAIN}:${APP_PORT}${SUB_PATH}（未配置反代，直连应用端口）"
+  fi
+
+  # 结论：全部就绪才算「部署完成」，否则明说还有几件事没成
+  local -a todos=()
+  if [[ "${SERVICE_READY:-0}" != "1" ]]; then
+    todos+=("本地应用未在 ${APP_PORT} 端口就绪 —— 看上面的自动诊断，或 journalctl -u ${SERVICE_NAME} -n 100 --no-pager")
+  fi
+  if [[ "${NGINX_OK:-1}" == "1" && "${EXT_OK:-0}" != "1" ]]; then
+    todos+=("外网访问未通过 —— 看上面「外网探测未通过」的分步诊断")
+  fi
+  if [[ "${NGINX_OK:-1}" != "1" ]]; then
+    todos+=("Nginx 未由脚本配置 —— 需自建反代把 ${APP_PORT} 暴露出去（或去掉 --skip-nginx 重跑）")
+  fi
+
+  log ""
+  if ((${#todos[@]} == 0)); then
+    log "${C_GREEN}${C_BOLD}================ 部署完成 ================${C_RESET}"
+  else
+    log "${C_YELLOW}${C_BOLD}============ 部署结束，但有 ${#todos[@]} 项待处理 ============${C_RESET}"
+  fi
+  log ""
+  if [[ "${SERVICE_READY:-0}" == "1" ]]; then
+    log "  ${C_BOLD}访问地址${C_RESET}：${C_CYAN}${url}${C_RESET}"
+  else
+    log "  ${C_BOLD}访问地址${C_RESET}：${C_CYAN}${url}${C_RESET}  ${C_YELLOW}（应用当前未就绪，修好后才能打开）${C_RESET}"
+  fi
+  log ""
+  log "  ${C_BOLD}常用维护命令${C_RESET}"
+  if [[ "${SERVICE_OK:-1}" != "1" ]]; then
+    log "    ${C_YELLOW}（本次未由脚本拉起服务，请按下面命令自行启动）${C_RESET}"
+    if [[ "$MODE" == "systemd" && "$SKIP_SERVICE" != "1" ]]; then
+      log "    启动    systemctl start ${SERVICE_NAME}    # 单元已写入，先看 journalctl -u ${SERVICE_NAME} -n 100 排查"
+    fi
+    log "    手动启动 cd ${INSTALL_DIR} && env \$(grep -v '^#' .env | xargs) ${NODE_BIN:-node} server/index.js"
+    if [[ "$MODE" == "docker" ]]; then
+      log "    容器启动 cd ${INSTALL_DIR} && docker compose up -d"
+    fi
+  elif [[ "$MODE" == "systemd" ]]; then
+    log "    启动    systemctl start   ${SERVICE_NAME}"
+    log "    停止    systemctl stop    ${SERVICE_NAME}"
+    log "    重启    systemctl restart ${SERVICE_NAME}"
+    log "    状态    systemctl status  ${SERVICE_NAME} --no-pager"
+    log "    日志    journalctl -u ${SERVICE_NAME} -f --no-pager"
+    log "    开机自启 systemctl enable  ${SERVICE_NAME}（部署时已启用）"
+  else
+    log "    启动    cd ${INSTALL_DIR} && docker compose up -d"
+    log "    停止    cd ${INSTALL_DIR} && docker compose down"
+    log "    重启    cd ${INSTALL_DIR} && docker compose restart"
+    log "    状态    cd ${INSTALL_DIR} && docker compose ps"
+    log "    日志    cd ${INSTALL_DIR} && docker compose logs -f --tail=100"
+  fi
+  log "    环境变量 ${INSTALL_DIR}/.env（改后需重启服务）"
+  if [[ "${NGINX_OK:-1}" == "1" ]]; then
+    log "    Nginx 配置 ${NGINX_CONF}"
+    log "    Nginx 校验 nginx -t && nginx -s reload（面板环境也可在面板里点「重载配置」）"
+  else
+    log "    Nginx 配置 （本次未配置，由你自建反代）"
+  fi
+  if [[ "$TLS_MODE" != "none" && -n "$CERT_FULLCHAIN" ]]; then
+    if [[ "$CERT_FULLCHAIN" == "${ACME_CERT_DIR}/"* ]]; then
+      log "    证书     ${CERT_FULLCHAIN}（$(ca_label "$CA_PROVIDER")，acme.sh 自动续期）"
+      log "    手动续期 $(acme_bin) --cron --home ${ACME_HOME} && $(nginx_reload_cmd)"
+    elif [[ "$CERT_FULLCHAIN" == /etc/letsencrypt/* || "$CERT_FULLCHAIN" == */.acme.sh/* ]]; then
+      log "    证书     ${CERT_FULLCHAIN}（到期自动续期）"
+      log "    手动续期 certbot renew --force-renewal && $(nginx_reload_cmd)"
+    else
+      log "    证书     ${CERT_FULLCHAIN}（自备证书，脚本不代为续期）"
+      log "    续期     由你的 CA 客户端负责（如 certbot renew / acme.sh --cron），续期后重启服务"
+      log "    换 ACME 证书 网络与 DNS 就绪后重跑：bash ${SCRIPT_NAME} --domain ${DOMAIN} --tls ${CA_PROVIDER}"
+    fi
+  fi
+  log ""
+  log "  ${C_BOLD}后续说明${C_RESET}"
+  log "    1. 首次打开页面会进入初始化流程，创建${C_BOLD}管理员账号${C_RESET}并登录。"
+  log "    2. 在「系统设置 → 访问密钥管理」选择服务商并填入密钥，再到「存储桶」添加桶。"
+  log "    3. ${C_BOLD}务必定期备份数据目录${C_RESET}：${DATA_DIR}"
+  log "       其中含 AES 主密钥与全部云厂商密钥 —— 丢失后已加密文件无法解密，且不可恢复。"
+  log "       备份示例：tar -czf kepler-data-\$(date +%F).tar.gz -C ${DATA_DIR} ."
+  log "    4. 本服务为${C_BOLD}单实例${C_RESET}设计（data/ 目录有单实例锁），请勿同时运行多个实例。"
+  log "    5. 应用内开启 WebDAV 后，界面会显示客户端要填的地址（.env 中 WEBDAV_PUBLIC_URL + /dav/）；"
+  log "       Nginx 已默认反代 /dav 到应用内置的 ${WEBDAV_PORT} 端口，无需手工改配置，${C_BOLD}也不需要把 ${WEBDAV_PORT} 暴露到公网${C_RESET}。"
+  log "       若该端口已被占用，用 ${C_BOLD}WEBDAV_PORT=<其它端口>${C_RESET} 重跑本脚本，.env 与 Nginx 会一起改。"
+  log "    6. 终端执行 ${C_BOLD}kepler${C_RESET} 可打开管理菜单：重装、修改初始管理员用户名/密码、修改端口或卸载。"
+  log "    7. 重新执行本脚本可升级部署：会重新拉取源码并同步配置，数据目录不会被触碰。"
+  if ((${#todos[@]} > 0)); then
+    log ""
+    log "  ${C_YELLOW}${C_BOLD}待处理（按顺序来）${C_RESET}"
+    local i=1 t
+    for t in "${todos[@]}"; do
+      log "    ${i}) ${t}"
+      i=$((i + 1))
+    done
+    log "    修好后重跑本脚本即可复检（幂等）：$(rerun_cmd)"
+  fi
+  if [[ "$SKIP_NODE" == "1" || "$SKIP_DEPS" == "1" || "$SKIP_NGINX" == "1" || "$SKIP_SERVICE" == "1" ]]; then
+    log ""
+    log "  ${C_BOLD}本次跳过的步骤（需你自行负责）${C_RESET}"
+    [[ "$SKIP_NODE" == "1" ]]    && log "    · --skip-node    ：Node.js 由你管理，脚本只做版本校验"
+    [[ "$SKIP_DEPS" == "1" ]]    && log "    · --skip-deps    ：npm 依赖未安装，需执行 cd ${INSTALL_DIR} && npm ci --omit=dev"
+    [[ "$SKIP_NGINX" == "1" ]]   && log "    · --skip-nginx   ：反代与 HTTPS 由你配置，记得转发 X-Forwarded-Proto"
+    [[ "$SKIP_SERVICE" == "1" ]] && log "    · --skip-service ：进程守护由你配置（pm2 / supervisor / 容器编排）"
+    log "    去掉对应参数重跑即可让脚本接管：$(rerun_cmd)"
+  fi
+  log ""
+  log "  详细日志：${LOG_FILE}"
+  log ""
+}
+
+main() {
+  log "${C_BOLD}Kepler 对象存储管理系统 —— 一键部署${C_RESET}"
+  log "${C_DIM}（Ctrl+C 可随时中断；脚本可重复执行，重复执行等价于升级/修复）${C_RESET}"
+
+  if [[ "$UNINSTALL" == "1" ]]; then
+    detect_env
+    do_uninstall
+    exit 0
+  fi
+  if [[ "$MANAGE" == "1" ]]; then
+    detect_env
+    # 没有部署状态时，下面的「改端口 / 重装」会拿着内置默认值去写 .env、写状态文件、
+    # 重启一个并不存在的服务 —— 提前拦住，直接说清楚该先做什么。
+    if [[ "$STATE_LOADED" != "1" ]]; then
+      die_with_hint "未找到部署状态 ${STATE_FILE}，无法进入管理" \
+        "  · 本机可能还没有用本脚本部署过，或状态文件已被清理" \
+        "  · 首次部署：bash ${SCRIPT_NAME} --domain <域名>（部署完成后才会注册 kepler 命令）" \
+        "  · 若安装目录与数据目录仍在，可用 --dir/--data-dir 重新部署以恢复管理能力"
+    fi
+    if [[ -n "$MANAGE_ACTION" ]]; then
+      manage_action "$MANAGE_ACTION"
+    else
+      manage_menu
+    fi
+    exit 0
+  fi
+
+  step "环境检测与基础工具准备"
+  detect_env
+  need_pkgs_base
+
+  step "部署参数确认"
+  collect_config
+
+  step "安装 Node.js 运行时"
+  preflight_network
+  install_node
+
+  step "拉取源码并安装依赖"
+  prepare_source
+  install_app
+  # R39：install_app 可能刚把**本脚本自己**换成了新版本（脚本就在源码树里）。
+  # 必须在往下走之前把控制权交回最新那份，否则「环境变量 / 守护单元 / Nginx 配置」
+  # 会由旧逻辑生成，而应用已是新代码 —— 这正是「修完重新部署仍复现」的成因。
+  # 位置刻意放在 npm_install_deps 之前：第二趟用安装目录自身当源码目录，
+  # 依赖只装一次，不产生重复工作。
+  handoff_to_installed_script
+  npm_install_deps
+
+  step "生成环境变量与运行用户"
+  create_user
+  gen_env_file
+
+  step "配置进程守护（${MODE}）"
+  if [[ "$MODE" == "docker" ]]; then
+    if setup_docker_service; then SERVICE_OK=1; else SERVICE_OK=0; fi
+  else
+    if setup_systemd_service; then SERVICE_OK=1; else SERVICE_OK=0; fi
+  fi
+
+  step "安装并配置 Nginx 反向代理"
+  NGINX_OK=1
+  if install_nginx; then setup_firewall; else NGINX_OK=0; fi
+
+  step "申请并配置 HTTPS 证书（${TLS_MODE}）"
+  if [[ "$NGINX_OK" == "1" ]]; then
+    setup_tls || true
+  else
+    info "未配置 Nginx，跳过证书步骤（自建反代时请在反代层配置 HTTPS）。"
+  fi
+
+  step "健康检查"
+  wait_for_service
+  if [[ "$NGINX_OK" == "1" ]]; then external_check; fi
+
+  step "保存部署状态并注册 kepler 命令"
+  save_state
+  install_global_command
+
+  print_summary
+}
+
+# ------------------------------------------------------------------------------
+# 14.1 启动指纹（在 main 之前执行；供 5.1 的自我交接判断「我是不是最新那份」）
+# ------------------------------------------------------------------------------
+# ⚠️ 必须在**任何可能覆盖本文件的动作之前**采样，所以放在这里（main 调用点之前）：
+# install_app() 会把源码树同步进 INSTALL_DIR，若本次执行的就是
+# ${INSTALL_DIR}/deploy.sh，它就等于把自己换成新版本。等到那时再读自己，
+# 读到的已经是**新内容**，比对便永远成立 —— 那正是这个坑能一直藏着的原因。
+SELF_SCRIPT_FILE="${BASH_SOURCE[0]:-}"
+SELF_SCRIPT_HASH="$(script_content_hash "$SELF_SCRIPT_FILE")"
+
+# 被 source（而非直接执行）时只加载函数，便于静态检查与单元验证。
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+  main "$@"
+fi
