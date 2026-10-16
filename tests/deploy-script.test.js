@@ -282,6 +282,65 @@ test('deploy.sh：持久化状态、全局命令与菜单入口齐备', () => {
   }
 });
 
+test('deploy.sh：换账号 / 换仓库后仍能从当前仓库取源码（历史默认地址自动迁移）', async () => {
+  const src = readDeploy();
+  const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
+  const CURRENT = pkg.repository.url;
+  const LEGACY = 'https://github.com/xingsenfirst/Kepler.git';
+  const FORK = 'https://github.com/myfork/Kepler.git';
+
+  // ① 默认仓库地址必须与 package.json 的 repository.url 一致。
+  //    换账号/换仓库时最容易只改一头：一键安装命令走新地址（raw 可达、docs-sync 也盯着），
+  //    而独立运行时的 `git clone "$DEFAULT_REPO_URL"` 仍指向旧仓库 —— 用户装到一半
+  //    只看到一句「源码拉取失败」，完全不知道是脚本里的地址过期了。
+  const m = /^readonly DEFAULT_REPO_URL="([^"]+)"/m.exec(src);
+  assert(m, 'deploy.sh 必须定义只读的 DEFAULT_REPO_URL（独立运行时用它 git clone 源码）');
+  assert.strictEqual(m[1], CURRENT,
+    `DEFAULT_REPO_URL 必须与 package.json 的 repository.url 一致：${m[1]} ≠ ${CURRENT}（换仓库时两处会漂移）`);
+
+  // ② 历史地址表必须含本次迁移的旧默认值 —— 旧仓库现已 404，老安装机的
+  //    /etc/kepler/deploy.conf 里还存着它；删掉这条，那些机器就再也重装不起来。
+  assert(hasFn(src, 'migrate_repo_url'),
+    '必须实现 migrate_repo_url()：把历史默认仓库地址迁移到当前默认值');
+  const block = /^readonly LEGACY_DEFAULT_REPO_URLS=\(([\s\S]*?)\)/m.exec(src);
+  assert(block, '必须声明 LEGACY_DEFAULT_REPO_URLS 历史地址表');
+  const legacy = [...block[1].matchAll(/"([^"]+)"/g)].map((x) => x[1]);
+  assert(legacy.includes(LEGACY),
+    `历史地址表必须含 ${LEGACY}（账号/仓库迁移前的默认值）：没有它，老安装机重装会 git clone 一个已不存在的仓库`);
+  assert(!legacy.includes(CURRENT), '历史地址表不得包含当前 DEFAULT_REPO_URL');
+
+  // ③ 只查「源码里有这行」是不够的（那正是「判据没落在实际执行的那一层」）：
+  //    load_state 里若不真调用迁移函数，旧地址仍会原样带进 git clone，静态检查却全绿。
+  //    这里把 STATE_DIR 改指临时目录，真跑一遍 load_state 看 REPO_URL 变成了什么。
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'kepler-repo-migrate-')).replace(/\\/g, '/');
+  try {
+    const r = await spawnBashSnippet(`
+set -Eeuo pipefail
+T="$PROBE_DIR"
+sed 's#^readonly STATE_DIR=.*#readonly STATE_DIR="'"$T"'"#' ./deploy.sh > "$T/deploy.sh"
+check() {
+  printf 'STATE_VERSION=1\\nREPO_URL=%s\\n' "$1" > "$T/deploy.conf"
+  ( source "$T/deploy.sh"; load_state; printf '%s' "$REPO_URL" )
+}
+printf 'LEGACY=%s\\n' "$(check '${LEGACY}')"
+printf 'FORK=%s\\n'   "$(check '${FORK}')"
+printf 'NOW=%s\\n'    "$(check '${CURRENT}')"
+`, { PROBE_DIR: tmp });
+    assert(!r.unavailable, `无法运行 bash 片段（跳过不了这条运行期判据）：${r.unavailable}`);
+    const get = (k) => {
+      const mm = new RegExp('^' + k + '=(.*)$', 'm').exec(r.out);
+      return mm ? mm[1] : undefined;
+    };
+    assert.strictEqual(get('LEGACY'), CURRENT,
+      '历史默认地址必须被迁移成当前默认地址：否则老安装机重装时 git clone 404，用户无从下手');
+    assert.strictEqual(get('FORK'), FORK,
+      '用户自建 fork 的地址必须原样保留 —— 自动改写会把「从自己仓库部署」悄悄换成官方仓库');
+    assert.strictEqual(get('NOW'), CURRENT, '当前默认地址必须原样返回（迁移不得误伤）');
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
 test('deploy.sh：改初始管理员的用户名与密码真实生效（临时数据目录）', async () => {
   const script = extractInlineScript();
   const { tmp, dataDir } = tempDataDir('kepler-deploy-admin-');

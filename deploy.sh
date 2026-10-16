@@ -89,6 +89,12 @@ readonly STATE_DIR="/etc/${SERVICE_NAME}"
 readonly STATE_FILE="${STATE_DIR}/deploy.conf"
 readonly GLOBAL_COMMAND="/usr/local/bin/${SERVICE_NAME}"
 readonly DEFAULT_REPO_URL="https://github.com/xingsen2005/Kepler.git"
+# 历史默认仓库地址（账号/仓库迁移前的值）。老安装机的 ${STATE_FILE} 里仍留着它，
+# 而旧仓库现已不存在（git clone 会 404）。load_state 会把「恰好等于历史默认值」的
+# 地址翻译成当前默认值，避免重装时拉一个死仓库；用户自建 fork 的地址不在其列、原样保留。
+readonly LEGACY_DEFAULT_REPO_URLS=(
+  "https://github.com/xingsenfirst/Kepler.git"
+)
 # WebDAV 独立 HTTPS 端口：应用侧同名环境变量，这里作为唯一事实来源，
 # .env 与 Nginx 上游都用它 —— 两边写死两份 8443 迟早会漂移成「界面有地址、反代不通」。
 WEBDAV_PORT="${WEBDAV_PORT:-8443}"
@@ -414,6 +420,24 @@ usage() {
   exit 0
 }
 
+# 把「历史默认仓库地址」翻译成当前默认值；其它地址原样返回。
+# 只在地址**恰好等于**某个历史默认值时替换 —— 用户自建/自托管的 fork 是有意选择，
+# 绝不能被自动改写（否则会把「从自己仓库部署」悄悄换回官方仓库）。
+# 注意：命令行 / 环境变量（--repo、REPO_URL）在 load_state 之后应用，优先级更高，
+# 因此显式指定的地址永远不会被这里改写。
+function migrate_repo_url() {
+  local url="$1" legacy
+  for legacy in "${LEGACY_DEFAULT_REPO_URLS[@]}"; do
+    if [[ "$url" == "$legacy" ]]; then
+      warn "部署状态里的仓库地址已过时（${url}）；自动切换为当前默认仓库：${DEFAULT_REPO_URL}"
+      printf '%s' "$DEFAULT_REPO_URL"
+      return 0
+    fi
+  done
+  printf '%s' "$url"
+  return 0
+}
+
 function load_state() {
   [[ -r "$STATE_FILE" ]] || return 0
   local key value
@@ -430,7 +454,7 @@ function load_state() {
       TLS_MODE) TLS_MODE="$value" ;;
       EMAIL) EMAIL="$value" ;;
       SUB_PATH) SUB_PATH="$value" ;;
-      REPO_URL) REPO_URL="$value" ;;
+      REPO_URL) REPO_URL="$(migrate_repo_url "$value")" ;;
       NODE_VERSION) NODE_VERSION="$value" ;;
       MIRROR) MIRROR="$value" ;;
       STAGING) STAGING="$value" ;;

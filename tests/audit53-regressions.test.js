@@ -32,6 +32,14 @@
  * 故 ⑨ 层把**系统发信**也真跑一遍：落盘口令 → 假服务器要求认证 → 断言它收到
  * 的 `AUTH PLAIN` 载荷就是那份口令；再走一次匿名 HTTP（`/auth/forgot`）。
  *
+ * ## ⑩ 启用开关层（R55 追加，见文件末尾）
+ *
+ * 卡片上那颗「启用 / 停用发信功能」开关**原先只落盘**、不拦任何服务端行为 ——
+ * 停用之后系统发的验证码照样发得出去。口径（经确认）：停用 = **系统自动发信
+ * （验证码 / 重置密码）一律不发**，而管理员手点的「发送测试邮件」**不受限制**
+ * （R53 已定，见 ⑦ 层）。闸门落在 `email-code.js` 的发信点上，**不折进**
+ * `smtpConfigured()` —— 后者回答的是「配没配」，不是「开没开」。
+ *
  * ⚠️ 协议层**必须真跑**：只断言「代码里有 `EHLO` 这几个字母」是证明不了握手
  *    顺序与响应码判定的 —— 而顺序错了在真服务器上一样会卡住。
  */
@@ -907,6 +915,155 @@ test('R53-10 · 取用：真 HTTP —— 匿名「忘记密码」触发的发信
       '路由 → email-code → smtp 整条链路上，口令必须一路都在');
     const text = dataText(mock.rec);
     assert(/验证码：\d{6}/.test(text), `信里必须是服务端签发的 6 位验证码，实际正文：${text.slice(0, 200)}`);
+  } finally {
+    if (typeof srv.closeAllConnections === 'function') srv.closeAllConnections();
+    srv.close();
+    mock.close();
+  }
+});
+
+/* ================================================================== *
+ * ⑩ 启用开关层：`smtp.enabled` 必须真的拦住**系统自动发信**
+ * ================================================================== */
+
+/**
+ * ⑩ 层为什么必要：卡片上那颗「启用 / 停用发信功能」开关**原先只落盘**、
+ * 不拦任何服务端行为 —— 停用之后系统发的验证码照样发得出去。
+ *
+ * 口径（经确认）：**停用 = 系统自动发信（验证码 / 重置密码）一律不发**；
+ * 管理员手点的「发送测试邮件」**不受限制**（R53 已定，见 ⑦ 层）—— 若一并停掉，
+ * 就关掉了「先配好、再验证」的窗口。
+ *
+ * ⚠️ 闸门刻意**不折进** `smtpConfigured()`：那个判据还管着「界面显示已配置 /
+ * 未配置」与测试邮件的准入；折进去会让卡片在停用后显示成「未配置」（配置其实还在），
+ * 并顺手把测试邮件一起停掉。故本层第一件要钉的就是**「停用 ≠ 未配置」**。
+ *
+ * ⚠️ 判据必须落在「假服务器到底收到几行命令」上：只断言 `sendCodeMail` 抛了错，
+ * 是钉不住「有没有偷偷发出去」的。
+ */
+
+test('R53-11 · 开关：停用后**系统发信**直接 503，且一个字节都不发出去', async () => {
+  const mock = await startMock({ ehlo: ['mock'], auth: 'PLAIN LOGIN', starttls: true });
+  try {
+    configStore.saveSmtp({
+      enabled: false, host: '127.0.0.1', port: mock.port, secure: false,
+      user: 'u@x.com', password: 'SECRET-PW', from: 'a@b.com', fromName: '',
+    });
+    // 「停用」不等于「未配置」：卡片与路由的闸门都仍应认为配置是完整的
+    assertEqual(configStore.smtpSendConfig().configured, true,
+      '停用只是「不发」，配置本身还在 —— configured 不得因此变成 false');
+    assertEqual(configStore.smtpView(configStore.load()).configured, true,
+      '对外视图同理：configured 回答的是「配没配」，不是「开没开」');
+
+    let err = null;
+    try {
+      await emailCode.sendCodeMail({ purpose: 'reset', email: 'a@b.com', username: 'x', code: '111111' });
+    } catch (e) { err = e; }
+    assert(err, '停用后系统发信必须直接抛错，而不是照发出去');
+    assertEqual(err.status, 503, '应为 503（配置类问题），而不是网络超时');
+    assertMatch(err.message, /停用/, '提示必须写明「已停用」，不能与「尚未配置」混为一谈');
+    assertEqual(mock.rec.lines.length, 0,
+      `停用后连一次连接都不该发起，实际收到 ${mock.rec.lines.length} 行：${JSON.stringify(mock.rec.lines.slice(0, 4))}`);
+  } finally {
+    mock.close();
+  }
+});
+
+test('R53-11 · 开关：同一份配置只要启用就照常发信（正向对照）', async () => {
+  const mock = await startMock({ ehlo: ['mock'], auth: 'PLAIN LOGIN', starttls: true });
+  try {
+    configStore.saveSmtp({
+      enabled: true, host: '127.0.0.1', port: mock.port, secure: false,
+      user: 'u@x.com', password: 'SECRET-PW', from: 'a@b.com', fromName: '',
+    });
+    await withPsk(() => emailCode.sendCodeMail({
+      purpose: 'reset', email: 'someone@example.com', username: 'alice', code: '246813',
+    }));
+    assertEqual(mock.rec.authSeen, 'PLAIN:\u0000u@x.com\u0000SECRET-PW',
+      '启用时必须照常发信 —— 缺了这条，「一律拒绝」也能让上一条全绿');
+  } finally {
+    mock.close();
+  }
+});
+
+test('R53-11 · 开关：停用不影响管理员手点的「发送测试邮件」（R53 既有口径）', async () => {
+  const mock = await startMock({ ehlo: ['mock'], auth: 'PLAIN LOGIN', starttls: true });
+  const s = await serve(ADMIN);
+  try {
+    configStore.saveSmtp({
+      enabled: false, host: '127.0.0.1', port: mock.port, secure: false,
+      user: 'u@x.com', password: 'SECRET-PW', from: 'a@b.com', fromName: '',
+    });
+    const t = await withPsk(() => request(s.port, 'POST', '/api/smtp/test', { body: {} }));
+    assertEqual(t.status, 200, `测试邮件不受开关限制，应 200，实际 ${t.status}：${t.raw}`);
+    assertEqual(mock.rec.authSeen, 'PLAIN:\u0000u@x.com\u0000SECRET-PW',
+      '测试邮件仍须真的与服务器完成一次会话（否则「不受限制」只是纸面口径）');
+  } finally {
+    s.close();
+    mock.close();
+  }
+});
+
+test('R53-11 · 开关：停用时匿名「忘记密码」仍恒真 200，且一封都不发（不留 oracle）', async () => {
+  const mock = await startMock({ ehlo: ['mock'], auth: 'PLAIN LOGIN', starttls: true });
+  await configStore.addUser({
+    username: 'r53-disabled', password: 'Unit!2026abc', role: 'user', email: 'target2@example.com',
+  });
+  configStore.saveSmtp({
+    enabled: false, host: '127.0.0.1', port: mock.port, secure: false,
+    user: 'u@x.com', password: 'SECRET-PW', from: 'a@b.com', fromName: '',
+  });
+  const app = express();
+  app.use(express.json());
+  app.use('/api', require(SERVER('routes', 'auth.js')));
+  const srv = http.createServer(app);
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  try {
+    // 两个不同 IP 各发一次（限流是按 IP 的），一个命中真实账户、一个不命中
+    const hit = await request(srv.address().port, 'POST', '/api/auth/forgot', {
+      headers: { 'X-Forwarded-For': '10.55.2.1' }, body: { identifier: 'r53-disabled' },
+    });
+    const miss = await request(srv.address().port, 'POST', '/api/auth/forgot', {
+      headers: { 'X-Forwarded-For': '10.55.2.2' }, body: { identifier: 'r53-no-such-user' },
+    });
+    assertEqual(hit.status, 200, `停用不是错误，响应仍须恒真 200，实际 ${hit.status}：${hit.raw}`);
+    assertEqual(hit.status, miss.status, '命中与未命中的状态码必须一致');
+    assertEqual(JSON.stringify(hit.json), JSON.stringify(miss.json),
+      '命中与未命中的响应体必须逐字节相同 —— 否则「停用」这个状态本身就成了一条账户存在性 oracle');
+    assertEqual(mock.rec.lines.length, 0,
+      '停用后不得有任何发信连接（发信失败也只记日志、响应一字不变）');
+  } finally {
+    if (typeof srv.closeAllConnections === 'function') srv.closeAllConnections();
+    srv.close();
+    mock.close();
+  }
+});
+
+test('R53-11 · 开关：停用时需登录的「发送邮箱验证码」如实回 503（与 /auth/forgot 刻意不同）', async () => {
+  const mock = await startMock({ ehlo: ['mock'], auth: 'PLAIN LOGIN', starttls: true });
+  await configStore.addUser({
+    username: 'r53-mailcode', password: 'Unit!2026abc', role: 'user', email: 'old@example.com',
+  });
+  const me = configStore.listUsers().find((u) => u.username === 'r53-mailcode');
+  assert(me && me.id, '前置：新建用户必须能查到 id（鉴权中间件只注入 id / username / role / permissions）');
+  configStore.saveSmtp({
+    enabled: false, host: '127.0.0.1', port: mock.port, secure: false,
+    user: 'u@x.com', password: 'SECRET-PW', from: 'a@b.com', fromName: '',
+  });
+  const app = express();
+  app.use(express.json());
+  app.use((req, _res, next) => { req.authUser = me; next(); });
+  app.use('/api', require(SERVER('routes', 'auth.js')));
+  const srv = http.createServer(app);
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  try {
+    const r = await request(srv.address().port, 'POST', '/api/auth/email/code', {
+      headers: { 'X-Forwarded-For': '10.55.3.1' }, body: { email: 'brand-new@example.com' },
+    });
+    assertEqual(r.status, 503,
+      `需登录的接口应如实告知「发信已停用」（用户提交的是自己的新地址，不存在 oracle 顾虑），实际 ${r.status}：${r.raw}`);
+    assertMatch(JSON.stringify(r.json), /停用/, '错误里必须写清是「已停用」而不是「未配置」');
+    assertEqual(mock.rec.lines.length, 0, '停用后不得发起任何发信连接');
   } finally {
     if (typeof srv.closeAllConnections === 'function') srv.closeAllConnections();
     srv.close();

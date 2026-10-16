@@ -1641,6 +1641,26 @@ const CASES = [
     },
     {
       /*
+       * 账号 / 仓库迁移后的「老安装机还能不能重装」。
+       *
+       * 老安装机的 /etc/kepler/deploy.conf 里存着**当年的默认仓库地址**（旧账号），
+       * 而那个仓库现在已 404；load_state 读 REPO_URL 时不再过 migrate_repo_url()，
+       * 旧地址就原样带进 prepare_source 的 `git clone --depth 1 "$REPO_URL"` ——
+       * 重装直接失败，用户只看到一句「源码拉取失败（<旧地址>）」，无从知道是脚本里
+       * 的默认值过期了（重装走的又是安装目录里那份脚本，它的 HEAD 注释已指向新地址）。
+       *
+       * ⚠️ 判据必须**真跑一次 load_state**（把 STATE_DIR 指到临时目录）：
+       * 只断言「源码里出现过 migrate_repo_url 这个词」是钉不住它的 —— 那正是假绿的标本。
+       */
+      name: 'D1-24 · load_state 不再迁移历史默认仓库地址（老安装机重装去拉一个 404 死仓库）',
+      file: 'deploy.sh',
+      anchor: '      REPO_URL) REPO_URL="$(migrate_repo_url "$value")" ;;',
+      replacement: '      REPO_URL) REPO_URL="$value" ;;',
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
+    {
+      /*
        * 「界面显示 https://localhost:8443/dav/，WebDAV 用不了」两处根因之一：
        * Nginx 站点配置里的 /dav 反代只是一段**注释**（「应用内开启后取消注释」），
        * 于是 https://<域名>/dav/ 根本没人转发 → 404。把 location 行退回注释态即可复现。
@@ -8491,6 +8511,43 @@ const CASES = [
       replacement: '  return Object.assign({}, s, { configured: true });',
       testFile: 'audit53-regressions.test.js',
       minFail: 1,
+    },
+    {
+      /*
+       * R53-11a：「启用 / 停用发信功能」开关若不拦**系统发信**，它就只是个装饰 ——
+       * 界面上写着「已停用」，登录页取码 / 忘记密码照样把邮件发出去。
+       *
+       * 撤掉 `email-code.js` 里那道 `if (!cfg.enabled)` 即可复现。判据落在
+       * 「假服务器到底收到几行命令」上，故 ⑩ 层里三条会同时变红
+       * （实测 `fail=3`：停用后 503 / 匿名 forgot 一封不发 / email-code 如实 503）。
+       */
+      name: 'R53-11a · 系统发信的「启用开关」闸门被撤除（停用后照样发信）',
+      file: 'server/email-code.js',
+      anchor: '  if (!cfg.enabled) {\n'
+        + '    throw Object.assign(new Error(\n'
+        + '      \'系统发信已由管理员停用（系统设置 → 发信设置 → 启用发信功能），暂时无法发送邮件。\',\n'
+        + '    ), { status: 503 });\n'
+        + '  }',
+      replacement: '  // 启用开关闸门已被反向对照移除',
+      testFile: 'audit53-regressions.test.js',
+      minFail: 3,
+    },
+    {
+      /*
+       * R53-11b：把 `enabled` 折进 `smtpConfigured()` —— 一种「看着更简洁」的写法。
+       *
+       * 后果是**停用被显示成「未配置」**：配置明明还在，卡片却说没配；错误文案也从
+       * 「已停用」退化成「尚未配置」，管理员会去重填一份本来就对的配置。
+       * 这条锚住的正是「`configured` 回答『配没配』、`enabled` 回答『开没开』」这个分法。
+       *
+       * 实测 `fail=4`：`R53-4` 的视图层 1 条 + ⑩ 层 3 条（视图的 `configured` 一并被污染）。
+       */
+      name: 'R53-11b · 把 enabled 折进 smtpConfigured（停用被显示成「未配置」）',
+      file: 'server/config-store.js',
+      anchor: '  return Boolean(s && s.host && s.from);',
+      replacement: '  return Boolean(s && s.host && s.from && s.enabled);',
+      testFile: 'audit53-regressions.test.js',
+      minFail: 4,
     },
   ];
 

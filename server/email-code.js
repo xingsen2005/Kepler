@@ -229,6 +229,26 @@ async function sendCodeMail({ purpose, email, username, code }) {
       '系统尚未配置发信（SMTP），无法发送邮件。请联系管理员在「系统设置 → 发信设置」中完成配置。',
     ), { status: 503 });
   }
+  /**
+   * 「发信设置」卡片上的启用开关（R55 追加）。
+   *
+   * 停用 = **系统自动发信一律不发** —— 验证码 / 重置密码这类信是服务端自己触发的，
+   * 管理员关掉开关要停的正是它们。闸门放在这里而不是 `smtpConfigured()`：
+   *
+   *  · `smtpConfigured()` 还管着「界面显示已配置 / 未配置」与 `routes/smtp.js` 的
+   *    管理员测试邮件，而 R53 已定**测试邮件不受开关限制**（它是管理员手动触发的
+   *    一次性动作；若受限制就关掉了「先配好、再验证」的窗口）；
+   *  · 把 `enabled` 折进那个判据会让卡片在停用后显示成「未配置」—— 配置明明还在。
+   *
+   * 两处调用方的表现刻意不同（与既有口径一致）：`/auth/forgot` 的 catch 只记日志、
+   * 响应**恒真**（它是匿名可达的，回不同的体就等于一条账户存在性 oracle）；
+   * `/auth/email/code` 需登录、且用户提交的是自己的新地址，故**如实回 503**。
+   */
+  if (!cfg.enabled) {
+    throw Object.assign(new Error(
+      '系统发信已由管理员停用（系统设置 → 发信设置 → 启用发信功能），暂时无法发送邮件。',
+    ), { status: 503 });
+  }
   const siteName = configStore.siteView(configStore.load()).siteName;
   const title = purpose === 'reset' ? '重置密码' : '验证邮箱';
   const subject = `${siteName} ${title}验证码`;
