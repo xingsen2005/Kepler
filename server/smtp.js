@@ -27,6 +27,10 @@
  *    填了用户名 ⇒ **直接报错**，不静默降级为「不登录直接发」（那会被绝大多数
  *    服务器拒收，且报错看起来像网络不通，极难排查）；
  *  - 编码：主题走 RFC 2047 编码字、正文走 base64，统一 UTF-8；
+ *  - **超时**：**建连（DNS → TCP → TLS 握手）与每条命令都有硬截止**（默认 15 秒）。
+ *    ⚠️ 建连那一段不能用 `socket.setTimeout` 代替（它只在**已建立**的连接上计「无活动」）；
+ *    对端把数据包**丢弃**时必须能报错，否则界面会永久卡在「发送中」。
+ *    `AggregateError`（多地址全部不可达）会被拆成**逐地址 + 逐错误码**的可执行文案。
  *  - 不支持：附件 / HTML 正文 / DKIM 签名 —— 本功能只需要发纯文本测试信。
  *
  * ## ⚠️ 信头注入（本模块最硬的一条约束）
@@ -67,11 +71,128 @@ function configError(msg) {
   return Object.assign(new Error(msg), { status: 400 });
 }
 
-/** 把底层网络错误包一层，带上「连的是谁」—— 否则日志里只有 ECONNREFUSED 一个词 */
+/**
+ * 底层错误码 → 「下一步该做什么」。
+ *
+ * 判据不是「有没有错误」，而是**用户能不能据此改对配置**：`ECONNREFUSED` 与
+ * `ETIMEDOUT` 看起来都是一句网络错误，实际一个要改端口、一个要放行防火墙。
+ */
+const CONN_HINT = {
+  ENOTFOUND: '域名解析失败 —— 服务器地址可能拼错，或本机 DNS 不可用',
+  EAI_AGAIN: '域名解析暂时无响应 —— 稍后重试，或把服务器地址直接填成 IP',
+  ECONNREFUSED: '对方主动拒绝 —— 端口号可能写错，或该端口未对外开放',
+  ETIMEDOUT: '连接超时（数据包被丢弃）—— 多为防火墙 / 云端安全组未放行出站该端口',
+  ENETUNREACH: '网络不可达 —— 本机没有到该地址的路由（IPv6 地址多为服务器未配置 IPv6 出口）',
+  EHOSTUNREACH: '主机不可达 —— 被路由或防火墙拦截',
+  ECONNRESET: '连接被重置 —— 可能被中间设备（防火墙 / 代理）拦截',
+  EPROTO: 'TLS 握手失败 —— 该端口可能不是隐式 TLS 端口（465 才是）',
+  ERR_TLS_CERT_ALTNAME_INVALID: '证书上的域名与所填地址不一致',
+  CERT_HAS_EXPIRED: '服务器证书已过期',
+  DEPTH_ZERO_SELF_SIGNED_CERT: '服务器使用自签名证书 —— 本模块不跳过证书校验',
+  UNABLE_TO_VERIFY_LEAF_SIGNATURE: '无法验证服务器证书链（系统根证书可能缺失）',
+};
+
+/** 取错误码对应的可执行提示；认不出时返回空串（宁可不提示，也不给错的建议） */
+function hintFor(code) {
+  return CONN_HINT[String(code || '').toUpperCase()] || '';
+}
+
+/**
+ * 把底层网络错误包一层，带上「连的是谁」—— 否则日志里只有 ECONNREFUSED 一个词。
+ *
+ * ⚠️ **必须拆开 `AggregateError`**：Node 20 起 `autoSelectFamily` 默认开启，
+ * 域名解析出多个地址（IPv4 / IPv6 各一条很常见）而**全部**连不上时，抛的是
+ * `AggregateError` ——它的 `message` 是**空串**，每条地址的真实原因藏在 `.errors[]` 里。
+ * 直接取 `e.message` 的结果是「失败（建连）：AggregateError」这一类**零信息**文案，
+ * 而管理员真正需要的恰好是「哪个地址、什么原因」（ENETUNREACH 与 ECONNREFUSED
+ * 要改的东西完全不同）。实测工单原文就是这句 `AggregateError`。
+ */
 function wrapConnError(e, o, when) {
-  const err = new Error(`连接 SMTP 服务器 ${o.host}:${o.port} 失败（${when}）：${(e && e.message) || e}`);
+  const where = `${o.host}:${o.port}`;
+  const errs = (e && Array.isArray(e.errors) ? e.errors : []).filter(Boolean);
+  if (errs.length) {
+    const detail = errs
+      .map((x) => `[${x.address || '?'}] ${x.code || x.message || '未知错误'}`)
+      .join('、');
+    const codes = [];
+    for (const x of errs) {
+      const c = String((x && x.code) || '').toUpperCase();
+      if (c && codes.indexOf(c) < 0) codes.push(c);
+    }
+    const hint = codes.map(hintFor).filter(Boolean)[0];
+    const err = new Error(`连接 SMTP 服务器 ${where} 失败（${when}）：`
+      + `${errs.length} 个地址全部不可达 —— ${detail}` + (hint ? `。${hint}` : ''));
+    err.cause = e;
+    err.connCodes = codes;
+    return err;
+  }
+  const code = String((e && (e.code || e.errno)) || '').toUpperCase();
+  const hint = hintFor(code);
+  const err = new Error(`连接 SMTP 服务器 ${where} 失败（${when}）：${(e && e.message) || e}`
+    + (hint ? `（${hint}）` : ''));
   err.cause = e;
+  if (code) err.connCodes = [code];
   return err;
+}
+
+/** 建连 / 握手超时（与「服务器无响应」区分：这一条发生在**连接建立完成之前**） */
+function connTimeoutError(o, when) {
+  const err = new Error(`连接 SMTP 服务器 ${o.host}:${o.port} 超时（${when}）：`
+    + `${o.timeoutMs} 毫秒内没有完成。常见原因：本机 / 服务器到外网该端口被防火墙或云端`
+    + '安全组拦截、网络不通、地址写错；若服务商同时开放 587 端口（STARTTLS），改用 587 '
+    + '一般可绕开对 465 的封锁。');
+  err.code = 'ETIMEDOUT';
+  err.isTimeout = true;
+  return err;
+}
+
+/**
+ * 等套接字的「成功事件」或错误，**带硬截止**。
+ *
+ * ## 为什么不能只靠 `socket.setTimeout`
+ *
+ * `socket.setTimeout` 计的是**已建立连接上的「无活动」**；而 DNS 解析、TCP 的 SYN
+ * 重传、TLS 握手这三段都发生在**连接建立之前**。只挂 `_bindLongLived()` 里的那个
+ * 空闲超时（它要等 `connect` 事件之后才装上）的后果是：对端把数据包**丢弃**
+ * （而非拒绝）时，Promise **永不 settle** —— 实测黑洞地址下 8 秒内**一个事件都没有**
+ * （真实 SYN 重传约 130 秒），表现就是界面上的「正在连接 SMTP 服务器并发送…」
+ * 与「发送中…」**永久卡住**，用户既拿不到错误、也不知道该等多久。
+ *
+ * 故这里用一个显式定时器兜住整段建连，到点即销毁套接字并抛超时错。
+ *
+ * @param {import('node:net').Socket} sock
+ * @param {string[]} okEvents 视为成功的首事件（`connect` / `secureConnect`）
+ * @param {object} o 已归一化选项（用其 `timeoutMs`）
+ * @param {string} when 阶段名（`建连` / `TLS 握手`）
+ */
+function awaitSocketEvent(sock, okEvents, o, when) {
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const fail = (err) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      try {
+        if (!sock.destroyed) sock.destroy();
+      } catch (_) { /* 销毁失败无需再处理 */ }
+      reject(err);
+    };
+    const timer = setTimeout(() => fail(connTimeoutError(o, when)), o.timeoutMs);
+    const onErr = (e) => fail(wrapConnError(e, o, when));
+    const onOk = () => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      resolve();
+    };
+    function cleanup() {
+      clearTimeout(timer);
+      sock.removeListener('error', onErr);
+      for (const ev of okEvents) sock.removeListener(ev, onOk);
+    }
+    sock.once('error', onErr);
+    for (const ev of okEvents) sock.once(ev, onOk);
+  });
 }
 
 /**
@@ -205,17 +326,12 @@ class SmtpSession {
      * 'data'（微任务晚于 I/O 回调），问候就丢了，表现为「连上了但一直等不到响应」。
      */
     sock.on('data', (chunk) => this._onData(chunk));
-    await new Promise((resolve, reject) => {
-      const onErr = (e) => { cleanup(); reject(wrapConnError(e, o, '建连')); };
-      const onOk = () => { cleanup(); resolve(); };
-      function cleanup() {
-        sock.removeListener('error', onErr);
-        sock.removeListener('connect', onOk);
-        sock.removeListener('secureConnect', onOk);
-      }
-      sock.once('error', onErr);
-      sock.once(o.secure ? 'secureConnect' : 'connect', onOk);
-    });
+    /**
+     * ⚠️ 这里必须走 `awaitSocketEvent` 而不是裸的 `once`：建连阶段（DNS / TCP / TLS）
+     * 也要有**硬截止**，否则对端丢包时 Promise 永不 settle（见该函数注释）。
+     * 连接建立之后的「无活动」超时仍由 `_bindLongLived()` 里的 `socket.setTimeout` 负责。
+     */
+    await awaitSocketEvent(sock, [o.secure ? 'secureConnect' : 'connect'], o, '建连');
     this.encrypted = !!o.secure;
     this._bindLongLived(sock);
   }
@@ -351,12 +467,8 @@ class SmtpSession {
     });
     secure.setEncoding('utf8');
     secure.on('data', (chunk) => this._onData(chunk));
-    await new Promise((resolve, reject) => {
-      const onErr = (e) => { reject(wrapConnError(e, o, 'TLS 握手')); };
-      const onOk = () => { secure.removeListener('error', onErr); resolve(); };
-      secure.once('error', onErr);
-      secure.once('secureConnect', onOk);
-    });
+    /** 同理：升级握手也可能被中间设备吞掉，必须有硬截止（原实现会让请求永久挂住） */
+    await awaitSocketEvent(secure, ['secureConnect'], o, 'TLS 握手');
     this.sock = secure;
     this.encrypted = true;
     this._bindLongLived(secure);
@@ -489,8 +601,13 @@ function validateForSend(o, opts) {
  */
 async function withSession(o, fn) {
   const s = new SmtpSession(o);
-  await s.connect();
   try {
+    /**
+     * ⚠️ `connect()` 必须**在 `try` 之内**：原先它写在 `try` 之前，建连一失败
+     * 就绕过了 `finally` 里的 `quit()` ⇒ 那条正在建连的套接字没人关。
+     * 超时路径尤其明显（超时的套接字不会被 Node 自动销毁）。
+     */
+    await s.connect();
     await s.handshake();
     if (!s.encrypted && s.caps.starttls) await s._starttls();
     let authUsed = '';

@@ -8783,6 +8783,54 @@ const CASES = [
       testFile: 'audit54b-regressions.test.js',
       minFail: 1,
     },
+    {
+      /**
+       * R57-09a：建连阶段的硬截止被拆掉，退回裸 `once` —— 这正是「界面永久卡在
+       * 正在连接 SMTP 服务器并发送…」的入口。
+       *
+       * ⚠️ 回退后的实现里**只留 `error` / 成功事件**，没有定时器：对端把数据包
+       * **丢弃**（而非拒绝）时两边都不触发 ⇒ 那个 Promise 永不 settle。
+       * 台账里 R57-09 用桩造出「永不 emit connect 的裸 Socket」，故它必红。
+       *
+       * ⚠️⭐ **这条变异的红法必须记清楚**（实测，与「干净的一条断言失败」不同）：
+       *   `# fail 1` + `# cancelled 3` ——
+       *   ① R57-09 **挂住**（正是它要证明的那个 bug）⇒ 跑者取消它的同批兄弟
+       *      R57-10 / R57-11（`cancelled`，不是 `fail`）；
+       *   ② R57-02 真红 —— 它是**连带伤**：R57-09 挂在 `finally` 之前，
+       *      桩把 `net.connect` / `net.createConnection` 留在变异态，后面用到
+       *      真套接字的用例全被带坏。
+       *   故 `minFail: 1` 取**报数器自己的 `# fail`**（=1，即 R57-02），
+       *   而**不能**按 `not ok` 行数（4）填 —— 那会把一个「挂住型」变异
+       *   误当成「干净单点」变异。**判红只需 ≥1，且必须含 R57-09 的亲属**；
+       *   这里 R57-09 表现成 cancelled，故判断依据是「`cancelled` 里出现了
+       *   R57-09」而不是「`not ok` 里出现了 R57-09」。
+       */
+      name: 'R57-09a · 建连阶段的硬截止被拆掉（对端丢包时永不 settle ⇒ 界面永久卡住）',
+      file: 'server/smtp.js',
+      anchor: "    await awaitSocketEvent(sock, [o.secure ? 'secureConnect' : 'connect'], o, '建连');",
+      replacement: "    await new Promise((res, rej) => { sock.once('error', rej); sock.once(o.secure ? 'secureConnect' : 'connect', res); });",
+      testFile: 'audit53-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * R57-10a：`AggregateError` 不再拆 `.errors[]` —— 退回「取 `e.message`」的
+       * 零信息文案，正是工单原文那句
+       * 「连接 SMTP 服务器 smtp.qq.com:465 失败（建连）：AggregateError」。
+       *
+       * ⚠️ 回退后错误对象仍然是 `AggregateError` 实例，`e.message` 是**空串** ⇒
+       * 走 `hintFor('')` 也拿不到提示。R57-10 断言「必须带出 240e::1 / ENETUNREACH /
+       * 183.47.120.204」三条，故必红。
+       *
+       * 实测 `fail=1`：只红 R57-10（R57-09 走超时分支不经过这里；R57-11 是正向对照）。
+       */
+      name: 'R57-10a · AggregateError 不再拆逐地址原因（退回零信息的「AggregateError」文案）',
+      file: 'server/smtp.js',
+      anchor: '  const errs = (e && Array.isArray(e.errors) ? e.errors : []).filter(Boolean);',
+      replacement: '  const errs = [];',
+      testFile: 'audit53-regressions.test.js',
+      minFail: 1,
+    },
   ];
 
 module.exports = { runCase, CASES, parseArgs };

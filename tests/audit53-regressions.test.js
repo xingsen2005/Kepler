@@ -42,6 +42,21 @@
  *
  * ⚠️ 协议层**必须真跑**：只断言「代码里有 `EHLO` 这几个字母」是证明不了握手
  *    顺序与响应码判定的 —— 而顺序错了在真服务器上一样会卡住。
+ *
+ * ## ⑪ 站点级探针层（R57 追加，见文件末尾）
+ *
+ * 「配置全对却收不到信」的根因是**失败被刻意静默**（`/auth/forgot` 恒真是防枚举的
+ * 必要设计）。修法不是把它改成如实报错（那会开出一条账户存在性 oracle），而是把失败中
+ * **与标识无关的那一部分**提前探出来：连不上 / STARTTLS 未宣告 / 认证被拒 / 口令缺失。
+ * ④ 层钉「管理员手点的测试邮件」，⑩ 层钉「系统自动发信是否被开关拦住」，
+ * ⑪ 层钉的是**站点级健康探针**本身及其在 `/auth/forgot` 里的**执行位置**。
+ *
+ * ## ⑫ 建连截止层（R57 追加，见文件末尾）
+ *
+ * 同一份工单的另外两个症状 —— 「失败（建连）：AggregateError」与「永远停在
+ * 正在连接 / 发送中」—— 其实是**同一个缺口**：建连阶段（DNS → TCP → TLS）没有
+ * 任何失败出口。两条护栏分别守住「有硬截止」「错误带得出逐地址原因 + 可执行提示」，
+ * 再加一条正向对照，证明截止逻辑不误伤正常连接（否则「一律立刻拒绝」也能全绿）。
  */
 const fs = require('fs');
 const os = require('os');
@@ -1240,5 +1255,120 @@ test('R57-04 · 端到端：配置齐全但服务器认证被拒时，匿名「�
     if (typeof srv.closeAllConnections === 'function') srv.closeAllConnections();
     srv.close();
     mock.close();
+  }
+});
+
+/* ================================================================== *
+ * ⑫ R57 建连截止层：把「建连阶段没有任何失败出口」这一根因钉死
+ * ================================================================== */
+
+/**
+ * ⑫ 层为什么必要（同一份工单的另外两个症状）
+ *
+ *  症状 A：`系统发信当前不可用：连接 SMTP 服务器 smtp.qq.com:465 失败（建连）：AggregateError`
+ *  症状 B：`正在连接 SMTP 服务器并发送…` / `发送中…` **永久卡住**
+ *
+ * 两者其实是**同一个缺口**：建连阶段（DNS 解析 → TCP SYN → TLS 握手）**没有任何失败出口**。
+ *
+ *  - `socket.setTimeout()` 计的是**已建立连接上的「无活动」**，且原实现要到
+ *    `_bindLongLived()`（在 `connect` 事件之后）才装上 ⇒ 对端把包**丢弃**（而非
+ *    拒绝）时那个 Promise **永不 settle**（实测黑洞地址 8 秒内零事件，真实 SYN
+ *    重传约 130 秒）⇒ 症状 B。
+ *  - Node 20 起 `autoSelectFamily` 默认开启，域名解析出多个地址而**全部**连不上时
+ *    抛的是 `AggregateError`，其 `message` 是**空串** ⇒ 原实现取 `e.message` 得到
+ *    零信息文案 ⇒ 症状 A。
+ *
+ * 故两条护栏分别守住「有硬截止」与「错误里带得出可执行信息」，再加一条**正向对照**
+ * 证明截止逻辑不误伤正常连接（否则「一律立刻拒绝」也能让前两条全绿）。
+ */
+
+test('R57-09 · 建连：对端丢包（数据包被丢弃）时按硬截止报错，绝不永久挂住', async () => {
+  const smtpLib = require(SERVER('smtp.js'));
+  const realConnect = net.connect;
+  const realCreate = net.createConnection;
+  /**
+   * ⚠️ `net.connect === net.createConnection` 是**同一个函数引用**（Node 里就是别名），
+   * 两个名字都要替换 —— 只换一个的话，本进程内 fake 服务器 / 其它测试的
+   * `server.listen` 之后的连接也会走这个桩，把整片测试挂住。
+   * 桩返回一个**永不 emit `connect` 的裸 Socket**，精确模拟「SYN 被丢弃」：
+   * 没有 error、没有 connect —— 只有硬截止能救。
+   */
+  let made = null;
+  const stub = () => { made = new net.Socket(); return made; };
+  net.connect = stub;
+  net.createConnection = stub;
+  try {
+    const t0 = Date.now();
+    await assertReject(
+      () => smtpLib.sendMail(Object.assign({}, BASE, {
+        host: 'blackhole.invalid', port: 465, secure: false, timeoutMs: 400,
+      })),
+      '对端丢包时必须报错 —— 永久 pending 就是那个"卡死"的 bug',
+    );
+    const dt = Date.now() - t0;
+    assert(dt >= 300, `不能立刻报错（否则测到的不是截止逻辑本身），实际 ${dt}ms`);
+    assert(dt < 3000, `硬截止必须真的生效（否则界面会一直停在"正在连接 SMTP 服务器并发送…"），实际 ${dt}ms`);
+    assert(made && made.destroyed, '超时后必须销毁套接字 —— 否则每次失败都泄漏一条连接');
+  } finally {
+    net.connect = realConnect;
+    net.createConnection = realCreate;
+  }
+});
+
+test('R57-10 · 建连：AggregateError 拆成逐地址原因与可执行提示（不是一句零信息文案）', async () => {
+  const smtpLib = require(SERVER('smtp.js'));
+  const realConnect = net.connect;
+  const realCreate = net.createConnection;
+  /** 模拟 `autoSelectFamily` 的真实产物：多地址全败，`message` 为空串，原因在 `.errors[]` */
+  const stub = () => {
+    const s = new net.Socket();
+    setImmediate(() => {
+      const e1 = Object.assign(new Error('connect ENETUNREACH 240e::1:465'), {
+        code: 'ENETUNREACH', address: '240e::1', port: 465,
+      });
+      const e2 = Object.assign(new Error('connect ETIMEDOUT 183.47.120.204:465'), {
+        code: 'ETIMEDOUT', address: '183.47.120.204', port: 465,
+      });
+      s.emit('error', new AggregateError([e1, e2]));
+    });
+    return s;
+  };
+  net.connect = stub;
+  net.createConnection = stub;
+  try {
+    /** ⚠️ `assertReject` 只返回 true，拿不到异常对象 ⇒ 这里手工捕一次（要读 message） */
+    let e = null;
+    try {
+      await smtpLib.sendMail(Object.assign({}, BASE, {
+        host: 'multi.example', port: 465, secure: false, timeoutMs: 3000,
+      }));
+    } catch (err) { e = err; }
+    assert(e, 'AggregateError 也必须走到失败出口（不能吞掉）');
+    assertMatch(e.message, /连接 SMTP 服务器 multi\.example:465 失败/);
+    assertMatch(e.message, /240e::1/, '自证：原因真的来自 errors[]，不是凭空拼的');
+    assertMatch(e.message, /ENETUNREACH/, '逐地址必须带上各自的错误码 —— 不同码要改的东西不同');
+    assertMatch(e.message, /183\.47\.120\.204/, '第 2 个地址的原因也必须带出来（不能只报第一个）');
+    assertMatch(e.message, /ETIMEDOUT/);
+    assertMatch(e.message, /网络不可达|路由|IPv6/, '必须附一条可执行的下一步，而不是把原始错误码甩给用户');
+    assert(
+      !/^连接 SMTP 服务器 [^：]*失败（[^）]*）：AggregateError$/.test(e.message),
+      '绝不能只剩一句零信息的 AggregateError —— 那正是工单原文',
+    );
+  } finally {
+    net.connect = realConnect;
+    net.createConnection = realCreate;
+  }
+});
+
+test('R57-11 · 正向对照：调大超时后真实 SMTP 会话仍成功（硬截止不误杀正常连接）', async () => {
+  const s = await startMock({ ehlo: ['mock'], auth: 'PLAIN LOGIN', starttls: true });
+  try {
+    const r = await withPsk(() => require(SERVER('smtp.js')).sendMail(
+      Object.assign({ host: '127.0.0.1', port: s.port, secure: false, timeoutMs: 8000 }, BASE),
+    ));
+    assertEqual(r.ok, true,
+      '正向对照：正常连接 + 足够超时必须成功 —— 缺了它，「一律立刻拒绝」也能让 R57-09 全绿');
+  } finally {
+    s.close();
   }
 });
