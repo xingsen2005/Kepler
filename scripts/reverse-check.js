@@ -1661,6 +1661,71 @@ const CASES = [
     },
     {
       /*
+       * R59-01a：`centos_eol_repo()` 被摘成恒假 —— EOL 专因（Vault 归档源）永不给出。
+       *
+       * CentOS 7/8 已 EOL，官方 yum 源整体下线，`dnf install` 连元数据都取不到；
+       * 用户报的「首次安装必定提示装 Node 失败」在 CentOS 8 上正来自这里。退回恒假后，
+       * 失败出口只剩通用【A】NodeSource 指南 —— 而那套方案在本机照样装不上
+       * （它也要走 dnf），用户照着做必然再失败一次。
+       *
+       * 台账里那条用例既查源码、又**真跑 bash** 逐个断言只在 CentOS 7/8 命中 ⇒ 恒假必红。
+       * 实测 `fail=1`。
+       */
+      name: 'R59-01a · CentOS EOL 判据被摘成恒假（Vault 归档源永不给出，用户照着 NodeSource 再失败一次）',
+      file: 'deploy.sh',
+      anchor: 'centos_eol_repo() {\n  [[ "${OS_ID:-}" == "centos" ]] || return 1',
+      replacement: 'centos_eol_repo() {\n  return 1',
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * R59-02a：`centos_vault_hints()` 里的三步命令被删成只剩一句空话 ——
+       * 用户拿不到「换成 Vault 源」的可敲命令，等于这条修复没落地。
+       *
+       * ⚠️ 变异只删「清理并重建缓存」那一步（`dnf clean all` + `makecache`）：
+       * 这是三步里最容易被忽略、也最容易「看着像对、其实没生效」的一步 ——
+       * 只换源不清缓存，旧的 mirrorlist 元数据会继续作祟。台账用例专门钉了它。
+       * 实测 `fail=1`。
+       */
+      name: 'R59-02a · Vault 指引丢掉「清理并重建缓存」这一步（只换源不清缓存，元数据继续作祟）',
+      file: 'deploy.sh',
+      anchor: '  add_hint "      ${PM} clean all"\n  add_hint "      ${PM} makecache"\n',
+      replacement: '',
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * R59-03a：GitHub 拉不通时不再改用 Gitee 镜像 —— 退回「失败即 die」。
+       *
+       * 国内服务器拉 GitHub 常超时/TLS 被重置；镜像重试能省掉用户「手动换 --repo
+       * 再跑一遍」这一趟。
+       *
+       * ⚠️⭐ **必须两步一起撤**（这正是「护栏比名字弱」的标本）：`prepare_source`
+       * 里 `MIRROR_REPO_URL` 出现**两处** —— 自动重试那一行、以及失败提示里
+       * 「手动用镜像重跑」那一行。只撤前者时，`/MIRROR_REPO_URL/` 仍被后者满足 ⇒
+       * 第一版 `fail=0`（实测）。且判据也必须落在**执行的那一行**
+       * （`git clone --depth 1 "$MIRROR_REPO_URL"`），而不是「这个词出现过」。
+       * 两步同撤 + 判据收紧后 `fail=1`。
+       */
+      name: 'R59-03a · 克隆失败不再改用 Gitee 镜像重试（国内服务器拉 GitHub 失败即中断）',
+      file: 'deploy.sh',
+      mutations: [
+        {
+          anchor: '      if run git clone --depth 1 "$MIRROR_REPO_URL" "${tmp}/src"; then',
+          replacement: '      if false; then',
+        },
+        {
+          anchor: '      add_hint "     · 国内服务器推荐用 Gitee 镜像（脚本已自动试过，仍失败可手动重试）："\n      add_hint "       $(rerun_cmd --repo ${MIRROR_REPO_URL})"',
+          replacement: '      : # 镜像提示已移除',
+        },
+      ],
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
+    {
+      /*
        * 「界面显示 https://localhost:8443/dav/，WebDAV 用不了」两处根因之一：
        * Nginx 站点配置里的 /dav 反代只是一段**注释**（「应用内开启后取消注释」），
        * 于是 https://<域名>/dav/ 根本没人转发 → 404。把 location 行退回注释态即可复现。

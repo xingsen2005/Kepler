@@ -5,7 +5,7 @@
 > 本文件是**事后重建**的，不是随每次发版逐条维护的发布记录。项目虽托管在 GitHub（`origin` 可用、有提交历史），但提交历史**未按发布切分** —— 提交信息多为「bug fix」这类无信息量占位，也没有留存任何发布记录文档，因此：
 >
 > - **不给出任何发布日期**。版本标题写「日期未归档」，而不是填一个看起来合理的日期；
-> - 版本号的唯一事实源是 `package.json` 的 `version` 字段（当前 `1.8.4`）；
+> - 版本号的唯一事实源是 `package.json` 的 `version` 字段（当前 `1.8.5`）；
 > - `1.2.5` 之前各版本的**逐版本变更与发布日期均未归档**，本文件不追溯、不虚构；
 > - 可核实素材只有两处，都在 `Develop_Document.md`：**「六、审计发现台账（合并存档）」**（编号台账 `SEC-*` / `FUN-*` / `PERF-*` / `LOW-*` / `S*` / `P*`、历轮汇总）与**「审计后的行为变更」**小节。
 >
@@ -49,6 +49,32 @@
 - **修法**：`server/config-store.js` 新增 **`smtpSendConfig()`** —— 发信路径**唯一**的取配置入口（明文口令 + `configured` 判据一次给全），`server/email-code.js` 与 `server/routes/smtp.js` 一律改走它；「能不能发信」的判据抽成 `smtpConfigured()` 纯函数，供**对外视图**与**发信端**共用（判据分叉会表现成「路由放行并回『验证码已发送』，而发信端抛 503」）。
 - **护栏**：`tests/audit53-regressions.test.js` 新增第 ⑨ **取用层** 4 条 —— 落盘一份口令后真连一个**要求认证**的假 SMTP（沿用 `TLS-PSK` 免证书），断言它收到的 `AUTH PLAIN` 载荷就是那份口令、且验证码真的进了 DATA 正文；再走一次匿名 `POST /api/auth/forgot`，把「路由 → `email-code.js` → `smtp.js`」整条链路串起来（测试文件 32 → **36 条**，反向对照台账 +4 条 `R53-10a`~`R53-10d`）。
 - 本修复属**同一发布包内**的缺陷修复，**版本号不变**。
+
+## [1.8.5] - 日期未归档
+
+**部署脚本（`deploy.sh`）的两个真实安装故障修复**（用户工单，非审计轮，R59）。两处都是「首次安装必定失败，且失败信息里给的方案在本机照样装不上」。
+
+### 修复 · 已 EOL 的 CentOS 上 Node 必定装不上
+
+- **症状**：CentOS 8（及 CentOS 7）上首次安装，Node 安装**必定**失败；失败提示里给出的是 NodeSource for RHEL 系（`curl … rpm.nodesource.com/setup_20.x | bash - && dnf install -y nodejs --allowerasing`）—— 但这套方案**本机也装不上**，因为它同样要走 `dnf`。
+- **根因**：CentOS 8 已于 2021-12-31、CentOS 7 已于 2024-06-30 **EOL**，官方 yum 源（mirrorlist 与镜像站）整体下线，`dnf` 连元数据都取不到 ⇒ 换哪个包都装不上。这**不是**网络问题，也**不是** NodeSource 的问题。
+- **修法**：新增 `centos_eol_repo()` 判据（只在 **CentOS 7/8 且非 Stream** 上为真）与 `centos_vault_hints()`，在 Node 安装的三个失败出口（二进制下载失败 / 解压失败 / 三种方式都没装上）经 `node_eol_hints()` 追加**「改用 Vault 归档源」的三步可敲命令**：
+  ① 下载与本机版本匹配的 Vault 源文件（阿里云镜像 `mirrors.aliyun.com/repo/Centos-vault-<主版本>.repo`，版本从 `VERSION_ID` 现取，不写死）；
+  ② `dnf clean all` + `dnf makecache`（清理并重建缓存）；
+  ③ 重装 node（回到 NodeSource）。
+  并**建议用户迁移到 Rocky Linux / AlmaLinux 或 CentOS Stream**（Vault 只是权宜之计，EOL 机器收不到安全更新）。
+- 另在 `node_manual_hints()` 的 RHEL 系那段【A】提示**旁边**就地加一句警告（用 `centos_eol_repo` 门控，不会在 Rocky/Alma 上说错话）—— 用户报的正是「报错里给的方案在本机根本装不上」，不该让他照着再失败一次。
+
+### 修复 · GitHub 拉不通时没有国内替代方案
+
+- **症状**：国内服务器上 `git clone` GitHub 仓库常拉不通（连接超时 / TLS 被重置），部署中断在「源码拉取失败」，用户只能自己想办法。
+- **修法**：新增只读常量 `MIRROR_REPO_URL="https://gitee.com/xing_sen/kepler"`（Gitee 国内镜像，内容与 GitHub 同步）。`prepare_source()` 在克隆失败时，**若用的是默认地址**（用户没显式 `--repo`）则自动改用 Gitee 镜像**重试一次**；仍失败时，失败提示里给出「手动用 Gitee 镜像重跑」的可复制命令（`--repo <镜像地址>`）。⚠️ **门控是必需的**：用户显式 `--repo` 的地址是其意图（多为自建 fork），不该被自动顶成官方镜像。
+
+### 护栏与验证
+
+- `tests/deploy-script.test.js` 新增 3 条（45 → **48**）：① EOL 判据与 Vault 三步（**真跑 bash 片段**断言 `centos_eol_repo()` 只在 CentOS 7/8 命中、Stream/Rocky/RHEL 不命中）；② 提示必须在【A】旁边点破且用真函数门控；③ Gitee 镜像地址正确、重试带「当前地址 == 默认地址」门控、失败提示含可复制的重跑命令。
+- `scripts/reverse-check.js` 新增 `R59-01a` / `R59-02a` / `R59-03a` 三条反向对照（台账 711 → **714**），逐条实跑确认撤销后必红（各 `fail=1`）。
+- ⚠️ **一处判据污染教训**：Vault 指引的文字里原本写了 `mirrorlist.centos.org`，撞上既有护栏「不得再拿它当探针」（那条护栏扫的是**剥注释后的代码**，而提示文案也算代码）⇒ 已改写为不带该域名的措辞。
 
 ## [1.8.4] - 日期未归档
 

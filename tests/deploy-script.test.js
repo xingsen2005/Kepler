@@ -2239,3 +2239,127 @@ test('deploy.sh：交接前的预检与锁交接（R39-01e）', () => {
   assert(!/bash -n/.test(rn),
     '不得在 reinstall_now 里再写一份 shebang / bash -n 判据 —— 两份判据迟早漂移成两种行为');
 });
+
+/* ================================================================== *
+ * R59 · CentOS EOL（Vault 归档源）与 Gitee 国内镜像
+ * ================================================================== */
+
+/**
+ * 用户报的两件事（承接 deploy.sh 的安装体验）：
+ *
+ *  ㈠ 首次安装**必定**提示安装 Node 失败，而报错里已经给出「能装成功的方案」
+ *     （NodeSource for RHEL 系）。可这套方案在 **CentOS 8** 上照样失败 ——
+ *     因为 CentOS 8 已 EOL，官方 yum 源（mirrorlist.centos.org / mirror.centos.org）
+ *     整体下线，`dnf` 连元数据都取不到，换哪个包都装不上。正解是把源换成**归档源
+ *     （Vault）**：① 下载与本机版本匹配的 repo 文件 ② 清理并重建缓存 ③ 重装 node。
+ *     并应建议用户迁移到 Rocky / Alma / CentOS Stream。
+ *
+ *  ㈡ GitHub 仓库在国内服务器上常拉不通，需给出 **Gitee 国内镜像**
+ *     （https://gitee.com/xing_sen/kepler）这条替代路径。
+ *
+ * 两条都必须是「**判据落在实际执行的那一层**」：不能只断言「源码里有 Vault 这个词」，
+ * 那正是假绿的标本 —— 下面用真跑 bash 片段来证明 `centos_eol_repo()` 真的只在
+ * CentOS 7/8（非 Stream）上返回 0。
+ */
+
+test('deploy.sh：已 EOL 的 CentOS 必须给出 Vault（归档源）方案，而不是让用户照着 NodeSource 再失败一次', async () => {
+  const src = readDeploy();
+  assert(hasFn(src, 'centos_eol_repo'),
+    '必须有 centos_eol_repo() 具名判据：只在确定 EOL 的 CentOS 7/8 上为真');
+  assert(hasFn(src, 'centos_vault_hints'),
+    '必须有 centos_vault_hints()：把「改成 Vault 源」的三步可敲命令集中在一处');
+  assert(hasFn(src, 'node_eol_hints'),
+    '必须有 node_eol_hints()：与 node_conflict_hints 同型，只在失败出口调用');
+
+  // ① 判据必须落在 install_node 的失败出口（node_manual_hints 之后），
+  //    否则 HINTS=() 会把它冲掉 —— 与 R40 的 node_conflict_hints 同一条坑。
+  const body = codeOnly(fnBody(src, 'install_node'));
+  assert(/node_eol_hints/.test(body),
+    'install_node 的失败出口必须调用 node_eol_hints —— 否则 EOL 专因根本到不了用户眼前');
+  const iManual = body.lastIndexOf('node_manual_hints');
+  const iEol = body.lastIndexOf('node_eol_hints');
+  assert(iManual !== -1 && iEol !== -1 && iManual < iEol,
+    'node_eol_hints 必须在 node_manual_hints **之后**调用：后者会 HINTS=() 清空，提前 add 会被冲掉');
+
+  // ② 三步命令必须齐全且用 VERSION_ID 现取版本（不写死 8）。
+  const vault = codeOnly(fnBody(src, 'centos_vault_hints'));
+  assert(/mirrors\.aliyun\.com\/repo\/Centos-vault-/.test(vault),
+    'Vault 源文件必须走阿里云镜像（官方 vault.centos.org 国内慢/不通）：'
+    + '这是用户点名要的解法，也是国内服务器真正拉得动的地址');
+  assert(/VERSION_ID/.test(vault),
+    'Vault 源地址必须按 VERSION_ID 现取版本，不得写死 —— 同一段代码要服务 7 与 8');
+  assert(/\bclean all\b/.test(vault) && /\bmakecache\b/.test(vault),
+    '必须给出「清理并重建缓存」两步（dnf clean all + dnf makecache）：'
+    + '只换源不清缓存，旧的 mirrorlist 元数据会继续作祟');
+  assert(/setup_20\.x/.test(vault),
+    '第 ③ 步必须回到「重装 node」——三步是一套完整可敲的动作，缺了它用户不知道换完源之后干嘛');
+  assert(/Rocky|Alma/.test(vault) && /CentOS Stream/.test(vault),
+    '必须建议迁移到 Rocky / Alma / CentOS Stream：Vault 只是权宜之计，EOL 的机器收不到安全更新');
+
+  // ③ 判据本身真跑：centos_eol_repo 只在 CentOS 7/8（非 Stream）上为真。
+  //    这是「判据落在实际执行的那一层」——源码里有 `return 0` 字样不代表它真会返回 0。
+  const r = await spawnBashSnippet(`
+set -Eeuo pipefail
+source ./deploy.sh
+trap - ERR
+set +e
+chk() { OS_ID="$1"; OS_NAME="$2"; VERSION_ID="$3"; centos_eol_repo && printf 'EOL=%s|%s|%s\\n' "$1" "$2" "$3"; }
+chk centos "CentOS Linux 8" "8"
+chk centos "CentOS Linux 7 (Core)" "7"
+chk centos "CentOS Stream 8" "8"
+chk centos "CentOS Linux 9" "9"
+chk rocky  "Rocky Linux 8.9 (Green Obsidian)" "8.9"
+chk rhel   "Red Hat Enterprise Linux 8.9 (Ootpa)" "8.9"
+printf 'END\\n'
+`);
+  if (r.unavailable) return;
+  const lines = (r.out + r.err).split('\n').filter((l) => l.startsWith('EOL='));
+  assert.strictEqual(lines.length, 2,
+    `centos_eol_repo 只应在 CentOS 7 / 8 上为真（实测命中 ${lines.length} 条）：${lines.join(' / ')}`);
+  assert(lines.some((l) => l.includes('|8')) && lines.some((l) => l.includes('|7')),
+    'CentOS 7 与 8 都必须命中（两者的官方源都已下线）');
+  assert(!lines.some((l) => /Stream/.test(l)),
+    'CentOS Stream 仍在维护，绝不能命中 —— 误报会让用户把好机器当成 EOL 去改源');
+  assert(!lines.some((l) => /rocky|rhel/i.test(l)),
+    'Rocky / RHEL 不得命中：它们的源仍在维护，改 Vault 反而是破坏');
+});
+
+test('deploy.sh：NodeSource 之外的 CentOS EOL 说明必须在【A】旁边点破（不让用户照着失败方案再试一次）', () => {
+  const hints = codeOnly(fnBody(readDeploy(), 'node_manual_hints'));
+  // 只在「已 EOL 的 CentOS」上追加那句警告 —— 用真函数门控，不能无条件打印。
+  assert(/centos_eol_repo/.test(hints),
+    'node_manual_hints 必须用 centos_eol_repo 门控 EOL 警告：无条件打印会在 Rocky/Alma 上说错话');
+  assert(/Vault/.test(hints),
+    'RHEL 系那段提示里要点破「本机源已随 EOL 下线，【A】会失败，请走 Vault」——'
+    + '这正是用户第一条诉求：报错里给的方案在本机根本装不上');
+});
+
+test('deploy.sh：GitHub 拉不通时自动改用 Gitee 国内镜像重试（且不误伤用户显式 --repo）', async () => {
+  const src = readDeploy();
+  const m = /^readonly MIRROR_REPO_URL="([^"]+)"/m.exec(src);
+  assert(m, '必须定义只读的 MIRROR_REPO_URL（Gitee 国内镜像地址）');
+  assert(m[1] === 'https://gitee.com/xing_sen/kepler',
+    `MIRROR_REPO_URL 必须是用户指定的 Gitee 地址，实际：${m[1]}`);
+  // 镜像地址不得等于默认地址，否则「重试」只是把同一个打不通的地址再试一遍。
+  const def = /^readonly DEFAULT_REPO_URL="([^"]+)"/m.exec(src);
+  assert(def && def[1] !== m[1], 'Gitee 镜像必须与默认的 GitHub 地址不同');
+
+  const body = codeOnly(fnBody(src, 'prepare_source'));
+  assert(/MIRROR_REPO_URL/.test(body),
+    'prepare_source 必须在克隆失败时改用 Gitee 镜像重试');
+  // 门控：只在「用的是默认地址」时才自动替换 —— 用户显式 --repo 的地址是其意图，不该被顶掉。
+  assert(/"\$REPO_URL" == "\$DEFAULT_REPO_URL"/.test(body),
+    '镜像重试必须以「当前地址 == 默认地址」为前置：用户显式 --repo 的 fork 不该被换成官方镜像');
+  /**
+   * ⚠️ 必须断言**镜像克隆真的被调用**（`git clone … "$MIRROR_REPO_URL"`），而不是
+   * 只查 `MIRROR_REPO_URL` 这个词出现过 —— 后者会被**失败提示**里那句「手动用镜像
+   * 重跑」满足，于是「自动重试被删掉」也照样全绿（实测：只把 `if` 改成 `if false`
+   * 时 `fail=0`，正是「护栏比名字弱」的标本）。这里要求的是**执行的那一行**。
+   */
+  assert(/git clone --depth 1 "\$MIRROR_REPO_URL"/.test(body),
+    '失败后必须**真的执行** `git clone --depth 1 "$MIRROR_REPO_URL"` 重试：'
+    + '只断言常量名出现过会被失败提示里的同名字样满足（假绿）');
+  // 失败出口的提示里也要给出「手动换镜像」这一条，且带上可复制的重跑命令。
+  assert(/--repo \$\{MIRROR_REPO_URL\}/.test(body),
+    '失败提示里必须给出「手动用 Gitee 镜像重跑」的可复制命令 —— 自动重试也失败时这是最后一根稻草');
+});

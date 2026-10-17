@@ -89,6 +89,10 @@ readonly STATE_DIR="/etc/${SERVICE_NAME}"
 readonly STATE_FILE="${STATE_DIR}/deploy.conf"
 readonly GLOBAL_COMMAND="/usr/local/bin/${SERVICE_NAME}"
 readonly DEFAULT_REPO_URL="https://github.com/xingsen2005/Kepler.git"
+# 国内镜像（Gitee）。GitHub 在国内服务器上经常拉不通（连接超时 / TLS 被重置），
+# 故克隆失败时自动改用同仓库的 Gitee 镜像重试一次 —— 内容与 GitHub 同步。
+# 只在「用户没显式指定 --repo」时启用（显式指定的地址是用户的意图，不该被替换）。
+readonly MIRROR_REPO_URL="https://gitee.com/xing_sen/kepler"
 # 历史默认仓库地址（账号/仓库迁移前的值）。老安装机的 ${STATE_FILE} 里仍留着它，
 # 而旧仓库现已不存在（git clone 会 404）。load_state 会把「恰好等于历史默认值」的
 # 地址翻译成当前默认值，避免重装时拉一个死仓库；用户自建 fork 的地址不在其列、原样保留。
@@ -1324,6 +1328,51 @@ node_tarball_base() {
   if [[ "$MIRROR" == "cn" ]]; then printf '%s' "https://registry.npmmirror.com/-/binary/node"; else printf '%s' "https://nodejs.org/dist"; fi
 }
 
+# 本机是否是「已 EOL、官方源已下线」的 CentOS？
+#
+# CentOS 8 于 2021-12-31、CentOS 7 于 2024-06-30 先后 EOL，官方 mirrorlist 与
+# `mirror.centos.org` 已下线 ⇒ `dnf install` 任何包都会报
+#   Failed to download metadata for repo 'appstream': Cannot prepare internal mirrorlist
+# 这**不是**网络问题，也**不是** NodeSource 的问题：源本身没了，换哪个包都装不上。
+# 判据取 OS_ID（centos）+ 主版本（7/8）—— 只对这些确定 EOL 的版本给 Vault 方案，
+# 不去猜别的发行版。CentOS Stream 8/9 仍在维护，不在其列（ID 也是 centos，故还要排掉
+# "stream"：os-release 里 CentOS Stream 的 VERSION 含 "Stream"，用 PRETTY_NAME 兜一层）。
+centos_eol_repo() {
+  [[ "${OS_ID:-}" == "centos" ]] || return 1
+  case "${OS_NAME:-}" in *Stream*) return 1 ;; esac
+  local major="${VERSION_ID:-}"; major="${major%%.*}"
+  case "$major" in 7|8) return 0 ;; *) return 1 ;; esac
+}
+
+# 「官方源已 EOL」时把 CentOS 换到 Vault（归档源）的可敲命令。
+#
+# 用户报的场景：CentOS 8 上 `dnf install` nodejs 失败，报错里给出的是 NodeSource，
+# 但 NodeSource 也要走 dnf 装包 ⇒ 源没了照样装不上。方案是把已归档版本指到
+# 阿里云的 Vault 镜像（官方 vault.centos.org 国内慢/不通），三步：
+#   ① 下载与本机版本匹配的 CentOS-Vault.repo（从 mirrorlist 换到归档地址）
+#   ② 清理并重建缓存（--disablerepo 掉已失效的 mirrorlist 源）
+#   ③ 重新装 node
+# 版本号从 VERSION_ID 现取（7/8），不写死。
+centos_vault_hints() {
+  local major="${VERSION_ID:-}"; major="${major%%.*}"
+  add_hint ""
+  add_hint "  【EOL 专因】本机是 CentOS ${major}，该版本已停止维护（EOL），"
+  add_hint "  官方 yum 源（镜像列表 mirrorlist 与镜像站 mirror）早已整体下线 —— 故 dnf 连"
+  add_hint "  元数据都取不到，NodeSource 装不上【不是】网络或 NodeSource 的问题。"
+  add_hint "  先把源换成「归档源（Vault）」，再装 node（阿里云镜像，国内可达）："
+  add_hint "    ① 下载与本机版本匹配的 Vault 源文件"
+  add_hint "      curl -fsSL -o /etc/yum.repos.d/CentOS-Vault.repo \\"
+  add_hint "        https://mirrors.aliyun.com/repo/Centos-vault-${major}.repo"
+  add_hint "    ② 清理并重建缓存"
+  add_hint "      ${PM} clean all"
+  add_hint "      ${PM} makecache"
+  add_hint "    ③ 重新安装 Node.js"
+  add_hint "      curl -fsSL https://rpm.nodesource.com/setup_20.x | bash -"
+  add_hint "      ${PM} install -y nodejs --allowerasing"
+  add_hint "  ⚠️ 只是权宜之计：CentOS ${major} 已不再收到安全更新，务必尽快迁移到"
+  add_hint "  Rocky Linux / AlmaLinux（1:1 兼容的重建版）或 CentOS Stream（滚动维护版）。"
+}
+
 # Node.js 手动安装指引（自动安装失败 / --skip-node 版本不足时给出）
 node_manual_hints() {
   local arch="${NODE_ARCH:-x64}"
@@ -1338,7 +1387,14 @@ node_manual_hints() {
     dnf|yum)
       add_hint "  【A】NodeSource（RHEL/CentOS/Rocky/Alma —— 与本机匹配）"
       add_hint "    curl -fsSL https://rpm.nodesource.com/setup_20.x | bash -"
-      add_hint "    ${PM} install -y nodejs --allowerasing" ;;
+      add_hint "    ${PM} install -y nodejs --allowerasing"
+      # 已 EOL 的 CentOS 上，【A】一定装不上（源没了）—— 直接把 Vault 方案摆在紧后面，
+      # 而不是让用户照着【A】再失败一次。
+      if centos_eol_repo; then
+        add_hint ""
+        add_hint "  ⚠️ 注意：本机 CentOS 的官方源已随 EOL 下线，【A】会因源不可用而失败 ——"
+        add_hint "  请直接看下面的【EOL 专因】改用 Vault 归档源。"
+      fi ;;
     *)
       add_hint "  【A】发行版源：$(pm_install_cmd) nodejs npm" ;;
   esac
@@ -1389,6 +1445,12 @@ node_conflict_hints() {
   add_hint "    （若第 2 步卸不掉：说明有别的包依赖它，看 ${PM} repoquery --whatrequires nodejs）"
   add_hint "    · 不想动系统包就用下面【C】的官方二进制包：它装进 /usr/local，"
   add_hint "      完全不经过包管理器，与系统里那份 nodejs 互不冲突 —— 最省事的一条路。"
+}
+
+# 失败出口上，若本机是已 EOL 的 CentOS，把 Vault 方案补进 HINTS。
+# 与 node_conflict_hints 同型：只在 node_manual_hints 之后调用（它会 HINTS=() 清空）。
+node_eol_hints() {
+  if centos_eol_repo; then centos_vault_hints; fi
 }
 
 # RPM 系装 nodejs 时**额外要带的参数**（唯一实现点）。
@@ -1500,6 +1562,7 @@ install_node() {
     rm -rf "$tmp"
     node_manual_hints
     if ((node_conflict)); then node_conflict_hints; fi
+    node_eol_hints
     HINTS+=("" "下载失败的地址：${url}" "  检查连通性：curl -sI ${url} -m 8 ; echo \$?")
     die_with_hint "Node.js 二进制包下载失败" "${HINTS[@]}"
   fi
@@ -1512,6 +1575,7 @@ install_node() {
     add_hint "  curl -fsSL -o /tmp/node.tar.gz ${url}"
     add_hint "  tar -xzf /tmp/node.tar.gz -C /usr/local --strip-components=1"
     add_hint "  常见原因：/usr/local 不可写、tar 不支持 gzip、下载的其实是 HTML 错误页（用 file /tmp/node.tar.gz 看看）"
+    node_eol_hints
     die_with_hint "Node.js 解压到 /usr/local 失败" "${HINTS[@]}"
   fi
   if have ldconfig; then run_soft ldconfig; fi
@@ -1519,6 +1583,7 @@ install_node() {
   if [[ -z "$NODE_BIN" ]] || ! version_ge "$("$NODE_BIN" -v | sed 's/^v//' || true)" "$required"; then
     node_manual_hints
     if ((node_conflict)); then node_conflict_hints; fi
+    node_eol_hints
     die_with_hint "Node.js 自动安装失败（三种方式都没装上 v${required}+）" "${HINTS[@]}"
   fi
   ok "Node.js 安装完成（二进制包）：$("$NODE_BIN" -v) → ${NODE_BIN}"
@@ -1578,12 +1643,30 @@ prepare_source() {
   local tmp; tmp="$(mktemp -d)"
   info "未发现本地源码，从仓库拉取：${REPO_URL}"
   if ! run git clone --depth 1 "$REPO_URL" "${tmp}/src"; then
+    # GitHub 在国内服务器上常拉不通 —— 若用的是默认地址（用户没显式 --repo），
+    # 自动改用同仓库的 Gitee 国内镜像重试一次。镜像与 GitHub 内容同步，
+    # 能省掉用户「手动换 --repo 再跑一遍」这一趟。
+    if [[ "$REPO_URL" == "$DEFAULT_REPO_URL" ]]; then
+      warn "从默认仓库拉取失败，改用国内镜像（Gitee）重试：${MIRROR_REPO_URL}"
+      rm -rf "${tmp}/src"
+      if run git clone --depth 1 "$MIRROR_REPO_URL" "${tmp}/src"; then
+        info "已从 Gitee 镜像拉取成功（若需长期使用可在部署状态里用 --repo 固定该地址）。"
+        SRC_DIR="${tmp}/src"
+        SRC_TMP_DIR="$tmp"
+        return 0
+      fi
+      warn "Gitee 镜像仍拉取失败。"
+    fi
     rm -rf "$tmp"
     HINTS=()
     local l
     while IFS= read -r l; do [[ -n "$l" ]] && add_hint "  日志 | ${l}"; done <<<"$(log_key_lines 5)"
     add_hint ""
     add_hint "  1) 换可访问的仓库：--repo <git 地址>"
+    if [[ "$REPO_URL" == "$DEFAULT_REPO_URL" ]]; then
+      add_hint "     · 国内服务器推荐用 Gitee 镜像（脚本已自动试过，仍失败可手动重试）："
+      add_hint "       $(rerun_cmd --repo ${MIRROR_REPO_URL})"
+    fi
     add_hint "  2) 或先把项目上传/解压到服务器，再在该目录内执行本脚本（脚本会自动识别同目录源码）"
     add_hint "  3) 检查网络：curl -sI https://github.com -m 8 ; echo \$?"
     die_with_hint "源码拉取失败（${REPO_URL}）" "${HINTS[@]}"
