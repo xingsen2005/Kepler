@@ -2792,8 +2792,8 @@ acme_failure_hints() {
     add_hint "  【判断】这家 CA 要求 EAB（外部账户绑定）凭据，当前缺失或不被接受。"
     acme_eab_lines
   elif grep -qiE 'acme\.sh 安装失败|下载到的 (文件|acme\.sh)' <<<"$tail_log"; then
-    add_hint "  【判断】acme.sh 本体没装上（官方源在 GitHub，官方安装器就是从那儿取文件）。"
-    add_hint "  脚本已自动尝试 gitee 镜像仍失败 —— 多半是这台机器的出口对两个源都不通。"
+    add_hint "  【判断】acme.sh 本体没装上（**首选国内镜像** gitee.com/neilpang/acme.sh，官方 GitHub 源仅作兜底）。"
+    add_hint "  脚本已自动试过国内镜像与官方源仍失败 —— 多半是这台机器的出口对两个源都不通。"
     add_hint "  手工装好后再重跑（二选一）："
     add_hint "    ① gitee 克隆：git clone https://gitee.com/neilpang/acme.sh.git /root/acme-sh-src && cd /root/acme-sh-src && ./acme.sh --install -m ${EMAIL}"
     add_hint "    ② 任何能上网的机器下载后传到服务器：https://gitee.com/neilpang/acme.sh/raw/master/acme.sh → 放到 ${ACME_HOME}/acme.sh（chmod 0700）"
@@ -2935,32 +2935,46 @@ acme_install_cert() {
 # 不支持 EAB 参数），最后必然签不到证书。所以这里：
 #   1) 不用 `curl … | sh`：管道会把左侧下载失败吞掉（$? 取到右侧 sh 的 0），
 #      404/错误页也可能被当成脚本执行 —— 与 D1-06 同一条教训；
-#   2) 官方源失败自动改走 gitee 镜像（acme.sh 官方 wiki《Install in China》给的地址）；
-#   3) 落盘后双检：首行 shebang（拦「内容不是脚本」）+ bash -n（拦「是脚本但被截断」）。
+#   2) **首选国内镜像**（Gitee 上 acme.sh 作者 neilpang 维护的官方仓库镜像），
+#      GitHub 官方源（raw.githubusercontent.com）反而降为**兜底** —— 国内服务器连
+#      官方源常要白等一个 connect-timeout 甚至直接失败，把它放在首选等于每次部署
+#      都先赔上一次超时（这正是「明明有国内镜像却仍偶发装不上」的由来）；
+#   3) 落盘后**三重校验**：首行 shebang（拦「内容不是脚本」）+ `VER=` 版本行
+#      （拦「镜像返回了不相关的脚本」）+ bash -n（拦「是脚本但被截断」）。
 install_acme_sh() {
   if [[ -s "$(acme_bin)" ]]; then return 0; fi
   have curl || { warn "缺少 curl，无法安装 acme.sh。"; return 1; }
   mkdir -p "$ACME_HOME"
   local tmp; tmp="$(mktemp "${ACME_HOME}/.acme.sh.download.XXXXXX")"
   local src=""
+  # ⚠️ 顺序即策略：国内镜像在前、官方源在后。不要「为了稳妥」改回官方优先 ——
+  # 那会让每一台国内服务器都先撞一次 GitHub 超时，与本次修复的目标正好相反。
   if run curl -fsSL --connect-timeout 15 -o "$tmp" \
-       https://raw.githubusercontent.com/acmesh-official/acme.sh/master/acme.sh; then
-    src="官方源（GitHub）"
+       https://gitee.com/neilpang/acme.sh/raw/master/acme.sh; then
+    src="国内镜像（Gitee）"
   else
-    warn "从官方源（raw.githubusercontent.com）下载 acme.sh 失败（国内服务器常见），改用 gitee 镜像…"
+    warn "从国内镜像（gitee.com/neilpang/acme.sh）下载 acme.sh 失败，改用官方源（GitHub）…"
     if run curl -fsSL --connect-timeout 15 -o "$tmp" \
-         https://gitee.com/neilpang/acme.sh/raw/master/acme.sh; then
-      src="gitee 镜像"
+         https://raw.githubusercontent.com/acmesh-official/acme.sh/master/acme.sh; then
+      src="官方源（GitHub）"
     else
       rm -f "$tmp"
-      warn "acme.sh 安装失败：官方源与 gitee 镜像都连不上。"
+      warn "acme.sh 安装失败：国内镜像与官方源都连不上。"
       return 1
     fi
   fi
-  # 双检（缺一不可）：shebang 拦「镜像返回了错误页」，bash -n 拦「脚本被截断」
+  # 三重校验（缺一不可）：shebang 拦「镜像返回了错误页」、VER= 拦「拿到的是别的脚本」、
+  # bash -n 拦「脚本被截断」。少任意一条，被污染的内容都可能被当成安装脚本执行。
   if [[ "$(head -c 2 "$tmp")" != '#!' ]]; then
     rm -f "$tmp"
     warn "下载到的文件不是脚本（首行不是 shebang），已丢弃：${src}"
+    return 1
+  fi
+  # acme.sh 源码第 3 行就是 `VER=x.y.z`（实测 3.1.5）—— 用它确认「拿到的确实是
+  # acme.sh」而不是某个同样带 shebang 的无关脚本（镜像劫持 / 目录页伪装都能过 shebang 检查）。
+  if ! grep -q '^VER=' "$tmp"; then
+    rm -f "$tmp"
+    warn "下载到的文件不像 acme.sh（缺 VER= 版本行），已丢弃：${src}"
     return 1
   fi
   if ! bash -n "$tmp"; then

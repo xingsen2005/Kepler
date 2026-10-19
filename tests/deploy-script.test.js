@@ -1153,6 +1153,66 @@ test('deploy.sh：acme.sh 的安装必须「先落盘校验再安装」，且带
     '不跑官方 --install（它会写 root 的 crontab），续期任务自己落 /etc/cron.d，必须带 --cron --home');
 });
 
+test('deploy.sh：acme.sh 下载必须「国内镜像优先」，GitHub 官方源仅作兜底', async () => {
+  // 背景（R60）：上一版是「官方源优先 + gitee 兜底」。国内服务器每次部署都要先撞一次
+  // raw.githubusercontent.com 的 connect-timeout（15s，丢包时更久），甚至直接失败——
+  // 明明有国内镜像却仍然「偶发装不上」，根因就是这个顺序。
+  //
+  // ⚠️ 判据必须落在「**第一个被执行的下载地址**」上，而不是「gitee 出现过」：
+  // 只把两个 URL 换位置、或让 gitee 仍出现在兜底分支里，`/gitee/` 都能满足 ⇒ 假绿。
+  const body = codeOnly(fnBody(readDeploy(), 'install_acme_sh'));
+
+  const urls = [...body.matchAll(/https:\/\/[^\s"';]+/g)].map((m) => m[0]);
+  assert(urls.length >= 2, `install_acme_sh 里应有两个下载源，实际：${JSON.stringify(urls)}`);
+  assert.strictEqual(urls[0], 'https://gitee.com/neilpang/acme.sh/raw/master/acme.sh',
+    `第一个尝试的下载地址必须是国内镜像，否则每台国内服务器都先白等一次 GitHub 超时；实际第一个：${urls[0]}`);
+  assert(urls.includes('https://raw.githubusercontent.com/acmesh-official/acme.sh/master/acme.sh'),
+    '国内镜像失败时仍要保留官方源兜底 —— 镜像临时异常就彻底装不上 acme.sh');
+  // 内容指纹：只查 shebang 会放过「同样是 #! 开头的无关脚本」；acme.sh 第 3 行是 VER=
+  assert(/grep -q '\^VER='/.test(body),
+    '落盘后必须查 VER= 版本行：shebang 只拦「不是脚本」，拦不住「是脚本但不是 acme.sh」');
+
+  // 行为验证：假 curl 只记录**实际被请求的 URL**，证明顺序不是抄在注释里。
+  const r = await spawnBashSnippet(`
+set -Eeuo pipefail
+source ./deploy.sh
+trap - ERR
+# 只替换「日志包装层」run()：它会把输出重定向到 /var/log（开发机 / CI 不可写，
+# 而 LOG_FILE 是 readonly，改不了）。被测的下载顺序原样执行 —— 与前端沙箱里替换
+# toast / openModal 同一口径，不碰被测逻辑本身。
+run() { "$@"; }
+T="$(mktemp -d)"
+# ⚠️ Git-Bash 的 mktemp 返回 Windows 路径（C:\\Users\\…）；直接塞进 PATH 会被 ':' 按
+# 盘符拆开，导致假 curl 永远轮不到（实测退化成真实 curl，白等 15s 超时）。统一转 POSIX。
+TP="$(cygpath -u "$T" 2>/dev/null || printf '%s' "$T")"
+trap 'rm -rf "$T"' EXIT
+mkdir -p "$TP/bin" "$TP/acme"
+cat > "$TP/bin/curl" <<'FAKE'
+#!/bin/sh
+out=""; url=""; prev=""
+for a in "$@"; do
+  [ "$prev" = "-o" ] && out="$a"
+  case "$a" in http*) url="$a" ;; esac
+  prev="$a"
+done
+printf '%s\\n' "$url" >> "$CURL_LOG"
+printf '#!/bin/sh\\nVER=9.9.9\\n' > "$out"
+exit 0
+FAKE
+chmod +x "$TP/bin/curl"
+export CURL_LOG="$TP/urls.txt"
+export PATH="$TP/bin:$PATH"
+export ACME_HOME="$TP/acme"
+install_acme_sh >/dev/null 2>&1 || true
+cat "$CURL_LOG" 2>/dev/null || echo "(no url)"
+`, {});
+  const tried = (r.out || '').trim().split('\n').filter(Boolean);
+  assert.strictEqual(tried[0], 'https://gitee.com/neilpang/acme.sh/raw/master/acme.sh',
+    `实际执行的第一个下载地址必须是国内镜像（假 curl 记录到：${JSON.stringify(tried)}；err=${(r.err || '').slice(0, 300)}）`);
+  assert.strictEqual(tried.length, 1,
+    `国内镜像成功时不该再去请求 GitHub（实际请求序列：${JSON.stringify(tried)}）`);
+});
+
 test('deploy.sh：默认 CA 必须是 zerossl，且旧状态残留 letsencrypt 时要主动提醒换 CA', async () => {
   // 背景：用户在公共后缀域名（*.l.cd）上反复用 LE 被 rateLimited 拒签，明确要求「不要再使用 LE」。
   // 但之前跑 LE 时状态文件已持久化 CA_PROVIDER=letsencrypt，即使把默认值改成 zerossl，

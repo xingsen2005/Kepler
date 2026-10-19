@@ -1594,6 +1594,35 @@ const CASES = [
     },
     {
       /*
+       * R60-01a：把 acme.sh 的下载源换回「官方 GitHub 优先 + gitee 兜底」。
+       *
+       * 这正是本次修复要消灭的形态：国内服务器每次部署都先撞一次
+       * raw.githubusercontent.com 的 connect-timeout（15s，丢包时更久），
+       * 明明有国内镜像却「偶发装不上」。
+       *
+       * ⚠️ 必须用**缩进**区分两行 URL（主分支 7 空格、兜底分支 9 空格）：
+       * 若锚点不带缩进，9 空格行里就包含「7 空格 + URL」这个子串，
+       * `String.replace` 只替首处 ⇒ 第二步会改错行、两步互相抵消 ⇒ `fail=0` 假绿。
+       * 顺序也关键：先把「兜底」换成 gitee，再把「主分支」换成 github ——
+       * 反过来第二步会命中刚换成 github 的主分支，而不是兜底。
+       */
+      name: 'R60-01a · acme.sh 下载换回「GitHub 官方源优先」（国内服务器先白等一次超时）',
+      file: 'deploy.sh',
+      mutations: [
+        {
+          anchor: '         https://raw.githubusercontent.com/acmesh-official/acme.sh/master/acme.sh; then',
+          replacement: '         https://gitee.com/neilpang/acme.sh/raw/master/acme.sh; then',
+        },
+        {
+          anchor: '       https://gitee.com/neilpang/acme.sh/raw/master/acme.sh; then',
+          replacement: '       https://raw.githubusercontent.com/acmesh-official/acme.sh/master/acme.sh; then',
+        },
+      ],
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
+    {
+      /*
        * 把速率限制判据退回「只认 rate limit / too many / exceeded」，漏掉 acme.sh 实际的
        * 驼峰措辞 rateLimited、Le_OrderFinalize、429。后果：acme.sh 被限流时的日志（
        * error:rateLimited / status 429）匹配不到限流分支，掉进「未能识别」兜底，
