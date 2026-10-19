@@ -404,12 +404,24 @@ function renderPage(res, status, { title, head, body, wide }) {
   .pay-orig { text-align: center; color: #9aa1ab; font-size: 14px; text-decoration: line-through;
     text-decoration-thickness: 1px; margin-top: 6px; }
   .pay-cap { text-align: center; color: #8a8f98; font-size: 12px; }
-  /* R62：券码输入行。与支付表单分成两个 <form>（HTML 不允许嵌套表单） */
-  .coupon-form { display: flex; gap: 8px; align-items: center; margin: 14px 0 2px; }
-  .coupon-form input[type=text] { flex: 1; min-width: 0; border: 1px solid #d5dbe3; border-radius: 8px;
-    padding: 9px 11px; font-size: 13px; outline: none; letter-spacing: .06em; }
+  /* R62：优惠券折叠块 —— 默认收起，点「使用优惠券」展开。
+     用原生 <details>/<summary>：分享页是服务端渲染、且 CSP 不允许内联脚本，
+     原生折叠是这里唯一「零脚本且一定能用」的形态。 */
+  .coupon-box { margin-top: 14px; border: 1px solid #d5dbe3; border-radius: 8px; padding: 0 12px; }
+  .coupon-box summary { cursor: pointer; padding: 11px 0; font-size: 13px; color: #0067c0;
+    list-style: none; outline: none; user-select: none; }
+  .coupon-box summary::-webkit-details-marker { display: none; }
+  .coupon-box summary::before { content: '＋ '; }
+  .coupon-box[open] summary::before { content: '－ '; }
+  .coupon-form { display: flex; gap: 8px; align-items: center; padding: 0 0 12px; margin: 0; }
+  .coupon-form input[type=text] { flex: 1 1 auto; min-width: 0; width: auto;
+    border: 1px solid #d5dbe3; border-radius: 8px; padding: 9px 11px; font-size: 13px;
+    outline: none; letter-spacing: .06em; }
   .coupon-form input[type=text]:focus { border-color: #0067c0; box-shadow: 0 0 0 3px rgba(0,103,192,.12); }
-  .coupon-form .btn { margin-top: 0; white-space: nowrap; }
+  /* ⚠️ .btn 的基础样式是 display:block; width:100% —— 放进 flex 行会把输入框挤成一条
+     （实测截图里就是一个几十像素的空盒子）。这里必须显式改成「按内容自适应、不收缩」。 */
+  .coupon-form .btn { flex: 0 0 auto; width: auto; margin: 0; padding: 9px 14px;
+    font-size: 13px; white-space: nowrap; }
   .pay-opts { margin: 16px 0 2px; }
   .pay-opt { display: flex; align-items: center; gap: 9px; padding: 11px 12px;
     border: 1px solid #d5dbe3; border-radius: 8px; margin-bottom: 8px; cursor: pointer; font-size: 14px; }
@@ -560,15 +572,26 @@ function payPage(res, l, ps, available, err, note = '', coupon = null) {
   // R62 需求 6：券无效时就地给出对应提示（未开始 / 已过期 / 已用尽 / 不适用 / 已用过…）
   const couponWarn = c && !c.ok ? `<div class="warn">${esc(c.message || '优惠券无效')}</div>` : '';
   /**
-   * ⚠️ 券表单必须**独立于支付表单**：HTML 不允许嵌套 `<form>`，浏览器会静默丢掉内层，
-   * 表现就是「点应用没反应」。因此它排在支付表单之前、自带一个提交按钮。
+   * R62（UI 修正）：券码区放在「立即支付」**下方**，且**默认折叠**成一行「使用优惠券」。
+   *
+   * 三个理由：
+   *  · 未用券的用户占多数，一整行输入框 + 按钮摆在价格与支付方式之间，会把
+   *    「选支付方式 → 立即支付」这条主路径打断；
+   *  · 折叠用原生 `<details>`，**不需要任何脚本**（分享页 CSP 不允许内联脚本）；
+   *  · 只有「已选券」或「券无效」时才默认展开 —— 那两种情况用户必须看到输入框。
+   *
+   * ⚠️ 它必须**独立于支付表单**（HTML 不允许嵌套 `<form>`），且排在支付表单之后。
    */
-  const couponForm = `
-      <form method="POST" action="/s/${esc(l.id)}/coupon" class="coupon-form">
-        <input type="text" name="code" value="${c && c.code ? esc(c.code) : ''}" placeholder="优惠券码（可选）" maxlength="32" autocomplete="off" spellcheck="false">
-        <button class="btn small" type="submit">${applied ? '更换' : '应用'}</button>
-        ${applied ? '<button class="btn small ghost" type="submit" name="clear" value="1">不使用</button>' : ''}
-      </form>`;
+  const couponBox = `
+      <details class="coupon-box"${c ? ' open' : ''}>
+        <summary>${applied ? '已使用优惠券（点击更换或取消）' : '使用优惠券'}</summary>
+        ${couponWarn}
+        <form method="POST" action="/s/${esc(l.id)}/coupon" class="coupon-form">
+          <input type="text" name="code" value="${c && c.code ? esc(c.code) : ''}" placeholder="请输入优惠券码" maxlength="32" autocomplete="off" spellcheck="false">
+          <button class="btn" type="submit">${applied ? '更换' : '应用'}</button>
+          ${applied ? '<button class="btn ghost" type="submit" name="clear" value="1">不使用</button>' : ''}
+        </form>
+      </details>`;
   renderPage(res, err ? 400 : 200, {
     title: '付费下载',
     head: `<div class="center-head">
@@ -579,14 +602,13 @@ function payPage(res, l, ps, available, err, note = '', coupon = null) {
     body: `
       ${err ? `<div class="warn">${esc(err)}</div>` : ''}
       ${note ? `<div class="warn">${esc(note)}</div>` : ''}
-      ${couponWarn}
       ${priceHtml}
-      ${couponForm}
       <form method="POST" action="/s/${esc(l.id)}/pay">
         ${applied ? `<input type="hidden" name="coupon" value="${esc(c.code)}">` : ''}
         <div class="pay-opts">${opts}</div>
         <button class="btn primary" type="submit">立即支付</button>
-      </form>`,
+      </form>
+      ${couponBox}`,
   });
 }
 

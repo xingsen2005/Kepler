@@ -431,3 +431,28 @@ test('R62-15 · 分享页接线：券码入口 + 原价划线 + 下单带优惠�
   // 分享页身份：限特定用户要靠登录身份
   assertMatch(src, /authSession\.parseToken/, '分享页必须能从会话识别登录用户');
 });
+
+test('R62-16 · 付费页券码区在「立即支付」下方、默认折叠，按钮不被 width:100% 撑开（UI 工单）', () => {
+  const src = readServer('share-routes.js');
+
+  // 用 `D + '{...}'` 拼出模板里的 `$` `{`：直接写 `${…}` 会被 ESLint 的
+  // no-template-curly-in-string 当成「忘了用模板字符串」而报警告。
+  const D = '$';
+  const payAt = src.indexOf('action="/s/' + D + '{esc(l.id)}/pay"');
+  // ⚠️ 判据要落在**渲染顺序**上，而不是文件里的定义顺序：`const couponBox = …` 定义在
+  // `payPage` 之前，但真正决定位置的是 body 模板里的插槽 `${couponBox}`。
+  const slotAt = src.indexOf(D + '{couponBox}');
+  assert(payAt >= 0 && slotAt >= 0, '自证：应能找到支付表单与券码区的模板插槽');
+  assert(payAt < slotAt, '券码区必须插在支付表单之后 —— 即显示在「立即支付」按钮下方（工单要求）');
+
+  assert(src.includes('<details class="coupon-box"' + D + "{c ? ' open' : ''}>"),
+    '默认必须折叠：只有「已选券 / 券无效」（c 非空）时才展开 —— 未用券的用户不该被一排输入框打断主路径');
+  assert(src.includes('<summary>') && src.includes('使用优惠券'),
+    '折叠标题必须是「使用优惠券」这一行');
+
+  // 工单截图的直接成因：.btn 基础样式 display:block + width:100% 在 flex 行里把输入框挤成一条
+  assertMatch(src, /\.coupon-form \.btn \{[^}]*width: auto/,
+    '券表单里的按钮必须改成自适应宽度 —— 沿用 .btn 的 width:100% 会把输入框挤成一条（工单截图）');
+  assertMatch(src, /\.coupon-form \.btn \{[^}]*flex: 0 0 auto/,
+    '按钮不得参与收缩（flex: 0 0 auto）');
+});

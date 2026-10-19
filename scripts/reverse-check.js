@@ -1697,6 +1697,20 @@ const CASES = [
     },
     {
       /*
+       * R62-05a：券表单里的按钮改回 `width: 100%`（工单截图的直接成因）。
+       *
+       * `.btn` 的基础样式就是 `display:block; width:100%`，放进 flex 行后按钮占满整行、
+       * 输入框被挤成一条几十像素的空盒子 —— 用户看到的正是那张截图。
+       */
+      name: 'R62-05a · 券表单按钮改回 width:100%（输入框被挤成一条）',
+      file: 'server/share-routes.js',
+      anchor: '  .coupon-form .btn { flex: 0 0 auto; width: auto; margin: 0; padding: 9px 14px;',
+      replacement: '  .coupon-form .btn { flex: 0 0 auto; width: 100%; margin: 0; padding: 9px 14px;',
+      testFile: 'coupon.test.js',
+      minFail: 1,
+    },
+    {
+      /*
        * 把速率限制判据退回「只认 rate limit / too many / exceeded」，漏掉 acme.sh 实际的
        * 驼峰措辞 rateLimited、Le_OrderFinalize、429。后果：acme.sh 被限流时的日志（
        * error:rateLimited / status 429）匹配不到限流分支，掉进「未能识别」兜底，
