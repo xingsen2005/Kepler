@@ -93,6 +93,11 @@ readonly DEFAULT_REPO_URL="https://github.com/xingsen2005/Kepler.git"
 # 故克隆失败时自动改用同仓库的 Gitee 镜像重试一次 —— 内容与 GitHub 同步。
 # 只在「用户没显式指定 --repo」时启用（显式指定的地址是用户的意图，不该被替换）。
 readonly MIRROR_REPO_URL="https://gitee.com/xing_sen/kepler"
+# 仓库连通性探针的有界超时（秒）。
+# GitHub 在国内服务器上被黑洞时，TCP 根本连不上，而 **git 自己不设连接超时** ——
+# 旧写法「先 clone、失败了再换镜像」因此要等很久才给出结论（用户盯着滚动条怀疑卡死）。
+# 探针只做一次 ls-remote，秒级回答「通不通」。
+readonly REPO_PROBE_TIMEOUT=15
 # 历史默认仓库地址（账号/仓库迁移前的值）。老安装机的 ${STATE_FILE} 里仍留着它，
 # 而旧仓库现已不存在（git clone 会 404）。load_state 会把「恰好等于历史默认值」的
 # 地址翻译成当前默认值，避免重装时拉一个死仓库；用户自建 fork 的地址不在其列、原样保留。
@@ -1620,6 +1625,60 @@ preflight_network() {
 # ------------------------------------------------------------------------------
 # 5. 部署源码
 # ------------------------------------------------------------------------------
+
+# 仓库连通性判据：`git ls-remote` 只取引用、不下载对象，是最便宜的真连通探针。
+#
+# ⚠️ 为什么不用 `curl -sI https://github.com`：那是**另一条路**。网页首页与 git
+# 克隆端点不是同一个服务（首页 200 不代表 clone 能成；首页被墙也不代表 clone 不通，
+# 用户可能已给 github.com 配好代理而未给网页配）。判据必须落在**真正要执行的那件事**上。
+#
+# ⚠️ 三个硬约束：
+#   ① `timeout` 兜底：被黑洞时连接会一直挂着，探针必须自己掐断（否则等于没有探针）；
+#   ② `GIT_TERMINAL_PROMPT=0`：私有仓库 / 缺凭据时 git 会停在输入提示上等用户敲，
+#      非交互脚本会就此冻住 —— 探针必须"失败得干脆"；
+#   ③ 输出丢 /dev/null：探针只回答「通不通」，不把 refs 灌进日志。
+repo_reachable() {
+  local url="$1" rc=0
+  if have timeout; then
+    GIT_TERMINAL_PROMPT=0 timeout "$REPO_PROBE_TIMEOUT" git ls-remote --heads "$url" >/dev/null 2>&1 || rc=$?
+  else
+    GIT_TERMINAL_PROMPT=0 git ls-remote --heads "$url" >/dev/null 2>&1 || rc=$?
+  fi
+  return "$rc"
+}
+
+# 决定「本次从哪个仓库拉源码」——**唯一实现点**，只输出地址、不打印日志
+# （打印留给调用方，避免 `$(...)` 把日志一起捕获）。
+#
+# 顺序就是需求本身：**先测 GitHub 通不通，不通才转 Gitee 镜像**。
+# 旧写法「先克隆 GitHub、失败了再换镜像」的判据没错，但**信号来得太晚**：
+# 被黑洞时 git 会挂很久，用户看到的是一段没有结论的等待，而不是一句"改用镜像"。
+#
+# ⚠️ 用户显式 `--repo` 时**既不探测也不替换**：那个地址就是他的意图（可能是内网
+# GitLab，也可能是自建 fork）。拿官方镜像把它顶掉属于"纠正用户"，比装不上更糟。
+choose_clone_url() {
+  if [[ "$REPO_URL" != "$DEFAULT_REPO_URL" ]]; then
+    printf '%s' "$REPO_URL"
+    return 0
+  fi
+  if repo_reachable "$REPO_URL"; then
+    printf '%s' "$REPO_URL"
+  else
+    printf '%s' "$MIRROR_REPO_URL"
+  fi
+  return 0
+}
+
+# 走镜像时**如实告知可能不是最新版** —— 两条成功路径（探针直接选镜像 / 官方克隆
+# 失败后重试成功）共用这一处文案，避免一条说、另一条静悄悄地不说。
+# 同时把实际拿到的 commit 报出来：用户下次对比官方提交时有个确切参照物。
+warn_mirror_staleness() {
+  local dir="$1" got=""
+  got="$(git -C "$dir" log -1 --format='%h %cd' --date=short 2>/dev/null || true)"
+  warn "本次源码取自 Gitee 镜像（commit ${got:-未知}）：镜像由人工同步，可能落后于官方最新提交。"
+  warn "  网络恢复后重装即可拿到官方最新版：$(rerun_cmd --repo "${DEFAULT_REPO_URL}" --reinstall)"
+}
+
 prepare_source() {
   local script_dir; script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   if [[ "$REINSTALL" != "1" && -f "${script_dir}/package.json" && -d "${script_dir}/server" ]]; then
@@ -1641,22 +1700,35 @@ prepare_source() {
     fi
   fi
   local tmp; tmp="$(mktemp -d)"
-  info "未发现本地源码，从仓库拉取：${REPO_URL}"
-  if ! run git clone --depth 1 "$REPO_URL" "${tmp}/src"; then
-    # GitHub 在国内服务器上常拉不通 —— 若用的是默认地址（用户没显式 --repo），
-    # 自动改用同仓库的 Gitee 国内镜像重试一次。镜像与 GitHub 内容同步，
-    # 能省掉用户「手动换 --repo 再跑一遍」这一趟。
-    if [[ "$REPO_URL" == "$DEFAULT_REPO_URL" ]]; then
-      warn "从默认仓库拉取失败，改用国内镜像（Gitee）重试：${MIRROR_REPO_URL}"
-      rm -rf "${tmp}/src"
-      if run git clone --depth 1 "$MIRROR_REPO_URL" "${tmp}/src"; then
-        info "已从 Gitee 镜像拉取成功（若需长期使用可在部署状态里用 --repo 固定该地址）。"
-        SRC_DIR="${tmp}/src"
-        SRC_TMP_DIR="$tmp"
-        return 0
-      fi
+  # ── 先探后选 ──────────────────────────────────────────────────────────────
+  # 需求：**默认走官方（GitHub），连不通才转 Gitee 镜像**。
+  # 旧写法是「先 clone 官方、失败了再换镜像」—— 判据没错，但信号来得太晚：
+  # 被黑洞时 git 不设连接超时，要挂很久才吐结论。这里先花 ≤${REPO_PROBE_TIMEOUT}s
+  # 用 ls-remote 问一句「通不通」，再决定从哪儿 clone。
+  local clone_url=""
+  clone_url="$(choose_clone_url)"
+  if [[ "$clone_url" == "$REPO_URL" ]]; then
+    info "未发现本地源码，从仓库拉取：${clone_url}"
+  else
+    warn "GitHub 连接不通（${REPO_PROBE_TIMEOUT}s 内有界探测未通过），改用国内镜像（Gitee）：${clone_url}"
+    warn "  镜像由人工同步，可能不是最新版；网络恢复后重装即可回到官方源。"
+  fi
+  local cloned=0
+  if run git clone --depth 1 "$clone_url" "${tmp}/src"; then
+    cloned=1
+  elif [[ "$clone_url" == "$DEFAULT_REPO_URL" ]]; then
+    # 探测只看引用（ls-remote 不下载对象），克隆要真下对象 —— 半通 / 限速时
+    # 仍可能失败，所以保留旧逻辑那层兜底：官方失败后再用镜像试一次。
+    warn "从默认仓库拉取失败，改用国内镜像（Gitee）重试：${MIRROR_REPO_URL}"
+    rm -rf "${tmp}/src"
+    if run git clone --depth 1 "$MIRROR_REPO_URL" "${tmp}/src"; then
+      clone_url="$MIRROR_REPO_URL"
+      cloned=1
+    else
       warn "Gitee 镜像仍拉取失败。"
     fi
+  fi
+  if ((cloned != 1)); then
     rm -rf "$tmp"
     HINTS=()
     local l
@@ -1668,11 +1740,19 @@ prepare_source() {
       add_hint "       $(rerun_cmd --repo ${MIRROR_REPO_URL})"
     fi
     add_hint "  2) 或先把项目上传/解压到服务器，再在该目录内执行本脚本（脚本会自动识别同目录源码）"
-    add_hint "  3) 检查网络：curl -sI https://github.com -m 8 ; echo \$?"
+    # 判据落在**真正要执行的那件事**上：`curl -sI https://github.com` 是另一条路
+    # （网页首页 200 不代表 clone 端点通），用户照着它验证会得到相反的结论。
+    add_hint "  3) 检查网络（与克隆同一条路）：git ls-remote ${REPO_URL} ; echo \$?"
     die_with_hint "源码拉取失败（${REPO_URL}）" "${HINTS[@]}"
   fi
   SRC_DIR="${tmp}/src"
   SRC_TMP_DIR="$tmp"   # 复制完成后清理
+  # 走镜像时说清「可能不是最新版」+ 实际拿到的 commit。
+  # 放在这里而不是 install_app：此刻 ${SRC_DIR}/.git 还在（同步时会排除掉），
+  # 才能取到真实 commit；两条成功路径（探针直接选镜像 / 官方失败后兜底）共用这一处。
+  if [[ "$clone_url" == "$MIRROR_REPO_URL" ]]; then
+    warn_mirror_staleness "$SRC_DIR"
+  fi
 }
 
 install_app() {

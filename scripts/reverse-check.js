@@ -1819,19 +1819,24 @@ const CASES = [
        * 国内服务器拉 GitHub 常超时/TLS 被重置；镜像重试能省掉用户「手动换 --repo
        * 再跑一遍」这一趟。
        *
-       * ⚠️⭐ **必须两步一起撤**（这正是「护栏比名字弱」的标本）：`prepare_source`
-       * 里 `MIRROR_REPO_URL` 出现**两处** —— 自动重试那一行、以及失败提示里
+       * ⚠️ 必须两步一起撤**且缩进要跟着当前实现走**：`prepare_source` 里
+       * `MIRROR_REPO_URL` 出现**两处** —— 自动重试那一行、以及失败提示里
        * 「手动用镜像重跑」那一行。只撤前者时，`/MIRROR_REPO_URL/` 仍被后者满足 ⇒
        * 第一版 `fail=0`（实测）。且判据也必须落在**执行的那一行**
        * （`git clone --depth 1 "$MIRROR_REPO_URL"`），而不是「这个词出现过」。
        * 两步同撤 + 判据收紧后 `fail=1`。
+       *
+       * ⚠️ R63 把这段镜像兜底从「顶层 if」挪进了 `elif [[ "$clone_url" == ... ]]`
+       * 分支，缩进由 6 空格变 4 空格 —— 旧 anchor 因此**未命中**（invariants 立刻报
+       * 「1 条失效 anchor」）。这正是「改判据形态会老化别处 anchor」的标本：
+       * 挪动代码块时必须回头把台账里钉这段代码的条目一起重锚。
        */
       name: 'R59-03a · 克隆失败不再改用 Gitee 镜像重试（国内服务器拉 GitHub 失败即中断）',
       file: 'deploy.sh',
       mutations: [
         {
-          anchor: '      if run git clone --depth 1 "$MIRROR_REPO_URL" "${tmp}/src"; then',
-          replacement: '      if false; then',
+          anchor: '    if run git clone --depth 1 "$MIRROR_REPO_URL" "${tmp}/src"; then',
+          replacement: '    if false; then',
         },
         {
           anchor: '      add_hint "     · 国内服务器推荐用 Gitee 镜像（脚本已自动试过，仍失败可手动重试）："\n      add_hint "       $(rerun_cmd --repo ${MIRROR_REPO_URL})"',
@@ -9011,6 +9016,109 @@ const CASES = [
       anchor: '  const errs = (e && Array.isArray(e.errors) ? e.errors : []).filter(Boolean);',
       replacement: '  const errs = [];',
       testFile: 'audit53-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * R63：deploy.sh 的**选源逻辑**改成「先测 GitHub 连通性，不通才转 Gitee」。
+       * 用户原话：「拉取远端源码的仓库默认为 gitee，但 gitee 极有可能不是最新版，
+       * 改为『测试连接 GitHub，连不通再转 gitee』」。
+       *
+       * ⚠️ 本轮**不推进版本号**（用户明确要求「无需推进版本号，也无需推送 github」），
+       * 所以台账标签用 R63 只是「第 63 批改动」的编号，与 CHANGELOG 版本号无关 ——
+       * invariants 也不做「标签 ↔ 版本」的绑定。
+       *
+       * 这六条钉的是同一个契约的六个面：**判据要落在真正执行的那件事上**，
+       * 且信号要来得早（几秒探测）而不是「撞一次再换」。
+       */
+
+      /*
+       * R63-01a：克隆绕开 choose_clone_url，直接用 `$REPO_URL`。
+       *
+       * 后果：`repo_reachable` 照跑、日志照打印「探测不通，改用镜像」，**克隆却仍打
+       * 官方地址** —— 探测白做，用户还是等那一段没有结论的时间。这正是「信号算了
+       * 但没接上」的形态：源码里两个词都在，行为却回到修复前。
+       */
+      name: 'R63-01a · 克隆直接用 $REPO_URL（探测算了却没接上，行为退回修复前）',
+      file: 'deploy.sh',
+      anchor: '  if run git clone --depth 1 "$clone_url" "${tmp}/src"; then',
+      replacement: '  if run git clone --depth 1 "$REPO_URL" "${tmp}/src"; then',
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * R63-02a：连通性探针改用 `curl -sI https://github.com`。
+       *
+       * 这是最像「已经修好了」的坏法：探针确实存在、也确实有界超时，但判据落在
+       * **另一条路**上 —— 网页首页 200 不代表 git 克隆端点通（用户可能只给网页配了
+       * 代理），首页被墙也不代表 clone 不通。结论会与克隆实际结果相反。
+       */
+      name: 'R63-02a · 连通性探针改用 curl -I（网页首页 200 ≠ git 克隆端点通）',
+      file: 'deploy.sh',
+      anchor: '    GIT_TERMINAL_PROMPT=0 timeout "$REPO_PROBE_TIMEOUT" git ls-remote --heads "$url" >/dev/null 2>&1 || rc=$?',
+      replacement: '    GIT_TERMINAL_PROMPT=0 timeout "$REPO_PROBE_TIMEOUT" curl -sI "https://github.com" >/dev/null 2>&1 || rc=$?',
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * R63-03a：探针不再用 `timeout` 兜底。
+       *
+       * GitHub 被黑洞时 TCP 根本连不上，而 **git 自己不设连接超时** ⇒ `ls-remote`
+       * 会一直挂着。没有 timeout 的探针不是「快一点的探针」，而是把原来那段
+       * 没有结论的等待**原封不动**搬到了探测里 —— 等于没修。
+       */
+      name: 'R63-03a · 探针不再用 timeout 兜底（被黑洞时一直挂着，等于没有探针）',
+      file: 'deploy.sh',
+      anchor: '    GIT_TERMINAL_PROMPT=0 timeout "$REPO_PROBE_TIMEOUT" git ls-remote --heads "$url" >/dev/null 2>&1 || rc=$?',
+      replacement: '    GIT_TERMINAL_PROMPT=0 git ls-remote --heads "$url" >/dev/null 2>&1 || rc=$?',
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * R63-04a：`choose_clone_url` 里「显式 --repo 直接返回」那道短路被删掉。
+       *
+       * 后果：用户从**内网 GitLab / 自建 fork** 部署时，脚本先去探测那个地址（多余，
+       * 还可能卡 15s），探测不通就把官方 Gitee 镜像顶上去 —— 装出来的是别人的代码。
+       * 「纠正用户」比装不上更糟：它悄悄换了源码来源却不报错。
+       */
+      name: 'R63-04a · 显式 --repo 也被探测并替换（内网 / 自建 fork 被官方镜像顶掉）',
+      file: 'deploy.sh',
+      anchor: '  if [[ "$REPO_URL" != "$DEFAULT_REPO_URL" ]]; then\n    printf \'%s\' "$REPO_URL"\n    return 0\n  fi',
+      replacement: '',
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * R63-05a：走镜像分支不再调用 `warn_mirror_staleness`。
+       *
+       * 这正是用户提这件事的**理由**：「gitee 极有可能不是最新版」。装一份落后于
+       * 官方的代码却不吭声，用户只能在「功能怎么没有」的工单里反推原因。
+       * 提示里必须带实际 commit，否则「落后多少」无从谈起。
+       */
+      name: 'R63-05a · 走镜像时不再提示「可能不是最新版」（用户不知道装的是旧代码）',
+      file: 'deploy.sh',
+      anchor: '  if [[ "$clone_url" == "$MIRROR_REPO_URL" ]]; then\n    warn_mirror_staleness "$SRC_DIR"\n  fi',
+      replacement: '  : # 镜像新鲜度提示已移除',
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * R63-06a：失败提示里的诊断命令退回 `curl -sI https://github.com`。
+       *
+       * 与 R63-02a 同一条坑的用户侧版本：用户照着提示自证网络，curl 说通、clone
+       * 却失败（或反过来），于是把问题归到脚本「乱报错」上。诊断命令必须与克隆
+       * 走同一条路，结论才有意义。
+       */
+      name: 'R63-06a · 失败提示退回 curl -I github.com（用户自证的结论与克隆相反）',
+      file: 'deploy.sh',
+      anchor: '    add_hint "  3) 检查网络（与克隆同一条路）：git ls-remote ${REPO_URL} ; echo \\$?"',
+      replacement: '    add_hint "  3) 检查网络：curl -sI https://github.com -m 8 ; echo \\$?"',
+      testFile: 'deploy-script.test.js',
       minFail: 1,
     },
   ];
