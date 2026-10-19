@@ -1372,3 +1372,48 @@ test('R57-11 · 正向对照：调大超时后真实 SMTP 会话仍成功（硬�
     s.close();
   }
 });
+
+/* ================================================================== *
+ * ⑬ R61：发信失败的「详情被 S3 翻译层覆盖」
+ * ================================================================== */
+
+test('R61-01 · 发信失败必须把 SMTP 的详细原因原样回给界面（不得被 S3 翻译层覆盖）', async () => {
+  /**
+   * 工单原文：「SMTP再次出错，报错提示：发送失败：网络连接异常，请检查网络后重试」。
+   *
+   * 那句话**不是 SMTP 模块说的** —— 全库只有 `server/s3.js` 的 `translateError()`
+   * 会产出它。链路是：`smtp.sendMail()` 抛出的连接错误**没有 `status`** ⇒
+   * `apiHandler` 判 `e.status ? e : translateError(e)` ⇒ 落进**对象存储**的翻译层 ⇒
+   * 正则命中 `ETIMEDOUT / ECONNRESET / ENOTFOUND …` ⇒ 整段替换成那句零信息文案。
+   * R58 拼好的「哪个地址、几个地址全部不可达、各自什么错误码、该改端口还是放行防火墙」
+   * 就这样在到达界面之前被吃掉了 —— 用户看到的和没修之前一模一样。
+   *
+   * 判据落在**真实 HTTP 响应体**上（而不是「smtp.js 里有没有写 status」）：
+   * 后者只能证明「写了」，证明不了「路由层真的用上了」。
+   */
+  const s = await serve(ADMIN);
+  try {
+    /**
+     * `127.0.0.1:1` —— 本机必然 `ECONNREFUSED`，即时返回：不发外网请求、
+     * 不依赖任何外部服务、也不需要等 SYN 重传（测试必须稳定且快）。
+     */
+    configStore.saveSmtp({
+      host: '127.0.0.1', port: 1, secure: false, user: '', password: '', from: 'a@b.com',
+    });
+    const r = await request(s.port, 'POST', '/api/smtp/test', { body: {} });
+    const msg = String((r.json && r.json.error) || '');
+
+    assertMatch(msg, /连接 SMTP 服务器 127\.0\.0\.1:1 失败/,
+      `必须点名「连的是谁、在哪个阶段失败」；实际：${msg}`);
+    assertMatch(msg, /ECONNREFUSED|对方主动拒绝/,
+      `必须带底层错误码与可执行提示（拒绝 ≠ 超时：一个要改端口、一个要放行防火墙）；实际：${msg}`);
+    assert(!/网络连接异常/.test(msg),
+      `绝不能把 SMTP 失败说成 S3 翻译层的「网络连接异常，请检查网络后重试」—— 那正是工单原文；实际：${msg}`);
+    assert(!/^操作失败，请重试$/.test(msg),
+      `也不能退化成无信息的兜底文案；实际：${msg}`);
+    assertEqual(r.status, 500,
+      `连接失败应回 500（与原先由翻译层给出的状态码一致，本修复只改文案）；实际 ${r.status}：${msg}`);
+  } finally {
+    s.close();
+  }
+});

@@ -599,6 +599,36 @@ function validateForSend(o, opts) {
  * @param {object} o 已归一化的选项
  * @param {(s: SmtpSession, authUsed: string) => Promise<*>} fn 会话就绪后的动作
  */
+/**
+ * 给 SMTP 的错误盖上「面向用户」的 HTTP 状态。
+ *
+ * ## 为什么必须盖（R61 实测的真实故障）
+ *
+ * `routes/_shared.js` 的 `apiHandler` 对**没有 `status`** 的错误一律送
+ * `translateError()` —— 而那是**对象存储**的翻译层（`server/s3.js`）。它的
+ * 「网络类」分支匹配 `timeout|ETIMEDOUT|ECONNRESET|ENOTFOUND|EAI_AGAIN|fetch failed`，
+ * 命中就把整段文案替换成一句「网络连接异常，请检查网络后重试」。
+ *
+ * 于是 R58 辛苦拼出来的诊断（连的是哪个地址、几个地址全部不可达、每个地址各自的
+ * 错误码、该改端口还是该放行防火墙）**在到达界面之前就被这一句覆盖掉了** ——
+ * 用户看到的就是那句零信息文案，和没修之前一模一样。
+ *
+ * `apiHandler` 的判据是 `e.status ? e : translateError(e)`：带 `status` 的错误原样使用。
+ * 500 与原先由翻译层给出的状态码一致，因此本修复**只改文案、不改变 HTTP 语义**。
+ */
+function markUserFacing(e) {
+  const err = e instanceof Error ? e : new Error(String(e));
+  if (!err.status) err.status = 500;
+  return err;
+}
+
+/**
+ * 建一条 SMTP 会话并在其上执行 `fn`。
+ *
+ * ⚠️ 这是 `sendMail()` 与 `verify()` **共同**的错误出口：把 `markUserFacing()`
+ * 放在这里（而不是各条 `throw` 上），新增的错误路径才不会漏盖 ——
+ * 漏掉一条就又是一次「详情被 S3 翻译层吞掉」。
+ */
 async function withSession(o, fn) {
   const s = new SmtpSession(o);
   try {
@@ -616,6 +646,9 @@ async function withSession(o, fn) {
       await s.auth();
     }
     return await fn(s, authUsed);
+  } catch (e) {
+    // 唯一出口：所有连接 / 握手 / 认证 / 协议错误都在这里盖章（见上方 markUserFacing）
+    throw markUserFacing(e);
   } finally {
     await s.quit().catch(() => {});
   }

@@ -1623,6 +1623,25 @@ const CASES = [
     },
     {
       /*
+       * R61-01a：撤掉 `withSession` 出口处给 SMTP 错误盖的 `status`。
+       *
+       * 后果：连接错误没有 `status` ⇒ `apiHandler` 判 `e.status ? e : translateError(e)`
+       * ⇒ 落进**对象存储**的翻译层 ⇒ R58 拼好的「哪个地址 / 什么码 / 该改什么」
+       * 被替换成一句「网络连接异常，请检查网络后重试」—— 工单原文。
+       *
+       * anchor 用**单行代码**（`throw markUserFacing(e);` 全库唯一），不含注释行：
+       * `invariants.test.js` 的 anchor 自检是**双侧 stripComments() 后**比对，
+       * 跨注释行的锚点在剥注释后会失配。
+       */
+      name: 'R61-01a · SMTP 错误不再盖 status（详情被 S3 翻译层覆盖成「网络连接异常」）',
+      file: 'server/smtp.js',
+      anchor: '    throw markUserFacing(e);',
+      replacement: '    throw e;',
+      testFile: 'audit53-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /*
        * 把速率限制判据退回「只认 rate limit / too many / exceeded」，漏掉 acme.sh 实际的
        * 驼峰措辞 rateLimited、Le_OrderFinalize、429。后果：acme.sh 被限流时的日志（
        * error:rateLimited / status 429）匹配不到限流分支，掉进「未能识别」兜底，
