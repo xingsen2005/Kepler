@@ -161,9 +161,10 @@ function buildViewGateHarness() {
     decls + '\nfunction viewFromHash()' + body
     + '\nreturn { viewFromHash: viewFromHash, MAIN_VIEWS: MAIN_VIEWS, VIEW_ENTRY: VIEW_ENTRY };');
   const boot = factory({ hash: '' }, { getElementById: () => null });
-  // R54③ 新增 `invitemgr` ⇒ 8 → 9。这个数字是**自证**（证明抽出来的确实是真东西），
-  // 不是判据本身 —— 判据是下面那些 viewFromHash() 的行为断言。
-  assertEqual(boot.MAIN_VIEWS.length, 9, 'R47 自证：MAIN_VIEWS 应有 9 个区块');
+  // R54③ 新增 `invitemgr` ⇒ 8 → 9；R62 新增 `couponmgr` ⇒ 9 → 10。
+  // 这个数字是**自证**（证明抽出来的确实是真东西），不是判据本身 —— 判据是下面那些
+  // viewFromHash() 的行为断言。新增主区块时同步这里即可。
+  assertEqual(boot.MAIN_VIEWS.length, 10, 'R47 自证：MAIN_VIEWS 应有 10 个区块');
   assertEqual(boot.VIEW_ENTRY.ordermgr, 'side-orders', 'R47 自证：VIEW_ENTRY 应把订单区块映射到它的入口');
   return {
     viewFromHash: (hash, { hidden = [], missing = [] } = {}) => {

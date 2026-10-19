@@ -23,6 +23,10 @@ const paymentProviders = require('./payment-providers');
 const paymentRules = require('./payment-rules');
 const paymentOrders = require('./payment-orders');
 const paymentGateway = require('./payment-gateway');
+// R62：优惠券 —— 校验 / 核销 / 退款回退的唯一实现点在 coupon-store
+const couponStore = require('./coupon-store');
+// R62：分享页也要能认出「已登录的人」—— 只有这样「限特定用户」与「每人一次」才成立
+const authSession = require('./auth-session');
 const { getClient, p, tracked } = require('./s3');
 const { streamDownload } = require('./download-stream');
 // R51：勾选多个（或含文件夹）时的打包下发 —— 零依赖 tar.gz，见该模块文件头
@@ -115,6 +119,13 @@ const cookieName = (id) => 'sp_' + id;
 const payCookieName = (id) => 'sp_' + id + '_pay';
 
 /**
+ * R62：这个浏览器在这条链接上选中的优惠券码。
+ *
+ * ⚠️ 与 `payCookieName` **刻意分开**：那张是**订单凭证**（HMAC 票据，决定能不能下载），
+ * 这张只是用户的一次输入（随时可换、可清空）。混在一起会让「换券」把支付凭证顶掉。
+ */
+const couponCookieName = (id) => 'sp_' + id + '_coupon';
+/**
  * R21-01：加密访问令牌在**分享侧**的存放位置。
  *
  * 分享页是服务端渲染的（下载入口就是一条普通 `<a href="/s/:id/dl">` 导航），
@@ -183,9 +194,74 @@ function paidStateFor(l) {
   });
 }
 
+/**
+ * R62：订单**未成交**时把券还回去。
+ *
+ * 券是在建单时核销的（那一刻就要占住次数，否则同一张「每人一次」的券能被
+ * 并发下出多笔订单）。因此下单失败 / 网关拒绝时**必须**回退，否则用户一次
+ * 都没付成，券却被扣掉一次 —— 表现是「试了两次就提示已用尽」。
+ *
+ * 与退款回退（`routes/payment.js`）共用 store 的同一个 `releaseByOrder()`：
+ * 按**订单号**定位，天然幂等（找不到就返回 null）。
+ */
+function releaseCouponForOrder(order) {
+  if (!order || !order.couponId) return null;
+  return couponStore.releaseByOrder(order.id);
+}
+
 /** 访问者对该链接的支付状态 */
 function payerStateFor(l, req) {
   return paymentOrders.payerState(l.id, getCookie(req, payCookieName(l.id)));
+}
+
+/**
+ * R62：分享页访客身份。
+ *
+ * 分享页是**匿名可达**的，但 `限特定用户` 与「每用户只能使用一次」都必须认人。
+ * 判据分两层，且**只有这一处**：
+ *  · 有有效会话 → 用账号 id（这是唯一可信的身份）；
+ *  · 没有会话 → 交给 `couponStore.identityFrom()` 用「出口 IP + UA」近似。
+ *    ⚠️ 这只够支撑「每用户一次」，**不能**支撑「限特定用户」—— 那种券在
+ *    `validateForUse()` 里要求 `userId` 非空且命中名单，匿名访客必然被判 `wrong_user`。
+ */
+function visitorIdentity(req) {
+  const token = authSession.parseToken(req);
+  const session = token ? authSession.getSession(token) : null;
+  const userId = session && session.user ? String(session.user.id || '') : '';
+  return {
+    userId,
+    identity: couponStore.identityFrom({
+      userId,
+      ip: security.clientIp(req),
+      userAgent: req.headers['user-agent'],
+    }),
+  };
+}
+
+/**
+ * R62：读取并校验「当前浏览器选中的券」。
+ *
+ * @returns {null | {code:string, ok:boolean, message:string,
+ *                   originalFen?:number, discountFen?:number, payableFen?:number, coupon?:object}}
+ *   `null` = 这个浏览器没选券；`ok:false` 的返回**不会**被写进 Cookie（见 `POST /s/:id/coupon`）。
+ */
+function couponStateFor(l, req) {
+  const code = getCookie(req, couponCookieName(l.id));
+  if (!code) return null;
+  const who = visitorIdentity(req);
+  const r = couponStore.validateForUse({
+    code, link: l, identity: who.identity, userId: who.userId,
+  });
+  if (!r.ok) return { code, ok: false, message: r.message };
+  return {
+    code,
+    ok: true,
+    message: '',
+    originalFen: r.originalFen,
+    discountFen: r.discountFen,
+    payableFen: r.payableFen,
+    coupon: r.coupon,
+  };
 }
 
 /** 手动解析请求头中的 Cookie（避免引入 cookie-parser 依赖） */
@@ -324,7 +400,16 @@ function renderPage(res, status, { title, head, body, wide }) {
      它和 .icon-big 一样是定宽块，text-align 管不到，必须靠 margin 居中。 */
   .center-head .file-icon { display: block; margin: 0 auto 14px; }
   .pay-amount { font-size: 27px; font-weight: 600; color: #b45309; text-align: center; margin: 4px 0 2px; }
+  /* R62：用券后的「原价」—— 划线 + 变灰，与下方突出的优惠价形成对比（需求 5） */
+  .pay-orig { text-align: center; color: #9aa1ab; font-size: 14px; text-decoration: line-through;
+    text-decoration-thickness: 1px; margin-top: 6px; }
   .pay-cap { text-align: center; color: #8a8f98; font-size: 12px; }
+  /* R62：券码输入行。与支付表单分成两个 <form>（HTML 不允许嵌套表单） */
+  .coupon-form { display: flex; gap: 8px; align-items: center; margin: 14px 0 2px; }
+  .coupon-form input[type=text] { flex: 1; min-width: 0; border: 1px solid #d5dbe3; border-radius: 8px;
+    padding: 9px 11px; font-size: 13px; outline: none; letter-spacing: .06em; }
+  .coupon-form input[type=text]:focus { border-color: #0067c0; box-shadow: 0 0 0 3px rgba(0,103,192,.12); }
+  .coupon-form .btn { margin-top: 0; white-space: nowrap; }
   .pay-opts { margin: 16px 0 2px; }
   .pay-opt { display: flex; align-items: center; gap: 9px; padding: 11px 12px;
     border: 1px solid #d5dbe3; border-radius: 8px; margin-bottom: 8px; cursor: pointer; font-size: 14px; }
@@ -454,11 +539,36 @@ function infoPage(res, l, opts = {}) {
 
 /** 付费页：展示金额与可选渠道，提交后创建订单 */
 
-function payPage(res, l, ps, available, err, note = '') {
+function payPage(res, l, ps, available, err, note = '', coupon = null) {
   const opts = available.map((id, i) => {
     const p = paymentProviders.platform(id);
     return `<label class="pay-opt"><input type="radio" name="platform" value="${esc(id)}"${i === 0 ? ' checked' : ''}> <span>${esc(p.name)}</span></label>`;
   }).join('');
+  const c = coupon || null;
+  const applied = Boolean(c && c.ok);
+  /**
+   * R62 需求 5：用了券就「原价划线变灰 + 优惠后价格突出」。
+   * 没用券时保持原样（只有一个大金额）—— 凭空显示一个「原价」划线价会让
+   * 免费/未用券的用户误以为自己错过了折扣。
+   */
+  const priceHtml = applied
+    ? `<div class="pay-orig">¥${paymentRules.formatAmount(c.originalFen)}</div>
+      <div class="pay-amount">¥${paymentRules.formatAmount(c.payableFen)}</div>
+      <div class="pay-cap">已使用优惠券 <code>${esc(c.code)}</code>，优惠 ¥${paymentRules.formatAmount(c.discountFen)}</div>`
+    : `<div class="pay-amount">¥${paymentRules.formatAmount(ps.amountFen)}</div>
+      <div class="pay-cap">人民币（CNY）</div>`;
+  // R62 需求 6：券无效时就地给出对应提示（未开始 / 已过期 / 已用尽 / 不适用 / 已用过…）
+  const couponWarn = c && !c.ok ? `<div class="warn">${esc(c.message || '优惠券无效')}</div>` : '';
+  /**
+   * ⚠️ 券表单必须**独立于支付表单**：HTML 不允许嵌套 `<form>`，浏览器会静默丢掉内层，
+   * 表现就是「点应用没反应」。因此它排在支付表单之前、自带一个提交按钮。
+   */
+  const couponForm = `
+      <form method="POST" action="/s/${esc(l.id)}/coupon" class="coupon-form">
+        <input type="text" name="code" value="${c && c.code ? esc(c.code) : ''}" placeholder="优惠券码（可选）" maxlength="32" autocomplete="off" spellcheck="false">
+        <button class="btn small" type="submit">${applied ? '更换' : '应用'}</button>
+        ${applied ? '<button class="btn small ghost" type="submit" name="clear" value="1">不使用</button>' : ''}
+      </form>`;
   renderPage(res, err ? 400 : 200, {
     title: '付费下载',
     head: `<div class="center-head">
@@ -469,9 +579,11 @@ function payPage(res, l, ps, available, err, note = '') {
     body: `
       ${err ? `<div class="warn">${esc(err)}</div>` : ''}
       ${note ? `<div class="warn">${esc(note)}</div>` : ''}
-      <div class="pay-amount">¥${paymentRules.formatAmount(ps.amountFen)}</div>
-      <div class="pay-cap">人民币（CNY）</div>
+      ${couponWarn}
+      ${priceHtml}
+      ${couponForm}
       <form method="POST" action="/s/${esc(l.id)}/pay">
+        ${applied ? `<input type="hidden" name="coupon" value="${esc(c.code)}">` : ''}
         <div class="pay-opts">${opts}</div>
         <button class="btn primary" type="submit">立即支付</button>
       </form>`,
@@ -504,7 +616,7 @@ function orderMetaRows(order, extra) {
  * （见 payment-gateway 的设计说明），确认到账后置为已支付，页面随即自动放行。
  * 轮询只解决"能不能自动刷新"，**不参与支付结果的判定**。
  */
-function payingPage(res, l, order, ps) {
+function payingPage(res, l, order) {
   const p = paymentProviders.platform(order.platform);
   renderPage(res, 200, {
     title: '等待支付结果',
@@ -526,7 +638,7 @@ function payingPage(res, l, order, ps) {
 }
 
 /** 微信支付 Native：展示二维码并轮询支付结果 */
-function qrPayPage(res, l, order, ps, charge) {
+function qrPayPage(res, l, order, charge) {
   const p = paymentProviders.platform(order.platform);
   renderPage(res, 200, {
     title: '扫码支付',
@@ -536,7 +648,7 @@ function qrPayPage(res, l, order, ps, charge) {
       <p class="sub">支付完成后本页会自动放行，无需刷新。</p>
       </div>`,
     body: `
-      <div class="pay-amount">¥${paymentRules.formatAmount(ps.amountFen)}</div>
+      <div class="pay-amount">¥${paymentRules.formatAmount(order.amountFen)}</div>
       <div class="pay-cap">人民币（CNY）</div>
       <div class="qr-box">${charge.svg || ''}</div>
       <div class="meta">
@@ -549,7 +661,7 @@ function qrPayPage(res, l, order, ps, charge) {
 }
 
 /** 支付失败：给出原因并允许重新发起 */
-function payFailedPage(res, l, order, ps) {
+function payFailedPage(res, l, order) {
   renderPage(res, 402, {
     title: '支付未完成',
     head: `<div class="center-head">
@@ -559,7 +671,7 @@ function payFailedPage(res, l, order, ps) {
       </div>`,
     body: `
       <div class="meta">
-        <div><span>需付金额</span><b>¥${paymentRules.formatAmount(ps.amountFen)}</b></div>
+        <div><span>需付金额</span><b>¥${paymentRules.formatAmount(order.amountFen)}</b></div>
       </div>
       <a class="btn primary" href="/s/${esc(l.id)}" style="text-align:center;text-decoration:none">重新支付</a>`,
   });
@@ -781,23 +893,28 @@ router.get('/s/:id', async (req, res) => {
   if (ps.effective) {
     const payer = payerStateFor(l, req);
     if (payer.state === 'paid') {
+      const paidRows = [['付费下载', `<b>已支付 ¥${paymentRules.formatAmount(payer.order.amountFen)}</b>`]];
+      if (payer.order.discountFen > 0) {
+        paidRows.push(['优惠', `−¥${paymentRules.formatAmount(payer.order.discountFen)}`
+          + (payer.order.couponCode ? `（优惠券 ${esc(payer.order.couponCode)}）` : '')]);
+      }
       return infoPage(res, l, {
         // R51：分页页码来自 `?page=N`（列表页的翻页链接就带它）；
         // 非法值由 listPage 收敛到 1，单文件页忽略它。
         page: req.query.page,
-        extraRows: [['付费下载', `<b>已支付 ¥${paymentRules.formatAmount(payer.order.amountFen)}</b>`]],
+        extraRows: paidRows,
         note: '支付已完成，可直接下载。',
         noteKind: 'ok',
       });
     }
-    if (payer.state === 'pending') return payingPage(res, l, payer.order, ps);
-    if (payer.state === 'failed') return payFailedPage(res, l, payer.order, ps);
+    if (payer.state === 'pending') return payingPage(res, l, payer.order);
+    if (payer.state === 'failed') return payFailedPage(res, l, payer.order);
     // 已退款：票据仍然有效（能认出这个人），但不再放行下载 —— 复用付费页让他重新支付
     if (payer.state === 'refunded') {
-      return payPage(res, l, ps, paySnapshot().available, '', refundNote());
+      return payPage(res, l, ps, paySnapshot().available, '', refundNote(), couponStateFor(l, req));
     }
     const snap = paySnapshot();
-    return payPage(res, l, ps, snap.available, '');
+    return payPage(res, l, ps, snap.available, '', '', couponStateFor(l, req));
   }
 
   // 配置了付费但当前不生效（支付停用 / 无可用渠道）：明确告知当前免费，配置仍在
@@ -1037,6 +1154,67 @@ function chargeSubject(l) {
 }
 
 /** 发起支付：创建 pending 订单 → 调网关下单 → 跳转收银台或展示二维码 */
+/**
+ * R62：应用 / 更换 / 取消优惠券。
+ *
+ * 为什么单独一条路由、而不是把券码直接塞进 `POST /s/:id/pay`：
+ *  · 需求 5 要求「使用优惠券后**页面上的价格**变成原价划线 + 优惠价」——
+ *    这必须是一次**重新渲染**（服务端渲染的页面），而不是等到付款时才生效；
+ *  · 券可能因为「刚被用尽 / 刚过期 / 不适用于本链接」而失效，用户需要**当场**
+ *    看到原因（需求 6），而不是点了「立即支付」才被退回。
+ *
+ * 券码只写进 Cookie、不进 URL：它是可抵扣金额的凭据，GET 会把 URL 写进
+ * 浏览器历史与反向代理日志（与 `POST /invites/export` 同一条理由）。
+ */
+router.post('/s/:id/coupon', asyncHandler(async (req, res) => {
+  const l = shareStore.get(req.params.id);
+  if (!l) return statePage(res, 'notfound');
+  const st = shareStore.status(l);
+  if (st !== 'active') return statePage(res, st, shareStore.view(l));
+  if (l.passwordHash && !shareStore.verifyToken(l, getCookie(req, cookieName(l.id)))) {
+    return res.redirect(303, '/s/' + l.id);
+  }
+  const ps = paidStateFor(l);
+  if (!ps.effective) return res.redirect(303, '/s/' + l.id); // 已转免费，券无意义
+
+  const ip = security.clientIp(req);
+  const rl = security.couponLimiter(`${ip}:${l.id}`);
+  if (!rl.ok) {
+    return payPage(res, l, ps, paySnapshot().available,
+      `尝试次数过多，请 ${rl.retryAfter} 秒后重试`, '',
+      { code: String((req.body && req.body.code) || ''), ok: false, message: '尝试次数过多，请稍后再试' });
+  }
+
+  const raw = String((req.body && req.body.code) || '').trim();
+  const clear = String((req.body && req.body.clear) || '') === '1' || !raw;
+  if (clear) {
+    res.clearCookie(couponCookieName(l.id), { path: '/' });
+    return res.redirect(303, '/s/' + l.id);
+  }
+
+  const who = visitorIdentity(req);
+  const r = couponStore.validateForUse({
+    code: raw, link: l, identity: who.identity, userId: who.userId,
+  });
+  if (!r.ok) {
+    /**
+     * 无效券**不写进 Cookie**，并顺手清掉旧值：否则用户换了一张坏券之后，
+     * 页面会一边显示「新券无效」一边按**旧券**算钱 —— 两种事实同时出现在一屏。
+     */
+    res.clearCookie(couponCookieName(l.id), { path: '/' });
+    return payPage(res, l, ps, paySnapshot().available, '', '',
+      { code: raw, ok: false, message: r.message });
+  }
+
+  res.cookie(couponCookieName(l.id), r.coupon.code, shareCookieOptions(l.id));
+  // 日志只记券 id 与优惠额，**不记券码本身**（与邀请码同：审计日志是明文 JSONL）
+  statsStore.addLog({
+    action: 'share.coupon', detail: `分享链接 ${l.id} 应用优惠券 ${r.coupon.id}`
+      + `（优惠 ¥${paymentRules.formatAmount(r.discountFen)}，应付 ¥${paymentRules.formatAmount(r.payableFen)}，IP：${ip}）`,
+  });
+  return res.redirect(303, '/s/' + l.id);
+}));
+
 router.post('/s/:id/pay', asyncHandler(async (req, res) => {
   const l = shareStore.get(req.params.id);
   if (!l) return statePage(res, 'notfound');
@@ -1052,12 +1230,12 @@ router.post('/s/:id/pay', asyncHandler(async (req, res) => {
   // 限流：同一 IP 对同一链接的支付发起（防止刷订单）
   const ip = security.clientIp(req);
   const rl = security.shareLimiter(`${ip}:${l.id}`);
-  if (!rl.ok) return payPage(res, l, ps, paySnapshot().available, `操作过于频繁，请 ${rl.retryAfter} 秒后重试`);
+  if (!rl.ok) return payPage(res, l, ps, paySnapshot().available, `操作过于频繁，请 ${rl.retryAfter} 秒后重试`, '', couponStateFor(l, req));
 
   const platform = String((req.body && req.body.platform) || '');
   const available = paySnapshot().available;
   if (!available.includes(platform)) {
-    return payPage(res, l, ps, available, '请选择一个可用的支付方式');
+    return payPage(res, l, ps, available, '请选择一个可用的支付方式', '', couponStateFor(l, req));
   }
 
   // R14-05：动单之前先问「这个人现在是什么支付态」—— 与 `GET /s/:id`（:571）和
@@ -1073,21 +1251,65 @@ router.post('/s/:id/pay', asyncHandler(async (req, res) => {
   }
 
   let order;
+  /**
+   * R62：券只作用于**新建订单**。复用在途订单时不能改价 —— 那笔订单已经按原金额
+   * 在网关侧下过单（商户单号就是 order.id），改价会让「订单金额」与「网关收款额」分叉。
+   */
+  let applied = null;
   if (payer.state === 'pending' && payer.order) {
     // 复用在途订单。网关侧商户单号就是 order.id（payment-gateway 用 out_trade_no: order.id），
     // 因此重复下单是幂等的，不会在网关侧产生第二笔。
     order = payer.order;
   } else {
+    /**
+     * R62：券在**下单这一刻**再校验一次，而不是直接信任页面上的结果 ——
+     * 页面可能停留很久（券在此期间被别人用完 / 过期），Cookie 也可能被伪造。
+     * 表单里的 hidden `coupon` 优先于 Cookie：它来自本页渲染时的那张券，更接近用户意图。
+     */
+    const code = String((req.body && req.body.coupon) || '').trim()
+      || getCookie(req, couponCookieName(l.id));
+    if (code) {
+      const who = visitorIdentity(req);
+      const r = couponStore.validateForUse({
+        code, link: l, identity: who.identity, userId: who.userId,
+      });
+      if (!r.ok) {
+        res.clearCookie(couponCookieName(l.id), { path: '/' });
+        return payPage(res, l, ps, available, '', '', { code, ok: false, message: r.message });
+      }
+      applied = r;
+    }
+    const amountFen = applied ? applied.payableFen : ps.amountFen;
     // 文件名 / 对象键 / 存储桶一并快照进订单：链接删除后订单管理页仍要能回答
     // "付的什么、来自哪个桶"（R48 的「收入统计」按桶与文件归集）
     order = paymentOrders.create({
-      linkId: l.id, platform, amountFen: ps.amountFen,
+      linkId: l.id, platform, amountFen,
+      // R62：原价 / 优惠 / 券信息一并快照 —— 券被删掉或改配置后，历史订单仍要
+      // 能回答「这笔原价多少、优惠了多少、用的是哪张券」。
+      originalFen: ps.amountFen,
+      discountFen: applied ? applied.discountFen : 0,
+      couponCode: applied ? applied.coupon.code : '',
+      couponId: applied ? applied.coupon.id : '',
+      couponType: applied ? applied.coupon.type : '',
       currency: ps.currency, payerIp: ip,
       fileName: l.fileName, fileKey: l.key, bucket: l.bucket,
     });
+    /**
+     * 核销与建单在**同一个同步片段**里（中间没有 await）⇒ 不存在「券在这两步之间
+     * 被别人用掉」的窗口。按 orderId 幂等，重复调用不会重复计数。
+     */
+    if (applied) {
+      couponStore.consume({
+        couponId: applied.coupon.id,
+        identity: visitorIdentity(req).identity,
+        orderId: order.id,
+      });
+    }
     res.cookie(payCookieName(l.id), paymentOrders.orderToken(order), shareCookieOptions(l.id));
     statsStore.addLog({
-      action: 'share.pay', detail: `分享链接 ${l.id} 创建支付订单 ${order.id}（${platform}，¥${paymentRules.formatAmount(order.amountFen)}，IP：${ip}）`,
+      action: 'share.pay',
+      detail: `分享链接 ${l.id} 创建支付订单 ${order.id}（${platform}，¥${paymentRules.formatAmount(order.amountFen)}`
+        + `${applied ? `，原价 ¥${paymentRules.formatAmount(order.originalFen)}，优惠券 ${order.couponId}` : ''}，IP：${ip}）`,
     });
   }
 
@@ -1095,7 +1317,7 @@ router.post('/s/:id/pay', asyncHandler(async (req, res) => {
   // 否则商户单号对应的网关与本次请求的渠道会对不上。
   const chargePlatform = order.platform;
   if (!available.includes(chargePlatform)) {
-    return payPage(res, l, ps, available, '原支付方式已停用，请重新发起支付');
+    return payPage(res, l, ps, available, '原支付方式已停用，请重新发起支付', '', couponStateFor(l, req));
   }
 
   const cfg = (configStore.getPayment().platforms || {})[chargePlatform] || {};
@@ -1107,12 +1329,13 @@ router.post('/s/:id/pay', asyncHandler(async (req, res) => {
    */
   if (!base) {
     paymentOrders.markFailed(order.id, '站点对外地址未配置且当前访问地址不可信');
+    releaseCouponForOrder(order); // R62：没成交就不该消耗一次券
     statsStore.addLog({
       action: 'share.pay', level: 'warn',
       detail: `分享链接 ${l.id} 订单 ${order.id} 拒绝下单：站点对外地址未配置、且请求 Host 不属本站（R24-01）`,
     });
     return payPage(res, l, ps, available,
-      '无法确定本站对外地址：请管理员在「系统设置 → 支付设置」中填写站点对外地址后再试');
+      '无法确定本站对外地址：请管理员在「系统设置 → 支付设置」中填写站点对外地址后再试', '', couponStateFor(l, req));
   }
   const charge = await paymentGateway.createCharge(chargePlatform, cfg, {
     order,
@@ -1128,17 +1351,18 @@ router.post('/s/:id/pay', asyncHandler(async (req, res) => {
 
   if (!charge.ok) {
     paymentOrders.markFailed(order.id, charge.error || '下单失败');
+    releaseCouponForOrder(order); // R62：没成交就不该消耗一次券
     statsStore.addLog({
       action: 'share.pay', level: 'error',
       detail: `分享链接 ${l.id} 订单 ${order.id} 下单失败（${chargePlatform}）：${charge.error || '未知原因'}`,
     });
-    return payPage(res, l, ps, available, `创建支付订单失败：${charge.error || '未知原因'}`);
+    return payPage(res, l, ps, available, `创建支付订单失败：${charge.error || '未知原因'}`, '', couponStateFor(l, req));
   }
   if (charge.tradeNo) paymentOrders.setTradeNo(order.id, charge.tradeNo);
 
-  if (charge.kind === 'qrcode') return qrPayPage(res, l, order, ps, charge);
+  if (charge.kind === 'qrcode') return qrPayPage(res, l, order, charge);
   if (charge.kind === 'redirect' && charge.url) return res.redirect(302, charge.url);
-  return payingPage(res, l, order, ps);
+  return payingPage(res, l, order);
 }));
 
 /**

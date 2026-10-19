@@ -1642,6 +1642,61 @@ const CASES = [
     },
     {
       /*
+       * R62-01a：价格封顶失效 —— 优惠金额不再封到「原价 − 1 分」。
+       *
+       * 后果：10 元券买 6 元文件 ⇒ 应付 0 元，而支付网关不接受 0 元订单；
+       * 订单页也会出现「原价 6 + 优惠 10 = 实付 0.01」这种对不上账的组合。
+       */
+      name: 'R62-01a · 优惠不再封顶到「原价 − 1 分」（券面额大于价格时应付变成 0）',
+      file: 'server/coupon-store.js',
+      anchor: '  const maxDiscount = Math.max(0, orig - MIN_PAYABLE_FEN);\n  const applied = Math.min(want, maxDiscount);',
+      replacement: '  const applied = want;',
+      testFile: 'coupon.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * R62-02a：撤掉「每个用户只能使用一次」的判据。
+       *
+       * 后果：同一账号可以反复使用同一张定向券，需求 3 的第二半直接失效。
+       */
+      name: 'R62-02a · 「每个用户只能使用一次」不再拦同一身份',
+      file: 'server/coupon-store.js',
+      anchor: "    if (!who || c.uses.some((u) => u.identity === who)) return fail('already_used');",
+      replacement: "    if (false) return fail('already_used');",
+      testFile: 'coupon.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * R62-03a：退款时不再回退优惠券。
+       *
+       * 后果：需求 8 失效 —— 钱退了，那张定向券仍然记着「这人用过了」，
+       * 买家重新下单时只会看到「您已使用过该优惠券」。
+       */
+      name: 'R62-03a · 退款不再让非无门槛券恢复可用（需求 8 失效）',
+      file: 'server/routes/payment.js',
+      anchor: "    if (o.couponId && o.couponType && o.couponType !== 'any') {",
+      replacement: '    if (false) {',
+      testFile: 'coupon.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * R62-04a：下单时不再快照原价。
+       *
+       * 后果：订单页的「原价 / 优惠 / 应付」三列失去依据（原价退化成实付，
+       * 优惠列永远为 0），历史订单再也说不清「这张券到底减了多少」。
+       */
+      name: 'R62-04a · 下单不再快照原价（订单页「原价 / 优惠」失去依据）',
+      file: 'server/share-routes.js',
+      anchor: '      originalFen: ps.amountFen,',
+      replacement: '      originalFen: amountFen,',
+      testFile: 'coupon.test.js',
+      minFail: 1,
+    },
+    {
+      /*
        * 把速率限制判据退回「只认 rate limit / too many / exceeded」，漏掉 acme.sh 实际的
        * 驼峰措辞 rateLimited、Le_OrderFinalize、429。后果：acme.sh 被限流时的日志（
        * error:rateLimited / status 429）匹配不到限流分支，掉进「未能识别」兜底，

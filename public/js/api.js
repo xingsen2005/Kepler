@@ -374,6 +374,13 @@ export const API = {
   deleteInvites: (ids) => request('POST', '/api/invites/delete', { ids }),
   exportInvites: (ids) => requestText('POST', '/api/invites/export', { ids: ids || [] }),
 
+  // R62：优惠券设置（全部仅管理员）。券码可直接抵扣金额，与邀请码同级保护。
+  coupons: () => request('GET', '/api/coupons'),
+  generateCoupons: (b) => request('POST', '/api/coupons', b),
+  updateCoupon: (id, b) => request('PUT', `/api/coupons/${encodeURIComponent(id)}`, b),
+  bulkUpdateCoupons: (ids, b) => request('POST', '/api/coupons/bulk', Object.assign({ ids }, b)),
+  deleteCoupons: (ids) => request('POST', '/api/coupons/delete', { ids }),
+
   // 访问密钥管理
   listCredentials: () => request('GET', '/api/credentials'),
   addCredential: (b) => request('POST', '/api/credentials', b),

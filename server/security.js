@@ -492,6 +492,15 @@ const encUnlockLock = createFailLock({ name: 'enc-unlock', maxFails: 5, baseLock
 const shareLimiter = createLimiter({ name: 'share', windowMs: 10 * 60 * 1000, max: 20 });
 const shareLock = createFailLock({ name: 'share', maxFails: 5, baseLockMs: 30 * 60 * 1000, maxLockMs: 30 * 60 * 1000 });
 
+/**
+ * R62：优惠券校验 —— 券码是 10 位「可手抄」口令，而校验端点匿名可达。
+ *
+ * 不限流就等于给了一条可枚举的折扣通道（10 位 × 31 字符虽大，但攻击者只需要
+ * 「猜中一张」就够，且每次尝试都很便宜）。与 `shareLimiter` **分开计数**：
+ * 输错几次券码不该把「发起支付」的预算一起消耗掉（那会让用户连付款都付不了）。
+ */
+const couponLimiter = createLimiter({ name: 'share-coupon', windowMs: 10 * 60 * 1000, max: 30 });
+
 /* --- SEC-05：口令校验类入口的限流（旧实现只有登录与加密解锁有限流） --- */
 
 // 系统初始化：每 IP 每 10 分钟 ≤ 10 次（该端点匿名可达且会触发口令哈希）
@@ -629,6 +638,7 @@ module.exports = {
   loginLimiter, loginLock,
   encUnlockLimiter, encUnlockLock,
   shareLimiter, shareLock,
+  couponLimiter, // R62：优惠券校验（与 shareLimiter 分开计数）
   initLimiter, passwordLimiter, webdavAuthLimiter, shareDownloadLimiter, webdavRevealLimiter, payNotifyLimiter,
   payCheckLimiter, payStatusLimiter, shareViewLimiter,
   backupExportLimiter, // R38：备份导出校验账户口令的限流（与 passwordLimiter 刻意分开）

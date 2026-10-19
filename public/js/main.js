@@ -15,6 +15,7 @@ import * as syssettings from './syssettings.js';
 import * as credmgr from './credmgr.js';
 import * as ipmgr from './ipmgr.js';
 import * as invitemgr from './invitemgr.js';
+import * as couponmgr from './couponmgr.js';
 import { verifyWindowsHello, webauthnSupported } from './webauthn.js';
 import { providerMeta } from './provider-logos.js';
 import { openProfileDialog } from './profile.js';
@@ -1087,6 +1088,13 @@ function renderUserMenu() {
   const invitePage = document.getElementById('invitemgr');
   if (invitePage && !isAdmin) invitePage.hidden = true;
 
+  // R62 优惠券设置：`GET /coupons` 会原样回传券码明文（管理员要复制分发），
+  // 且券码能直接抵扣金额 —— 入口与整个页面一律只对管理员可见。
+  const sideCoupon = document.getElementById('side-coupon');
+  if (sideCoupon) sideCoupon.hidden = !isAdmin;
+  const couponPage = document.getElementById('couponmgr');
+  if (couponPage && !isAdmin) couponPage.hidden = true;
+
   // IP 地址管理（含「IP 访问屏蔽」+「IP 地址限速」两张卡）：规则详情含其它用户的
   // 来源 IP，增删改与预检全部为管理员专属 —— 侧栏入口与整个页面一并隐藏。
   // 普通用户既看不到入口，也进不去页面；ipmgr 会据此跳过规则列表请求，避免无谓 403。
@@ -1621,6 +1629,8 @@ function bindToolbar() {
   $('side-logs').onclick = () => { switchMainView('dashboard'); dashboard.showLogs(); closeSidebar(); };
   // R54③：邀请码设置（管理员专属；入口在 renderUserMenu() 里按角色隐藏）
   $('side-invite').onclick = () => { switchMainView('invitemgr'); closeSidebar(); };
+  // R62：优惠券设置（管理员专属；入口在 renderUserMenu() 里按角色隐藏）
+  $('side-coupon').onclick = () => { switchMainView('couponmgr'); closeSidebar(); };
   $('side-settings').onclick = () => { switchMainView('credmgr'); closeSidebar(); };
   $('side-help').onclick = () => { help.open(); closeSidebar(); };
 
@@ -1681,7 +1691,7 @@ function toggleSidebar(force) {
 }
 function closeSidebar() { toggleSidebar(false); }
 
-const MAIN_VIEWS = ['explorer', 'dashboard', 'linkmgr', 'ordermgr', 'ipmgr', 'bucketmgr', 'systemsettings', 'invitemgr', 'credmgr'];
+const MAIN_VIEWS = ['explorer', 'dashboard', 'linkmgr', 'ordermgr', 'ipmgr', 'bucketmgr', 'systemsettings', 'invitemgr', 'couponmgr', 'credmgr'];
 
 /**
  * 侧栏 / 工具栏里每个区块的**入口元素**。`null` = 无专门入口（explorer 是默认落点）。
@@ -1701,6 +1711,8 @@ const VIEW_ENTRY = {
   systemsettings: 'btn-syssettings',
   // R54③：邀请码设置的管理员专属入口 —— 登记在册才能被门控挡下（`viewFromHash()` 读它的 hidden）
   invitemgr: 'side-invite',
+  // R62：优惠券设置 —— 同样是管理员专属，登记在册才能被门控挡下
+  couponmgr: 'side-coupon',
   credmgr: 'side-settings',
 };
 
@@ -1751,6 +1763,7 @@ function switchMainView(v, { syncHash = true } = {}) {
   else if (v === 'bucketmgr') bucketmgr.refresh();
   else if (v === 'systemsettings') syssettings.refresh();
   else if (v === 'invitemgr') invitemgr.refresh();
+  else if (v === 'couponmgr') couponmgr.refresh();
   else if (v === 'credmgr') credmgr.refresh();
   else updateStatusbar();
   if (v !== 'bucketmgr') bucketmgr.stop(); // 离开管理页时停止统计轮询
@@ -1796,6 +1809,8 @@ function resetMainView() {
   ipmgr.reset();
   // R54③：邀请码列表（含明文口令）属上一个管理员会话的数据，跨账号必须丢弃
   invitemgr.reset();
+  // R62：优惠券列表（含券码明文）同样属上一个管理员会话的数据，跨账号必须丢弃
+  couponmgr.reset();
   // R44：上个账号的「文件类型」筛选值不跨会话保留（否则新账号一进来就看到被滤空的目录）
   App.state.typeFilter = '';
   closeSidebar();

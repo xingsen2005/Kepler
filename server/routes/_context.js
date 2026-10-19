@@ -25,6 +25,7 @@ module.exports = {
   smtp: require('../smtp'), // R53：零依赖 SMTP 发信客户端
   emailCode: require('../email-code'), // R54②：邮箱验证码（签发 / 核销 / 发信唯一实现点）
   inviteStore: require('../invite-store'), // R54③：邀请码（生成 / 核销 / 导出唯一实现点）
+  couponStore: require('../coupon-store'), // R62：优惠券（生成 / 校验 / 核销 / 退款回退唯一实现点）
   encStore: require('../enc-store'),
   ipGuard: require('../ip-guard'),
   s3: require('../s3'),

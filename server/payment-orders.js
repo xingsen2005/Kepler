@@ -182,14 +182,32 @@ function masterKey() {
  * 创建订单（pending）
  * @returns {object} 订单（内部形态）
  */
-function create({ linkId, platform, amountFen, currency, payerIp, fileName, fileKey, bucket, tradeNo }) {
+function create({
+  linkId, platform, amountFen, currency, payerIp, fileName, fileKey, bucket, tradeNo,
+  // R62：优惠券相关的**快照**。券可能事后被删除 / 改配置，订单必须自己记住
+  // 「原价多少、优惠多少、用的是哪张券」，否则历史订单的对账信息会随券一起消失。
+  originalFen, discountFen, couponCode, couponId, couponType,
+}) {
   const orders = load().orders;
   const now = new Date().toISOString();
+  const paid = Number(amountFen) || 0;
+  const orig = Number(originalFen) > 0 ? Number(originalFen) : paid;
   const o = {
     id: newId(),
     linkId: String(linkId),
     platform: String(platform || ''),
-    amountFen: Number(amountFen) || 0,
+    amountFen: paid,
+    /**
+     * `originalFen` 是**订单当时**的原价，`discountFen` 是**这张订单上真的减掉**
+     * 的金额（券面额大于原价时按「原价 − 1 分」封顶，见 coupon-store.computePayable）。
+     * 三者必须满足 `originalFen − discountFen === amountFen` —— 这是订单页
+     * 「原价 / 优惠 / 应付」三列能对上的唯一保证。
+     */
+    originalFen: orig,
+    discountFen: Math.max(0, Number(discountFen) || 0),
+    couponCode: String(couponCode || ''),
+    couponId: String(couponId || ''),
+    couponType: String(couponType || ''),
     currency: currency || 'CNY',
     status: 'pending',
     createdAt: now,
@@ -547,6 +565,12 @@ function view(o) {
     linkId: o.linkId,
     platform: o.platform,
     amountFen: o.amountFen,
+    // R62：优惠相关快照（历史订单没有这些字段 ⇒ 原价回退为实付、优惠 0、无券）
+    originalFen: Number(o.originalFen) > 0 ? Number(o.originalFen) : (Number(o.amountFen) || 0),
+    discountFen: Math.max(0, Number(o.discountFen) || 0),
+    couponCode: o.couponCode || '',
+    couponId: o.couponId || '',
+    couponType: o.couponType || '',
     currency: o.currency,
     status: o.status,
     createdAt: o.createdAt,

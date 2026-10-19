@@ -633,6 +633,149 @@ function parseInviteNoteInput(v) {
   return parseSmtpTextInput(v, INVITE_NOTE_MAX, '备注');
 }
 
+/* ============================ 优惠券（R62） ============================ */
+
+/**
+ * 券码与邀请码共用同一套字符集与长度：两者都是**给人抄、给人念**的短口令
+ * （优惠券会被管理员贴进群里、或被买家手输）。`0/O`、`1/I/L` 同形的坑完全一样，
+ * 故字符集**复用**而不是再定义一份 —— 两份字面量迟早会漂移。
+ */
+const COUPON_CODE_ALPHABET = INVITE_CODE_ALPHABET;
+const COUPON_CODE_LEN = INVITE_CODE_LEN;
+const COUPON_CODE_RE = new RegExp(`^[${COUPON_CODE_ALPHABET}]{${COUPON_CODE_LEN}}$`);
+
+/** 单次批量生成上限（优惠券比邀请码分发范围更窄，200 已远超正常场景） */
+const COUPON_BATCH_MAX = 200;
+const COUPON_NOTE_MAX = INVITE_NOTE_MAX;
+
+/**
+ * 单张券可领取/使用的总次数上限。`0` = 不限制（与邀请码同一语义：
+ * **0 不是「一次都不能用」**，而是「不限」）。
+ */
+const COUPON_MAX_USES_MAX = INVITE_MAX_USES_MAX;
+
+/** 优惠券的**适用范围**类型 —— 也是需求原文里的「类型限制」三档 */
+const COUPON_TYPES = ['any', 'links', 'users'];
+
+/**
+ * 一次最多关联多少个目标（链接 / 用户）。
+ *
+ * 上限的意义不是业务约束，而是**请求体与落盘体积**：`linkIds` / `userIds` 会整段
+ * 进 `coupons.json`，无上限等于允许一次请求把文件写大一个数量级。
+ */
+const COUPON_MAX_TARGETS = 200;
+
+/** 优惠金额（分）的上下界：与 `payment-rules` 的金额区间保持一致 */
+const COUPON_AMOUNT_MIN_FEN = 1;
+const COUPON_AMOUNT_MAX_FEN = 10000000;
+
+/** 单张券最多保留多少条核销台账（超出丢最旧；`used` 计数始终准确） */
+const COUPON_USES_MAX = 200;
+
+/** 券码归一化：**直接复用** `normalizeInviteCode`（去全部空白 + 转大写，语义逐字相同）。
+ *  刻意不再抄一份实现 —— 同一判据两份代码必然漂移，而漂移的表现是
+ *  「邀请码能粘贴带空格、优惠券却说无效」这种没人会往那儿想的差异。 */
+const normalizeCouponCode = normalizeInviteCode;
+
+/** 适用范围归一化：认不出的一律回落到 `any`（不因为一个脏值把券变成「谁都不可用」） */
+function normalizeCouponType(v) {
+  const s = String(v == null ? '' : v).trim().toLowerCase();
+  return COUPON_TYPES.indexOf(s) >= 0 ? s : 'any';
+}
+
+function parseCouponCodeInput(v) {
+  const raw = v == null ? '' : String(v);
+  if (/[\r\n]/.test(raw)) return { ok: false, error: '优惠券码不能包含换行符' };
+  const s = normalizeCouponCode(raw);
+  if (!s) return { ok: false, error: '请输入优惠券码' };
+  if (!COUPON_CODE_RE.test(s)) {
+    return { ok: false, error: `优惠券码格式不正确（应为 ${COUPON_CODE_LEN} 位字母数字，不含 0/O/1/I/L）` };
+  }
+  return { ok: true, value: s };
+}
+
+function parseCouponCountInput(v) {
+  const n = Number(v);
+  if (v === undefined || v === null || v === '' || !Number.isFinite(n) || !Number.isInteger(n)) {
+    return { ok: false, error: '生成数量须为整数' };
+  }
+  if (n < 1) return { ok: false, error: '生成数量至少为 1' };
+  if (n > COUPON_BATCH_MAX) return { ok: false, error: `一次最多生成 ${COUPON_BATCH_MAX} 张优惠券` };
+  return { ok: true, value: n };
+}
+
+/**
+ * 优惠**金额**（元）→ 分。
+ *
+ * 入参是「元」（界面上的输入框），落盘一律是整数「分」——与 `payment-rules`
+ * 全局一致，杜绝浮点误差。最低 0.01 元：0 元券在语义上就是「免费」，
+ * 那会让下单链路必须处理「应付 0 元」这种网关不接受的状态（本版本刻意不支持）。
+ */
+function parseCouponAmountInput(v) {
+  if (v === undefined || v === null || v === '') return { ok: false, error: '请填写优惠金额' };
+  const n = Number(v);
+  if (!Number.isFinite(n)) return { ok: false, error: '优惠金额必须是数字' };
+  if (n < 0) return { ok: false, error: '优惠金额不能为负数' };
+  const fen = Math.round(n * 100);
+  if (fen < COUPON_AMOUNT_MIN_FEN) return { ok: false, error: '优惠金额最低 0.01 元' };
+  if (fen > COUPON_AMOUNT_MAX_FEN) return { ok: false, error: `优惠金额不能超过 ${COUPON_AMOUNT_MAX_FEN / 100} 元` };
+  return { ok: true, value: fen };
+}
+
+/**
+ * 券的「总使用次数」校验：**复用**邀请码的同一实现（`0` = 不限制、负数必须拒绝、
+ * 上限同为 `COUPON_MAX_USES_MAX`）。理由同 `normalizeCouponCode`：同一判据不写两份。
+ */
+const parseCouponMaxUsesInput = parseInviteMaxUsesInput;
+
+/**
+ * 券的「开始 / 到期时间」。
+ *
+ * - `null` / `''` → `null`（开始 = 立即可用；到期 = 永久有效）
+ * - 接受 ISO 8601 与 epoch 毫秒，统一归一成 ISO 字符串
+ *
+ * 与邀请码的差别：**开始时间允许是过去**（「立刻生效」的正常写法），
+ * 只有到期时间必须晚于当前时间 —— 否则存下来的是一张出生即失效的券。
+ */
+function parseCouponTimeInput(v, label, now = Date.now()) {
+  if (v === undefined || v === null || v === '') return { ok: true, value: null };
+  let ms;
+  if (typeof v === 'number') ms = v;
+  else {
+    const s = String(v).trim();
+    if (/^\d+$/.test(s)) ms = Number(s);
+    else ms = Date.parse(s);
+  }
+  if (!Number.isFinite(ms)) return { ok: false, error: `${label}格式不正确` };
+  if (label === '到期时间' && ms <= now) {
+    return { ok: false, error: '到期时间须晚于当前时间；若要立即失效请使用「停用」' };
+  }
+  return { ok: true, value: new Date(ms).toISOString() };
+}
+
+/** 目标 id 列表（链接 / 用户）：去空白、去重、限长、拒绝非字符串 */
+function parseCouponIdsInput(v, label) {
+  const list = Array.isArray(v) ? v : [];
+  const out = [];
+  const seen = new Set();
+  for (const raw of list) {
+    if (typeof raw !== 'string') continue;
+    const s = raw.trim();
+    if (!s || seen.has(s)) continue;
+    seen.add(s);
+    out.push(s);
+  }
+  if (!out.length) return { ok: false, error: `请至少选择 1 个${label}` };
+  if (out.length > COUPON_MAX_TARGETS) {
+    return { ok: false, error: `一次最多选择 ${COUPON_MAX_TARGETS} 个${label}` };
+  }
+  return { ok: true, value: out };
+}
+
+function parseCouponNoteInput(v) {
+  return parseSmtpTextInput(v, COUPON_NOTE_MAX, '备注');
+}
+
 module.exports = {
   LIMITS, resolveCap, HARD_MAX,
   MB, normalizeSpeedLimit, toMBps, parseSpeedLimitInput,
@@ -652,4 +795,11 @@ module.exports = {
   INVITE_BATCH_MAX, INVITE_MAX_USES_MAX, INVITE_NOTE_MAX, INVITE_USED_BY_MAX,
   normalizeInviteCode, parseInviteCodeInput, parseInviteCountInput,
   parseInviteMaxUsesInput, parseInviteExpiresInput, parseInviteNoteInput,
+  // R62：优惠券
+  COUPON_CODE_ALPHABET, COUPON_CODE_LEN, COUPON_CODE_RE,
+  COUPON_BATCH_MAX, COUPON_NOTE_MAX, COUPON_MAX_USES_MAX, COUPON_TYPES,
+  COUPON_MAX_TARGETS, COUPON_AMOUNT_MIN_FEN, COUPON_AMOUNT_MAX_FEN, COUPON_USES_MAX,
+  normalizeCouponCode, normalizeCouponType,
+  parseCouponCodeInput, parseCouponCountInput, parseCouponAmountInput,
+  parseCouponMaxUsesInput, parseCouponTimeInput, parseCouponIdsInput, parseCouponNoteInput,
 };

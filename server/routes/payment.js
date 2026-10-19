@@ -16,7 +16,7 @@
  *  - 敏感字段（密钥 / 证书 / Secret）任何情况下都不回传明文，只回传「是否已配置」；
  *  - 审计日志只记录"哪个平台、改了什么开关"，绝不记录字段值。
  */
-const { express, configStore, statsStore, paymentProviders, paymentRules, paymentOrders, shareStore, security } = require('./_context');
+const { express, configStore, statsStore, paymentProviders, paymentRules, paymentOrders, shareStore, security, couponStore } = require('./_context');
 const { requireAdmin } = require('./_shared');
 
 const router = express.Router();
@@ -128,9 +128,26 @@ router.post('/payment/orders/:id/refund', requireAdmin, (req, res) => {
       return res.status(400).json({ error: why });
     }
     const o = paymentOrders.markRefunded(req.params.id);
+    /**
+     * R62（需求 8）：退款后让「定向券」对该用户**可重新使用**。
+     *
+     * 口径按需求原文：只有**非「无门槛」**的券才回退 —— 无门槛券是面向所有人的
+     * 公共券，它的一次核销不随某个人的退款而返还；而「限特定链接 / 限特定用户」
+     * 本质上是发给这个人的，钱退了就该还给他。
+     *
+     * ⚠️ 判据用订单上的 `couponType` **快照**，而不是现查券记录：券可能已被删除、
+     * 或事后被改成别的类型，而「当时那张券是什么类型」才决定这次退款要不要回退。
+     * 回退按**订单号**定位（`releaseByOrder`），不是按身份 —— 同一用户可能用同一张券
+     * 下过多笔订单，只按身份删会把他其它订单的核销记录一并抹掉。
+     */
+    let couponReleased = null;
+    if (o.couponId && o.couponType && o.couponType !== 'any') {
+      couponReleased = couponStore.releaseByOrder(o.id);
+    }
     statsStore.addLog({
       action: 'payment.refund', level: 'warn',
-      detail: `管理员「${req.authUser.username}」将订单 ${o.id} 标记为已退款（¥${paymentRules.formatAmount(o.amountFen)}，原支付凭证已失效）`,
+      detail: `管理员「${req.authUser.username}」将订单 ${o.id} 标记为已退款（¥${paymentRules.formatAmount(o.amountFen)}，原支付凭证已失效）`
+        + (couponReleased ? `；优惠券 ${o.couponId} 已对该用户恢复可用` : ''),
     });
     res.json({ ok: true, order: paymentOrders.view(o) });
   } catch (e) {

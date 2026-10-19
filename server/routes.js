@@ -63,6 +63,9 @@ router.use(require('./routes/site'));
 // ⚠️ 模块内的顺序有语义 —— `/invites/bulk` / `/invites/delete` / `/invites/export`
 // 三个字面量路径必须排在 `PUT /invites/:id` 之前（见该文件末尾的说明）。
 router.use(require('./routes/invite'));
+// R62：优惠券设置（5 条，全部 requireAdmin）。与 invites 相邻，只注册 `/coupons*`。
+// ⚠️ `/coupons/bulk` / `/coupons/delete` 两条字面量路径必须排在 `PUT /coupons/:id` 之前。
+router.use(require('./routes/coupon'));
 router.use(require('./routes/links'));
 router.use(require('./routes/fs'));
 router.use(require('./routes/stats'));

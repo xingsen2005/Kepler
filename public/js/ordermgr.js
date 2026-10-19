@@ -229,7 +229,11 @@ function render() {
 
   box.innerHTML = `<table class="lk-table">
     <thead><tr>
-      <th>文件</th><th>文件链接</th><th>订单号</th><th>金额</th><th>支付方式</th>
+      <th>文件</th><th>文件链接</th><th>订单号</th>
+      <th title="优惠前的链接标价">原价</th><th title="优惠后应支付的金额">应付</th>
+      <th title="这张订单上实际减掉的金额">优惠</th><th title="实际收到的金额（未支付时为空）">实付</th>
+      <th title="本笔订单使用的优惠券">优惠券</th>
+      <th>支付方式</th>
       <th>创建时间</th><th>付款时间</th><th>支付状态</th><th>是否已下载</th><th style="width:90px">操作</th>
     </tr></thead>
     <tbody>
@@ -241,11 +245,28 @@ function render() {
         // 已带 class 的列只能追加类名（重复 class 属性会被 HTML 解析器丢弃）
         const dimExtra = o.status === 'refunded' ? ' lk-dim' : '';
         const refundTitle = o.refundedAt ? `退款时间：${escapeHtml(fmtTime(o.refundedAt))}` : '';
+        /**
+         * R62：原价 / 优惠 / 应付 / 实付 四列的口径（需求 7）。
+         *  - 原价：链接当时的标价（订单快照，历史订单缺失时回退为实付）
+         *  - 应付：原价 − 优惠（= 订单金额 amountFen，二者必须恒等）
+         *  - 优惠：这张订单上**真的**减掉的钱（券面额超价时已封顶）
+         *  - 实付：只有「已支付 / 已退款」才有值；未付时给占位符而不是 ¥0.00 ——
+         *    「还没付」与「付了 0 元」是两件事。
+         */
+        const orig = Number(o.originalFen) > 0 ? Number(o.originalFen) : (Number(o.amountFen) || 0);
+        const disc = Math.max(0, Number(o.discountFen) || 0);
+        const payable = Math.max(0, orig - disc);
+        const actuallyPaid = (o.status === 'paid' || o.status === 'refunded')
+          ? (Number(o.amountFen) || 0) : null;
         return `<tr data-id="${escapeHtml(o.id)}"${rowClassOf(o) ? ` class="${rowClassOf(o)}"` : ''}>
           <td class="lk-file${dimExtra}" title="${escapeHtml(o.fileKey || o.fileName)}">${escapeHtml(o.fileName || '(未记录文件名)')}</td>
           <td>${fmtLink(o)}</td>
           <td class="ord-no-wrap${dimExtra}" title="${escapeHtml(o.tradeNo || '')}">${escapeHtml(o.id)}</td>
-          <td${dim}><b style="color:#b45309">${escapeHtml(fmtAmount(o))}</b></td>
+          <td${dim}>${disc ? escapeHtml(yuan(orig)) : '<span class="ord-dash">' + escapeHtml(yuan(orig)) + '</span>'}</td>
+          <td${dim}><b style="color:#b45309">${escapeHtml(yuan(payable))}</b></td>
+          <td${dim}>${disc ? `<span style="color:#047857">−${escapeHtml(yuan(disc))}</span>` : '<span class="ord-dash">—</span>'}</td>
+          <td${dim}>${actuallyPaid === null ? '<span class="ord-dash">—</span>' : `<b>${escapeHtml(yuan(actuallyPaid))}</b>`}</td>
+          <td${dim}>${o.couponCode ? `<code title="${escapeHtml(o.couponId || '')}">${escapeHtml(o.couponCode)}</code>` : '<span class="ord-dash">—</span>'}</td>
           <td${dim}>${escapeHtml(o.platformName || o.platform || '—')}</td>
           <td${dim}>${escapeHtml(fmtTime(o.createdAt))}</td>
           <td${dim}>${fmtTimeOrDash(o.paidAt)}</td>

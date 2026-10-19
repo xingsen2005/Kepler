@@ -76,6 +76,10 @@ const EXPECTED = [
   // ⚠️ 三条字面量路径（bulk / delete / export）必须排在 `PUT /invites/:id` 之前。
   'GET /invites', 'POST /invites', 'POST /invites/bulk',
   'POST /invites/delete', 'POST /invites/export', 'PUT /invites/:id',
+  // R62：优惠券设置五条，**全部 requireAdmin** —— 券码可直接抵扣金额。
+  // ⚠️ 两条字面量路径（bulk / delete）必须排在 `PUT /coupons/:id` 之前。
+  'GET /coupons', 'POST /coupons', 'POST /coupons/bulk',
+  'POST /coupons/delete', 'PUT /coupons/:id',
   'PUT /buckets/local/:id/enabled', 'PUT /buckets/local/:id/active', 'PUT /buckets/visibility',
   'DELETE /buckets/local/:id', 'GET /buckets/stats',
   'POST /buckets/local/:id/clear', 'GET /buckets/local/:id/fragments',
@@ -205,6 +209,10 @@ test('敏感接口均挂载 requireAdmin', () => {
     // 少挂一个 requireAdmin 就等于给任何登录用户一条「批量读取免注册口令」的通道。
     'GET /invites', 'POST /invites', 'POST /invites/bulk',
     'POST /invites/delete', 'POST /invites/export', 'PUT /invites/:id',
+    // R62：优惠券五条全部要求管理员 —— 生成接口能造出「直接抵扣金额」的凭据，
+    // `GET /coupons` 会原样回传券码明文，少挂一个守卫就等于把券发给所有登录用户。
+    'GET /coupons', 'POST /coupons', 'POST /coupons/bulk',
+    'POST /coupons/delete', 'PUT /coupons/:id',
   ];
   const unprotected = mustBeAdmin.filter((r) => !adminGuarded.includes(r));
   assertEqual(unprotected.length, 0,
