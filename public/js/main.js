@@ -1135,6 +1135,9 @@ function renderUserMenu() {
   if (ipCard) ipCard.hidden = !isAdmin;
   const ipSpeedCard = document.getElementById('ipspeed-card');
   if (ipSpeedCard) ipSpeedCard.hidden = !isAdmin;
+  // R65：订单取回封禁（第三张卡片）—— 封禁列表含他人来源 IP，同样仅管理员可见
+  const ipRestoreCard = document.getElementById('iprestore-card');
+  if (ipRestoreCard) ipRestoreCard.hidden = !isAdmin;
 
   // 自定义请求域名：保存走 PUT /api/config（管理员专属），且是全局生效的共享设置。
   // 普通用户整卡隐藏；credmgr 据此跳过域名回填。

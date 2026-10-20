@@ -43,7 +43,7 @@ function isAdmin() {
  * 换账号时就会残留上一个角色的 DOM（越权显示用户列表）。整卡按角色显隐之后，
  * 角色切换只是"显示 / 隐藏一个整块"，不存在需要还原的中间状态。
  */
-const ADMIN_ONLY_CARDS = ['sysset-site-card', 'sysset-user-card', 'sysset-smtp-card', 'sysset-concurrency-card', 'sysset-lb-card', 'sysset-enc-card', 'sysset-excludes-card', 'sysset-webdav-card', 'sysset-captcha-card', 'sysset-payment-card', 'sysset-backup-card'];
+const ADMIN_ONLY_CARDS = ['sysset-site-card', 'sysset-restore-card', 'sysset-user-card', 'sysset-smtp-card', 'sysset-concurrency-card', 'sysset-lb-card', 'sysset-enc-card', 'sysset-excludes-card', 'sysset-webdav-card', 'sysset-captcha-card', 'sysset-payment-card', 'sysset-backup-card'];
 
 /** 隐藏仅管理员可见的卡片（非管理员直接不渲染其内容） */
 function setAdminCardVisible(cardId, visible) {
@@ -89,6 +89,8 @@ export function refresh() {
   loadSmtp();
   // R54：站点设置（站点名称 / 公开注册 / 新用户身份）
   loadSite();
+  // R65：订单取回（取回次数上限 / 连续输错上限）
+  loadRestore();
   // R48：线程并发（值随 /config 下发，这里只负责把当前值渲染进表单并刷新推导预览）
   renderConcurrency();
   loadLoadBalance();
@@ -167,6 +169,9 @@ function wire() {
   // 站点设置（R54）：保存（卡片没有开关，因此只有一个按钮要接）
   const siteSave = document.getElementById('btn-site-save');
   if (siteSave) siteSave.onclick = saveSiteSettings;
+  // R65：订单取回（无开关，只有两个数字 + 保存）
+  const retSave = document.getElementById('btn-restore-save');
+  if (retSave) retSave.onclick = saveRestoreSettings;
   // 分段选择（服务商 / 失败策略 / 加密方式 / 注册模式 / 新用户身份）
   ['captcha-provider', 'captcha-onerror', 'smtp-secure', 'site-registration', 'site-role'].forEach((id) => {
     const wrap = document.getElementById(id);
@@ -859,6 +864,18 @@ export function reset() {
   if (siteStatus) siteStatus.textContent = '';
   chipSelect('site-registration', SITE_REGISTRATION_DEFAULT);
   chipSelect('site-role', SITE_ROLE_DEFAULT);
+  // R65：订单取回 —— 两个输入框属于「上一个账号填过的界面状态」，必须清掉
+  //（否则换账号后管理员看到的是一份旧的、与自己站上配置无关的数字）
+  const rUses = document.getElementById('restore-max-uses');
+  if (rUses) rUses.value = '';
+  const rFails = document.getElementById('restore-max-fails');
+  if (rFails) rFails.value = '';
+  const rMsg = document.getElementById('restore-msg');
+  if (rMsg) { rMsg.textContent = ''; rMsg.className = 'form-msg'; }
+  const rState = document.getElementById('restore-state');
+  if (rState) rState.textContent = '';
+  const rStatus = document.getElementById('restore-status');
+  if (rStatus) rStatus.textContent = '';
 }
 
 /* ============================ 发信设置（仅管理员，R53） ============================ */
@@ -1074,6 +1091,89 @@ async function saveSiteSettings() {
     toast('站点设置已保存', { type: 'success' });
   } catch (e) {
     siteMsg('保存失败：' + (e.message || '未知错误'), 'bad');
+  }
+}
+
+/* ============================ 订单取回（仅管理员，R65） ============================ */
+
+/**
+ * 「订单取回」卡片：付费分享页「恢复购买」的两道护栏。
+ *
+ * ## 为什么没有启用开关
+ *
+ * 需求明确「该卡片不需要开关，默认持久化」。这不是省一块 UI —— 两个值都是**护栏**：
+ * `maxUses` 关掉等于让订单号变成无限制的万能凭证（一个号码可以给一群人用），
+ * `maxFails` 关掉等于对匿名端点开放无限次猜测。没有「合理的关闭场景」，
+ * 也就没有开关可言；要放宽就把数字调大。
+ *
+ * ## 前端只做「友好提示」，不复制边界
+ *
+ * 真正的边界在 `limits.js`（服务端 400 会带原因）。这里只把「明显不是数字」和
+ * 「显然越界」提前挡住，避免为一个笔误跑一趟请求 —— 但**绝不**把值静默改成合法值：
+ * 界面显示 3、实际存了 1，是最难发现的一类分叉（见 `parseMbpsInput` 的同款说明）。
+ */
+const RESTORE_USES_MIN = 1;
+const RESTORE_USES_MAX = 100;
+const RESTORE_FAILS_MIN = 1;
+const RESTORE_FAILS_MAX = 50;
+
+function restoreMsg(text, cls) {
+  const msg = document.getElementById('restore-msg');
+  if (!msg) return;
+  msg.textContent = text;
+  msg.className = 'form-msg show ' + (cls || 'ok');
+}
+
+/** 读一个整数输入框：空串 / 非整数 / 越界都给出可读原因（返回 `{ ok, value, error }`） */
+function readIntInput(id, min, max, label) {
+  const el = document.getElementById(id);
+  const raw = el ? String(el.value || '').trim() : '';
+  if (!raw) return { ok: false, error: `请填写${label}` };
+  if (!/^\d+$/.test(raw)) return { ok: false, error: `${label}须为整数` };
+  const n = Number(raw);
+  if (n < min || n > max) return { ok: false, error: `${label}须在 ${min}–${max} 之间` };
+  return { ok: true, value: n };
+}
+
+/** 用服务端视图回填表单 */
+function renderRestore(c) {
+  c = c || {};
+  const uses = document.getElementById('restore-max-uses');
+  const fails = document.getElementById('restore-max-fails');
+  if (uses) uses.value = c.maxUses === undefined ? '' : String(c.maxUses);
+  if (fails) fails.value = c.maxFails === undefined ? '' : String(c.maxFails);
+  const status = document.getElementById('restore-status');
+  if (status) {
+    status.textContent = (c.maxUses && c.maxFails)
+      ? `（每笔订单 ${c.maxUses} 次 · 连续输错 ${c.maxFails} 次封 24 小时）`
+      : '';
+  }
+}
+
+async function loadRestore() {
+  if (!isAdmin()) return; // 普通用户连请求都不发（卡片已整卡隐藏）
+  try {
+    renderRestore(await API.restoreConfig());
+  } catch (e) {
+    if (e && e.status === 403) return; // 非管理员：静默（卡片整体不可见）
+    const status = document.getElementById('restore-status');
+    if (status) status.textContent = '(加载失败)';
+  }
+}
+
+async function saveRestoreSettings() {
+  if (!isAdmin()) { toast('仅管理员可修改订单取回设置', { type: 'error' }); return; }
+  const uses = readIntInput('restore-max-uses', RESTORE_USES_MIN, RESTORE_USES_MAX, '取回次数限制');
+  if (!uses.ok) { restoreMsg(uses.error, 'bad'); return; }
+  const fails = readIntInput('restore-max-fails', RESTORE_FAILS_MIN, RESTORE_FAILS_MAX, '错误尝试次数上限');
+  if (!fails.ok) { restoreMsg(fails.error, 'bad'); return; }
+  try {
+    const r = await API.saveRestoreConfig({ maxUses: uses.value, maxFails: fails.value });
+    renderRestore(r);
+    restoreMsg('订单取回设置已保存（立即生效）', 'ok');
+    toast('订单取回设置已保存', { type: 'success' });
+  } catch (e) {
+    restoreMsg('保存失败：' + (e.message || '未知错误'), 'bad');
   }
 }
 

@@ -252,6 +252,12 @@ function create({
     paidAt: null,
     refundedAt: null, // 由管理员标记的退款时间（本系统不代持资金，无网关退款调用）
     downloadedAt: null, // 是否已下载（付费下载的核心对账字段）
+    /**
+     * R65：凭订单号成功取回下载权限的次数（由 `claimForLink()` 在成功时自增）。
+     * 历史订单没有这个字段 ⇒ 读侧按 0 处理（`Number(x) || 0`），等价于「一次都没取回过」。
+     */
+    restoreCount: 0,
+    lastRestoredAt: null,
     failReason: '',
     payerIp: String(payerIp || ''),
     // 文件快照：链接删除后仍能回答"付的是什么"
@@ -479,10 +485,16 @@ function listForUser(userId) {
  *
  * @param {string} no 用户输入的订单号（已归一化）
  * @param {string} linkId 当前分享链接 id
+ * @param {{maxUses?: number}} [opts] R65：同一订单号可成功取回的次数上限
+ *   （`0` / 缺省 = 不限制；判据在**本函数**里，调用方不得另写一份）
  * @returns {{ok: boolean, reason: string, order: object|null, message: string}}
- *   reason: '' | 'invalid' | 'mismatch' | 'pending' | 'failed' | 'refunded'
+ *   reason: '' | 'invalid' | 'mismatch' | 'pending' | 'failed' | 'refunded' | 'used_up'
+ *
+ * ⚠️ **成功时这里会把 `restoreCount` 加一并落盘**：「取回次数」必须在**判定与发放的
+ * 同一处**递增，否则两个并发请求会同时读到旧计数（都能过闸门，实际取回 N+1 次）。
+ * 这也意味着本函数**不再是一个纯查询** —— 名字仍是 claim（认领），语义就是「认领一次」。
  */
-function claimForLink(no, linkId) {
+function claimForLink(no, linkId, opts) {
   /**
    * ⚠️ 这里交给 `findByOrderNo()` **原样**处理，不要先 `normalize`：
    * 老订单的 id 是 base64url，可能含 `-` / `_`，先抹掉分隔符就再也命中不了
@@ -498,7 +510,30 @@ function claimForLink(no, linkId) {
       message: '未找到该订单号，或该订单号不属于当前分享链接。请核对后重试。',
     };
   }
-  if (o.status === 'paid') return { ok: true, reason: '', order: o, message: '' };
+  if (o.status === 'paid') {
+    /**
+     * R65：取回次数上限。只在 `paid` 之后判、在 `paid` 之内加 —— 未支付 / 已退款 /
+     * 已失败的订单本来就取不到，不该消耗这个额度。
+     */
+    const max = Number(opts && opts.maxUses);
+    const limit = Number.isFinite(max) && max > 0 ? Math.floor(max) : 0;
+    const used = Math.max(0, Number(o.restoreCount) || 0);
+    if (limit > 0 && used >= limit) {
+      return {
+        ok: false,
+        reason: 'used_up',
+        order: o,
+        message: `该订单号已达到取回次数上限（${limit} 次），不能再凭它取回下载权限。`
+          + '如需重新下载，请联系分享者。',
+      };
+    }
+    if (limit > 0) {
+      o.restoreCount = used + 1;
+      o.lastRestoredAt = new Date().toISOString();
+      persist();
+    }
+    return { ok: true, reason: '', order: o, message: '' };
+  }
   if (o.status === 'refunded') {
     return {
       ok: false,
@@ -719,6 +754,9 @@ function view(o) {
     paidAt: o.paidAt || null,
     refundedAt: o.refundedAt || null,
     downloadedAt: o.downloadedAt || null,
+    /** R65：已凭订单号取回下载权限几次（订单管理页不展示，供排障与售后核对） */
+    restoreCount: Math.max(0, Number(o.restoreCount) || 0),
+    lastRestoredAt: o.lastRestoredAt || null,
     fileName: o.fileName || '',
     tradeNo: o.tradeNo || '',
     failReason: o.failReason || '',

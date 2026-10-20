@@ -24,6 +24,8 @@ const authSession = require('./auth-session');
 const security = require('./security');
 const secureStore = require('./secure-store');
 const paymentOrders = require('./payment-orders');
+// R65：订单取回的自动封禁（同样有去抖落盘，停机前要刷一次）
+const restoreGuard = require('./restore-guard');
 const { gzipMiddleware } = require('./gzip');
 const requestContext = require('./request-context');
 const { loadTlsCert, hintText } = require('./tls-cert');
@@ -320,6 +322,11 @@ function gracefulShutdown(signal) {
        * （`paid` 退回落盘前的 `pending`）。无待写内容时是空操作，成本为零。
        */
       try { paymentOrders.flush(); } catch (e) { /* ignore */ }
+      /**
+       * R65：订单取回的封禁是**去抖 300ms** 写的。停机前不刷一次，「刚被封的那个 IP
+       * 在重启后立刻解封」就会成为绕过它的固定手法（重启本身就是最短的一条路）。
+       */
+      try { restoreGuard.flush(); } catch (e) { /* ignore */ }
       /**
        * R48：加密工作线程池必须显式收摊。
        *

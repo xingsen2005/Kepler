@@ -46,6 +46,8 @@ const authSession = require('./auth-session');
 const orderNo = require('./order-no');
 // R64：免费下载记录 —— 「查看历史订单」里「免费下载的文件」的唯一来源（只记首次）
 const downloadLog = require('./download-log');
+// R65：订单取回的连续输错封禁（只作用于取回端点，见该模块文件头）
+const restoreGuard = require('./restore-guard');
 const { getClient, p, tracked } = require('./s3');
 const { streamDownload } = require('./download-stream');
 // R51：勾选多个（或含文件夹）时的打包下发 —— 零依赖 tar.gz，见该模块文件头
@@ -1995,11 +1997,31 @@ router.post('/s/:id', asyncHandler(async (req, res) => {
 
 /** 「恢复购买」输入页（游客的主路径：他没有账号可归集订单，只能凭号码取回） */
 function restorePage(res, l, opts = {}) {
+  /**
+   * R65：被「连续输错」封禁时**不渲染表单**。
+   *
+   * 渲染一个必然失败的输入框会让人一直重试（既有 24 小时的等待，又有 400 的错误页），
+   * 而这里真正需要告诉他的是三件事：为什么被拦、什么时候能再试、管理员从哪儿解封。
+   */
+  if (opts.blocked && opts.blocked.banned) {
+    const until = opts.blocked.until ? fmtDate(opts.blocked.until) : '';
+    return renderPage(res, 429, {
+      title: '暂时无法取回',
+      head: `<div class="center-head">
+      <h1>尝试次数过多</h1>
+      <p class="sub">该网络地址因<b>连续多次输错订单号</b>，已被限制使用「恢复购买」。</p>
+      </div>`,
+      body: `
+      <div class="warn">限制将在 <b>${esc(until || '24 小时后')}</b> 自动解除（受限期间分享页浏览与付费下载都不受影响）。
+        如果这是误判，请联系站点管理员在「IP 地址管理」中解封。</div>
+      <a class="btn ghost" href="/s/${esc(l.id)}" style="text-align:center;text-decoration:none">返回文件页</a>`,
+    });
+  }
   const err = opts.error ? `<div class="warn">${esc(opts.error)}</div>` : '';
   renderPage(res, opts.error ? 400 : 200, {
     title: '恢复购买',
     head: `<div class="center-head">
-      <div class="icon-big" style="background:#e8f1fb;color:#0067c0;font-size:22px">🧾</div>
+      
       <h1>恢复购买</h1>
       <p class="sub">输入付款时拿到的订单号，即可取回这条分享的下载权限，<b>无需再次付费</b>。</p>
       </div>`,
@@ -2122,6 +2144,12 @@ router.get('/s/:id/restore', (req, res) => {
   if (l.passwordHash && !shareStore.verifyToken(l, getCookie(req, cookieName(l.id)))) {
     return res.redirect(303, '/s/' + l.id);
   }
+  // R65：被「连续输错」封禁时直接告知，不去渲染一个必然失败的表单
+  const ban = restoreGuard.isBanned(security.clientIp(req));
+  if (ban.banned) {
+    res.setHeader('Retry-After', String(ban.retryAfter));
+    return restorePage(res, l, { blocked: ban });
+  }
   return restorePage(res, l);
 });
 
@@ -2144,12 +2172,24 @@ router.post('/s/:id/restore', asyncHandler(async (req, res) => {
   }
 
   const ip = security.clientIp(req);
+  /**
+   * R65：先看是不是已被「连续输错」封禁。
+   *
+   * 顺序刻意排在限流器**之前**：限流器给的是「10 分钟后重试」，而封禁是 24 小时 ——
+   * 先报短的那个会让人以为等 10 分钟就好了，白等。
+   */
+  const ban = restoreGuard.isBanned(ip);
+  if (ban.banned) {
+    res.setHeader('Retry-After', String(ban.retryAfter));
+    return restorePage(res, l, { blocked: ban });
+  }
   const rl = security.orderRestoreLimiter(ip);
   if (!rl.ok) {
     res.setHeader('Retry-After', String(rl.retryAfter));
     return restorePage(res, l, { error: `尝试次数过多，请 ${rl.retryAfter} 秒后重试。` });
   }
 
+  const cfg = configStore.getRestore();
   const raw = String((req.body && req.body.orderNo) || '');
   const no = orderNo.normalize(raw);
   /**
@@ -2157,19 +2197,46 @@ router.post('/s/:id/restore', asyncHandler(async (req, res) => {
    * R64 之前的老订单没有 36 位订单号，它们当年的「订单号」是 24 位记录 id，
    * 用户手里留着的就是那个值 —— 因此把长度放宽到 8~64、只限字母数字，
    * 真正的有效性一律交给 `claimForLink()`（查表 + 链接归属 + 支付状态）。
+   *
+   * ⚠️ R65：形状错误**也计入连续输错次数**。否则「乱敲一串」就成了零成本的探测方式，
+   * 而攻击者只要每次都发不合形状的串，就永远不会触发上一档的失败计数。
    */
   if (!/^[0-9A-Za-z_-]{8,64}$/.test(no)) {
+    const g = restoreGuard.noteFail(ip, cfg.maxFails);
+    if (g.justBanned) {
+      statsStore.addLog({
+        action: 'share.restore-block', level: 'warn',
+        detail: `IP ${ip} 连续输错订单号达 ${cfg.maxFails} 次，已限制「恢复购买」24 小时（链接 ${l.id}）`,
+      });
+    }
     return restorePage(res, l, { error: '订单号格式不正确，请核对后重新输入。' });
   }
 
-  const r = paymentOrders.claimForLink(no, l.id);
+  const r = paymentOrders.claimForLink(no, l.id, { maxUses: cfg.maxUses });
   if (!r.ok) {
+    /**
+     * 「取回次数已用完」**不算输错**：那是一笔真实存在、确实付过款的订单，
+     * 只是额度用尽。把它计入失败次数会让「反复用自己的订单号重试」的人被封，
+     * 而封禁要针对的是猜号，不是额度。
+     */
+    if (r.reason !== 'used_up') {
+      const g = restoreGuard.noteFail(ip, cfg.maxFails);
+      if (g.justBanned) {
+        statsStore.addLog({
+          action: 'share.restore-block', level: 'warn',
+          detail: `IP ${ip} 连续输错订单号达 ${cfg.maxFails} 次，已限制「恢复购买」24 小时（链接 ${l.id}）`,
+        });
+      }
+    }
     statsStore.addLog({
       action: 'share.restore', level: 'warn',
       detail: `分享页恢复购买失败（链接 ${l.id}，原因：${r.reason}，IP：${ip}）`,
     });
     return restorePage(res, l, { error: r.message });
   }
+
+  // 成功：连击计数归零（失败次数是「连续」语义，成功一次就从头算）
+  restoreGuard.noteSuccess(ip);
 
   // 与正常支付流程下发**同一枚**票据：后续所有下载判定因此无需新增任何分支
   res.cookie(payCookieName(l.id), paymentOrders.orderToken(r.order), shareCookieOptions(l.id));

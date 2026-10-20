@@ -6203,11 +6203,13 @@ const CASES = [
       name: 'R48-04a · 「线程并发」卡片未登记为管理员专属（普通用户可见可改）',
       file: 'public/js/syssettings.js',
       /**
-       * R54 同步：名单最前面又插入了 `'sysset-site-card', `（站点设置卡片），
-       * 故 anchor 带上新成员；旧的写法已不在源码里。
+       * R54 / R65 同步：名单最前面又插入了 `'sysset-site-card', `（站点设置）与
+       * `'sysset-restore-card', `（订单取回），故 anchor 带上这两个新成员；
+       * 旧的写法已不在源码里 —— 不随实现迁移的话这条对照会**静默失效**
+       * （既不变红也不报错，`invariants` 的 anchor 自检就是为此存在的）。
        */
-      anchor: "const ADMIN_ONLY_CARDS = ['sysset-site-card', 'sysset-user-card', 'sysset-smtp-card', 'sysset-concurrency-card',",
-      replacement: "const ADMIN_ONLY_CARDS = ['sysset-site-card', 'sysset-user-card', 'sysset-smtp-card',",
+      anchor: "const ADMIN_ONLY_CARDS = ['sysset-site-card', 'sysset-restore-card', 'sysset-user-card', 'sysset-smtp-card', 'sysset-concurrency-card',",
+      replacement: "const ADMIN_ONLY_CARDS = ['sysset-site-card', 'sysset-restore-card', 'sysset-user-card', 'sysset-smtp-card',",
       testFile: 'audit48-regressions.test.js',
       minFail: 1,
     },
@@ -7550,9 +7552,11 @@ const CASES = [
       // R53-09a：卡片可见性。不登记 ⇒ 普通用户看到卡片、点保存却被 403。
       name: 'R53-09a · 「发信设置」卡片未登记进 ADMIN_ONLY_CARDS（普通用户可见）',
       file: 'public/js/syssettings.js',
-      // R54 同步：名单最前面新增了 'sysset-site-card'，anchor 带上新成员
-      anchor: "const ADMIN_ONLY_CARDS = ['sysset-site-card', 'sysset-user-card', 'sysset-smtp-card',",
-      replacement: "const ADMIN_ONLY_CARDS = ['sysset-site-card', 'sysset-user-card',",
+      // R54 / R65 同步：名单前面已变成 'sysset-site-card', 'sysset-restore-card'，
+      // 故 anchor 不再从 `const ADMIN_ONLY_CARDS = ` 起算 —— 只取「smtp 紧跟在 user 之后」
+      // 这一小段（仍全文唯一），变异即把 smtp 从名单里摘掉。
+      anchor: "'sysset-user-card', 'sysset-smtp-card', 'sysset-concurrency-card',",
+      replacement: "'sysset-user-card', 'sysset-concurrency-card',",
       testFile: 'audit53-regressions.test.js',
       minFail: 1,
     },
@@ -9141,11 +9145,17 @@ const CASES = [
        *
        * 后果：需求里那句「所有前提建立在订单状态是支付成功」被悄悄破掉 ——
        * 一个刚下单还没付款（甚至支付失败）的订单号就能换到下载权限。
+       *
+       * ⚠️ R65 同步：`paid` 分支从单行 `return` 展开成了一个块（里面要先判取回配额），
+       * 旧 anchor（那行单行 return）已不在源码里。anchor 改为**分支头那一行**
+       * （全文唯一，且是纯代码行 —— 注释会被剥成等长空白，不能进 anchor）。
+       * 刻意**不**连带下一行：`paid` 分支头与 `const max` 之间隔着一整块注释，
+       * 带 `\n` 拼两行的写法在这里必然命不中（本轮实测踩过）。
        */
       name: 'R64-02a · 恢复购买不再要求「支付成功」（pending 也能换到下载权限）',
       file: 'server/payment-orders.js',
-      anchor: "  if (o.status === 'paid') return { ok: true, reason: '', order: o, message: '' };",
-      replacement: "  if (o.status === 'paid' || o.status === 'pending') return { ok: true, reason: '', order: o, message: '' };",
+      anchor: "  if (o.status === 'paid') {",
+      replacement: "  if (o.status === 'paid' || o.status === 'pending') {",
       testFile: 'share-orders.test.js',
       minFail: 2,
     },
@@ -9175,6 +9185,77 @@ const CASES = [
       anchor: "    if (o.status !== 'paid') continue;",
       replacement: '    continue;',
       testFile: 'share-orders.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * R65-01a：撤掉「按订单号的取回次数上限」。
+       *
+       * 后果：需求 1 完全失效 —— 一枚订单号可以被无限次取回，把它转发给谁都能拿到
+       * 下载权限。`R65-04` 与 `R65-07` 各自从「函数层」与「HTTP 层」钉这件事，
+       * 故预期**两条**都红（`minFail` 写 2，不许顺手调小）。
+       */
+      name: 'R65-01a · 取回次数上限被撤（同一订单号无限次取回）',
+      file: 'server/payment-orders.js',
+      anchor: '    if (limit > 0 && used >= limit) {',
+      replacement: '    if (false) {',
+      testFile: 'restore-settings.test.js',
+      minFail: 2,
+    },
+    {
+      /*
+       * R65-02a：把封禁判定泄漏到**分享页浏览**上（需求 3 点名的就是这件事）。
+       *
+       * 后果：一个 IP 在取回时连续输错几次，之后连分享页都打不开 —— 一处
+       * 只该管「取回」的限速闸门顺手升级成全网封锁。`R65-08` 就是这条的护栏。
+       */
+      name: 'R65-02a · 取回封禁泄漏到分享页浏览（封禁变成全网封锁）',
+      file: 'server/share-routes.js',
+      anchor: "router.get('/s/:id', async (req, res) => {\n  const l = shareStore.get(req.params.id);\n  if (!l) return statePage(res, 'notfound');",
+      replacement: "router.get('/s/:id', async (req, res) => {\n  if (restoreGuard.isBanned(security.clientIp(req)).banned) return res.status(429).send('blocked');\n  const l = shareStore.get(req.params.id);\n  if (!l) return statePage(res, 'notfound');",
+      testFile: 'restore-settings.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * R65-03a：管理端「解封」不再真的删记录（过滤条件恒真）。
+       *
+       * 后果：界面上点了「解封」、接口回 200，`removed` 却是 false（界面提示
+       * 「当前未被限制」），被封的 IP 仍然进不去 —— 需求 3 的可解封承诺失效。
+       */
+      name: 'R65-03a · 管理端解封不生效（过滤条件恒真）',
+      file: 'server/restore-guard.js',
+      anchor: '  g.bans = g.bans.filter((b) => ipKey(b.ip) !== key);',
+      replacement: '  g.bans = g.bans.filter(() => true);',
+      testFile: 'restore-settings.test.js',
+      minFail: 2,
+    },
+    {
+      /*
+       * R65-04a：给卡片塞回一个开关（需求 4：该卡片不需要开关）。
+       *
+       * 后果：出现「关闭」状态后，这条匿名取回通道在关掉时**无任何限制**，
+       * 比默认开着更糟；而且这个开关与「两个值落盘即生效」的语义互相矛盾。
+       */
+      name: 'R65-04a · 「订单取回」卡片被加回启用开关（破坏需求 4）',
+      file: 'public/index.html',
+      anchor: '                  <label>取回次数限制</label>',
+      replacement: '                  <input type="checkbox" id="restore-enabled" checked>\n                  <label>取回次数限制</label>',
+      testFile: 'restore-settings.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * R65-05a：「连续」语义被破坏 —— 成功一次不再清零。
+       *
+       * 后果：这枚 IP 一辈子只能错 `maxFails` 次，跨天、跨月、跨重启都不恢复；
+       * 用户偶尔手误敲错一次，几个月后攒满就被封 24 小时，且完全不明白为什么。
+       */
+      name: 'R65-05a · 成功取回不清零（「连续」退化为「累计」）',
+      file: 'server/restore-guard.js',
+      anchor: '  if (key) counters.delete(key);',
+      replacement: '  if (false) counters.delete(key);',
+      testFile: 'restore-settings.test.js',
       minFail: 1,
     },
   ];

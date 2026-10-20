@@ -84,6 +84,7 @@ const downloadLog = require(SERVER('download-log.js'));
 const authSession = require(SERVER('auth-session.js'));
 const security = require(SERVER('security.js'));
 const orderNo = require(SERVER('order-no.js'));
+const restoreGuard = require(SERVER('restore-guard.js'));
 const shareRoutes = require(SERVER('share-routes.js'));
 
 /** 起一个只挂分享路由的本地服务 */
@@ -355,6 +356,17 @@ test('R64-10 · 恢复购买拒绝：未支付 / 已退款 / 其它链接 / 不�
       assertMatch(r.raw, /恢复购买/, `${c.why} 应停留在恢复购买页并给出提示`);
     }
     // 未支付与已退款必须给出**不同**文案（一个"去付款"，一个"凭证失效"）
+    /**
+     * ⚠️ R65 起多了一道闸门：同一 IP **连续输错 5 次**即封 24 小时（`maxFails` 默认 5），
+     * 而本用例上面已经错了 4 次 —— 下面这两次一凑正好第 5、6 次，于是第 6 次会被
+     * 封禁页（429）接走，永远看不到「已退款」那句文案。
+     *
+     * 这**不是**实现对不上：本用例要验的是「两种拒绝的文案是否同形」，连击封禁是
+     * 另一件事（它有自己的用例 R65-05/R65-06）。故先把连击计数清掉再比对 ——
+     * `unban()` 会连带 `counters.delete(key)`，此处本来就没封，返回 false 无副作用。
+     * 刻意**不用**去调 `maxFails`：那会让本用例依赖 R65 的默认值，默认值一改就红。
+     */
+    restoreGuard.unban('127.0.0.1');
     const p1 = await request(srv.port, 'POST', '/s/' + l.id + '/restore', { body: { orderNo: pending.orderNo } });
     const p2 = await request(srv.port, 'POST', '/s/' + l.id + '/restore', { body: { orderNo: refunded.orderNo } });
     assertMatch(p1.raw, /尚未支付成功/, '未支付应有对应提示');

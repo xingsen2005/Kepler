@@ -65,6 +65,9 @@ function wire() {
   if (addSp) addSp.onclick = () => openIpRuleDialog(null, 'speed');
   const testBtn = document.getElementById('btn-ipguard-test');
   if (testBtn) testBtn.onclick = testIpBlocked;
+  // R65：订单取回封禁（自动产生、24 小时过期、只拦「恢复购买」）
+  const rfRes = document.getElementById('btn-iprestore-refresh');
+  if (rfRes) rfRes.onclick = () => refreshIpGuard();
 }
 
 /* ============================== 作用范围 ============================== */
@@ -162,7 +165,8 @@ async function refreshIpGuard() {
   if (card && card.hidden) return;
   const box = document.getElementById('ipguard-table');
   const spBox = document.getElementById('ipspeed-table');
-  if (!box && !spBox) return;
+  const rsBox = document.getElementById('iprestore-table');
+  if (!box && !spBox && !rsBox) return;
   rebuildTestScope();
 
   let d;
@@ -171,6 +175,7 @@ async function refreshIpGuard() {
   } catch (e) {
     if (box) box.innerHTML = `<div class="lk-empty">IP 规则加载失败：${escapeHtml(e.message)}</div>`;
     if (spBox) spBox.innerHTML = '';
+    if (rsBox) rsBox.innerHTML = '';
     return;
   }
   ipCache = d;
@@ -204,6 +209,56 @@ async function refreshIpGuard() {
       bindRuleRowActions(spBox, speeds);
     }
   }
+  /**
+   * R65：订单取回封禁（第三栏）。
+   *
+   * ⚠️ 它与 `rules` 是**两张表**：这是「连续输错订单号」自动产生、24 小时过期、
+   * 只拦「恢复购买」的临时限制。因此这里**没有**「启用 / 禁用 / 编辑 / 作用范围」，
+   * 只有一个「解封」—— 把它做成规则那套按钮会让人以为它也在拦访问。
+   */
+  if (rsBox) {
+    const bans = d.restoreBans || [];
+    const rsCount = document.getElementById('iprestore-count');
+    if (rsCount) rsCount.textContent = bans.length ? `（${bans.length} 个地址受限）` : '';
+    rsBox.innerHTML = bans.length
+      ? restoreBanTableHtml(bans)
+      : '<div class="lk-empty">当前没有地址被限制「订单取回」。连续输错订单号达上限时会自动出现在这里，24 小时后自动解除。</div>';
+    rsBox.querySelectorAll('tr[data-ip] [data-act="unban"]').forEach((btn) => {
+      btn.onclick = () => unbanRestore(btn.closest('tr').dataset.ip);
+    });
+  }
+}
+
+/** 订单取回封禁表（第三栏；只有「解封」一个操作 —— 见 `refreshIpGuard` 的说明） */
+function restoreBanTableHtml(bans) {
+  return `<table class="lk-table ipg-table">
+    <thead><tr>
+      <th>IP 地址</th><th>连续输错</th><th>封禁时间</th><th>自动解封</th><th style="width:120px">操作</th>
+    </tr></thead>
+    <tbody>
+      ${bans.map((b) => `<tr data-ip="${escapeHtml(b.ip)}">
+        <td class="lk-file" style="font-family:Consolas,monospace">${escapeHtml(b.ip)}</td>
+        <td><span class="lk-badge warn">${Number(b.fails) || 0} 次</span></td>
+        <td>${b.at ? fmtTime(b.at) : '—'}</td>
+        <td>${fmtTime(b.until)}</td>
+        <td class="lk-acts"><button class="mini-btn" data-act="unban">解封</button></td>
+      </tr>`).join('')}
+    </tbody></table>`;
+}
+
+/**
+ * 解封一个 IP 的「订单取回」限制。
+ *
+ * 返回 `removed:false` 表示本来就没封（可能刚到期自动解除了）—— 这时提示「当前未被限制」
+ * 而不是「已解封」，否则管理员会以为自己刚刚救了一个正在受限的人。
+ */
+async function unbanRestore(ip) {
+  try {
+    const r = await API.unbanRestore(ip);
+    toast(r.removed ? `已解除 ${ip} 的订单取回限制` : `${ip} 当前未被限制（可能已到期）`,
+      { type: r.removed ? 'success' : 'warn' });
+    refreshIpGuard();
+  } catch (e) { toast('解封失败：' + e.message, { type: 'error' }); }
 }
 
 async function toggleIpRule(rule) {

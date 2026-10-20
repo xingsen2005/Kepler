@@ -234,6 +234,15 @@
             <div id="ipspeed-table"></div>
             <div class="card-note">对<b>固定 IP 或 CIDR 地址段</b>限制<b>下载速率</b>（规则写法与上面的屏蔽规则完全一致），适合给下载器 / 爬虫 / 合作方单独排队，而不必整个禁掉它。<br>限速按<b>地址段聚合</b>：一个 /24 段内的所有设备共享这份带宽，因此「每台 1 MB/s」要按段内设备数换算总量。命中限速规则的下载<b>不会被拒绝</b>，只是慢一些；它同样支持<b>全局 / 桶级</b>两级作用范围与<b>请求方法</b>过滤（下载走 GET / HEAD）。<br>本页限速与「API Key 管理 / 存储桶管理 / 用户管理 / 分享链接」里的限速<b>取最小值</b>生效：任何一处设了更小的值，实际速率就按那个更小的走。</div>
           </div>
+            <!-- 订单取回封禁（R65）：自动产生、24 小时自动过期、**只拦「恢复购买」**。
+                 刻意与上面两张卡片分栏：那两张是管理员手工维护的**访问**规则，
+                 这里只是自动生成的、只作用于一条路径的临时限制，没有「编辑 / 作用范围」。 -->
+            <div class="dash-card wide" id="iprestore-card">
+            <h3>订单取回封禁 <span id="iprestore-count" class="lk-count"></span>
+              <button id="btn-iprestore-refresh" class="mini-btn">刷新</button></h3>
+            <div id="iprestore-table"></div>
+            <div class="card-note">「订单取回」是付费分享页上的「恢复购买」：用户凭订单号取回下载权限。<b>同一 IP 连续输错订单号</b>达上限后会被限制 24 小时（上限在「系统设置 → 订单取回」里改）。<br>这类封禁<b>只拦「恢复购买」</b>：被封的 IP 仍可浏览分享页、下载已付费或免费的文件、登录与使用其它功能，与上面的「IP 访问屏蔽」完全是两件事。<br>到期会自动解除；要提前放行，点对应行的「解封」即可（立即生效）。</div>
+          </div>
           </div>
         </section>
 
@@ -336,6 +345,43 @@
                   <li>本卡片仅管理员可见；普通用户看不到也无法修改站点设置。</li>
                   <li><b>邀请码</b>模式下，登录页会多出「邀请码」输入框；邀请码本身在左侧栏的「<b>邀请码设置</b>」里生成与管理（可批量生成、批量设置次数 / 过期时间 / 身份、批量删除，并<b>导出为 txt</b>）。</li>
                   <li>选择「邀请码」后请记得先去生成一批邀请码，否则没有人能注册进来。</li>
+                </ul>
+              </div>
+            </div>
+            <!-- 订单取回（仅管理员，R65）：两道护栏，**没有启用开关**。
+                 需求明确「默认持久化」—— 关掉取回次数等于让订单号变成无限制的凭证，
+                 关掉错误上限等于对匿名端点开放无限次猜测。 -->
+            <div class="dash-card wide sysset-card" id="sysset-restore-card">
+              <h3 class="sysset-h3"><span class="sysset-tag site">取回</span>订单取回 <span id="restore-status" class="lk-count"></span></h3>
+              <div class="enc-warn">
+                <b>简要说明</b>：付费分享页的「<b>恢复购买</b>」允许用户凭订单号取回下载权限。下面两道护栏<b>始终生效、无需开关</b>：一道限制「一笔订单号能被用几次」，一道限制「一个 IP 能连续猜错几次」。
+              </div>
+
+              <div class="form-row">
+                <div class="form-item">
+                  <label>取回次数限制</label>
+                  <input type="text" id="restore-max-uses" class="full" inputmode="numeric" placeholder="3" autocomplete="off" spellcheck="false">
+                  <div class="hint">同一笔<b>订单号</b>最多可成功取回几次（1–100，默认 3）。用尽后该订单号不再能取回，需联系分享者；<b>不同订单号互不影响</b>，同一账号在多台设备上取回也算次数。</div>
+                </div>
+                <div class="form-item">
+                  <label>错误尝试次数上限</label>
+                  <input type="text" id="restore-max-fails" class="full" inputmode="numeric" placeholder="5" autocomplete="off" spellcheck="false">
+                  <div class="hint">同一 IP <b>连续</b>输错几次订单号即封禁 <b>24 小时</b>（1–50，默认 5）；中间成功一次即清零，24 小时没有新的输错也清零。取回次数用尽<b>不算输错</b>。</div>
+                </div>
+              </div>
+
+              <div id="restore-msg" class="form-msg"></div>
+              <div class="form-item" style="margin-top:4px">
+                <button id="btn-restore-save" class="mini-btn primary">保存设置</button>
+                <span id="restore-state" class="hint" style="margin-left:10px"></span>
+              </div>
+
+              <div class="card-note">
+                <ul class="note-list">
+                  <li>封禁<b>只影响「恢复购买」这一件事</b>：被封的 IP 仍可正常浏览分享页、下载已付费 / 免费文件、登录与使用其它任何功能。</li>
+                  <li>解封在左侧栏的「<b>IP 地址管理</b>」→「订单取回封禁」里操作（可单个解封），封禁 24 小时后也会<b>自动解除</b>。</li>
+                  <li>本卡片<b>没有启用开关</b>：两个值落盘即生效，重启后依然保持。</li>
+                  <li>这一页同时受<b>频率</b>限流约束（每个 IP 每 10 分钟 20 次），两者互不替代：限流防刷、这里的上限防猜。</li>
                 </ul>
               </div>
             </div>
@@ -797,7 +843,7 @@
             <div class="dash-card wide sysset-card">
               <h3 class="sysset-h3"><span class="sysset-tag about">关于</span>关于</h3>
               <div class="about-body">
-                <p><b>Kepler 对象存储管理系统</b> Build 1.9.0</p>
+                <p><b>Kepler 对象存储管理系统</b> Build 1.9.1</p>
                 <ul class="about-list">
                   <li>开发者：邢森</li>
                   <li>项目地址：<a href="https://github.com/xingsen2005/Kepler" target="_blank">https://github.com/xingsen2005/Kepler</a></li>

@@ -33,6 +33,9 @@ const { assertSafeEndpoint } = require('./endpoint-guard');
 const {
   normalizeSpeedLimit, CONCURRENCY_FILES_MAX, normalizeSmtpPort, SMTP_PORT_DEFAULT,
   SITE_NAME_DEFAULT, normalizeRegistrationMode, normalizeDefaultRole, normalizeEmail,
+  // R65：订单取回的两个上限（读盘兜底与入参校验同源于 limits.js）
+  RESTORE_USES_DEFAULT, RESTORE_USES_MIN, RESTORE_USES_MAX,
+  RESTORE_FAILS_DEFAULT, RESTORE_FAILS_MIN, RESTORE_FAILS_MAX,
 } = require('./limits');
 
 /**
@@ -222,6 +225,13 @@ const DEFAULT_CONFIG = {
     siteName: SITE_NAME_DEFAULT, // 浏览器标题栏 + 邮件发件人显示名的兜底
     registration: 'closed', // 'open' | 'invite' | 'closed'
     defaultRole: 'user', // 新注册用户直接赋予的身份
+    updatedAt: '',
+  },
+  // R65：订单取回（按订单号取回下载权限）。**没有启用开关** —— 需求明确「默认持久化」，
+  // 且它是「取回」这条路径的两条护栏，关掉等于让订单号变成无限制的万能凭证。
+  restore: {
+    maxUses: RESTORE_USES_DEFAULT, // 同一笔订单号最多可成功取回几次
+    maxFails: RESTORE_FAILS_DEFAULT, // 同一 IP 连续输错几次封 24 小时
     updatedAt: '',
   },
   // R53：发信设置（SMTP）。`password` 的处置与验证码 `secretKey` 完全一致 ——
@@ -422,6 +432,31 @@ function normalizeSiteInto(cfg) {
   };
 }
 
+/**
+ * R65：订单取回的上限归一化（补齐结构 + 越界收敛到最近的合法值）。
+ *
+ * 与 `normalizeSiteInto()` 同款：**只负责补结构与兜底，不负责拒绝入参** ——
+ * 拒绝非法值是路由层（`parseRestoreUsesInput` / `parseRestoreFailsInput`）的事。
+ * 读盘时遇到越界值必须收敛而不是原样带进判据：`maxUses = 0` 会让所有订单号
+ * 一秒都用不了，`maxFails = 0` 会让第一次手误就封掉整个出口 IP。
+ *
+ * ⚠️ 归一是**幂等**的：同一份数据重复过一遍结果不变（`assertEqual(normalize(normalize(x)),
+ * normalize(x))` 在护栏里有断言），否则每次读盘都会把 `updatedAt` 改写成新时间。
+ */
+function normalizeRestoreInto(cfg) {
+  const src = (cfg && cfg.restore && typeof cfg.restore === 'object') ? cfg.restore : {};
+  const clamp = (v, min, max, dft) => {
+    const n = Number(v);
+    if (!Number.isFinite(n)) return dft;
+    return Math.min(max, Math.max(min, Math.floor(n)));
+  };
+  cfg.restore = {
+    maxUses: clamp(src.maxUses, RESTORE_USES_MIN, RESTORE_USES_MAX, RESTORE_USES_DEFAULT),
+    maxFails: clamp(src.maxFails, RESTORE_FAILS_MIN, RESTORE_FAILS_MAX, RESTORE_FAILS_DEFAULT),
+    updatedAt: typeof src.updatedAt === 'string' ? src.updatedAt : '',
+  };
+}
+
 function normalize(raw) {
   if (!raw || typeof raw !== 'object') return null;
   // v1 判定：存在扁平 secretId/bucket 且没有 credentials 数组
@@ -470,6 +505,9 @@ function normalize(raw) {
   normalizeSmtpInto(cfg);
   // R54：站点设置。同理 —— 历史配置没有这一段，读盘时补齐为「默认站点名 + 关闭注册」。
   normalizeSiteInto(cfg);
+  // R65：订单取回的两个上限。历史配置没有这一段 —— 补齐为默认值（3 次 / 5 次），
+  // 而不是「缺失即不限制」：不限制等于把订单号变成万能凭证。
+  normalizeRestoreInto(cfg);
   if (!cfg.webdav || typeof cfg.webdav !== 'object') cfg.webdav = { enabled: false, accounts: [] };
   if (typeof cfg.webdav.enabled !== 'boolean') cfg.webdav.enabled = false;
   if (!Array.isArray(cfg.webdav.accounts)) cfg.webdav.accounts = [];
@@ -1739,6 +1777,58 @@ function siteView(cfg) {
   };
 }
 
+/* ============================ 订单取回（R65） ============================ */
+
+/**
+ * 读取订单取回的两个上限（**服务端内部**使用，也是唯一读取口径）。
+ *
+ * 返回值永远结构完整：磁盘上没有这一段时得到的是默认的 3 次 / 5 次，
+ * 与 `normalizeRestoreInto()` 同一份判据 —— 两处各写一套必然在边界上分叉。
+ */
+function getRestore() {
+  const cfg = load();
+  const shadow = { restore: cfg ? cfg.restore : undefined };
+  normalizeRestoreInto(shadow);
+  return shadow.restore;
+}
+
+/**
+ * 保存订单取回设置（**严格 PATCH**：未给出的字段保持原值）。
+ *
+ * 非法值由路由层先挡在 400（`parseRestoreUsesInput` / `parseRestoreFailsInput`），
+ * 这里只做兜底归一 —— 与 `saveSite()` 同一分工。
+ */
+function saveRestore(patch) {
+  const cfg = requireStore();
+  const prev = getRestore();
+  const p = patch || {};
+  const shadow = {
+    restore: {
+      maxUses: p.maxUses !== undefined ? p.maxUses : prev.maxUses,
+      maxFails: p.maxFails !== undefined ? p.maxFails : prev.maxFails,
+      updatedAt: new Date().toISOString(),
+    },
+  };
+  normalizeRestoreInto(shadow);
+  cfg.restore = shadow.restore;
+  persist(cfg);
+  return getRestore();
+}
+
+/**
+ * 订单取回设置的**对外视图**（唯一实现点）。
+ *
+ * 只回两个数字：这份配置里没有机密，但「哪些字段对外可见」只允许有一处答案。
+ * 它**不**下发给普通用户 —— 普通用户在分享页看到的拒绝文案由服务端决定，
+ * 前端不需要（也不应该）自己复刻一份限额来算「还能取回几次」。
+ */
+function restoreView(cfg) {
+  const shadow = { restore: (cfg && cfg.restore) || undefined };
+  normalizeRestoreInto(shadow);
+  const r = shadow.restore;
+  return { maxUses: r.maxUses, maxFails: r.maxFails, updatedAt: r.updatedAt };
+}
+
 /* ============================ 「是否仍是默认值」判据（R55） ============================ */
 
 /**
@@ -2630,6 +2720,8 @@ module.exports = {
   getSmtp, saveSmtp, smtpView, smtpSendConfig, smtpConfigured,
   // R54：站点设置（站点名称 / 公开注册 / 新用户身份）—— 无机密，siteView 整段下发
   getSite, saveSite, siteView,
+  // R65：订单取回（同一订单号可成功取回几次 / 同一 IP 连续输错几次封 24 小时）
+  getRestore, saveRestore, restoreView,
   // R55：「是否仍是默认值」判据 —— 供配置备份的「全新实例」闸门（backup.isEmptyData）使用
   smtpIsDefault, siteIsDefault,
   getCaptcha, saveCaptcha,

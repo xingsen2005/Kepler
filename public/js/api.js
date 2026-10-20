@@ -430,6 +430,13 @@ export const API = {
   toggleIpRule: (id, enabled) => request('PUT', `/api/ipguard/rules/${encodeURIComponent(id)}/enabled`, { enabled }),
   deleteIpRule: (id) => request('DELETE', `/api/ipguard/rules/${encodeURIComponent(id)}`),
   testIpRule: (ip, method, bucketId) => request('GET', '/api/ipguard/test?' + qs({ ip, method, bucketId })),
+  // R65：解除某个 IP 的「订单取回」封禁（IP 放请求体：IPv6 带冒号、IPv4 带点，
+  // 塞进路径段还要处理百分号编码，而这里要的只是「解掉一个地址」）
+  unbanRestore: (ip) => request('POST', '/api/ipguard/restore-bans/unban', { ip }),
+
+  // R65：订单取回设置（仅管理员；无启用开关，落盘即生效）
+  restoreConfig: () => request('GET', '/api/restore/config'),
+  saveRestoreConfig: (b) => request('PUT', '/api/restore/config', b),
 
   // R37：下载限速的「上层下限」查询（`{ scope, id }` 或 `{ scope:'link', bucket }`）。
   // 设置限速本身走各实体既有的 PUT（见 speedlimit.js 的 SAVE_BY_SCOPE），不另开写接口。

@@ -69,6 +69,9 @@ const EXPECTED = [
   // R54：站点设置。`GET /site/info` **刻意不挂** requireAdmin —— 登录页在拿到会话之前
   // 就要用站点名称设浏览器标题栏（已登记进 index.js 的 PUBLIC_API）；它只回站点名称一个字段。
   'GET /site/info', 'GET /site/config', 'PUT /site/config',
+  // R65：订单取回设置（取回次数上限 / 连续输错上限）。两条都 requireAdmin ——
+  // 它们决定的是匿名端点「恢复购买」能被试多少次，普通用户不该看到也不该改。
+  'GET /restore/config', 'PUT /restore/config',
   // R54③：邀请码设置六条，**全部 requireAdmin** —— 邀请码是一枚免注册口令
   // （身份还可能是管理员），可见面与「用户管理」同级。
   // ⚠️ 导出（`POST /invites/export`）是 POST 而不是 GET：响应体是明文邀请码集合，
@@ -88,6 +91,10 @@ const EXPECTED = [
   'GET /acl-check', 'PUT /acl-check/disabled',
   'GET /ipguard', 'POST /ipguard/rules', 'PUT /ipguard/rules/:id',
   'PUT /ipguard/rules/:id/enabled', 'DELETE /ipguard/rules/:id', 'GET /ipguard/test',
+  // R65：解封「取回下载权限」连击封禁（见 routes/ipguard.js 的 restore-bans 段）。
+  // ⚠️ 与上面的**规则表**是两张独立的表：规则是管理员自己配的拦截规则，
+  // 这里的封禁是 restore-guard 运行时自动落盘的，只拦「用订单号取回」一件事。
+  'POST /ipguard/restore-bans/unban',
   // R37：查「上层已经设了多小的下载限速」——四个设置入口的提示文案用它。
   // 不挂 requireAdmin（普通用户在「创建分享链接」时也要能看到自己的上限）。
   'GET /throttle/ceiling',
@@ -189,6 +196,9 @@ test('敏感接口均挂载 requireAdmin', () => {
     'PUT /acl-check/disabled',
     'GET /ipguard', 'POST /ipguard/rules', 'PUT /ipguard/rules/:id',
     'PUT /ipguard/rules/:id/enabled', 'DELETE /ipguard/rules/:id', 'GET /ipguard/test',
+    // R65：解除「订单取回」的自动封禁（IP 放在请求体里 —— IPv6 带冒号、IPv4 带点，
+    // 塞进路径段还要百分号编码）。与上面的规则表是两张表，见 routes/ipguard.js。
+    'POST /ipguard/restore-bans/unban',
     // 退款会把订单置为不可逆终态并让支付凭证失效，必须与其它写操作同级保护
     'POST /payment/orders/:id/refund',
     // R32-01：批量删除订单流水（不可逆），与退款同级 —— 同样是「一点就是一片」的写操作
@@ -204,6 +214,11 @@ test('敏感接口均挂载 requireAdmin', () => {
     // R54：站点名称 / 公开注册 / 新用户身份都是全局设置。
     // ⚠️ `GET /site/info` 故意**不在**此列 —— 它是公开只读、只回站点名称。
     'GET /site/config', 'PUT /site/config',
+    // R65：订单取回的两道护栏。放宽它们等于让匿名端点「恢复购买」可以无限次尝试
+    // （`maxUses` 变成「不限制」= 一个订单号给一群人用；`maxFails` 变成不封 = 可枚举）。
+    'GET /restore/config', 'PUT /restore/config',
+    // R65：解封是写操作（把一条 24 小时限制提前放掉），与规则增删同级
+    'POST /ipguard/restore-bans/unban',
     // R54③：邀请码六条**全部**要求管理员。这一条不是形式主义 ——
     // `GET /invites` 会原样回传邀请码明文（管理员要复制分发，打码就失去意义），
     // 少挂一个 requireAdmin 就等于给任何登录用户一条「批量读取免注册口令」的通道。

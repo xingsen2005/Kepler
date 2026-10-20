@@ -776,6 +776,53 @@ function parseCouponNoteInput(v) {
   return parseSmtpTextInput(v, COUPON_NOTE_MAX, '备注');
 }
 
+/* ============================ 订单取回（R65） ============================ */
+
+/**
+ * 「订单取回」的两个上限（系统设置 → 订单取回）。
+ *
+ *  - `RESTORE_USES_*`：**同一笔订单号**最多可成功取回下载权限几次（按订单计，
+ *    不是按 IP）。它的作用是「订单号泄漏 / 被转发给一群人」时有个止损点，
+ *    而同一用户在几台设备上各取回一次不该被卡住 —— 因此默认值给到 3。
+ *  - `RESTORE_FAILS_*`：同一来源 IP **连续**输错几次订单号就封 24 小时。
+ *
+ * ⚠️ 下限一律是 **1**：允许填 0 会让「取回」这个功能直接不可用，而界面上
+ * 又没有任何开关可以表达「我确实想关掉它」—— 那是一个只能靠改配置回滚的死状态。
+ */
+const RESTORE_USES_MIN = 1;
+const RESTORE_USES_MAX = 100;
+const RESTORE_USES_DEFAULT = 3;
+const RESTORE_FAILS_MIN = 1;
+const RESTORE_FAILS_MAX = 50;
+const RESTORE_FAILS_DEFAULT = 5;
+/** 连续输错触发封禁后的封禁时长：固定 24 小时（需求 2 原文），不做成可配 */
+const RESTORE_BAN_MS = 24 * 60 * 60 * 1000;
+/** 「连续」的空闲重置窗口：超过这个时长没有新的失败，连击计数归零 */
+const RESTORE_FAIL_IDLE_MS = 24 * 60 * 60 * 1000;
+
+/** 通用整数入参判据（上下限 + 提示文案都由调用方给全） */
+function parseIntInRange(v, min, max, label) {
+  const n = Number(v);
+  if (v === undefined || v === null || v === '' || !Number.isFinite(n)) {
+    return { ok: false, error: `${label}须为数字` };
+  }
+  const value = Math.floor(n);
+  if (value < min || value > max) {
+    return { ok: false, error: `${label}须在 ${min}–${max} 之间` };
+  }
+  return { ok: true, value };
+}
+
+/** 校验接口入参：取回次数限制 */
+function parseRestoreUsesInput(v) {
+  return parseIntInRange(v, RESTORE_USES_MIN, RESTORE_USES_MAX, '取回次数限制');
+}
+
+/** 校验接口入参：连续输错次数上限 */
+function parseRestoreFailsInput(v) {
+  return parseIntInRange(v, RESTORE_FAILS_MIN, RESTORE_FAILS_MAX, '错误尝试次数上限');
+}
+
 module.exports = {
   LIMITS, resolveCap, HARD_MAX,
   MB, normalizeSpeedLimit, toMBps, parseSpeedLimitInput,
@@ -802,4 +849,9 @@ module.exports = {
   normalizeCouponCode, normalizeCouponType,
   parseCouponCodeInput, parseCouponCountInput, parseCouponAmountInput,
   parseCouponMaxUsesInput, parseCouponTimeInput, parseCouponIdsInput, parseCouponNoteInput,
+  // R65：订单取回（配置上限 + 封禁时长）
+  RESTORE_USES_MIN, RESTORE_USES_MAX, RESTORE_USES_DEFAULT,
+  RESTORE_FAILS_MIN, RESTORE_FAILS_MAX, RESTORE_FAILS_DEFAULT,
+  RESTORE_BAN_MS, RESTORE_FAIL_IDLE_MS,
+  parseRestoreUsesInput, parseRestoreFailsInput,
 };

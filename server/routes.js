@@ -58,6 +58,10 @@ router.use(require('./routes/smtp'));
 // R54：站点设置。`GET /site/info` 已登记进 index.js 的 PUBLIC_API（登录页要用站点名称设标题）；
 // 挂在 users 之后 ⇒ 不影响 `/users/me` 的注册下标（tests/routes-surface.test.js 有硬编码）。
 router.use(require('./routes/site'));
+// R65：订单取回设置（2 条，全部 requireAdmin）。只注册 `/restore/config`，
+// 与前后模块无路径歧义；**刻意不放进 `/site/*`** —— 站点设置讲的是「站点是谁」，
+// 这份设置讲的是「取回这条路径的护栏」，两者的权限与变更理由都不同。
+router.use(require('./routes/restore'));
 // R54③：邀请码设置（6 条，全部 requireAdmin）。挂在 links 之前只是**就近**：
 // 它只注册 `/invites*`，与前后模块不存在路径歧义。
 // ⚠️ 模块内的顺序有语义 —— `/invites/bulk` / `/invites/delete` / `/invites/export`

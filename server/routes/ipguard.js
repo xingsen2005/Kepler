@@ -4,6 +4,8 @@
  */
 const { express, configStore, statsStore, ipGuard } = require('./_context');
 const { requireAdmin } = require('./_shared');
+// R65：订单取回的自动封禁（只作用于取回端点；管理端在这里展示与解封）
+const restoreGuard = require('../restore-guard');
 
 const router = express.Router();
 
@@ -25,7 +27,42 @@ router.get('/ipguard', requireAdmin, (req, res) => {
   const v = ipGuard.view();
   const buckets = configStore.listBuckets().buckets;
   v.rules = v.rules.map((r) => ruleScopeView(r, buckets));
+  /**
+   * R65：订单取回的**自动封禁**一并下发。
+   *
+   * 它与上面的 `rules` 是**两张表**，刻意不合并：`rules` 是管理员手工维护的
+   * 访问规则（命中即 403，作用于全部请求），而这里是「连续输错订单号」自动产生、
+   * 24 小时后自动过期、**只拦取回端点**的临时限制。混进同一张表会出现两个问题：
+   * ① 界面上的「启用 / 禁用 / 编辑 / 作用范围」对它全都不适用；
+   * ② 有人会以为删掉它就能放行访问（实际它从来没拦过访问）。
+   */
+  v.restoreBans = restoreGuard.listBans();
   res.json(Object.assign({ ok: true, methods: ipGuard.ALLOWED_METHODS }, v));
+});
+
+/**
+ * 解封某个 IP 的「订单取回」限制（R65，仅管理员）。
+ *
+ * 路径用 `POST .../unban` 而不是 `DELETE /ipguard/restore-bans/:ip`：IPv6 地址里
+ * 有 `:`、IPv4 里有 `.`，塞进路径段还要处理百分号编码，而这里要的只是「解掉一个
+ * 地址」，放在请求体里最不容易出错。返回 `removed:false` 表示本来就没封 ——
+ * 界面据此提示「该 IP 当前未被限制」，而不是一律报「已解封」。
+ */
+router.post('/ipguard/restore-bans/unban', requireAdmin, (req, res) => {
+  const ip = String((req.body || {}).ip || '').trim();
+  if (!ip) return res.status(400).json({ error: '请提供要解封的 IP 地址' });
+  let removed;
+  try {
+    removed = restoreGuard.unban(ip);
+  } catch (e) {
+    return res.status(500).json({ error: e.message });
+  }
+  statsStore.addLog({
+    action: 'ipguard.restore-unban', level: 'warn',
+    detail: `管理员「${req.authUser.username}」${removed ? '解除' : '尝试解除（该 IP 未被封禁）'}`
+      + ` IP ${ip} 的「订单取回」限制`,
+  });
+  res.json({ ok: true, ip, removed, restoreBans: restoreGuard.listBans() });
 });
 
 router.post('/ipguard/rules', requireAdmin, (req, res) => {
