@@ -214,7 +214,7 @@ router.get('/fs/stat', async (req, res) => {
       uploader: readUploader(head.headers),
     });
   } catch (e) {
-    if (e.statusCode === 404 || e.statusCode === '404' || /NotFound|NoSuchKey/i.test(String(e.code || ''))) {
+    if (isNotFoundError(e)) {
       return res.status(404).json({ error: '对象不存在：' + normalizeKey(String(req.query.path || '')) });
     }
     const err = e.status ? e : translateError(e);
@@ -1084,12 +1084,28 @@ router.get('/fs/download', async (req, res) => {
   }
 });
 
+/**
+ * R69：会**以文档/脚本形态**被浏览器渲染的扩展名 —— 缩略图不为它们签名直链。
+ *
+ * `/fs/thumb` 的回应是 302 到对象存储的预签名 URL，命中后由存储侧按对象**自带的**
+ * `Content-Type` 下发（没有 `Content-Disposition`、也不经过本进程的 `nosniff`）。
+ * 上传侧对 Content-Type 是放行的（WebDAV PUT 直接取请求头），于是一个 `text/html`
+ * 对象在这条链路上就是一个**同源文档**。图片类不受影响（`<img>` 上下文不执行脚本），
+ * 因此这里只拦"能当文档跑"的类型：给一个占位图标，让用户走下载。
+ */
+const THUMB_UNSAFE_RE = /\.(?:html?|xhtml|shtml|svg|xml|xsl|xslt|js|mjs|css|pdf)$/i;
+
 // 缩略图：302 跳转到对象存储预签名临时 URL（1 小时有效）；加密文件返回占位图标（密文无法生成缩略图）
 router.get('/fs/thumb', async (req, res) => {
   try {
     const cfg = requireConfig();
     const client = getClient(cfg);
     const key = normalizeKey(String(req.query.path || ''));
+    if (THUMB_UNSAFE_RE.test(key)) {
+      // R69：不给这类对象签直链（见 THUMB_UNSAFE_RE 的说明）
+      res.status(200).type('svg').setHeader('Cache-Control', 'private, max-age=300');
+      return res.send('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96"><rect width="96" height="96" rx="12" fill="#eef2f7"/><path d="M30 28h26l12 12v28a4 4 0 0 1-4 4H32a4 4 0 0 1-4-4V32a4 4 0 0 1 4-4z" fill="none" stroke="#8a94a6" stroke-width="4"/><path d="M56 28v12h12" fill="none" stroke="#8a94a6" stroke-width="4"/><text x="48" y="84" text-anchor="middle" font-size="11" fill="#616161" font-family="sans-serif">请下载查看</text></svg>');
+    }
     if (encStore.getMeta(cfg.bucket, key)) {
       res.status(200).type('svg').setHeader('Cache-Control', 'private, max-age=300');
       return res.send('<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 96 96"><rect width="96" height="96" rx="12" fill="#eef2f7"/><rect x="34" y="42" width="28" height="22" rx="4" fill="none" stroke="#8a94a6" stroke-width="4"/><path d="M39 42v-6a9 9 0 0 1 18 0v6" fill="none" stroke="#8a94a6" stroke-width="4"/><circle cx="48" cy="53" r="3" fill="#8a94a6"/><text x="48" y="82" text-anchor="middle" font-size="11" fill="#616161" font-family="sans-serif">已加密</text></svg>');
@@ -1191,9 +1207,37 @@ async function assertNoConflict(client, cfg, newKey, label) {
     await p(client, 'headObject', { Bucket: cfg.bucket, Region: cfg.region, Key: newKey });
     throw badRequest(`目标名称“${name}”已存在`);
   } catch (e) {
-    // headObject 对不存在的对象会抛错 —— 只有我们自己抛的"已存在"才需要继续上抛
+    // 我们自己抛的"已存在"（badRequest）必须继续上抛
     if (e && e.status === 400 && /已存在/.test(String(e.message || ''))) throw e;
+    /**
+     * AUDIT-69 / L-12：**只有「确认不存在」才放行**。
+     *
+     * 收口前的判据是「我不是 400 就当你没抛过」—— 403（凭据缺 `s3:HeadObject`、
+     * 策略只给读写不给 head）、5xx、DNS/超时全被当成「目标不存在」，随后那次
+     * 复制/移动照样写入，**云端覆写不可撤销**，且用户全程无感。
+     * 这里改成白名单：`isNotFoundError()` 命中才继续，其余一律 fail-closed。
+     */
+    if (!isNotFoundError(e)) {
+      throw Object.assign(
+        new Error(`无法确认目标位置“${name}”是否已存在（${(e && (e.code || e.message)) || '未知错误'}），已中止以免覆盖`),
+        { status: 409, code: 'CONFLICT_PROBE_FAILED' },
+      );
+    }
   }
+}
+
+/**
+ * AUDIT-69 / L-12：**「对象确认不存在」的唯一判据**。
+ *
+ * 口径取自 S3 兼容协议三大家的共同子集：HTTP 404，或错误码 `NoSuchKey` /
+ * `NotFound`。其余（403 / AccessDenied / 5xx / 网络类）都**不是**「不存在」的证据
+ * ——把权限错误或网络抖动当成「不存在」，就等于把 fail-closed 的探测改成 fail-open。
+ */
+function isNotFoundError(e) {
+  if (!e) return false;
+  const sc = e.statusCode === undefined ? e.status : e.statusCode;
+  if (Number(sc) === 404) return true;
+  return /NoSuchKey|NotFound/i.test(String(e.code || ''));
 }
 
 /**
@@ -1215,9 +1259,13 @@ async function headSize(client, cfg, key) {
  *
  * `headSize()` 不能拿来判存在性 —— 它把「不存在」和「大小恰好是 0」塌缩成同一个
  * `0`，而 0 字节对象（例如文件夹标记）恰恰是最需要被认出来的那一种。这里只认
- * 「`headObject` 调用成功」为存在，其余（NoSuchKey、权限不足、网络抖动）一律按
- * **不存在**处理 —— 与 `assertNoConflict()` 的判据同款：真的不存在才继续，
- * 误判成「不存在」时后面那次复制自己会失败，而误判成「存在」会让复制凭空不可用。
+ * 「`headObject` 调用成功」为存在。
+ *
+ * ⚠️ AUDIT-69 / L-12：**「探测不出来」不等于「不存在」**。收口前这里把
+ * 「权限不足（403）/ 网络抖动 / 5xx」也归成 `false`，于是复制路径把它当空位
+ * 直接写入 —— 云端覆写不可撤销，而用户看到的是一次「复制成功」。现在只有
+ * `isNotFoundError()` 才返回 `false`，其余情况**抛错**（调用方已按单项失败上报，
+ * 整批不会中断）。误判成「存在」最多让复制多问一句，误判成「不存在」会丢数据。
  *
  * 用途仅限 R52-03 的复制冲突探测（`/fs/move` 用的是会抛错的 `assertNoConflict`，
  * 因为移动只有「拒绝」一种出口，而复制需要把冲突交给用户决策）。
@@ -1227,7 +1275,11 @@ async function existsKey(client, cfg, key) {
     await p(client, 'headObject', { Bucket: cfg.bucket, Region: cfg.region, Key: key });
     return true;
   } catch (e) {
-    return false;
+    if (isNotFoundError(e)) return false;
+    throw Object.assign(
+      new Error(`无法确认目标位置是否已存在（${(e && (e.code || e.message)) || '未知错误'}），已中止以免覆盖`),
+      { status: 409, code: 'CONFLICT_PROBE_FAILED' },
+    );
   }
 }
 

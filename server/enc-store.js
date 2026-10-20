@@ -135,6 +135,7 @@ function defaultSettings() {
     useSalt: true, // 随机盐恒开（历史遗留字段，不再提供关闭入口）
     passwordHash: '',
     passwordSalt: '',
+    passwordParams: null, // R69：成本参数（null = 旧版默认 N=16384）
     updatedAt: '',
   };
 }
@@ -158,6 +159,7 @@ function loadSettings() {
       useSalt: true, // 强制开启：即使历史配置为 false 也覆盖为 true
       passwordHash: String(j.passwordHash || ''),
       passwordSalt: String(j.passwordSalt || ''),
+      passwordParams: j.passwordParams && typeof j.passwordParams === 'object' ? j.passwordParams : null,
       updatedAt: j.updatedAt || '',
     });
   } else {
@@ -194,12 +196,9 @@ function parseMagicInput(input) {
  * 禁止使用 `crypto.scryptSync` —— 它会占满单线程事件循环，
  * 几十个并发请求即可让全站无响应（详见 config-store.js 同名函数的说明）。
  */
-function scryptHex(pw, saltHex) {
-  return new Promise((resolve, reject) => {
-    crypto.scrypt(String(pw), Buffer.from(saltHex, 'hex'), 32, (err, key) => {
-      if (err) reject(err); else resolve(key.toString('hex'));
-    });
-  });
+function scryptHex(pw, saltHex, params) {
+  // R69：与账户口令共用同一套成本参数（`SCRYPT_PARAMS`）与唯一实现点
+  return configStore.scryptHex(pw, saltHex, params || configStore.SCRYPT_PARAMS);
 }
 
 /**
@@ -223,9 +222,11 @@ async function updateSettings(patch) {
     if (patch.password === null || patch.password === '') {
       cur.passwordHash = '';
       cur.passwordSalt = '';
+      cur.passwordParams = null;
     } else {
       cur.passwordSalt = crypto.randomBytes(16).toString('hex');
       cur.passwordHash = await scryptHex(patch.password, cur.passwordSalt);
+      cur.passwordParams = configStore.SCRYPT_PARAMS;
     }
   }
   masterKey(); // 确保密钥文件存在
@@ -1184,12 +1185,30 @@ function passwordSet() { return !!loadSettings().passwordHash; }
 async function checkPassword(pw) {
   const s = loadSettings();
   if (!s.passwordHash) return true; // 未设置密码 → 不拦截
-  const h = await scryptHex(pw, s.passwordSalt);
+  const params = configStore.normalizeScryptParams(s.passwordParams);
+  const h = await scryptHex(pw, s.passwordSalt, params);
+  let ok = false;
   try {
-    return crypto.timingSafeEqual(Buffer.from(h, 'hex'), Buffer.from(s.passwordHash, 'hex'));
+    ok = crypto.timingSafeEqual(Buffer.from(h, 'hex'), Buffer.from(s.passwordHash, 'hex'));
   } catch (e) {
     return false;
   }
+  if (!ok) return false;
+  // R69：存量哈希（旧成本）在"验证通过"这一刻透明升级 —— 与 config-store 同一纪律
+  if (params.N < configStore.SCRYPT_PARAMS.N) {
+    try {
+      const salt = crypto.randomBytes(16).toString('hex');
+      const hash = await scryptHex(pw, salt, configStore.SCRYPT_PARAMS);
+      const live = loadSettings();
+      if (live.passwordHash === s.passwordHash) {
+        live.passwordSalt = salt;
+        live.passwordHash = hash;
+        live.passwordParams = configStore.SCRYPT_PARAMS;
+        persistSettings();
+      }
+    } catch (e) { /* 升级失败不影响本次校验结果 */ }
+  }
+  return true;
 }
 
 /**

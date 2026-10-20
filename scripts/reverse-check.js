@@ -1169,8 +1169,8 @@ const CASES = [
        */
       name: 'R14-04 · addUser 把 requireStore() 挪回 await 之前（静默丢更新）',
       file: 'server/config-store.js',
-      anchor: '  const { salt, hash } = await hashPassword(password);\n  const cfg = requireStore();',
-      replacement: '  const cfg = requireStore();\n  const { salt, hash } = await hashPassword(password);',
+      anchor: '  const { salt, hash, params } = await hashPassword(password);\n  const cfg = requireStore();',
+      replacement: '  const cfg = requireStore();\n  const { salt, hash, params } = await hashPassword(password);',
       testFile: 'invariants.test.js',
       minFail: 1,
     },
@@ -1662,7 +1662,7 @@ const CASES = [
        */
       name: 'R62-02a · 「每个用户只能使用一次」不再拦同一身份',
       file: 'server/coupon-store.js',
-      anchor: "    if (!who || c.uses.some((u) => u.identity === who)) return fail('already_used');",
+      anchor: "    if (!who || (Array.isArray(c.identities) ? c.identities : []).indexOf(who) >= 0) return fail('already_used');",
       replacement: "    if (false) return fail('already_used');",
       testFile: 'coupon.test.js',
       minFail: 1,
@@ -2438,8 +2438,8 @@ const CASES = [
     {
       name: 'R22-02 · 转发头取值不再校验格式（非法串各自成为独立来源 → 限流 / 锁定键随头轮换）',
       file: 'server/security.js',
-      anchor: "  return isIpLiteral(first) ? first : '';",
-      replacement: '  return first;',
+      anchor: "  return isIpLiteral(pick) ? pick : '';",
+      replacement: '  return pick;',
       testFile: 'audit22-regressions.test.js',
       minFail: 1,
     },
@@ -7209,18 +7209,12 @@ const CASES = [
       // 塌缩成同一个 0，0 字节对象（文件夹标记）恰恰最需要被认出来 —— 故存在性单独一个函数。
       name: 'R52-03b · 目标存在性探测恒为「不存在」（同名冲突永远探测不到）',
       file: 'server/routes/fs.js',
-      anchor: '  try {\n'
-        + '    await p(client, \'headObject\', { Bucket: cfg.bucket, Region: cfg.region, Key: key });\n'
-        + '    return true;\n'
+      anchor: '    return true;\n'
         + '  } catch (e) {\n'
-        + '    return false;\n'
-        + '  }',
-      replacement: '  try {\n'
-        + '    await p(client, \'headObject\', { Bucket: cfg.bucket, Region: cfg.region, Key: key });\n'
-        + '    return false;\n'
+        + '    if (isNotFoundError(e)) return false;',
+      replacement: '    return false;\n'
         + '  } catch (e) {\n'
-        + '    return false;\n'
-        + '  }',
+        + '    if (isNotFoundError(e)) return false;',
       testFile: 'audit52-regressions.test.js',
       minFail: 1,
     },
@@ -8126,9 +8120,16 @@ const CASES = [
        * **输入**：函数还在、混淆照跑、界面照显示"已记住"，但密码再也没被保存过。
        */
       name: 'R54b-08b · 「记住密码」不保存密码（只混淆了个空串）',
+      /**
+       * ⚠️ R69 改锚：H-1 把「保存密码」那条路径**整段删掉**了，原来的变异对象
+       * （`xorBytes(...)` 那行）已不存在。这里改为盯**新实现里唯一可能重新泄露凭据
+       * 的地方** —— 读到历史记录时的**就地清洗**：`saved.k` / `saved.p` 是升级前
+       * 落盘的那份「密钥 + 异或密文」，不清洗就会一直躺在 localStorage 里等下一次
+       * 被还原。把清洗条件改成恒假 ⇒ `R54b-8` 的断言立刻红。
+       */
       file: 'public/js/main.js',
-      anchor: '    const secret = xorBytes(new TextEncoder().encode(String(password || \'\')), key);',
-      replacement: '    const secret = xorBytes(new TextEncoder().encode(\'\'), key);',
+      anchor: '    if (saved.k !== undefined || saved.p !== undefined) {',
+      replacement: '    if (false) {',
       testFile: 'audit54b-regressions.test.js',
       minFail: 1,
     },
@@ -9240,8 +9241,8 @@ const CASES = [
        */
       name: 'R65-02a · 取回封禁泄漏到分享页浏览（封禁变成全网封锁）',
       file: 'server/share-routes.js',
-      anchor: "router.get('/s/:id', async (req, res) => {\n  const l = shareStore.get(req.params.id);\n  if (!l) return statePage(res, 'notfound');",
-      replacement: "router.get('/s/:id', async (req, res) => {\n  if (restoreGuard.isBanned(security.clientIp(req)).banned) return res.status(429).send('blocked');\n  const l = shareStore.get(req.params.id);\n  if (!l) return statePage(res, 'notfound');",
+      anchor: '  const viewRl = security.shareViewLimiter(security.clientIp(req));\n',
+      replacement: "  if (restoreGuard.isBanned(security.clientIp(req)).banned) return res.status(429).send('blocked');\n  const viewRl = security.shareViewLimiter(security.clientIp(req));\n",
       testFile: 'restore-settings.test.js',
       minFail: 1,
     },
@@ -9580,6 +9581,267 @@ const CASES = [
       anchor: "    foot: [{ text: '关闭' }],\n",
       replacement: '',
       testFile: 'agreement-settings.test.js',
+      minFail: 1,
+    },
+
+    /* ---------------------------- R69（安全漏洞分析报告修复） ---------------------------- */
+    {
+      /**
+       * R69-01a：登录遮罩打开时把「用户名」回填进密码框 —— 恢复「密码驻留客户端」的
+       * 最小可观测形态。
+       *
+       * 撤掉后：`pwInput.value = ''` 变成回填，判据 `R69-01` 立刻红。这条不验证
+       * 「有没有再引入加密/异或」，只验证「登录页绝不往密码框里塞任何值」。
+       */
+      name: 'R69-01a · 登录页把已有值回填进密码框（回到「密码驻留客户端」）',
+      // 实测 fail=1：`R69-01`
+      file: 'public/js/main.js',
+      anchor: "  pwInput.value = '';",
+      replacement: "  pwInput.value = String(saved.username || '');",
+      testFile: 'audit69-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * R69-02a：勾选框文案退回「会保存密码」的说法。
+       *
+       * 撤掉后：页面不再声明「不保存密码」，而功能上确实不保存 —— 只剩用户
+       * 自己猜。判据 `R69-02` 是**三个词**的组合（有「记住用户名」/ 无「记住密码」/
+       * 有「不保存密码」），改任何一个都会红。
+       */
+      name: 'R69-02a · 登录页文案不再声明「不保存密码」',
+      // 实测 fail=1：`R69-02`
+      file: 'public/index.html',
+      anchor: '不保存密码',
+      replacement: '密码仅做混淆',
+      testFile: 'audit69-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * R69-03a：部署模式下 `/auth/init` 不再验安装令牌 —— H-2 的原始形态。
+       *
+       * 撤掉后：匿名请求又能在「进程已启动、所有者还没打开页面」的窗口里创建管理员。
+       * 判据 `R69-04` 走真 HTTP（无令牌 / 错令牌都必须 403 且不留账户）。
+       */
+      name: 'R69-03a · 部署模式 /auth/init 不验安装令牌（管理员抢占窗口重开）',
+      // 实测 fail=2：`R69-04`（无令牌与错令牌都 200 了，两条各红一次）
+      file: 'server/routes/auth.js',
+      anchor: "    if (setupTokenRequired()) {\n      const given = String((req.body && req.body.setupToken) || req.get('x-setup-token') || '').trim();",
+      replacement: "    if (false) {\n      const given = '';",
+      testFile: 'audit69-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * R69-04a：用户名重新允许 `@` —— M-2 的原始形态（可与邮箱空间重叠）。
+       *
+       * 撤掉后：`a@b.com` 这类用户名会与邮箱找回通道撞车。判据 `R69-06` 断言的是
+       * **错误文案**（「不能包含 @」），所以它同时钉住了「白名单也不许含 @」——
+       * 只把 @ 从白名单里去掉而不加专项检查，文案会变成通用格式错，同样会红。
+       */
+      name: 'R69-04a · 用户名重新允许 @（与邮箱空间重叠，可劫持找回通道）',
+      // 实测 fail=1：`R69-06`
+      file: 'server/config-store.js',
+      anchor: "  if (name.includes('@')) {",
+      replacement: '  if (false) {',
+      testFile: 'audit69-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * R69-05a：scrypt 成本参数退回 N=16384。
+       *
+       * 撤掉后：哈希成本降 8 倍（内存 16MB vs 128MB），离线爆破提速一个量级。
+       * 判据 `R69-08` 同时断言「参数值」与「参数真的进算法」（两种 N 的哈希必须不同）。
+       */
+      name: 'R69-05a · scrypt 成本参数退回 N=16384（离线爆破成本降一个量级）',
+      // 实测 fail=3：`R69-08`（参数值）、`R69-09`（旧哈希被判为「能用新参数验过」）、
+      // `R69-10`（新建用户的 passwordParams 跟着退回 16384）
+      file: 'server/config-store.js',
+      anchor: 'const SCRYPT_PARAMS = { N: 131072, r: 8, p: 1 };',
+      replacement: 'const SCRYPT_PARAMS = { N: 16384, r: 8, p: 1 };',
+      testFile: 'audit69-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * R69-06a：`permissions` 非空不再被拒 —— 管理员又能"设置"一个不生效的权限。
+       *
+       * 判据 `R69-12` 走真 HTTP：非空必须 400 且不留账户，空对象必须放行。
+       */
+      name: 'R69-06a · 非空 permissions 重新被接受（给出「已限制」的假象）',
+      // 实测 fail=1：`R69-12`
+      file: 'server/routes/users.js',
+      anchor: '  if (Object.keys(permissions).length === 0) return null;',
+      replacement: '  return null;',
+      testFile: 'audit69-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * R69-07a：注册冲突的全局预算被放到形同虚设（30 → 10000）。
+       *
+       * 撤掉后：oracle 的带宽回到「每 10 分钟 10000 次」，等于没限。判据 `R69-13`
+       * 直接驱动预算：30 次放行、第 31 次必须拒。
+       */
+      name: 'R69-07a · 注册冲突预算被放大到形同虚设（枚举带宽回到不设限）',
+      // 实测 fail=1：`R69-13`
+      file: 'server/security.js',
+      anchor: "const registerConflictLimiter = createLimiter({ name: 'auth-register-conflict', windowMs: 10 * 60 * 1000, max: 30 });",
+      replacement: "const registerConflictLimiter = createLimiter({ name: 'auth-register-conflict', windowMs: 10 * 60 * 1000, max: 10000 });",
+      testFile: 'audit69-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * R69-08a：账户级减速上限清零 —— 跨 IP 撞库重新变成"不限速"。
+       *
+       * 判据 `R69-15` 断言「第 21 次起延迟 > 0 且 ≤ 1500」。改上限或改阈值都会红。
+       */
+      name: 'R69-08a · 账户级减速上限清零（分布式撞库不再被拖慢）',
+      // 实测 fail=1：`R69-15`
+      file: 'server/security.js',
+      anchor: 'const ACCOUNT_FAIL_DELAY_MAX_MS = 1500;',
+      replacement: 'const ACCOUNT_FAIL_DELAY_MAX_MS = 0;',
+      testFile: 'audit69-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * R69-09a：XFF 退回「永远取首段」—— M-4 的原始形态。
+       *
+       * 撤掉后：追加式反代 / CDN 链路下，请求方自己写的第一段就是"你的 IP"，
+       * 一个请求换一个合法地址即可轮换限流键、撤销封禁。判据 `R69-16` 直接用
+       * `TRUST_PROXY_HOPS=1` 的配置驱动 `forwardedClientIp()`。
+       */
+      name: 'R69-09a · XFF 退回永远取首段（请求方可自选 IP，限流/封禁可轮换）',
+      // 实测 fail=1：`R69-16`
+      file: 'server/security.js',
+      anchor: '  const idx = TRUST_PROXY_HOPS > 0\n    ? Math.max(0, Math.min(parts.length - 1, parts.length - TRUST_PROXY_HOPS))\n    : 0;',
+      replacement: '  const idx = 0;',
+      testFile: 'audit69-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * R69-10a：限流器 hits 表去掉硬上限 —— L-8 的原始形态。
+       *
+       * 撤掉后：每个新键都永久留下一条记录，IPv6 场景下是无界内存增长。
+       * 判据 `R69-17` 用 `maxEntries: 2` 造淘汰，被淘汰的键必须重新从 1 计数。
+       */
+      name: 'R69-10a · 限流 hits 表去掉硬上限（IPv6 慢速内存 DoS 重开）',
+      // 实测 fail=1：`R69-17`
+      file: 'server/security.js',
+      anchor: '      if (!rec && hits.size >= maxEntries) {',
+      replacement: '      if (!rec && hits.size >= 1e9) {',
+      testFile: 'audit69-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * R69-11a：查单金额不再对账 —— I-5 的原始形态。
+       *
+       * 撤掉后：网关说 paid 就发货，"付 1 分买 100 元"这条纵深缺口重新打开。
+       * 判据 `R69-20` 拦真 fetch、造「实付 1 分 / 应付 1 元」。
+       */
+      name: 'R69-11a · 查单不再核对金额（付 1 分也能确认 1 元的订单）',
+      // 实测 fail=1：`R69-20`
+      file: 'server/payment-gateway.js',
+      anchor: '  if (Math.abs(want - got) > AMOUNT_TOLERANCE_FEN) {',
+      replacement: '  if (false) {',
+      testFile: 'audit69-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * R69-12a：「每人一次」退回读**被截断的台账** —— L-1 的原始形态。
+       *
+       * 撤掉后：第 201 次核销之后，最早那位用户又能用同一张券。判据 `R69-21`
+       * 刻意「先让第一个身份用完、再灌满台账把它挤出 uses」，顺序反过来测不到。
+       */
+      name: 'R69-12a · 「每人一次」退回读 200 条截断台账（第 201 次后可重复用）',
+      // 实测 fail=1：`R69-21`（第一个身份能二次使用）
+      file: 'server/coupon-store.js',
+      anchor: "    if (!who || (Array.isArray(c.identities) ? c.identities : []).indexOf(who) >= 0) return fail('already_used');",
+      replacement: "    if (!who || c.uses.map((u) => u.identity).indexOf(who) >= 0) return fail('already_used');",
+      testFile: 'audit69-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * R69-13a：「确认不存在」的判据退化成恒真 —— L-12 的核心。
+       *
+       * 撤掉后：403 / 5xx / 网络错误全部被当成「目标不存在」，随后的复制/移动照样
+       * 写入，云端覆写不可撤销。判据 `R69-22` **把源文件里这个函数的原文切出来执行**
+       * —— 只查「源码里有 isNotFoundError」挡不住 `return true` 这种退化。
+       */
+      name: 'R69-13a · isNotFoundError 退化成恒真（403/网络错误被当成「不存在」）',
+      // 实测 fail=1：`R69-22`（切源文件里的函数原文执行，403 那条断言先红）
+      file: 'server/routes/fs.js',
+      anchor: "  const sc = e.statusCode === undefined ? e.status : e.statusCode;\n  if (Number(sc) === 404) return true;\n  return /NoSuchKey|NotFound/i.test(String(e.code || ''));",
+      replacement: '  return true;',
+      testFile: 'audit69-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * R69-14a：声明了 256KB 解析器却不调用 —— I-4 的「又一句死代码」形态。
+       *
+       * 撤掉后：`/pay/notify/*` 回到 2MB 上限，匿名面内存放大 8 倍。
+       * 判据 `R69-23` 同时钉「顺序」（256KB 早于 2MB）与「真的调用」。
+       */
+      name: 'R69-14a · 256KB 解析器只声明不调用（通知端点回到 2MB 上限）',
+      // 实测 fail=1：`R69-23`
+      file: 'server/index.js',
+      anchor: '  return NOTIFY_BODY_LIMIT_PARSER(req, res, next);',
+      replacement: '  return next();',
+      testFile: 'audit69-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * R69-15a：Node 二进制包不再校验哈希 —— L-11 的原始形态。
+       *
+       * 撤掉后：`curl` 下来的 tar.gz 直接解到 `/usr/local`，镜像/代理/缓存任何一跳
+       * 都能换掉将要运行的 node。判据 `R69-24` 断言「校验调用存在且在解压之前」。
+       */
+      name: 'R69-15a · Node 二进制包不校验 SHA-256（下载即解压到 /usr/local）',
+      // 实测 fail=1：`R69-24`
+      file: 'deploy.sh',
+      anchor: '  verify_node_tarball "${tmp}/node.tar.gz" "$ver" "$NODE_ARCH" "$base"\n',
+      replacement: '',
+      testFile: 'audit69-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * R69-16a：restore-guard 只 `set` 不 `delete` —— I-17 的「注释与实现不符」。
+       *
+       * 撤掉后：Map 的插入序 = 首次插入序，淘汰的不是「最久未活动」而是「最早出现」，
+       * 刚在用的 IP 反而可能被丢掉（连同它的连击计数一起归零）。
+       */
+      name: 'R69-16a · restore-guard 只 set 不 delete（淘汰顺序退回首次插入序）',
+      // 实测 fail=1：`R69-25`
+      file: 'server/restore-guard.js',
+      anchor: '  counters.delete(key);\n  counters.set(key, { fails, lastAt: now });',
+      replacement: '  counters.set(key, { fails, lastAt: now });',
+      testFile: 'audit69-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * R69-17a：`GET /s/:id` 不再限流 —— L-2 的原始形态。
+       *
+       * 撤掉后：匿名访客并发请求同一个分享 URL 就能把云端调用放大 N 倍。
+       * 判据 `R69-26` 要求「两个入口共用同一枚限流器」且「限流早于 shareStore.get」。
+       */
+      name: 'R69-17a · GET /s/:id 不再限流（分享页入口可被并发放大）',
+      // 实测 fail=1：`R69-26`（限流器出现次数掉到 1）
+      file: 'server/share-routes.js',
+      anchor: '  const viewRl = security.shareViewLimiter(security.clientIp(req));',
+      replacement: '  const viewRl = { ok: true, retryAfter: 0 };',
+      testFile: 'audit69-regressions.test.js',
       minFail: 1,
     },
   ];

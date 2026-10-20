@@ -215,7 +215,7 @@ export function openProfileDialog() {
     const emailCode = ((overlay.querySelector('#p-f-email-code') || {}).value || '').trim();
 
     if (!username.trim()) { showMsg('用户名不能为空', 'bad'); return; }
-    if (password && password.length < 6) { showMsg('密码长度不能少于 6 位', 'bad'); return; }
+    if (password && password.length < 8) { showMsg('密码长度不能少于 8 位', 'bad'); return; }
     if (password !== confirm) { showMsg('两次输入的密码不一致', 'bad'); return; }
 
     const body = { username: username.trim() };

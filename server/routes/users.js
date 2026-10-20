@@ -21,6 +21,30 @@ function isAdmin(req) {
   return Boolean(req.authUser && req.authUser.role === 'admin');
 }
 
+/**
+ * R69 / L-7：**`permissions` 是保留字段，不参与任何鉴权判断**。
+ *
+ * 现状：全库只有 `role` 会进 `requireAdmin` / `bucketsFor` / `credentialsFor` 的判据；
+ * `permissions` 一路被存下来、回显、并在编辑用户时写审计日志「更新权限」，但**没有
+ * 任何一处读它**。结果是：管理员在接口上写 `permissions` 会得到「更新成功」，
+ * 而那个权限其实一点作用都没有 —— 这是一条**错误的安全预期**，比缺功能更危险
+ * （有人会以为自己已经把某个用户限制住了）。
+ *
+ * 对外只有两个诚实的选择：服务端落地细粒度 RBAC，或者**明确拒绝**非空 `permissions`。
+ * 落地 RBAC 需要一张权限表 + 每个路由的判据，属于功能扩建；本轮按「宁可拒绝、
+ * 不可假装」处理：非空即 400 并指路 `role`。空对象 `{}` 是历史默认值，放行以兼容
+ * 既有调用方（前端从不发送该字段）。
+ */
+function rejectUnsupportedPermissions(permissions) {
+  if (permissions === undefined || permissions === null) return null;
+  if (typeof permissions !== 'object' || Array.isArray(permissions)) {
+    return 'permissions 字段必须是不参与鉴权的保留字段（当前版本不支持，请留空）';
+  }
+  if (Object.keys(permissions).length === 0) return null;
+  return '当前版本不支持细粒度 permissions：该字段不参与任何授权判断，'
+    + '设置后不会生效。请改用「角色」（管理员 / 普通用户）控制访问范围。';
+}
+
 /* ============================ 自助资料（所有登录用户） ============================ */
 
 // 当前用户资料（等价于 /auth/me 的 user 字段，但语义上归属"我的资料"）
@@ -206,6 +230,9 @@ router.post('/users', requireAdmin, async (req, res) => {
         email = r.value;
       }
     }
+    // R69 / L-7：permissions 不参与鉴权 —— 非空一律拒绝，别给管理员留下"已限制"的错觉
+    const permErr = rejectUnsupportedPermissions(b.permissions);
+    if (permErr) return res.status(400).json({ error: permErr });
     const user = await configStore.addUser({
       username: b.username,
       password: b.password,
@@ -237,6 +264,9 @@ router.put('/users/:id', requireAdmin, async (req, res) => {
     if (b.username !== undefined) patch.username = b.username;
     if (b.password !== undefined && b.password !== '') patch.password = b.password;
     if (b.role !== undefined) patch.role = b.role;
+    // R69 / L-7：同 `/users` —— 非空 permissions 一律 400（该字段不参与鉴权）
+    const permErr = rejectUnsupportedPermissions(b.permissions);
+    if (permErr) return res.status(400).json({ error: permErr });
     if (b.permissions !== undefined) patch.permissions = b.permissions;
     // R37：用户级下载限速（0 = 不限速）
     if (b.speedLimit !== undefined) {

@@ -361,6 +361,13 @@ let resendTimer = null;
  * 默认取最保守的 `closed`：拿不到配置时不摆一个点了必然失败的「注册」入口。
  */
 let siteRegistration = 'closed';
+/**
+ * R69：首次初始化是否必须出示「安装令牌」。
+ *
+ * 由 `/auth/me` 的 `setupTokenRequired` 决定（服务端 = 部署模式且尚无用户）。
+ * 默认 `false`：拿不到这个字段时按本机模式处理，不凭空多出一个必填框。
+ */
+let setupTokenRequired = false;
 
 /**
  * R68：公开接口 `/api/site/agreements` 的返回值（三页提示 + 被引用到的协议正文）。
@@ -415,84 +422,55 @@ function openAgreementFromLink(docKey) {
 }
 
 /**
- * 「记住密码」的本机痕迹。
+ * 「记住用户名」的本机痕迹（R69）。
  *
- * ⚠️ 这里保存的是**用户名与密码本身**（R54② 起，它取代了旧版的「记住登录状态」）——
- * 因此密码**必须经一层混淆**再落 localStorage：明文存储意味着任何一次「打开开发者
- * 工具看一眼」就能把凭据抄走。
+ * ⚠️ 这里**只保存用户名**。R54② 曾把密码一起存进这条记录 —— 用一把同样躺在这条
+ * 记录里的随机密钥做异或。异或是对合运算：能读到这条记录的人，用同一份代码一行
+ * 就能还原明文，那层"混淆"的实际强度**等于明文存储**。而 localStorage 没有
+ * HttpOnly、没有 SameSite、生命周期无限（XSS / 浏览器扩展 / 公用电脑 / 配置备份
+ * 都能拿到）。真正让用户免于重复登录的是**服务端会话有效期**（勾选后 30 天），
+ * 客户端存密码的边际价值抵不上这个代价，因此这条通道整条撤掉。
  *
- * ⚠️ 但**混淆不是加密**：密钥就在同一条记录里，能取到密文的人一样能取到密钥。
- * 它挡的是"顺手一瞥"与误读，挡不住任何一个会开开发者工具的人 —— 界面上的提示
- * 必须如实这么写，不能让用户以为它安全。真正让用户免于重复登录的是**会话有效期**
- * （勾选后服务端会话 30 天）。
+ * 旧版本写下的记录里可能还带 `k` / `p`（密钥与密文）：`loadRemember` 读到就
+ * **就地重写**成不含它们的形态 —— 升级不是"不再写入"就够，盘上已有的那份也必须消失。
  */
 const REMEMBER_LS_KEY = 's3mgr.auth.v1';
 /** R49：同上，历史键名做兜底别名（见 `LEGACY_LS_KEY` 的说明） */
 const LEGACY_REMEMBER_LS_KEY = 'cosmgr.auth.v1';
 
-/** 「记住密码」的取值口径（集中在这里，避免散落的布尔判断各写一套语义） */
-const REMEMBER_MODE = { NONE: 'none', PASSWORD: 'password' };
+/** 「记住用户名」的取值口径（集中在这里，避免散落的布尔判断各写一套语义） */
+const REMEMBER_MODE = { NONE: 'none', USERNAME: 'username' };
+/** R69：旧版本写进记录的密码模式值 —— 只用于把老记录识别成「记住用户名」 */
+const LEGACY_REMEMBER_PASSWORD_MODE = 'password';
 
-/** 取一串随机字节做混淆密钥（`crypto.getRandomValues` 不要求安全上下文） */
-function rememberKey() {
-  const bytes = new Uint8Array(16);
-  try {
-    window.crypto.getRandomValues(bytes);
-  } catch (e) {
-    // 极端环境（无 WebCrypto）：退化成时间派生的伪随机 —— 这一层本来就只是混淆
-    for (let i = 0; i < bytes.length; i++) bytes[i] = Math.floor(Math.random() * 256);
-  }
-  return bytes;
-}
-
-/** 字节 → base64（用二进制字符串中转，避免 btoa 遇到 >0xFF 的码位报错） */
-function bytesToB64(bytes) {
-  let s = '';
-  for (let i = 0; i < bytes.length; i++) s += String.fromCharCode(bytes[i]);
-  return btoa(s);
-}
-
-function b64ToBytes(b64) {
-  const s = atob(b64);
-  const out = new Uint8Array(s.length);
-  for (let i = 0; i < s.length; i++) out[i] = s.charCodeAt(i);
-  return out;
-}
-
-/** 字节级异或（对合运算：同一个函数既用来混淆，也用来还原） */
-function xorBytes(src, key) {
-  const out = new Uint8Array(src.length);
-  for (let i = 0; i < src.length; i++) out[i] = src[i] ^ key[i % key.length];
-  return out;
-}
-
+/**
+ * 从本机痕迹里取回用户名与勾选状态。
+ * 任何一步不对都返回空对象（宁可让用户手打，也不能抛错卡住登录页）。
+ */
 function loadRemember() {
-  // R49：老键名（cosmgr.*）做只读迁移，避免升级后「记住密码」的勾选状态凭空消失
-  try { return JSON.parse(readMigrating(REMEMBER_LS_KEY, LEGACY_REMEMBER_LS_KEY)) || {}; } catch (e) { return {}; }
-}
-
-/** 从本机痕迹里取回密码；任何一步不对都返回空串（宁可让用户手打，也不能抛错卡住登录页） */
-function rememberPassword(saved) {
+  // R49：老键名（cosmgr.*）做只读迁移，避免升级后勾选状态凭空消失
   try {
-    if (!saved || saved.mode !== REMEMBER_MODE.PASSWORD || !saved.username || !saved.k || !saved.p) return '';
-    return new TextDecoder().decode(xorBytes(b64ToBytes(saved.p), b64ToBytes(saved.k)));
-  } catch (e) { return ''; }
+    const saved = JSON.parse(readMigrating(REMEMBER_LS_KEY, LEGACY_REMEMBER_LS_KEY)) || {};
+    const username = String(saved.username || '');
+    const remember = saved.mode === REMEMBER_MODE.USERNAME || saved.mode === LEGACY_REMEMBER_PASSWORD_MODE;
+    // R69：老记录（含 k/p）读到时立刻重写，把可还原的凭据从盘上抹掉
+    if (saved.k !== undefined || saved.p !== undefined) {
+      saveRemember(remember && username ? REMEMBER_MODE.USERNAME : REMEMBER_MODE.NONE, username);
+    }
+    return { mode: remember && username ? REMEMBER_MODE.USERNAME : REMEMBER_MODE.NONE, username };
+  } catch (e) { return {}; }
 }
 
 /**
  * 保存 / 清除本机痕迹（**唯一实现点**）。
- * @param {'none'|'password'} mode 见 `REMEMBER_MODE`
+ * @param {'none'|'username'} mode 见 `REMEMBER_MODE`
  */
-function saveRemember(mode, username, password) {
+function saveRemember(mode, username) {
   try {
-    if (mode !== REMEMBER_MODE.PASSWORD || !username) { localStorage.removeItem(REMEMBER_LS_KEY); return; }
-    const key = rememberKey();
-    const secret = xorBytes(new TextEncoder().encode(String(password || '')), key);
+    if (mode !== REMEMBER_MODE.USERNAME || !username) { localStorage.removeItem(REMEMBER_LS_KEY); return; }
     localStorage.setItem(REMEMBER_LS_KEY, JSON.stringify({
-      mode: REMEMBER_MODE.PASSWORD,
-      username: username || '',
-      k: bytesToB64(key),
-      p: bytesToB64(secret),
+      mode: REMEMBER_MODE.USERNAME,
+      username: String(username || ''),
     }));
   } catch (e) { /* 隐私模式下不可用，忽略 */ }
 }
@@ -509,8 +487,11 @@ async function checkAuth() {
     App.state.user = null;
     if (r.initialized === false) {
       authMode = 'init';
+      // R69：部署模式下首次初始化必须出示「安装令牌」（服务端生成，只出现在启动日志里）
+      setupTokenRequired = r.setupTokenRequired === true;
     } else {
       authMode = 'login';
+      setupTokenRequired = false;
     }
     return null;
   } catch (e) {
@@ -534,6 +515,9 @@ function showAuthOverlay() {
   const codeItem = document.getElementById('auth-code-item');
   // R54③：邀请码输入框（只有「邀请码」注册模式下的注册形态才出现）
   const inviteItem = document.getElementById('auth-invite-item');
+  // R69：安装令牌输入框（部署模式下首次初始化才出现）
+  const setupItem = document.getElementById('auth-setup-item');
+  const setupInput = document.getElementById('auth-setup');
   const submitBtn = document.getElementById('btn-auth-submit');
   const foot = document.getElementById('auth-foot');
   const errEl = document.getElementById('auth-error');
@@ -549,18 +533,22 @@ function showAuthOverlay() {
   const rememberBox = document.getElementById('auth-remember');
   const rememberItem = document.getElementById('auth-remember-item');
 
-  // 清空输入（密码/验证码始终清空；用户名在勾选过「记住密码」时回填）
+  // 清空输入（密码/验证码始终清空；用户名在勾选过「记住用户名」时回填）
   const saved = loadRemember();
-  if (rememberBox) rememberBox.checked = saved.mode === REMEMBER_MODE.PASSWORD;
-  // 创建管理员与注册时「记住密码」没有意义（都是刚设的密码），忘记密码也不适用
+  if (rememberBox) rememberBox.checked = saved.mode === REMEMBER_MODE.USERNAME;
+  // 创建管理员与注册时「记住用户名」没有意义（用户名是刚起的），忘记密码也不适用
   if (rememberItem) rememberItem.hidden = isInit || isRegister || isForgot;
-  userInput.value = saved.mode === REMEMBER_MODE.PASSWORD ? (saved.username || '') : '';
-  pwInput.value = saved.mode === REMEMBER_MODE.PASSWORD ? rememberPassword(saved) : '';
+  userInput.value = saved.mode === REMEMBER_MODE.USERNAME ? (saved.username || '') : '';
+  // R69：密码**从不**回填 —— 本机不再保存任何形式的密码
+  pwInput.value = '';
   document.getElementById('auth-confirm').value = '';
   document.getElementById('auth-code').value = '';
   document.getElementById('auth-invite').value = '';
   // 邀请码框默认整条隐藏，只有「注册 + 邀请码模式」那一个分支把它打开
   if (inviteItem) inviteItem.hidden = true;
+  // 安装令牌同理：只有「部署模式 + 首次初始化」才要求填写（本机回环不受影响）
+  if (setupItem) setupItem.hidden = !(isInit && setupTokenRequired);
+  if (setupInput) setupInput.value = '';
 
   // 三个入口整条换掉，不留"上一个模式"的残影
   document.getElementById('auth-forgot-link').hidden = !(authMode === 'login');
@@ -1025,6 +1013,13 @@ async function doAuthSubmit() {
     showAuthError('请输入邀请码');
     return;
   }
+  // R69：部署模式下首次初始化必须填安装令牌（非空只做前端即时反馈，真判据在服务端）
+  const setupTokenEl = document.getElementById('auth-setup');
+  const setupToken = setupTokenEl ? setupTokenEl.value.trim() : '';
+  if (authMode === 'init' && setupTokenRequired && !setupToken) {
+    showAuthError('请输入安装令牌（见服务端启动日志）');
+    return;
+  }
   // 人机验证：开启时必须已完成校验（token 由组件回调产出，服务端会回源复核）
   if (captchaState.active && !captchaState.token) {
     showAuthError('请先完成人机验证');
@@ -1037,7 +1032,8 @@ async function doAuthSubmit() {
   try {
     let r;
     if (authMode === 'init') {
-      r = await API.initAdmin({ username, password, confirmPassword: confirm });
+      r = await API.initAdmin(Object.assign({ username, password, confirmPassword: confirm },
+        setupToken ? { setupToken } : null));
     } else if (isRegister) {
       r = await API.register({
         username, password, confirmPassword: confirm,
@@ -1071,11 +1067,11 @@ async function doAuthSubmit() {
     if (r && r.user) {
       App.state.user = r.user;
       /**
-       * 「记住密码」的落点只有**登录**这一条路径：注册与初始化时那个复选框是隐藏的，
-       * 此刻去写它只会把用户原先保存的凭据清掉（而他并没有表达过这个意思）。
+       * 「记住用户名」的落点只有**登录**这一条路径：注册与初始化时那个复选框是隐藏的，
+       * 此刻去写它只会把用户原先记着的用户名清掉（而他并没有表达过这个意思）。
        */
       if (authMode === 'login') {
-        saveRemember(remember ? REMEMBER_MODE.PASSWORD : REMEMBER_MODE.NONE, username, password);
+        saveRemember(remember ? REMEMBER_MODE.USERNAME : REMEMBER_MODE.NONE, username);
       }
       // 登录成功即把主视图重置到 explorer：换账号（尤其管理员→普通用户）时，
       // 上一个会话停留的区块必须作废，不能让新账号看到旧账号渲染的内容。

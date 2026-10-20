@@ -42,10 +42,36 @@ const SITE_DOMAIN = normalizeHost(process.env.SITE_DOMAIN || '');
  */
 const TRUST_PROXY = String(process.env.TRUST_PROXY || '') === '1';
 
+/**
+ * R69：可信代理的**跳数**（0 = 沿用"取首段"的历史语义）。
+ *
+ * 只在 `TRUST_PROXY=1` 时有意义。见 `forwardedClientIp()`：追加式链路必须配这个值，
+ * 否则首段由请求方随便写。
+ */
+const TRUST_PROXY_HOPS = Math.max(0, Math.floor(Number(process.env.TRUST_PROXY_HOPS) || 0));
+
+/** 本进程是否加载到了可用的 TLS 证书（由 `index.js` 在启动时告知） */
+let TLS_AVAILABLE = false;
+function setTlsAvailable(v) { TLS_AVAILABLE = Boolean(v); }
+
 /** 会话 Cookie 的 Secure 属性（部署模式必须，避免明文 HTTP 泄露会话） */
 function secureCookieAttr() {
-  return IS_DEPLOY ? '; Secure' : '';
+  /**
+   * R69：`Secure` 必须与「浏览器**确实**在用 HTTPS」对齐，而不只是"部署模式"。
+   *
+   * `IS_DEPLOY` 的判据是「`HOST` 不是回环」，而 Docker 里 `HOST=0.0.0.0` 恒成立 ——
+   * 于是一个没有证书、没有反代的纯 HTTP 实例（`index.js` 在 `!TLS.ok && !TRUST_PROXY`
+   * 时刻意不跳转，就是为了让它还能用）会把每个会话 Cookie 都打上 `Secure`，
+   * 浏览器在明文页面上直接丢弃：登录接口返回 200，会话却永远建立不起来。
+   * 方向是 fail-closed，但这是一个**可用的实例被判死**的错误耦合。
+   *
+   * 现在只有两种"确实有 HTTPS"的形态才加：本进程加载了证书（`TLS_AVAILABLE`），
+   * 或位于可信反代之后（`TRUST_PROXY`，按约定由它终结 TLS）。
+   */
+  return (IS_DEPLOY && (TLS_AVAILABLE || TRUST_PROXY)) ? '; Secure' : '';
 }
+
+
 
 /**
  * 回环 / IPv4-mapped IPv6 归一化：`::ffff:127.0.0.1` → `127.0.0.1`、`::1` → `127.0.0.1`。
@@ -129,8 +155,26 @@ function hasForwardedHeader(req) {
 function forwardedClientIp(req) {
   if (!TRUST_PROXY) return '';
   if (!hasForwardedHeader(req)) return '';
-  const first = String(req.headers['x-forwarded-for']).split(',')[0].trim();
-  return isIpLiteral(first) ? first : '';
+  /**
+   * R69：`TRUST_PROXY_HOPS`（默认为 0）—— 从**右**往左按可信跳数剥取。
+   *
+   * 默认取首段的语义只在「前置代理**重写**该头」时成立（`deploy.sh` 生成的模板正是
+   * `proxy_set_header X-Forwarded-For $remote_addr;`）。若部署方用追加式
+   * （`$proxy_add_x_forwarded_for`）或前面还挂了 CDN，首段就完全由请求方决定 ——
+   * 每个请求换一个合法 IP，就能把按 IP 的限流、失败锁定、IP 黑名单、分享冻结一次性绕开。
+   * 追加式链路下，**离自己最近的那一跳写进末尾**，因此「可信跳数」才是可配置的正确维度：
+   *   `TRUST_PROXY_HOPS=1` → 取最后一段（只有一层反代）
+   *   `TRUST_PROXY_HOPS=2` → 取倒数第二段（CDN + 反代）
+   * 仍逐个校验为合法 IP 字面量：非法值一律不采信（退回空串，与"没有可用转发信息"同待遇）。
+   */
+  const parts = String(req.headers['x-forwarded-for'])
+    .split(',').map((s) => s.trim()).filter(Boolean);
+  if (!parts.length) return '';
+  const idx = TRUST_PROXY_HOPS > 0
+    ? Math.max(0, Math.min(parts.length - 1, parts.length - TRUST_PROXY_HOPS))
+    : 0;
+  const pick = parts[idx] || '';
+  return isIpLiteral(pick) ? pick : '';
 }
 
 /**
@@ -330,11 +374,22 @@ function csrfGuard(req) {
 /* ============================ 速率限制 ============================ */
 
 /**
+ * 限流器 `hits` 表的硬上限（R69）。
+ *
+ * `sweep()` 受 `windowMs` 门控（每 windowMs 才跑一遍），两次清扫之间匿名入口
+ * 仍可灌入任意多个新键 —— 没有上限就是一条无界内存增长路径（与 `FAILS_MAX`
+ * 同型）。IPv6 下换 `/64` 内的源地址就能成批造键，成本极低。
+ * 达上限后按插入顺序淘汰最旧键：这只承担**内存安全**职责，不承担安全边界职责
+ * （被淘汰的键相当于重置预算，但撞上它需要先灌满上万条）。
+ */
+const LIMITER_MAX_ENTRIES = 10000;
+
+/**
  * 创建速率限制器（滑动计数窗口）
  * @param {object} opt { name, windowMs, max }
  * @returns {(key: string) => { ok: boolean, retryAfter: number }} retryAfter 单位为秒
  */
-function createLimiter({ name = 'limit', windowMs = 60 * 1000, max = 10 }) {
+function createLimiter({ name = 'limit', windowMs = 60 * 1000, max = 10, maxEntries = LIMITER_MAX_ENTRIES }) {
   const hits = new Map(); // key -> { count, resetAt }
   let lastSweep = 0;
 
@@ -350,6 +405,13 @@ function createLimiter({ name = 'limit', windowMs = 60 * 1000, max = 10 }) {
     const k = String(key || '-');
     const rec = hits.get(k);
     if (!rec || rec.resetAt <= now) {
+      // R69：达硬上限后按插入顺序淘汰（Map 保持插入顺序）—— 见 LIMITER_MAX_ENTRIES
+      if (!rec && hits.size >= maxEntries) {
+        for (const old of hits.keys()) {
+          if (hits.size < maxEntries) break;
+          hits.delete(old);
+        }
+      }
       hits.set(k, { count: 1, resetAt: now + windowMs });
       return { ok: true, retryAfter: 0 };
     }
@@ -372,6 +434,52 @@ function limitMiddleware(limiter, keyFn) {
 }
 
 /* ============================ 失败锁定 ============================ */
+
+/**
+ * R69：跨 IP 的「账户级低速计数器」—— **只减速，不锁死**。
+ *
+ * 登录失败锁定按 `ip|用户名` 计数，这是刻意的（只按用户名锁会被人拿来 DoS 别人）。
+ * 代价是分布式暴破（代理池）完全不受账户级约束：每个 IP 各自一份预算。
+ * 这里补一个账户维度，但只作用于**响应速度**：同一用户名跨 IP 累计失败越多，
+ * 认证前的等待越长（上限 1.5 秒）。它不改变"谁能登录"，所以不会变成新的 DoS
+ * 工具 —— 受害者最多多等 1.5 秒，而撞库吞吐被压下去一个数量级。
+ */
+const ACCOUNT_FAIL_SOFT = 20;
+const ACCOUNT_FAIL_DELAY_MAX_MS = 1500;
+const ACCOUNT_FAILS_MAX = 20000;
+const accountFails = new Map(); // username -> { count, lastAt }
+
+function normalizeAccountKey(username) {
+  return String(username == null ? '' : username).trim().toLowerCase();
+}
+
+function noteAccountFail(username) {
+  const key = normalizeAccountKey(username);
+  if (!key) return;
+  const rec = accountFails.get(key);
+  if (!rec && accountFails.size >= ACCOUNT_FAILS_MAX) {
+    for (const k of accountFails.keys()) {
+      if (accountFails.size < ACCOUNT_FAILS_MAX) break;
+      accountFails.delete(k);
+    }
+  }
+  accountFails.set(key, { count: (rec ? rec.count : 0) + 1, lastAt: Date.now() });
+}
+
+function resetAccountFail(username) {
+  const key = normalizeAccountKey(username);
+  if (key) accountFails.delete(key);
+}
+
+/** 该用户名此刻该被"拖"多久（毫秒）；0 = 正常速率 */
+function accountFailDelayMs(username) {
+  const key = normalizeAccountKey(username);
+  const rec = key ? accountFails.get(key) : null;
+  if (!rec) return 0;
+  const over = rec.count - ACCOUNT_FAIL_SOFT;
+  if (over <= 0) return 0;
+  return Math.min(ACCOUNT_FAIL_DELAY_MAX_MS, 100 * over);
+}
 
 /**
  * RE-01：失败锁定表的硬上限。
@@ -613,6 +721,23 @@ const orderRestoreLimiter = createLimiter({ name: 'order-restore', windowMs: 10 
 const registerLimiter = createLimiter({ name: 'auth-register', windowMs: 10 * 60 * 1000, max: 10 });
 
 /**
+ * R69 / L-4：**全局（跨 IP）注册冲突预算** —— 每 10 分钟最多回答 30 次「该用户名已被占用」。
+ *
+ * 公开注册下的用户名冲突反馈是一把双刃剑：不告诉用户「换一个名字」，注册就没法用；
+ * 但「409 已存在 / 200 建成」本身就是一条用户名枚举 oracle。按 IP 限流（上一条）
+ * 挡不住代理池 —— 换 IP 就有新预算。
+ *
+ * 这里把**冲突答案本身**做成全站共享预算：额度耗尽后，冲突请求改回 429
+ * 「尝试过于频繁」，攻击者每 10 分钟最多确认 30 个用户名是否存在；而**新建成功
+ * 的路径不受影响**（真正要注册的人不会被卡），代价只是「不巧重名」的人会看到
+ * 一句含糊的 429 —— 这正是刻意的：oracle 的可用性必须低于合法用户的价值。
+ *
+ * 用**固定键**调 `createLimiter` 产出的实例（`'__global__'`），键数恒为 1。
+ */
+const registerConflictLimiter = createLimiter({ name: 'auth-register-conflict', windowMs: 10 * 60 * 1000, max: 30 });
+const REGISTER_CONFLICT_KEY = '__global__';
+
+/**
  * 「忘记密码」发码：每 IP 每 10 分钟 ≤ 10 次。
  *
  * 该端点匿名可达且**会真的发一封邮件**。限流保护的是两样东西：本站的 SMTP 发信
@@ -637,9 +762,12 @@ const resetLock = createFailLock({ name: 'auth-reset', maxFails: 5, baseLockMs: 
 const emailCodeLimiter = createLimiter({ name: 'auth-email-code', windowMs: 10 * 60 * 1000, max: 10 });
 
 module.exports = {
-  DEPLOY_HOST, IS_LOOPBACK, IS_DEPLOY, TRUST_PROXY,
+  DEPLOY_HOST, IS_LOOPBACK, IS_DEPLOY, TRUST_PROXY, TRUST_PROXY_HOPS,
   SITE_DOMAIN, // R38：部署脚本写入的本站对外域名（「本站」允许集的权威来源）
-  secureCookieAttr, clientIp,
+  secureCookieAttr, clientIp, setTlsAvailable, // R69：Secure 与实际 TLS 可用性对齐
+  // R69：账户级（跨 IP）低速计数 —— 只减速不锁死
+  noteAccountFail, resetAccountFail, accountFailDelayMs,
+  LIMITER_MAX_ENTRIES,
   // R17-01：唯一的 XFF 解析实现 + 「IP 及其来源」；R17-03：「这个地址是不是本站」
   // R22-02：`isIpLiteral` 是「转发头里的值是否可信」的唯一语法判据
   normalizeIp, forwardedClientIp, clientIpInfo, normalizeHost, isOwnSiteHost,
@@ -658,5 +786,5 @@ module.exports = {
   orderRestoreLimiter, // R64：「恢复购买」按订单号取回（与 shareLimiter 分开计数）
   backupExportLimiter, // R38：备份导出校验账户口令的限流（与 passwordLimiter 刻意分开）
   // R54②：注册 / 忘记密码 / 重置密码 / 邮箱验证码
-  registerLimiter, forgotLimiter, resetLimiter, resetLock, emailCodeLimiter,
+  registerLimiter, registerConflictLimiter, REGISTER_CONFLICT_KEY, forgotLimiter, resetLimiter, resetLock, emailCodeLimiter,
 };

@@ -67,6 +67,10 @@ const agreementView = require('./agreement-view');
 const router = express.Router();
 router.use(express.urlencoded({ extended: false }));
 // 异步通知是 JSON（微信 / PayPal），支付宝则是表单；两者都要能解析
+// ⚠️ 审计 I-4：JSON 这张上限**已经不吃这套了** —— 全局解析器在 `index.js` 里更早执行，
+// 会先把 body 读完并置 `req._body`，本行只对「显式跳过全局解析」的路径生效。
+// 真正生效的 256KB 判据在 `index.js` 的 `NOTIFY_BODY_LIMIT_PARSER`（按 `/pay/notify/` 前置挂载）。
+// 留着这一行是为了 cover 直接 import 本路由（不经 index.js）的测试与脚本。
 router.use(express.json({ limit: '256kb' }));
 
 /**
@@ -1156,8 +1160,6 @@ async function probeObjectMissing(l) {
 }
 
 router.get('/s/:id', async (req, res) => {
-  const l = shareStore.get(req.params.id);
-  if (!l) return statePage(res, 'notfound');
   /**
    * R14-10①：本端点此前**没有任何限流器**（全文件的 limiter 调用点都不含它）。
    *
@@ -1165,13 +1167,18 @@ router.get('/s/:id', async (req, res) => {
    * 只要并发请求同一个 URL 就能把云端调用数与费用放大 N 倍，慢桶场景下还会
    * 各持一条连接最长挂满 SDK 的 120 秒超时（主站与 WebDAV 共用同一进程）。
    * 按 IP 限流（300 次/10 分钟），命中时给出与其他限流路径一致的 429 页面。
+   *
+   * R69：限流**必须在查表之前**。旧位置在 `shareStore.get()` 与 404 之后，
+   * 于是「不存在的 ID」这条最容易被滥用的路径完全不计数 —— 而它正是扫描器
+   * 最先打的一条。挪到第一行后，"能不能查"与"查到了什么都"共用一个预算。
    */
   const viewRl = security.shareViewLimiter(security.clientIp(req));
   if (!viewRl.ok) {
     res.setHeader('Retry-After', String(viewRl.retryAfter));
-    return statePage(res, 'limited', shareStore.view(l),
-      `请求过于频繁，请 ${viewRl.retryAfter} 秒后重试。`);
+    return statePage(res, 'limited', null, `请求过于频繁，请 ${viewRl.retryAfter} 秒后重试。`);
   }
+  const l = shareStore.get(req.params.id);
+  if (!l) return statePage(res, 'notfound');
   let st = shareStore.status(l);
   // 只有「有效」与「已标记删除」两种状态需要探测：过期 / 次数用尽的链接
   // 本来就不提供下载，没必要为此多打一次云端；而标记过的要再探一次，
@@ -1862,7 +1869,7 @@ router.post('/pay/notify/:platform', asyncHandler(async (req, res) => {
   // SEC-03 ②：验签。通知只被当作"该去查一次单"的信号，伪造通知**本身**造不出
   // 已支付状态（判定仍来自服务端主动查单）；但它能白嫖商户的查单配额并污染日志，
   // 所以能验的平台一律验，验不过直接丢掉。
-  const sig = verifyNotified(platform, req);
+  const sig = await verifyNotified(platform, req);
   if (!sig.ok) {
     statsStore.addLog({ action: 'share.pay', level: 'warn', detail: `支付回调验签未通过已丢弃（平台：${platform}，IP：${ip}，原因：${sig.reason}）` });
     return res.status(403).end();
@@ -1884,12 +1891,14 @@ router.post('/pay/notify/:platform', asyncHandler(async (req, res) => {
  *  - 微信：通知体是 APIv3 密钥下的 AES-256-GCM 密文，**解不出来就说明对方没有
  *    密钥**，解密成功本身即是认证（GCM 带认证标签）。因此这里要求 apiV3Key 已配置，
  *    解密失败由 resolveNotifiedOrder 一并判定；
- *  - PayPal：官方仅提供「回调验签 API」，本地无法离线验签（需一次网络往返）。
- *    这里不做伪验签（那只会给出虚假的安全感），交由上面的限流兜底。
+ *  - PayPal：官方只提供「回调验签 API」，本地无法离线验签（需要一次网络往返）。
+ *    R69 起**真的去验**（`paypalVerifyWebhook`）：未配置 `Webhook ID` 时一律丢弃 ——
+ *    旧实现这一支无条件 `{ok:true}`，等于把"匿名可触发的出站调用放大器"留在公网，
+ *    而界面上的 `webhookId` 提示又让人以为已经验过签。
  *
- * @returns {{ok: boolean, reason?: string}}
+ * @returns {Promise<{ok: boolean, reason?: string}>}
  */
-function verifyNotified(platform, req) {
+async function verifyNotified(platform, req) {
   const b = req.body && typeof req.body === 'object' ? req.body : {};
   const cfg = (configStore.getPayment().platforms || {})[platform] || {};
   if (platform === 'alipay') {
@@ -1903,7 +1912,15 @@ function verifyNotified(platform, req) {
     if (!b.resource || !b.resource.ciphertext) return { ok: false, reason: '通知缺少加密资源' };
     return { ok: true };
   }
-  return { ok: true }; // PayPal：本地不可验签，依赖限流
+  if (platform === 'paypal') {
+    try {
+      const ok = await paymentGateway.paypalVerifyWebhook(cfg, req.headers, b);
+      return ok ? { ok: true } : { ok: false, reason: 'PayPal 验签未通过' };
+    } catch (e) {
+      return { ok: false, reason: String((e && e.message) || e) };
+    }
+  }
+  return { ok: false, reason: '未知平台' };
 }
 
 /**
@@ -2404,6 +2421,13 @@ router.get('/s/:id/history', (req, res) => {
  * 状态码与 GET 的状态页保持一致（404 / 410）。
  */
 router.head('/s/:id/dl', (req, res) => {
+  /**
+   * R69：HEAD 也要限流。它是 `GET /s/:id/dl` 的同名旁路（下载器先发 HEAD 探测），
+   * 旧实现**全程没有任何限流器** —— 匿名面于是留下一条不计数、不写日志的探测通道。
+   * 复用分享页的按 IP 预算（不占用下载次数：HEAD 仍然是无副作用的）。
+   */
+  const rl = security.shareViewLimiter(security.clientIp(req));
+  if (!rl.ok) { res.setHeader('Retry-After', String(rl.retryAfter)); res.status(429).end(); return; }
   const l = shareStore.get(req.params.id);
   if (!l) { res.status(404).end(); return; }
   const st = shareStore.status(l);

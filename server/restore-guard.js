@@ -95,9 +95,18 @@ function persist() {
 
 function flush() { writer.flush(); }
 
-/** 归一化 IP（只做 trim + 小写：IPv6 十六进制大小写不该产生两个身份） */
+/**
+ * 归一化 IP（只做 trim + 小写：IPv6 十六进制大小写不该产生两个身份）
+ *
+ * R69：空 IP 一律折算成固定键 `unknown`，**不再短路**。旧实现在 `isBanned` / `noteFail`
+ * 里对空 key 直接返回「未封禁 / 不计数」，而空 IP 恰恰是请求方可制造的：
+ * `TRUST_PROXY=1` 下发一个畸形 `X-Forwarded-For` 就能让 `clientIp` 返回空串 ——
+ * 于是「连续输错就封 24 小时」这道门对所有这类请求整体失效。折算成固定键后，
+ * 它们共用同一个封禁桶（代价是这类请求会一起被封，但那是它们自找的）。
+ */
 function ipKey(ip) {
-  return String(ip || '').trim().toLowerCase();
+  const s = String(ip || '').trim().toLowerCase();
+  return s || 'unknown';
 }
 
 /** 丢掉已到期的封禁（读路径上就地清理，免得列表里挂着一堆过期项） */
@@ -150,9 +159,13 @@ function noteFail(ip, maxFails, nowMs) {
 
   const st = counters.get(key);
   const fails = (st && now - st.lastAt <= RESTORE_FAIL_IDLE_MS) ? st.fails + 1 : 1;
+  // 审计 I-17：**先删再写**，让 Map 的插入序真正等于「最近活动序」。
+  // 只 `set` 已存在的键不会移动它的位置，于是下面那段「按最久未活动丢弃」实际退化成
+  // 「按首次插入丢弃」—— 注释与实现不符，被淘汰的可能是刚刚还在用的 IP。
+  counters.delete(key);
   counters.set(key, { fails, lastAt: now });
   if (counters.size > COUNTER_MAX) {
-    // 按最久未活动丢弃（Map 保持插入顺序，最早插入的最久没动过）
+    // 按最久未活动丢弃（先删再写之后，Map 的插入顺序就是最近活动顺序）
     for (const k of counters.keys()) {
       if (counters.size <= COUNTER_MAX) break;
       counters.delete(k);

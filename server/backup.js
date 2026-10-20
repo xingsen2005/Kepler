@@ -55,8 +55,15 @@ const CODE_HEAD = 'KEPLER-CONFIG-V1';
 const SEAL_HEAD = 'KEPLER-CONFIG-SEALED-V1';
 const FORMAT_VERSION = 1;
 
-/** scrypt 参数：与账户口令体系**完全独立**，只用于保护这一段密文 */
-const SCRYPT = { N: 16384, r: 8, p: 1, keylen: 32 };
+/**
+ * scrypt 参数：与账户口令体系**完全独立**，只用于保护这一段密文。
+ *
+ * R69：与账户口令同步提升到 N=2^17（旧值 16384 只保留给"解开历史导出码"）。
+ * `maxmem` 必须显式给：128*N*r = 128MB > Node 默认的 32MB 上限。
+ */
+const SCRYPT = { N: 131072, r: 8, p: 1, keylen: 32 };
+const SCRYPT_LEGACY = { N: 16384, r: 8, p: 1, keylen: 32 };
+const SCRYPT_MAXMEM = 192 * 1024 * 1024;
 const SALT_BYTES = 16;
 const IV_BYTES = 12;
 /** 备份密码长度约束（与 WebDAV 账户口令同一上限，避免同一套界面两种口径） */
@@ -405,11 +412,11 @@ function badCode(msg) {
 
 /* ============================ 导出码（加密） ============================ */
 
-function deriveKey(password, salt) {
-  return crypto.scryptSync(String(password), salt, SCRYPT.keylen, {
-    N: SCRYPT.N, r: SCRYPT.r, p: SCRYPT.p,
-    // 历史 Node 默认 maxmem 偏小，显式放宽（16MB 足够本参数）
-    maxmem: 64 * 1024 * 1024,
+function deriveKey(password, salt, params) {
+  const p = params || SCRYPT;
+  return crypto.scryptSync(String(password), salt, p.keylen, {
+    N: p.N, r: p.r, p: p.p,
+    maxmem: SCRYPT_MAXMEM,
   });
 }
 
@@ -458,12 +465,23 @@ function open(sealedCode, backupPassword) {
     throw badCode('导出码内容不完整（可能复制时缺了一段）');
   }
   let plain;
+  /**
+   * R69：`SEAL_HEAD` 没有随 KDF 参数一起升版（光看抬头分不出新旧），因此按
+   * **新参数 → 旧参数**的顺序各试一次。GCM 认证失败是"密码错"与"参数不匹配"的
+   * 共同表现，只有两种都失败才算真的错 —— 否则升级会让所有历史导出码一夜失效。
+   */
   try {
     const dec = crypto.createDecipheriv('aes-256-gcm', deriveKey(pw, salt), iv);
     dec.setAuthTag(tag);
     plain = Buffer.concat([dec.update(ct), dec.final()]);
   } catch (e) {
-    throw Object.assign(new Error('备份密码错误，或导出码已被篡改'), { status: 400, backupCodeInvalid: true });
+    try {
+      const dec = crypto.createDecipheriv('aes-256-gcm', deriveKey(pw, salt, SCRYPT_LEGACY), iv);
+      dec.setAuthTag(tag);
+      plain = Buffer.concat([dec.update(ct), dec.final()]);
+    } catch (e2) {
+      throw Object.assign(new Error('备份密码错误，或导出码已被篡改'), { status: 400, backupCodeInvalid: true });
+    }
   }
   return decodeCode(plain.toString('utf8'));
 }

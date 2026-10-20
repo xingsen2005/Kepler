@@ -841,9 +841,10 @@ test('R54b-8 · 登录页：有「注册」「忘记密码」「返回登录」�
   for (const id of ['auth-register-link', 'auth-forgot-link', 'auth-back-login']) {
     assert(new RegExp(`id="${id}"[^>]*\\shidden`).test(html), `#${id} 必须默认 hidden`);
   }
-  // 「记住密码」取代了原来的「记住登录状态」—— 文案不得再声称"不保存密码"
-  assert(!/仅保存用户名/.test(html), '「记住密码」已取代「记住登录状态」，旧的"绝不保存密码"文案必须撤掉');
-  assertMatch(html, /记住密码/);
+  // R69 起勾选框是「记住用户名」：密码不再落任何本机存储，文案必须与行为一致
+  assertMatch(html, /记住用户名/);
+  assert(!/记住密码/.test(html), 'R69：不再保存密码，文案不得再写「记住密码」');
+  assert(/不保存密码/.test(html), '提示必须写明「不保存密码」');
 
   const main = readJs('main.js');
   for (const mode of ['register', 'forgot']) {
@@ -868,32 +869,30 @@ test('R54b-8 · 登录页：有「注册」「忘记密码」「返回登录」�
     '注册入口必须同时看"是不是登录页"与"站点是否允许注册（open 或 invite）"');
 });
 
-test('R54b-8 · 「记住密码」：本机保存密码走 REMEMBER_MODE 分支，且带一个明确的关闭态', () => {
+test('R54b-8 · 「记住用户名」：本机只存用户名（R69 收窄，密码不再落盘）', () => {
   const main = readJs('main.js');
-  assertMatch(main, /REMEMBER_MODE/, '必须有一个集中的"记住密码"取值口径（而不是散落的布尔）');
-  for (const v of ['NONE', 'PASSWORD']) {
+  assertMatch(main, /REMEMBER_MODE/, '必须有一个集中的取值口径（而不是散落的布尔）');
+  for (const v of ['NONE', 'USERNAME']) {
     assert(main.includes(v), `REMEMBER_MODE 应有 ${v} 一档`);
   }
   // 保存 / 清除的唯一实现点
   assertMatch(main, /function\s+saveRemember/, '仍然只能有一个保存实现点');
   assertMatch(main, /function\s+loadRemember/, '仍然只能有一个读取实现点');
   /**
-   * 存的是**密码本身**，因此必须过一层混淆：明文落 localStorage 意味着
-   * 「打开开发者工具看一眼」就能把凭据抄走。
-   * ⚠️ 但混淆不是加密 —— 判据只能落在"真的做了变换"，不能声称它是安全的。
+   * R69：**只存用户名**。旧实现的「随机密钥 + 异或密文」两条一起躺在同一条记录里，
+   * 异或又是对合运算 —— 拿到记录的人一行就能还原明文，等同明文存储。因此这里断言
+   * 的是"那套东西已经整段消失"，而不只是"换了个函数名"。
    */
-  assertMatch(main, /xorBytes/, '落盘的密码必须经过一层异或混淆');
-  assertMatch(main, /getRandomValues/, '混淆密钥必须来自密码学随机源');
-  /**
-   * 混淆的**输入**必须是密码本身 —— 这条比"有没有调 xorBytes"更接近要害：
-   * 把 `String(password || '')` 换成 `''`，混淆照样跑、函数照样在，
-   * 但"记住密码"已经不再记住任何东西了。
-   */
-  assertMatch(main, /new TextEncoder\(\)\.encode\(String\(password/, '被混淆的必须是密码本身');
-  assertMatch(main, /p: bytesToB64\(secret\)/, '落盘的是混淆结果（`p`），不是用户名也不是明文');
-  assertMatch(main, /b64ToBytes\(saved\.p\), b64ToBytes\(saved\.k\)/, '取回密码时要同时用密文与密钥解');
-  // 界面提示必须如实说明"只是混淆、不是加密"
-  assertMatch(readHtml(), /并不是加密/, '提示必须如实说明"混淆不是加密"，不能让用户以为它安全');
+  assert(!/xorBytes/.test(main), '密码不再落盘，异或混淆这套实现必须整段删除');
+  assert(!/rememberPassword/.test(main), '不再有"取回密码"的入口');
+  assertMatch(main, /username: String\(username \|\| ''\)/, '落盘的内容只有用户名');
+  assert(!/\bk: bytesToB64|\bp: bytesToB64/.test(main), '记录里不得再出现密钥 k / 密文 p 字段');
+  // 回填：用户名照回，密码框恒置空
+  assertMatch(main, /pwInput\.value = '';/, '密码输入框只能置空，绝不回填');
+  // 老记录（带 k/p）读到就地重写 —— 升级后盘上不能还留着一份可还原的凭据
+  assertMatch(main, /saved\.k !== undefined \|\| saved\.p !== undefined/, '老记录必须在读取时就地清洗');
+  // 界面提示必须如实说明"只存用户名、不存密码"
+  assertMatch(readHtml(), /不保存密码/, '提示必须写明不保存密码');
 });
 
 test('R54b-8 · api.js 暴露注册 / 忘记密码 / 重置 / 邮箱验证码四个接口', () => {

@@ -378,7 +378,15 @@ let guard = null; // { rules: [], updatedAt }
  *     其 `text` 与 target 一字不差，旧判据会一直沿用坏缓存 ⇒ 规则静默失效。
  */
 function normalizeRule(r) {
-  const o = Object.assign({}, r);
+  /**
+   * 审计 I-21：**不要用 `Object.assign({}, r)` 复制外部来的对象**。
+   *
+   * `Object.assign` 走的是 `[[Set]]`，而 `__proto__` 在普通对象上是个 accessor ——
+   * 一条来自导入文件的规则只要自带 `"__proto__": {...}`，赋值就会改写目标对象的
+   * 原型（不是污染 `Object.prototype`，但足以让后面所有 `in` / 继承属性判断错乱）。
+   * 对象展开走的是 `CreateDataProperty`，`__proto__` 只会成为一个普通自有属性。
+   */
+  const o = { ...r };
   if (!Array.isArray(o.bucketIds)) {
     const legacy = String(o.bucketId || '').trim();
     o.bucketIds = legacy ? [legacy] : [];

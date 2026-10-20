@@ -5,7 +5,7 @@
 const { express, providers, configStore, statsStore } = require('./_context');
 const { createClient, p, translateError } = require('../s3');
 const { requireAdmin, roleOf, credentialsFor, validateCredentialFormat, asyncHandler, mapLimit } = require('./_shared');
-const { assertSafeEndpoint } = require('../endpoint-guard');
+const { assertSafeEndpoint, assertSafeEndpointResolved } = require('../endpoint-guard');
 // R25：按 API Key 的配额用量（负载均衡卡片）与写入闸门同源
 const bucketStats = require('../bucket-stats');
 // R37：限速入参合法性的唯一判据（与配额一样，非法值绝不能静默归一化成 0 = 不限速）
@@ -80,10 +80,23 @@ router.get('/credentials', (req, res) => {
 });
 
 // 新增（或按 SecretId 更新）密钥，并设为当前（仅管理员）
-router.post('/credentials', requireAdmin, (req, res) => {
+router.post('/credentials', requireAdmin, async (req, res) => {
   const b = req.body || {};
   const secretId = String(b.secretId || '').trim();
   const secretKey = String(b.secretKey || '').trim();
+  /**
+   * R69：自定义端点在落库前做一次**域名解析**复核（`assertSafeEndpointResolved`）。
+   * 同步版只判 IP 字面量，域名"保存时指公网、之后指内网"可全程通过；
+   * 这里在写入前解析一次，把这类端点挡在库外。
+   */
+  if (b.endpoint !== undefined && String(b.endpoint).trim()) {
+    try {
+      await assertSafeEndpointResolved(providers.composeEndpoint(
+        (b.provider && String(b.provider).trim()) || providers.DEFAULT_PROVIDER_ID, b.endpoint));
+    } catch (e) {
+      return res.status(e.status || 400).json({ error: e.message });
+    }
+  }
   if (b.provider !== undefined && String(b.provider).trim() && !providers.isSupported(String(b.provider).trim())) {
     return res.status(400).json({ error: '当前版本暂不支持该服务商，请选择其他服务商' });
   }
@@ -151,9 +164,20 @@ router.put('/credentials/visibility', requireAdmin, (req, res) => {
 });
 
 // 修改密钥（备注 / 可见性 / 启停 / 配额，仅管理员）——停用时自动设为不可见
-router.put('/credentials/:id', requireAdmin, (req, res) => {
+router.put('/credentials/:id', requireAdmin, async (req, res) => {
   try {
     const b = req.body || {};
+    // R69：同 POST /credentials —— 端点改动落库前做解析级复核
+    if (b.endpoint !== undefined && String(b.endpoint).trim()) {
+      const cur = (configStore.listCredentials().credentials || []).find((c) => c.id === req.params.id);
+      try {
+        await assertSafeEndpointResolved(providers.composeEndpoint(
+          (b.provider && String(b.provider).trim()) || (cur && cur.provider) || providers.DEFAULT_PROVIDER_ID,
+          b.endpoint));
+      } catch (e) {
+        return res.status(e.status || 400).json({ error: e.message });
+      }
+    }
     // R25：凭据级配额（0 = 无限制）。与桶配额**同款前置校验**（负数/非法值一律 400），
     // 否则「界面填 -1」会被归一化成 0（= 无限制），用户以为设了限制其实完全放开。
     if (b.quotaBytes !== undefined) {

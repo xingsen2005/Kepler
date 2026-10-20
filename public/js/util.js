@@ -322,7 +322,7 @@ export function promptDialog({ title, label, value = '', okText = '确定', hint
       <div class="form-item">
         <label>${escapeHtml(label || '')}</label>
         <input type="text" value="${escapeHtml(value)}">
-        ${hint ? `<div class="hint">${hint}</div>` : ''}
+        ${hint ? `<div class="hint">${escapeHtml(String(hint))}</div>` : ''}
       </div>`;
     const input = wrap.querySelector('input');
     const m = openModal({

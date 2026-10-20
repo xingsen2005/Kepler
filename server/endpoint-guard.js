@@ -121,8 +121,61 @@ function assertSafeEndpoint(endpoint) {
   return raw;
 }
 
+/**
+ * R69：在同步校验之上补一次**域名解析**复核（保存端点时调用）。
+ *
+ * 同步那层只判 IP 字面量与元数据主机名，这是刻意的边界（内网对象存储常用内部域名）。
+ * 但它留下一个缺口：`https://s3.attacker.example` 保存时解析到公网，之后（或靠 DNS
+ * 轮询）解析到 `169.254.169.254` / 内网地址，全程都能通过 —— 服务端随后会带着真实
+ * 云密钥连过去。这里在保存时解析一次并复判，把「域名指向内网」这一类挡在落库之前。
+ *
+ * 语义上与同步版**同级**（不是新增一档更严的策略）：
+ *  · 回环 / 私网 / 链路本地仍受 `ALLOW_LOOPBACK_ENDPOINT` / `ALLOW_PRIVATE_ENDPOINT` 控制；
+ *  · 解析失败**放行**（离线部署 / 内网 DNS 保存时不可达是常态，提前拒绝会让人配不进去；
+ *    真要连的时候连不上，那是另一码事）；
+ *  · 任一解析结果落在禁止段即整条拒绝 —— 多 A 记录里混一个内网地址就够做轮询绕过。
+ *
+ * ⚠️ 这**不是** TOCTOU 的终结：连接时 DNS 仍可能变。它的价值是把"保存即指向内网"
+ * 这条最省事的路径堵死；彻底的修法是连接期复判（需要把 DNS 解析下沉到出站客户端）。
+ *
+ * @returns {Promise<string>} 与同步版相同的"原样返回"
+ */
+async function assertSafeEndpointResolved(endpoint) {
+  const raw = assertSafeEndpoint(endpoint);
+  if (!raw) return '';
+  let u;
+  try { u = new URL(raw); } catch (e) { return raw; }
+  const host = u.hostname.replace(/^\[/, '').replace(/\]$/, '');
+  if (!host || isIpLiteral(host)) return raw; // 字面量已由同步版判过
+  if (normalizeHostForCompare(host) === 'localhost') return raw;
+
+  let addrs = [];
+  try {
+    const dns = require('dns');
+    addrs = await dns.promises.lookup(host, { all: true, verbatim: true });
+  } catch (e) {
+    return raw; // 解析不了 → 保持同步版的结论（见函数头第 2 条）
+  }
+  const ipGuard = require('./ip-guard');
+  for (const a of addrs) {
+    const ip = String((a && a.address) || '');
+    if (!ip) continue;
+    if (METADATA_HOSTS.has(ip)) {
+      throw reject(`服务端点域名 ${host} 解析到了云平台实例元数据地址，禁止使用`);
+    }
+    if (isLoopbackHost(ip) && !ALLOW_LOOPBACK_ENDPOINT) {
+      throw reject(`服务端点域名 ${host} 解析到了本机回环地址（如确需本地对象存储调试，请设置 ALLOW_LOOPBACK_ENDPOINT=1）`);
+    }
+    if (ipGuard.isPrivateIP(ip) && !ALLOW_PRIVATE_ENDPOINT) {
+      throw reject(`服务端点域名 ${host} 解析到了内网 / 链路本地 / 保留地址（如确需内网对象存储，请设置 ALLOW_PRIVATE_ENDPOINT=1）`);
+    }
+  }
+  return raw;
+}
+
 module.exports = {
   assertSafeEndpoint,
+  assertSafeEndpointResolved,
   isIpLiteral,
   isLoopbackHost,
   normalizeHostForCompare, // R27-25：黑名单比对前的唯一规范化点

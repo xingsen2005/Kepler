@@ -2349,7 +2349,11 @@ function constTimeEquals(a, b) {
  */
 function dummyHash(password) {
   return new Promise((resolve) => {
-    crypto.scrypt(String(password == null ? '' : password), Buffer.from('00'.repeat(16), 'hex'), 32, () => resolve());
+    // R69：空转哈希必须与真实路径**同一组成本参数** —— 否则「用户不存在」比
+    // 「密码错误」快 8 倍，时间侧信道反而成了用户名枚举器（升级 KDF 时最容易漏的一处）
+    crypto.scrypt(String(password == null ? '' : password), Buffer.from('00'.repeat(16), 'hex'), 32,
+      { N: SCRYPT_PARAMS.N, r: SCRYPT_PARAMS.r, p: SCRYPT_PARAMS.p, maxmem: SCRYPT_MAXMEM },
+      () => resolve());
   });
 }
 
@@ -2380,29 +2384,61 @@ async function authenticateWebdav(username, password) {
  * 因此 `addUser` / `updateUser` / `authenticateUser` / `verifyUserPassword` /
  * `authenticateWebdav` 全部改为 async。
  */
-function scryptHex(pw, saltHex) {
+/**
+ * R69：scrypt 的成本参数 —— **唯一实现点**（账户口令 / 备份码 / 加密查看密码共用这一组值）。
+ *
+ * 旧实现三处都靠 Node 的默认值（N=16384），比 OWASP 现行建议（N=2^17）低 8 倍；
+ * 口令哈希与盐就在 `config.enc` 里，一旦 `secret.key` 随备份/磁盘镜像一起泄露，
+ * 离线爆破的代价差 8 倍是实打实的。
+ *
+ * ⚠️ `maxmem` 必须显式给：N=2^17、r=8 需要 `128*N*r` = 128MB，而 Node 默认上限只有
+ * 32MB，不给这个参数会直接抛 `ERR_CRYPTO_INVALID_SCRYPT_PARAMS`。
+ */
+const SCRYPT_PARAMS = { N: 131072, r: 8, p: 1 };
+/** 存量哈希当初落的就是 Node 默认值 —— 只用于"验证"，绝不再用于生成 */
+const SCRYPT_PARAMS_LEGACY = { N: 16384, r: 8, p: 1 };
+const SCRYPT_MAXMEM = 192 * 1024 * 1024;
+
+function scryptHex(pw, saltHex, params) {
+  const p = params || SCRYPT_PARAMS;
   return new Promise((resolve, reject) => {
-    crypto.scrypt(String(pw), Buffer.from(saltHex, 'hex'), 32, (err, key) => {
-      if (err) reject(err); else resolve(key.toString('hex'));
-    });
+    crypto.scrypt(String(pw), Buffer.from(saltHex, 'hex'), 32,
+      { N: p.N, r: p.r, p: p.p, maxmem: SCRYPT_MAXMEM },
+      (err, key) => {
+        if (err) reject(err); else resolve(key.toString('hex'));
+      });
   });
+}
+
+/** 记录在用户上的参数（缺失 = 旧默认值，见 `paramsOf`） */
+function normalizeScryptParams(raw) {
+  const o = raw && typeof raw === 'object' ? raw : {};
+  const N = Number(o.N);
+  return {
+    N: Number.isFinite(N) && N >= 2 ? Math.floor(N) : SCRYPT_PARAMS_LEGACY.N,
+    r: 8,
+    p: 1,
+  };
+}
+function paramsOf(user) {
+  return normalizeScryptParams(user && user.passwordParams);
 }
 
 function generateSalt() {
   return crypto.randomBytes(16).toString('hex');
 }
 
-/** 生成口令哈希（异步）→ { salt, hash } */
+/** 生成口令哈希（异步）→ { salt, hash, params } */
 async function hashPassword(password) {
   const salt = generateSalt();
-  return { salt, hash: await scryptHex(password, salt) };
+  return { salt, hash: await scryptHex(password, salt, SCRYPT_PARAMS), params: SCRYPT_PARAMS };
 }
 
 /** 时序安全比较（异步），避免时序侧信道猜测密码 */
-async function verifyPassword(password, hash, salt) {
+async function verifyPassword(password, hash, salt, params) {
   if (!hash || !salt) return false;
   try {
-    const a = Buffer.from(await scryptHex(password, salt), 'hex');
+    const a = Buffer.from(await scryptHex(password, salt, params), 'hex');
     const b = Buffer.from(hash, 'hex');
     if (a.length !== b.length) return false;
     return crypto.timingSafeEqual(a, b);
@@ -2411,23 +2447,61 @@ async function verifyPassword(password, hash, salt) {
   }
 }
 
-/** 用户名合法性校验 */
+/**
+ * 用户名合法性校验
+ *
+ * R69：字符类里**不再包含 `@`**。旧白名单允许 `@`，而「忘记密码」是按
+ * 「用户名优先、邮箱其次」找账户的（见 `findUserByIdentifier`）—— 于是用户名空间
+ * 与邮箱空间重叠：把用户名设成受害者的邮箱，就能让他用邮箱找回时命中**攻击者的账户**，
+ * 验证码发往攻击者（或无人收到），受害者的邮箱恢复通道被静默堵死。
+ * 两个空间互斥是那条「先用户名后邮箱」判据成立的前提，前提必须由这里保证。
+ */
 function normalizeUsername(username) {
   const name = String(username || '').trim();
   if (!name) throw Object.assign(new Error('用户名不能为空'), { status: 400 });
-  if (!/^[a-zA-Z0-9_\u4e00-\u9fa5@.-]{2,32}$/.test(name)) {
-    throw Object.assign(new Error('用户名仅支持 2-32 位中文、字母、数字及 _ @ . - 字符'), { status: 400 });
+  if (name.includes('@')) {
+    throw Object.assign(new Error('用户名不能包含 @（邮箱请填写在「邮箱」一栏）'), { status: 400 });
+  }
+  if (!/^[a-zA-Z0-9_\u4e00-\u9fa5.-]{2,32}$/.test(name)) {
+    throw Object.assign(new Error('用户名仅支持 2-32 位中文、字母、数字及 _ . - 字符'), { status: 400 });
   }
   return name;
 }
 
+/**
+ * 弱口令黑名单（R69）。
+ *
+ * 只收「一眼就知道会被撞库命中」的那些，不做复杂度强制（大小写+符号的硬要求
+ * 换来的是 `Password1!` 这类更差的密码与便利贴）。长度下限才是真正起作用的那条。
+ */
+const WEAK_PASSWORDS = new Set([
+  '12345678', '123456789', '1234567890', '87654321', '11111111', '88888888', '00000000',
+  'password', 'password1', 'password123', 'passw0rd', 'p@ssw0rd',
+  'qwerty123', 'qwertyui', 'abc12345', 'abcd1234', 'admin123', 'administrator',
+  'iloveyou', 'woaini1314', '5201314520', 'a1234567', '1qaz2wsx', 'zaq12wsx',
+]);
+
 /** 密码强度校验（新增用户/修改密码时使用） */
 function assertPasswordPolicy(password) {
-  if (typeof password !== 'string' || password.length < 6) {
-    throw Object.assign(new Error('密码长度至少 6 位'), { status: 400 });
+  /**
+   * R69：下限从 6 提到 8。
+   *
+   * 6 位纯数字（100 万种）在离线爆破面前基本等于没有；配合「注册模式下的用户名
+   * 枚举」，在线暴破也只是几十小时的量级。OWASP 的现行下限是 8，这里对齐它。
+   * 上限保持 128（只为拦住"把整段文本误粘进口令框"）。
+   */
+  if (typeof password !== 'string' || password.length < 8) {
+    throw Object.assign(new Error('密码长度至少 8 位'), { status: 400 });
   }
   if (password.length > 128) {
     throw Object.assign(new Error('密码最长 128 个字符'), { status: 400 });
+  }
+  const low = password.toLowerCase();
+  if (WEAK_PASSWORDS.has(low)) {
+    throw Object.assign(new Error('该密码过于常见，容易被撞库命中，请更换'), { status: 400 });
+  }
+  if (/^(.)\1+$/.test(password)) {
+    throw Object.assign(new Error('密码不能是同一个字符的重复'), { status: 400 });
   }
 }
 
@@ -2725,7 +2799,7 @@ async function addUser({ username, password, role, permissions, speedLimit, emai
   // 随后的 `persist(cfg)` 又把 `cached` 指回旧对象，于是这段时间内别人的写入被
   // **整体覆盖** —— 双方都收到成功响应，一方的变更却静默消失（丢的若是角色/权限，
   // 就表现为「降权不生效」）。把 await 提到取 store 之前，异步间隙即不复存在。
-  const { salt, hash } = await hashPassword(password);
+  const { salt, hash, params } = await hashPassword(password);
   const cfg = requireStore();
   if (cfg.users.some((u) => u.username.toLowerCase() === name.toLowerCase())) {
     throw Object.assign(new Error('用户名已存在'), { status: 409 });
@@ -2739,6 +2813,7 @@ async function addUser({ username, password, role, permissions, speedLimit, emai
     username: name,
     passwordSalt: salt,
     passwordHash: hash,
+    passwordParams: params, // R69：哈希用的成本参数（缺失 = 旧版默认，见 paramsOf）
     role: normalizeRole(role),
     permissions: normalizePermissions(permissions),
     // 新用户默认未启用 Windows Hello；启用须走"注册并验证凭据"的完整流程
@@ -2777,6 +2852,7 @@ async function updateUser(id, patch) {
   if (cred) {
     user.passwordSalt = cred.salt;
     user.passwordHash = cred.hash;
+    user.passwordParams = cred.params;
   }
   if (patch.role !== undefined) {
     const role = normalizeRole(patch.role);
@@ -2824,8 +2900,28 @@ async function authenticateUser(username, password) {
   const user = cfg.users.find((u) => u.username.toLowerCase() === name.toLowerCase());
   // 用户不存在也做一次等价耗时的空转哈希，避免通过响应时间枚举用户名
   if (!user) { await dummyHash(password); return null; }
-  if (!(await verifyPassword(String(password == null ? '' : password), user.passwordHash, user.passwordSalt))) {
+  const plain = String(password == null ? '' : password);
+  if (!(await verifyPassword(plain, user.passwordHash, user.passwordSalt, paramsOf(user)))) {
     return null;
+  }
+  /*
+   * R69：**透明迁移**。存量哈希是用旧成本（N=16384）算的 —— 用户并不知道自己的
+   * 哈希是哪一档，要求他改一次密码才升级等于永远不升级。这里在"验证已通过"这个
+   * 唯一安全的时刻重算一次：`await` 提到取 store **之前**，随后的写入在同一同步
+   * 片段里完成（与 `addUser` / `updateUser` 同一条纪律：绝不在 await 期间持有 cfg）。
+   */
+  if (paramsOf(user).N < SCRYPT_PARAMS.N) {
+    const salt = generateSalt();
+    const hash = await scryptHex(plain, salt, SCRYPT_PARAMS);
+    const live = requireStore();
+    const target = live.users.find((u) => u.id === user.id);
+    if (target) {
+      target.passwordSalt = salt;
+      target.passwordHash = hash;
+      target.passwordParams = SCRYPT_PARAMS;
+      target.updatedAt = new Date().toISOString();
+      persist(live);
+    }
   }
   return userView(user);
 }
@@ -2854,27 +2950,31 @@ function findUserRawById(id) {
 /**
  * R54②：按「用户名 **或** 邮箱」读取原始用户记录（「忘记密码」的入口用）。
  *
- * 先按用户名匹配、再按邮箱匹配 —— 顺序固定，避免同一个输入同时命中两个账户时
- * 结果随 `cfg.users` 的顺序漂移。用户名不可能含 `@`（`normalizeUsername` 的白名单里没有它），
- * 所以两种输入天然互斥，「先用户名」不会把邮箱当用户名误判。
+ * R69：**含 `@` 的标识先按邮箱匹配**，其余先按用户名。旧实现无条件「用户名优先」，
+ * 而当时 `normalizeUsername` 的白名单里恰好有 `@` —— 两个空间重叠，把用户名设成
+ * 受害者的邮箱即可劫持他的邮箱找回通道。现在用户名已不允许 `@`（见
+ * `normalizeUsername`），这里再把顺序按「输入形态」定死，两层一起才能保证
+ * 「同一个输入只会命中它该命中的那个账户」。
+ *
+ * 顺序固定（不随 `cfg.users` 漂移）：`@` 只看邮箱，其余只看用户名；老数据里
+ * 若真有一个带 `@` 的用户名，作为兜底仍在第二顺位被匹配到。
  */
 function findUserByIdentifier(identifier) {
   const cfg = load();
   if (!cfg) return null;
   const s = String(identifier == null ? '' : identifier).trim();
   if (!s) return null;
-  const byName = cfg.users.find((u) => u.username.toLowerCase() === s.toLowerCase());
-  if (byName) return byName;
+  const byName = cfg.users.find((u) => u.username.toLowerCase() === s.toLowerCase()) || null;
   const mail = normalizeEmail(s);
-  if (!mail) return null;
-  return cfg.users.find((u) => normalizeEmail(u.email) === mail) || null;
+  const byMail = mail ? (cfg.users.find((u) => normalizeEmail(u.email) === mail) || null) : null;
+  return mail ? (byMail || byName) : byName;
 }
 
 /** 校验密码是否正确（不返回用户对象，供两步登录的第一步单独使用）（SEC-05：async） */
 async function verifyUserPassword(id, password) {
   const user = findUserRawById(id);
   if (!user) return false;
-  return verifyPassword(String(password == null ? '' : password), user.passwordHash, user.passwordSalt);
+  return verifyPassword(String(password == null ? '' : password), user.passwordHash, user.passwordSalt, paramsOf(user));
 }
 
 module.exports = {
@@ -2917,4 +3017,7 @@ module.exports = {
   // R33：账户封禁
   BAN_REASON_MAX, banInfo, setUserBan, clearUserBan,
   findUserRaw, findUserRawById, verifyUserPassword,
+  // R69：口令哈希的唯一实现点（用户口令 / 分享口令 / 加密查看口令 / 备份码共用同一组参数）
+  // `verifyPassword` 一并导出：只有它能把「旧参数哈希仍验得过」这条判据真正测出来
+  scryptHex, verifyPassword, SCRYPT_PARAMS, normalizeScryptParams,
 };

@@ -163,6 +163,45 @@ async function alipayCreate(cfg, { order, subject, returnUrl, notifyUrl }) {
   return { kind: 'redirect', url, tradeNo: '' };
 }
 
+/**
+ * 审计 I-5：查单结果的**金额复核**（纵深防御）。
+ *
+ * 「只要网关说 paid 就发货」缺一道对账：订单金额是服务端算的，但**到账金额**从来没被
+ * 校验过。当前三家网关的 `out_trade_no` 绑定了金额，所以少付并不可达 —— 这是纵深缺口，
+ * 不是可利用漏洞。但缺口一旦成立后果极重（付 0.01 元拿走 100 元的文件），值得提前堵。
+ *
+ * 口径：按「分」比较，容忍 ±1 分（不同网关的取整/四舍五入差异）。
+ *  · `order.amountFen` 缺失（老订单/内部调用）⇒ 无法比对，**跳过**（不误伤）；
+ *  · 网关响应里读不到金额 ⇒ **不放行**（fail-closed：宁可让人工核对，也不凭空发货）。
+ *
+ * @returns {{ok: true} | {ok: false, reason: string}}
+ */
+const AMOUNT_TOLERANCE_FEN = 1;
+
+/** 元 → 分；非法输入返回 NaN（不要用 0 兜底：0 会被当成"实付 0 元"而误判不符） */
+function fenFromYuan(v) {
+  const n = Number(String(v == null ? '' : v).trim());
+  if (!Number.isFinite(n)) return NaN;
+  return Math.round(n * 100);
+}
+
+function checkPaidAmount(order, actualFen, actualLabel) {
+  const want = Number(order && order.amountFen);
+  if (!Number.isFinite(want) || want <= 0) return { ok: true }; // 无应付额可对 ⇒ 跳过
+  const got = Number(actualFen);
+  if (!Number.isFinite(got)) {
+    return { ok: false, reason: '无法从网关响应中确认实付金额，已中止自动确认，请人工核对' };
+  }
+  if (Math.abs(want - got) > AMOUNT_TOLERANCE_FEN) {
+    return {
+      ok: false,
+      reason: `支付金额与订单金额不一致（实付 ${actualLabel || (got / 100).toFixed(2)}，`
+        + `应付 ${(want / 100).toFixed(2)}），已中止自动确认`,
+    };
+  }
+  return { ok: true };
+}
+
 async function alipayQuery(cfg, order) {
   const params = {
     app_id: cfg.appId,
@@ -186,6 +225,9 @@ async function alipayQuery(cfg, order) {
   }
   const st = node.trade_status;
   if (st === 'TRADE_SUCCESS' || st === 'TRADE_FINISHED') {
+    // I-5：先对账再认账（total_amount 是「元」字符串）
+    const amt = checkPaidAmount(order, fenFromYuan(node.total_amount), node.total_amount);
+    if (!amt.ok) return { paid: false, state: 'error', tradeNo: node.trade_no || '', failReason: amt.reason };
     return { paid: true, state: 'paid', tradeNo: node.trade_no || '', failReason: '' };
   }
   if (st === 'TRADE_CLOSED') return { paid: false, state: 'failed', tradeNo: node.trade_no || '', failReason: '交易已关闭' };
@@ -282,7 +324,17 @@ async function wechatQuery(cfg, order) {
   const r = await wechatRequest('GET', path, cfg);
   const st = r.trade_state;
   const tradeNo = r.transaction_id || '';
-  if (st === 'SUCCESS') return { paid: true, state: 'paid', tradeNo, failReason: '' };
+  if (st === 'SUCCESS') {
+    // I-5：微信以「分」回 total，直接比对（币种不符也视为对账失败）
+    const currency = (r.amount && r.amount.currency) || '';
+    if (currency && currency !== 'CNY') {
+      return { paid: false, state: 'error', tradeNo, failReason: `支付币种不符（${currency}）` };
+    }
+    const amt = checkPaidAmount(order, r.amount && r.amount.total,
+      r.amount && Number.isFinite(Number(r.amount.total)) ? `${(Number(r.amount.total) / 100).toFixed(2)} 元` : '');
+    if (!amt.ok) return { paid: false, state: 'error', tradeNo, failReason: amt.reason };
+    return { paid: true, state: 'paid', tradeNo, failReason: '' };
+  }
   if (st === 'CLOSED' || st === 'PAYERROR' || st === 'REVOKED') {
     return { paid: false, state: 'failed', tradeNo, failReason: '交易已关闭或支付失败' };
   }
@@ -333,6 +385,26 @@ async function paypalCreate(cfg, { order, subject, returnUrl, cancelUrl }) {
 }
 
 /** PayPal 的「查单」= 查询订单状态；若已获批准则顺带 capture（真正扣款） */
+/**
+ * 从 PayPal 订单报文里取「首笔 capture 的实付金额」（元字符串）。
+ * 结构：`purchase_units[].payments.captures[].amount.value`；未 capture 时读不到。
+ */
+function paypalCaptureAmount(orderJson) {
+  const units = (orderJson && orderJson.purchase_units) || [];
+  for (const u of units) {
+    const caps = (u && u.payments && u.payments.captures) || [];
+    for (const c of caps) {
+      const v = c && c.amount && c.amount.value;
+      if (v !== undefined && v !== null && v !== '') return String(v);
+    }
+  }
+  for (const u of units) {
+    const v = u && u.amount && u.amount.value;
+    if (v !== undefined && v !== null && v !== '') return String(v);
+  }
+  return '';
+}
+
 async function paypalQuery(cfg, order) {
   const id = order.tradeNo;
   if (!id) return { paid: false, state: 'pending', tradeNo: '', failReason: '' };
@@ -344,7 +416,12 @@ async function paypalQuery(cfg, order) {
   const json = await res.json().catch(() => null);
   if (!res.ok || !json) return { paid: false, state: 'error', tradeNo: id, failReason: 'PayPal 查询订单失败' };
   const status = json.status;
-  if (status === 'COMPLETED') return { paid: true, state: 'paid', tradeNo: id, failReason: '' };
+  if (status === 'COMPLETED') {
+    // I-5：对账（PayPal 金额是「元」字符串）
+    const amt = checkPaidAmount(order, fenFromYuan(paypalCaptureAmount(json)), paypalCaptureAmount(json));
+    if (!amt.ok) return { paid: false, state: 'error', tradeNo: id, failReason: amt.reason };
+    return { paid: true, state: 'paid', tradeNo: id, failReason: '' };
+  }
   if (status === 'VOIDED') return { paid: false, state: 'failed', tradeNo: id, failReason: '订单已作废' };
   if (status === 'APPROVED') {
     // 买家已同意，尚未扣款 —— 由我们主动 capture 完成收款
@@ -355,6 +432,8 @@ async function paypalQuery(cfg, order) {
     });
     const capJson = await cap.json().catch(() => null);
     if (cap.ok && capJson && capJson.status === 'COMPLETED') {
+      const amt = checkPaidAmount(order, fenFromYuan(paypalCaptureAmount(capJson)), paypalCaptureAmount(capJson));
+      if (!amt.ok) return { paid: false, state: 'error', tradeNo: id, failReason: amt.reason };
       return { paid: true, state: 'paid', tradeNo: id, failReason: '' };
     }
     const reason = (capJson && (capJson.message || capJson.name)) || '扣款未完成';
@@ -364,6 +443,45 @@ async function paypalQuery(cfg, order) {
     return { paid: false, state: 'failed', tradeNo: id, failReason: String(reason).slice(0, 200) };
   }
   return { paid: false, state: 'pending', tradeNo: id, failReason: '' };
+}
+
+/**
+ * R69：PayPal 回调验签 —— 官方验签 API（`/v1/notifications/verify-webhook-signature`）。
+ *
+ * 本地无法离线验签（签名用 PayPal 的证书链与私钥），只能回源问一次。代价是每个回调
+ * 多两次出站请求（取 token + 验签），换来的是「谁都能往这个端点灌伪造通知」这件事
+ * 不再成立 —— 之前这一支是**零验签直接放行**的。
+ *
+ * 未配置 `webhookId` 时直接抛错（调用方按"验不过"丢弃）：只有这样才能避免
+ * 「配置项摆在界面上、却从未被任何代码消费」的假象（旧实现正是如此）。
+ *
+ * @returns {Promise<boolean>} 验签通过与否
+ */
+async function paypalVerifyWebhook(cfg, headers, event) {
+  const webhookId = String((cfg && cfg.webhookId) || '').trim();
+  if (!webhookId) throw new Error('未配置 Webhook ID，无法验签');
+  const h = headers || {};
+  const need = ['paypal-auth-algo', 'paypal-cert-url', 'paypal-transmission-id', 'paypal-transmission-sig', 'paypal-transmission-time'];
+  for (const k of need) {
+    if (!String(h[k] || '').trim()) throw new Error(`回调缺少签名头 ${k}`);
+  }
+  const token = await paypalToken(cfg);
+  const res = await fetchWithTimeout(`${paypalHost(cfg.mode)}/v1/notifications/verify-webhook-signature`, {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      auth_algo: String(h['paypal-auth-algo']),
+      cert_url: String(h['paypal-cert-url']),
+      transmission_id: String(h['paypal-transmission-id']),
+      transmission_sig: String(h['paypal-transmission-sig']),
+      transmission_time: String(h['paypal-transmission-time']),
+      webhook_id: webhookId,
+      webhook_event: event,
+    }),
+  });
+  const json = await res.json().catch(() => null);
+  if (!res.ok || !json) throw new Error('PayPal 验签接口请求失败');
+  return json.verification_status === 'SUCCESS';
 }
 
 /* ============================ 统一入口 ============================ */
@@ -430,5 +548,6 @@ module.exports = {
   paypalHost, normalizePrivateKey, normalizePublicKey,
   alipaySignPayload, alipayBuildUrl, alipayTimestamp, alipayVerify,
   wechatSignPayload, wechatAuthorization, wechatDecryptResource,
+  paypalVerifyWebhook,
   createCharge, queryCharge,
 };

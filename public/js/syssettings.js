@@ -1794,7 +1794,7 @@ function showUserForm(user) {
     </div>
     <div class="form-item">
       <label>密码 ${isEdit ? '<span class="hint" style="margin-left:6px">留空则不修改密码</span>' : '<span class="req">*</span>'}</label>
-      <input type="password" id="u-f-password" maxlength="128" placeholder="${isEdit ? '留空保持原密码不变' : '6-128 位'}" autocomplete="new-password">
+      <input type="password" id="u-f-password" maxlength="128" placeholder="${isEdit ? '留空保持原密码不变' : '8-128 位'}" autocomplete="new-password">
     </div>
     <div class="form-item">
       <label>确认密码 ${isEdit ? '<span class="hint" style="margin-left:6px">留空则不修改</span>' : '<span class="req">*</span>'}</label>
@@ -1932,7 +1932,7 @@ async function saveUserFromForm(overlay, close, existing) {
 
   if (!username.trim()) { showMsg('用户名不能为空', 'bad'); return; }
   if (!isEdit && !password) { showMsg('密码不能为空', 'bad'); return; }
-  if (password && password.length < 6) { showMsg('密码长度不能少于 6 位', 'bad'); return; }
+  if (password && password.length < 8) { showMsg('密码长度不能少于 8 位', 'bad'); return; }
   if (password !== confirm) { showMsg('两次输入的密码不一致', 'bad'); return; }
 
   const body = { username: username.trim() };

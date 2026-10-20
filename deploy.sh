@@ -1333,6 +1333,76 @@ node_tarball_base() {
   if [[ "$MIRROR" == "cn" ]]; then printf '%s' "https://registry.npmmirror.com/-/binary/node"; else printf '%s' "https://nodejs.org/dist"; fi
 }
 
+# ------------------------------------------------------------------------------
+# 4.2.1 Node 二进制包的 SHA-256 校验（审计 L-11）
+#
+# 本脚本对 acme.sh 做过「HTML 特征 + bash -n」三重校验，对 Node 官方 tarball 却只是
+# `curl` 下来直接 `tar -xzf … -C /usr/local` —— 中间任何一跳（镜像、企业代理、DNS
+# 劫持、缓存投毒）都能把任意内容塞进生产机的 `/usr/local/bin`，而 **node 的可执行文件
+# 一旦是假的，后面所有校验都失去意义**（它才是运行本系统的那个进程）。
+#
+# 判据：下载官方 `SHASUMS256.txt` 比对。取校验单时**官方源优先**，镜像仅作兜底
+# （镜像可以篡改自己的校验单，官方源在 TLS 下不能）。
+# ------------------------------------------------------------------------------
+
+# 打印文件 sha256（三种工具轮一遍：精简镜像常常只有 openssl）
+sha256_of() {
+  local f="$1"
+  if have sha256sum; then sha256sum "$f" 2>/dev/null | awk '{print $1}'; return 0; fi
+  if have shasum; then shasum -a 256 "$f" 2>/dev/null | awk '{print $1}'; return 0; fi
+  if have openssl; then openssl dgst -sha256 "$f" 2>/dev/null | awk '{print $NF}'; return 0; fi
+  return 1
+}
+
+# 取 SHASUMS256.txt 到 $3；成功返回 0。$2 = 下载 tarball 时用的 base（兜底源）
+fetch_node_shasums() {
+  local ver="$1" fallback_base="$2" out="$3" rc=0
+  run_soft curl -fsSL --retry 2 --max-time 30 -o "$out" \
+    "https://nodejs.org/dist/v${ver}/SHASUMS256.txt" || rc=$?
+  if ((rc != 0)) && [[ "$fallback_base" != "https://nodejs.org/dist" ]]; then
+    warn "官方校验单下载失败，改用镜像的 SHASUMS256.txt 兜底（可信度低于官方源）。"
+    rc=0
+    run_soft curl -fsSL --retry 2 --max-time 30 -o "$out" \
+      "${fallback_base}/v${ver}/SHASUMS256.txt" || rc=$?
+  fi
+  return "$rc"
+}
+
+# 校验 ${tmp}/node.tar.gz；不通过则直接 die（不提供跳过开关：装一个来路不明的 node
+# 比装不上危险得多）。无法取得校验单时只警告 —— 离线/内网镜像环境下仍要能装。
+verify_node_tarball() {
+  local file="$1" ver="$2" arch="$3" fallback_base="$4"
+  local name="node-v${ver}-linux-${arch}.tar.gz"
+  local dir sums want got
+  dir="$(dirname "$file")"
+  sums="${dir}/SHASUMS256.txt"
+  if ! fetch_node_shasums "$ver" "$fallback_base" "$sums" || [[ ! -s "$sums" ]]; then
+    warn "无法取得 Node.js v${ver} 的 SHASUMS256.txt，跳过哈希校验（完整性问题请自行确认来源可信）。"
+    return 0
+  fi
+  want="$(awk -v n="$name" '$2 == n { print $1; exit }' "$sums")"
+  if [[ -z "$want" ]]; then
+    warn "校验单里没有 ${name}（可能是架构名与官方不一致），跳过哈希校验。"
+    return 0
+  fi
+  if ! got="$(sha256_of "$file")" || [[ -z "$got" ]]; then
+    warn "本机没有 sha256sum / shasum / openssl，跳过哈希校验。"
+    return 0
+  fi
+  if [[ "${got,,}" != "${want,,}" ]]; then
+    HINTS=()
+    add_hint "下载到的文件哈希与官方校验单不一致 —— **不要继续安装**。"
+    add_hint "  期望：${want}"
+    add_hint "  实际：${got}"
+    add_hint "常见原因：镜像/代理返回了被替换或损坏的内容（含缓存投毒、企业 SSL 审计代理）。"
+    add_hint "可手工核对后重试："
+    add_hint "  curl -fsSLO ${fallback_base}/v${ver}/SHASUMS256.txt"
+    add_hint "  curl -fsSLO $(node_tarball_base)/v${ver}/${name} && sha256sum -c SHASUMS256.txt --ignore-missing"
+    die_with_hint "Node.js 二进制包校验失败（${name}）" "${HINTS[@]}"
+  fi
+  ok "Node.js 二进制包校验通过（SHA-256 ${got:0:12}…）"
+}
+
 # 本机是否是「已 EOL、官方源已下线」的 CentOS？
 #
 # CentOS 8 于 2021-12-31、CentOS 7 于 2024-06-30 先后 EOL，官方 mirrorlist 与
@@ -1517,6 +1587,13 @@ install_node() {
   warn "系统源里的 Node.js 不满足要求（或源里没有），继续尝试 NodeSource 仓库。"
 
   # 4.2 NodeSource 仓库（Debian / RHEL 系）
+  #
+  # ⚠️ 信任假设（审计 L-11）：这两条是 `curl … | bash`，**无法做哈希校验** ——
+  # setup_20.x 是官方的**浮动分支脚本**（内容随上游更新），上游也不提供稳定哈希。
+  # 这里选择保留（它是标准做法，且装完的 npm 包仍受仓库签名保护），但把假设写明：
+  #  · 信任对象 = `deb.nodesource.com` / `rpm.nodesource.com` 的 TLS 证书链（本机 CA）；
+  #  · 若环境不允许「下载即执行」，请用下面的 4.3 官方 tarball 路径（已做 SHA-256 校验），
+  #    或在镜像里预装 Node.js 后用 --mode= 跳过安装。
   if [[ "$PM" == "apt" || "$PM" == "dnf" || "$PM" == "yum" ]]; then
     local major="$NODE_VERSION"; [[ -n "$major" ]] || major="20"
     major="${major%%.*}"
@@ -1572,6 +1649,8 @@ install_node() {
     die_with_hint "Node.js 二进制包下载失败" "${HINTS[@]}"
   fi
   rc=0
+  # 审计 L-11：下载完先校验哈希，再解压到 /usr/local（失败即中止，无跳过开关）
+  verify_node_tarball "${tmp}/node.tar.gz" "$ver" "$NODE_ARCH" "$base"
   run tar -xzf "${tmp}/node.tar.gz" -C /usr/local --strip-components=1 || rc=$?
   rm -rf "$tmp"
   if ((rc != 0)); then
@@ -3389,6 +3468,8 @@ ensure_docker() {
       zypper) run_soft zypper --non-interactive install docker docker-compose ;;
     esac
     if ! have docker; then
+      # ⚠️ 信任假设（审计 L-11）：get.docker.com 是浮动安装脚本，无稳定哈希可校；
+      # 优先走上面的发行版包（有仓库签名），这里只是最后的兜底。
       info "使用官方脚本安装 Docker…"
       have curl || pkg_install curl
       if [[ "$MIRROR" == "cn" ]]; then

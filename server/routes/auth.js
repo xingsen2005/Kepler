@@ -24,6 +24,10 @@ const { sessionCookie, clearCookie, webauthnContext } = require('./_shared');
 const { normalizeEmail, parseEmailInput, EMAIL_CODE_RESEND_MS } = require('../limits');
 // R54③：邀请码的入参判据（**只判格式**，核销由 `inviteStore.consume` 负责）
 const { parseInviteCodeInput } = require('../limits');
+// R69：首次初始化的「安装令牌」需要落盘（0600）与恒定时比较
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
 
 const router = express.Router();
 
@@ -48,8 +52,8 @@ function loginLockKey(ip, username) {
   return `${ip}|${String(username == null ? '' : username).trim().toLowerCase()}`;
 }
 
-/** 两步登录共用的前置检查：限流 + 账户锁定。返回 null 表示可继续 */
-function precheckLogin(req, res, username) {
+/** 两步登录共用的前置检查：限流 + 账户锁定 + 跨 IP 低速。返回 null 表示可继续 */
+async function precheckLogin(req, res, username) {
   const ip = security.clientIp(req);
   const rl = security.loginLimiter(ip);
   if (!rl.ok) {
@@ -65,6 +69,13 @@ function precheckLogin(req, res, username) {
     res.status(429).json({ error: `失败次数过多，账户已临时锁定，请 ${lockedLeft} 秒后重试` });
     return null;
   }
+  /**
+   * R69：跨 IP 的账户维度减速（见 `security.accountFailDelayMs`）。
+   * 分布式暴破每个 IP 各拿一份预算，只有"按用户名"的维度能看见它；
+   * 这里只拖慢、不封禁，所以受害者最多多等 1.5 秒，不会被人锁在门外。
+   */
+  const delay = security.accountFailDelayMs(username);
+  if (delay > 0) await new Promise((r) => setTimeout(r, delay));
   return { ip, lockKey };
 }
 
@@ -75,6 +86,7 @@ function precheckLogin(req, res, username) {
  */
 function completeLogin(res, user, remember, ip) {
   security.loginLock.reset(loginLockKey(ip || '', user.username));
+  security.resetAccountFail(user.username); // R69：成功一次即清掉跨 IP 累计
   const token = authSession.createSession(user, { remember: !!remember });
   res.setHeader('Set-Cookie', sessionCookie(token));
   statsStore.addLog({
@@ -91,7 +103,7 @@ router.post('/auth/login', async (req, res) => {
     const username = String(b.username || '').trim();
     const password = String(b.password || '');
 
-    const pre = precheckLogin(req, res, username);
+    const pre = await precheckLogin(req, res, username);
     if (!pre) return;
 
     // 人机验证（服务端回源校验；关闭时直接放行，不引入任何额外校验/依赖）
@@ -108,6 +120,7 @@ router.post('/auth/login', async (req, res) => {
     const user = await configStore.authenticateUser(username, password);
     if (!user) {
       const left = security.loginLock.fail(pre.lockKey);
+      security.noteAccountFail(username); // R69：跨 IP 的账户维度计数（只减速，见 precheckLogin）
       statsStore.addLog({ action: 'auth.fail', level: 'warn', detail: `登录失败（用户名：${username || '(空)'}）` });
       if (left > 0) return res.status(429).json({ error: `失败次数过多，账户已临时锁定，请 ${left} 秒后重试` });
       return res.status(401).json({ error: '用户名或密码错误' });
@@ -174,12 +187,12 @@ router.post('/auth/login', async (req, res) => {
 });
 
 // 登录第二步：校验 Windows Hello 断言，通过后签发会话
-router.post('/auth/login/webauthn', (req, res) => {
+router.post('/auth/login/webauthn', async (req, res) => {
   try {
     const b = req.body || {};
     const username = String(b.username || '').trim();
 
-    const pre = precheckLogin(req, res, username);
+    const pre = await precheckLogin(req, res, username);
     if (!pre) return;
 
     /**
@@ -216,6 +229,7 @@ router.post('/auth/login/webauthn', (req, res) => {
      */
     const authFail = (detail) => {
       const left = security.loginLock.fail(pre.lockKey);
+      security.noteAccountFail(username); // R69：跨 IP 的账户维度计数（只减速，见 precheckLogin）
       statsStore.addLog({ action: 'auth.fail', level: 'warn', detail: `Windows Hello 登录失败：${detail}（用户名：${username || '(空)'}）` });
       if (left > 0) return res.status(429).json({ error: `失败次数过多，账户已临时锁定，请 ${left} 秒后重试` });
       return res.status(401).json({ error: 'Windows Hello 验证失败，请重试' });
@@ -328,6 +342,14 @@ router.get('/auth/me', (req, res) => {
     return res.json({ ok: true, user: configStore.userView(raw) });
   }
   const initialized = configStore.listUsers().length > 0;
+  if (!initialized) {
+    // R69：部署模式下首次初始化需要安装令牌 —— 顺手在这里生成并打印（前端此刻正好在等这个响应）
+    return res.json({
+      ok: true, user: null, initialized,
+      setupTokenRequired: setupTokenRequired(),
+      setupHint: setupTokenHint(),
+    });
+  }
   res.json({ ok: true, user: null, initialized });
 });
 
@@ -338,12 +360,93 @@ router.get('/auth/me', (req, res) => {
 // 各自创建一个管理员（新建实例的抢先初始化窗口）。另加 IP 限流，
 // 避免被用来反复触发代价较高的口令哈希计算（SEC-05 同类风险）。
 let initInFlight = false;
+
+/* ==================== R69：首次初始化的「安装令牌」 ==================== */
+
+/**
+ * 部署模式下「第一个管理员」为什么必须出示令牌。
+ *
+ * `/auth/init` 是匿名可达的（它在 `PUBLIC_API` 白名单里，否则全新实例无法起步），
+ * 而它的唯一门禁曾经只是「还没有任何用户」+ 10 次/10 分钟的 IP 限流。按项目自己的
+ * 部署路径（Docker `HOST=0.0.0.0` + Nginx + 域名），实例从进程启动到所有者第一次
+ * 打开页面之间就存在一个**任何人都能创建管理员**的窗口；被抢先后所有者被永久挡在
+ * 门外（只能删 `data/` 重来），而攻击者拿到的是完整管理员权限。
+ *
+ * 本机模式（`HOST` 为回环，`IS_DEPLOY=false`）不要求令牌：那个形态下能访问
+ * `/auth/init` 的本来就是本机进程，加一档只会让「解压即用」变成「先翻日志」。
+ *
+ * 令牌在**第一次真正需要它的时候**生成（前端探活 / 首次初始化请求），这样
+ * 全新实例一打开页面，启动日志里就已经有它了；随后每轮启动只在首次初始化请求时
+ * 复读文件，不再重复打印。
+ */
+let setupTokenCache = '';
+let setupTokenPrinted = false;
+
+function setupTokenFile() {
+  // 与 `config-store` / `enc-store` 同一个数据目录（`data/` 已在 .gitignore 里）
+  return path.join(require('../data-dir').dataDir(), 'setup-token.txt');
+}
+
+function setupTokenRequired() {
+  return Boolean(security.IS_DEPLOY);
+}
+
+/** 生成（或复用）安装令牌；落盘 0600，并在控制台打印一次 */
+function ensureSetupToken() {
+  if (setupTokenCache) return setupTokenCache;
+  const file = setupTokenFile();
+  try {
+    setupTokenCache = String(fs.readFileSync(file, 'utf8') || '').trim();
+  } catch (e) { setupTokenCache = ''; }
+  if (!setupTokenCache) {
+    setupTokenCache = crypto.randomBytes(16).toString('hex');
+    try {
+      fs.mkdirSync(path.dirname(file), { recursive: true });
+      fs.writeFileSync(file, setupTokenCache + '\n', { mode: 0o600 });
+      try { fs.chmodSync(file, 0o600); } catch (e) { /* Windows 上 chmod 语义有限，忽略 */ }
+    } catch (e) { /* 落盘失败：仍用内存值，至少本次进程能完成初始化 */ }
+  }
+  if (!setupTokenPrinted) {
+    setupTokenPrinted = true;
+    // 只打印到服务端控制台/容器日志，**绝不**进任何 HTTP 响应或审计日志
+    console.log(`[kepler] 首次初始化令牌（安装令牌）：${setupTokenCache}`);
+    console.log('[kepler] 部署模式下的 /auth/init 需要它；已完成初始化后本文件可删除。');
+  }
+  return setupTokenCache;
+}
+
+/** 前端提示里要显示的位置（不泄露令牌本身） */
+function setupTokenHint() {
+  return setupTokenRequired()
+    ? '部署模式首次初始化需要安装令牌：见服务端启动日志，或服务器上的 data/setup-token.txt'
+    : '';
+}
+
+function setupTokenMatches(given) {
+  const want = ensureSetupToken();
+  const a = Buffer.from(String(given || ''), 'utf8');
+  const b = Buffer.from(want, 'utf8');
+  if (!a.length || a.length !== b.length) return false;
+  try { return crypto.timingSafeEqual(a, b); } catch (e) { return false; }
+}
+
 router.post('/auth/init', async (req, res) => {
   try {
     const ip = security.clientIp(req) || 'unknown';
     const limited = security.initLimiter(ip);
     if (!limited.ok) {
       return res.status(429).json({ error: `初始化尝试过于频繁，请 ${limited.retryAfter} 秒后重试` });
+    }
+    /**
+     * R69：部署模式下先验安装令牌 —— 位置在限流之后、任何查库/哈希之前：
+     * 令牌不对的请求连「系统有没有用户」都不该问出来。
+     */
+    if (setupTokenRequired()) {
+      const given = String((req.body && req.body.setupToken) || req.get('x-setup-token') || '').trim();
+      if (!setupTokenMatches(given)) {
+        statsStore.addLog({ action: 'auth.init', level: 'warn', detail: `初始化被拒绝（安装令牌不正确，来源 IP：${ip}）` });
+        return res.status(403).json({ error: '安装令牌不正确。令牌在服务端启动日志中（data/setup-token.txt）' });
+      }
     }
     if (configStore.listUsers().length > 0) {
       return res.status(409).json({ error: '系统已初始化，请使用已有账户登录' });
@@ -362,6 +465,12 @@ router.post('/auth/init', async (req, res) => {
         return res.status(400).json({ error: '两次输入的密码不一致' });
       }
       const user = await configStore.addUser({ username: b.username, password: b.password, role: 'admin', permissions: {} });
+      // R69：初始化完成即抹掉安装令牌文件 —— 它的全部生命周期就是「第一次初始化之前」
+      if (setupTokenRequired()) {
+        try { fs.unlinkSync(setupTokenFile()); } catch (e) { /* 文件不在也无所谓 */ }
+        setupTokenCache = '';
+        setupTokenPrinted = false; // 若日后用户被清空需要重新初始化，新令牌要能再打印一次
+      }
       const token = authSession.createSession(user);
       res.setHeader('Set-Cookie', sessionCookie(token));
       statsStore.addLog({ action: 'auth.init', detail: `系统初始化，创建管理员「${user.username}」` });
@@ -508,6 +617,27 @@ router.post('/auth/register', async (req, res) => {
     } catch (e) {
       // 建号失败 ⇒ 归还刚核销掉的那一次（用户名重复、密码不合规等都会走到这里）
       if (granted) inviteStore.rollback(granted.id, username);
+      /**
+       * R69 / L-4：**「用户名已存在」这条答案要走全站共享预算**。
+       *
+       * 公开注册下这条反馈无法取消（否则没人能注册），但它同时是一条用户名枚举
+       * oracle：429 之外的 409 / 200 差异，足以让人批量确认哪些账号真实存在。
+       * 按 IP 限流挡不住代理池，所以这里对「冲突答案」本身计数 —— 额度耗尽后
+       * 冲突一律回 429 且文案与限流完全一致，不再泄露「是否存在」。
+       * **注册成功的路径不经过这里**，正常用户不受影响。
+       */
+      if (e && e.status === 409 && /用户名已存在/.test(String(e.message || ''))) {
+        const budget = security.registerConflictLimiter(security.REGISTER_CONFLICT_KEY);
+        statsStore.addLog({
+          action: 'auth.register', level: 'warn',
+          detail: `用户名冲突（用户名：${username || '(空)'}；来源 IP：${ip}；`
+            + `本轮冲突预算：${budget.ok ? '未用尽' : '已用尽'}）`,
+        });
+        if (!budget.ok) {
+          res.setHeader('Retry-After', String(budget.retryAfter));
+          return res.status(429).json({ error: `尝试过于频繁，请 ${budget.retryAfter} 秒后重试` });
+        }
+      }
       throw e;
     }
 

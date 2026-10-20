@@ -478,7 +478,13 @@ test('R21-12 · 支付网关遇到 3xx 必须当「未确认」处理，绝不�
     if (String(url).includes('/v1/oauth2/token')) {
       return new Response(JSON.stringify({ access_token: 'tok' }), { status: 200, headers: { 'content-type': 'application/json' } });
     }
-    return new Response(JSON.stringify({ id: 'ORDER1', status: 'COMPLETED' }), { status: 200, headers: { 'content-type': 'application/json' } });
+    // R69/I-5：查单结果要能对账金额 —— 真实 PayPal 的 COMPLETED 报文必带 capture 金额，
+    // 缺了它会被「无法确认实付金额」拦下（fail-closed），那是**正确的**新行为，不是回归
+    return new Response(JSON.stringify({
+      id: 'ORDER1',
+      status: 'COMPLETED',
+      purchase_units: [{ payments: { captures: [{ amount: { value: '1.00', currency_code: 'CNY' } }] } }],
+    }), { status: 200, headers: { 'content-type': 'application/json' } });
   };
 
   const cfg = { mode: 'live', clientId: 'cid', clientSecret: 'sec' };

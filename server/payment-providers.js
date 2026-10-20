@@ -257,7 +257,7 @@ const PLATFORMS = {
         key: 'webhookId', official: 'webhook_id', label: 'Webhook ID', input: 'text', required: false,
         placeholder: '例如 0EH40505U7162512P',
         pattern: '^[0-9A-Za-z-]{6,64}$', patternHint: '6 ~ 64 位字母数字，可含 -', maxLength: 64,
-        hint: '用于校验 PayPal 事件通知的签名，未启用 Webhook 可留空。',
+        hint: '必填才能收 PayPal 回调：本系统用它在服务端调用验签接口（verify-webhook-signature）。留空则直接丢弃 PayPal 通知（不影响页面轮询与回跳确认支付）。',
       },
     ],
   },

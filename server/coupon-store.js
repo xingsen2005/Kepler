@@ -160,7 +160,32 @@ function normalizeRecord(r, seen, warn) {
     createdAt: typeof r.createdAt === 'string' ? r.createdAt : '',
     createdBy: typeof r.createdBy === 'string' ? r.createdBy : '',
     uses: normalizeUses(r.uses),
+    /**
+     * R69：**不截断**的「用过这张券的身份」索引。
+     *
+     * `uses` 是给人看的台账，只保留最近 `COUPON_USES_MAX`(=200) 条；而「每人一次」
+     * 的判据如果也读它，超 200 次核销后最早的用户就被挤出数组 —— 他可以再用一次，
+     * 且完全是静默的。索引只存身份字符串（去重），与台账解耦：
+     * 台账继续截断（那是显示与退款定位），判据改读这里。
+     */
+    identities: normalizeIdentities(r.identities, r.uses),
   };
+}
+
+/** 身份索引归一化：优先用显式字段；旧数据从台账（可能已截断）尽力恢复 */
+function normalizeIdentities(raw, uses) {
+  const out = [];
+  const seen = new Set();
+  const push = (v) => {
+    const s = String(v == null ? '' : v);
+    if (!s || seen.has(s)) return;
+    seen.add(s);
+    out.push(s);
+  };
+  if (Array.isArray(raw)) raw.forEach(push);
+  // 旧记录没有这个字段：从台账里恢复（截断前的部分已经不可知，属可接受的降级）
+  if (!Array.isArray(raw) && Array.isArray(uses)) uses.forEach((u) => push(u && u.identity));
+  return out;
 }
 
 function normalize(raw) {
@@ -340,7 +365,8 @@ function validateForUse({ code, link, identity, userId, now = Date.now() }) {
 
   if (c.perUserOnce) {
     const who = String(identity || '');
-    if (!who || c.uses.some((u) => u.identity === who)) return fail('already_used');
+    // R69：判据读**不截断**的身份索引，不再读台账（台账只保留最近 200 条）
+    if (!who || (Array.isArray(c.identities) ? c.identities : []).indexOf(who) >= 0) return fail('already_used');
   }
 
   const original = Number(link && link.paid && link.paid.amountFen) || 0;
@@ -375,6 +401,12 @@ function consume({ couponId, identity, orderId }) {
   });
   // 台账截断只影响「最早那几条的退款定位」，计数永远准
   if (c.uses.length > COUPON_USES_MAX) c.uses = c.uses.slice(-COUPON_USES_MAX);
+  /*
+   * R69：「每人一次」的判据索引**不截断**。台账被截断的是显示与退款定位，
+   * 身份集合必须一直留着 —— 否则第 201 次核销之后，最早那位用户又能用同一张券。
+   */
+  if (!Array.isArray(c.identities)) c.identities = [];
+  if (c.identities.indexOf(String(identity || '')) < 0) c.identities.push(String(identity || ''));
   c.used = Number(c.used || 0) + 1;
   persist();
   return view(c);
@@ -396,6 +428,15 @@ function releaseByOrder(orderId) {
     if (idx < 0) continue;
     const [hit] = c.uses.splice(idx, 1);
     c.used = Math.max(0, Number(c.used || 0) - 1);
+    /**
+     * R69：索引也要回退 —— 但只在「该身份确实没有其它核销记录」时移除。
+     * 同一用户可能用同一张券下过多笔订单（`perUserOnce` 为假时），
+     * 退掉其中一笔就把他从"用过"里删掉，等于把"每人一次"的额度还给他了。
+     */
+    if (Array.isArray(c.identities) && hit && hit.identity) {
+      const still = c.uses.some((u) => u.identity === hit.identity);
+      if (!still) c.identities = c.identities.filter((x) => x !== hit.identity);
+    }
     persist();
     return { couponId: c.id, identity: hit.identity, used: c.used };
   }
@@ -444,6 +485,7 @@ function generate({
       createdAt: now,
       createdBy: createdBy || '',
       uses: [],
+      identities: [], // R69：「每人一次」的不截断索引（与台账解耦）
     };
     store.coupons.push(rec);
     made.push(view(rec));

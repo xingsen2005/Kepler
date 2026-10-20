@@ -105,12 +105,9 @@ function newId() {
  * 分享密码是**攻击者可达的校验入口**（`/s/:id` 输入密码即触发），
  * 旧版 scryptSync 会被用来阻塞事件循环，故一律走异步 scrypt。
  */
-function hashPassword(pw, salt) {
-  return new Promise((resolve, reject) => {
-    crypto.scrypt(String(pw), Buffer.from(salt, 'hex'), 32, (err, key) => {
-      if (err) reject(err); else resolve(key.toString('hex'));
-    });
-  });
+function hashPassword(pw, salt, params) {
+  // R69：与账户口令共用同一套成本参数与实现（`config-store.scryptHex` 是唯一实现点）
+  return configStore.scryptHex(pw, salt, params || configStore.SCRYPT_PARAMS);
 }
 
 /* ------------------------- 视图 / 状态 ------------------------- */
@@ -439,6 +436,7 @@ async function create({ key, bucket, region, fileName, size, items, expiresHours
     const salt = crypto.randomBytes(16).toString('hex');
     l.passwordSalt = salt;
     l.passwordHash = await hashPassword(password, salt);
+    l.passwordParams = configStore.SCRYPT_PARAMS; // R69：成本参数随哈希一起落盘
   }
   links.unshift(l);
   persist();
@@ -457,10 +455,12 @@ async function update(id, patch) {
     if (patch.password === null || patch.password === '') {
       delete l.passwordHash;
       delete l.passwordSalt;
+      delete l.passwordParams;
     } else {
       const salt = crypto.randomBytes(16).toString('hex');
       l.passwordSalt = salt;
       l.passwordHash = await hashPassword(patch.password, salt);
+      l.passwordParams = configStore.SCRYPT_PARAMS;
     }
   }
   if (patch.resetCount) {
@@ -633,13 +633,32 @@ function markMissingByBucket(bucket) {
 /** 校验分享密码（SEC-05：async） */
 async function checkPassword(l, pw) {
   if (!l.passwordHash) return true;
+  const params = configStore.normalizeScryptParams(l.passwordParams);
   try {
-    const h = Buffer.from(await hashPassword(pw, l.passwordSalt), 'hex');
+    const h = Buffer.from(await hashPassword(pw, l.passwordSalt, params), 'hex');
     const t = Buffer.from(l.passwordHash, 'hex');
-    return h.length === t.length && crypto.timingSafeEqual(h, t);
+    if (!(h.length === t.length && crypto.timingSafeEqual(h, t))) return false;
   } catch (e) {
     return false;
   }
+  /**
+   * R69：**透明迁移**。存量链接的哈希是旧成本（N=16384）算的，而"验证通过"是
+   * 唯一能拿到明文的时刻 —— 就地重算一档，用户下次进来就已是新参数。
+   * 写在 `persist()` 的同一同步片段里（没有 await 夹在中间）。
+   */
+  if (params.N < configStore.SCRYPT_PARAMS.N) {
+    const salt = crypto.randomBytes(16).toString('hex');
+    let hash = '';
+    try { hash = await hashPassword(pw, salt, configStore.SCRYPT_PARAMS); } catch (e) { return true; }
+    const live = get(l.id);
+    if (live && live.passwordHash === l.passwordHash) {
+      live.passwordSalt = salt;
+      live.passwordHash = hash;
+      live.passwordParams = configStore.SCRYPT_PARAMS;
+      persist();
+    }
+  }
+  return true;
 }
 
 /**

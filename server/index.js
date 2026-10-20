@@ -54,6 +54,9 @@ const DATA_DIR = require('./data-dir').dataDir();
  * 证书文件在运行期被替换时，重启进程即可生效（本模块不缓存、也不监听文件变化）。
  */
 const TLS = loadTlsCert();
+// R69：告诉安全模块「本进程是否真的能提供 HTTPS」—— `Secure` Cookie 只在这时为真，
+// 否则"无证书的纯 HTTP 部署"会登录成功但会话永远建立不起来（见 secureCookieAttr）。
+security.setTlsAvailable(Boolean(TLS.ok));
 /**
  * 明文 HTTP 的 301 跳转目标端口。
  *  — 运维可用 `PUBLIC_HTTPS_PORT` 显式指定（反代对外不是 443 时必填）；
@@ -227,6 +230,25 @@ app.use('/api', (req, res, next) => {
  * 因此整体下移到鉴权块之后、路由之前 —— 顺序约束一条不破，只是不再为未认证请求缓冲。
  */
 app.use(['/api/fs/upload/simple', '/api/fs/upload/chunk'], express.raw({ type: () => true, limit: '64mb' }));
+
+/**
+ * 审计 I-4：**支付异步通知用更小的体积上限**。
+ *
+ * 原来 `share-routes.js` 里那句 `express.json({ limit: '256kb' })` 是**死代码**：
+ * 全局 2MB 解析器先挂载，它把 body 读完并置 `req._body = true`，后面那句直接跳过 ——
+ * 于是匿名可达的 `/s/:id/pay/notify/*` 实际能收 2MB，内存放大 8 倍。
+ *
+ * 修法不是调小全局上限（备份导入、批量改名都要 2MB），而是**在全局解析器之前**
+ * 给 notify 路径单独挂一个 256KB 解析器：它先跑，把 `req._body` 置真，全局解析器随后
+ * 自动跳过。位置仍在 ipGuard / 鉴权之后，不破坏 R27-22 的「不为未认证请求缓冲」。
+ */
+const NOTIFY_BODY_LIMIT_PARSER = express.json({ limit: '256kb' });
+const NOTIFY_PATH_RE = /^\/pay\/notify\//;
+app.use((req, res, next) => {
+  if (req.method !== 'POST' || !NOTIFY_PATH_RE.test(String(req.path || ''))) return next();
+  return NOTIFY_BODY_LIMIT_PARSER(req, res, next);
+});
+
 app.use(express.json({ limit: '2mb' }));
 
 // API
