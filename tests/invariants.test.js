@@ -967,8 +967,8 @@ const CANONICAL_IMPLS = [
      */
     mustContain: /deleteMultipleConfirmed/,
     why: '「复制失败必须回滚」的唯一实现点（三处复制入口共用）',
-    /** 三处复制入口：routes/fs.js、fs-gateway.movePrefix、WebDAV 目录 COPY（逐文件校验） */
-    callers: ['server/routes/fs.js', 'server/fs-gateway.js', 'server/webdav-server.js'],
+    /** R67：第三个调用点随 WebDAV 拆系统调用搬进 `webdav/app.js`（目录 COPY 的逐文件校验在那里） */
+    callers: ['server/routes/fs.js', 'server/fs-gateway.js', 'server/webdav/app.js'],
   },
   {
     /**
@@ -1079,7 +1079,9 @@ function uniqueImplViolations(files) {
 const HEAD_REQUIRED = [
   { file: 'server/routes/fs.js', path: '/fs/download' },
   { file: 'server/share-routes.js', path: '/s/:id/dl' },
-  { file: 'server/webdav-server.js', path: '*' },
+  /** R67：`app.head('*')` 随 Express 应用搬到 `server/webdav/app.js`，登记项跟着改而不是删掉
+   * （删掉这一项，会让「有 get 无 head」这条不变量在此处静默失效） */
+  { file: 'server/webdav/app.js', path: '*' },
 ];
 
 /** @param {(rel:string)=>string|null} read */
@@ -1780,7 +1782,7 @@ const GLOBAL_CHECKS = [
       { rel: 'server/fs-gateway.js', src: 'async function deletePrefixAll(client, cfg, key, onDeleted, opts) {\n  let stalled = false;\n  while (truncated && !stalled) { onDeleted([]); }\n}\nconst r = await deletePrefixAll(s3, cfg, pre, onDeleted, {});\n'
         + 'async function rollbackCopies(s3, cfg, keys) { await deleteMultipleConfirmed(s3, cfg, keys); }\nawait rollbackCopies(s3, cfg, fresh);\n' },
       { rel: 'server/routes/fs.js', src: 'await gateway.rollbackCopies(client, cfg, copied);\nawait gateway.deletePrefixAll(client, cfg, key, cb);\n' },
-      { rel: 'server/webdav-server.js', src: 'await gateway.rollbackCopies(s3, cfg, created);\n' },
+      { rel: 'server/webdav/app.js', src: 'await gateway.rollbackCopies(s3, cfg, created);\n' },
       { rel: 'server/routes/buckets.js', src: 'await gateway.deletePrefixAll(client, cfg, "", cb);\n' },
     ]),
     bad: () => uniqueImplViolations([
@@ -1801,7 +1803,7 @@ const GLOBAL_CHECKS = [
       { rel: 'server/fs-gateway.js', src: 'async function deletePrefixAll(client, cfg, key, onDeleted, opts) {\n  let stalled = false;\n  while (truncated && !stalled) { onDeleted([]); }\n}\nconst r = await deletePrefixAll(s3, cfg, pre, onDeleted, {});\n'
         + 'const rollbackCopies = async (s3, cfg, keys) => { await deleteMultipleConfirmed(s3, cfg, keys); };\nrollbackCopies(s3, cfg, fresh);\n' },
       { rel: 'server/routes/fs.js', src: 'await gateway.rollbackCopies(client, cfg, copied);\nawait gateway.deletePrefixAll(client, cfg, key, cb);\n' },
-      { rel: 'server/webdav-server.js', src: 'await gateway.rollbackCopies(s3, cfg, created);\n' },
+      { rel: 'server/webdav/app.js', src: 'await gateway.rollbackCopies(s3, cfg, created);\n' },
       { rel: 'server/routes/buckets.js', src: 'await gateway.deletePrefixAll(client, cfg, "", cb);\n' },
     ]),
     bad: () => uniqueImplViolations([
@@ -1812,7 +1814,7 @@ const GLOBAL_CHECKS = [
       { rel: 'server/upload-sessions.js', src: 'if (!secureStore.exitPathWritable(D)) return;\n' },
       { rel: 'server/fs-gateway.js', src: 'const rollbackCopies = async (s3, cfg, keys) => { await deleteMultipleConfirmed(s3, cfg, keys); };\nrollbackCopies(s3, cfg, fresh);\n' },
       { rel: 'server/routes/fs.js', src: 'await gateway.rollbackCopies(client, cfg, copied);\n' },
-      { rel: 'server/webdav-server.js', src: 'await gateway.rollbackCopies(s3, cfg, created);\n' },
+      { rel: 'server/webdav/app.js', src: 'await gateway.rollbackCopies(s3, cfg, created);\n' },
     ]),
   },
   {
@@ -1827,7 +1829,7 @@ const GLOBAL_CHECKS = [
       { rel: 'server/fs-gateway.js', src: 'async function deletePrefixAll(client, cfg, key, onDeleted, opts) {\n  let stalled = false;\n  while (truncated && !stalled) { onDeleted([]); }\n}\nconst r = await deletePrefixAll(s3, cfg, pre, onDeleted, {});\n'
         + 'function rollbackCopies(s3, cfg, keys) { return deleteMultipleConfirmed(s3, cfg, keys); }\nrollbackCopies(s3, cfg, fresh);\n' },
       { rel: 'server/routes/fs.js', src: 'await gateway.rollbackCopies(client, cfg, copied);\nawait gateway.deletePrefixAll(client, cfg, key, cb);\n' },
-      { rel: 'server/webdav-server.js', src: 'await gateway.rollbackCopies(s3, cfg, created);\n' },
+      { rel: 'server/webdav/app.js', src: 'await gateway.rollbackCopies(s3, cfg, created);\n' },
       { rel: 'server/routes/buckets.js', src: 'await gateway.deletePrefixAll(client, cfg, "", cb);\n' },
     ]),
     bad: () => uniqueImplViolations([
@@ -1838,7 +1840,7 @@ const GLOBAL_CHECKS = [
       { rel: 'server/upload-sessions.js', src: 'if (!secureStore.exitPathWritable(D)) return;\n' },
       { rel: 'server/fs-gateway.js', src: 'function rollbackCopies(s3, cfg, keys) { return deleteMultipleConfirmed(s3, cfg, keys); }\nrollbackCopies(s3, cfg, fresh);\n' },
       { rel: 'server/routes/fs.js', src: 'await gateway.rollbackCopies(client, cfg, copied);\n' },
-      { rel: 'server/webdav-server.js', src: 'const gone = 1;\n' },
+      { rel: 'server/webdav/app.js', src: 'const gone = 1;\n' },
     ]),
   },
 ];
@@ -2476,7 +2478,7 @@ test('R14 系列：第十四轮修复的静态不变量（每条自带扫描范�
     { name: 'R14-13 rename newKey 同源', fn: renameKeyViolations, files: ['server/routes/fs.js'], what: 'const newKey', min: 1 },
     { name: 'R14-04 异步写不持有旧 store', fn: asyncStoreWriteViolations, files: ['server/config-store.js'], what: 'async function ', min: 2 },
     { name: 'R14-05 发起支付先查支付态', fn: payStateViolations, files: ['server/share-routes.js'], what: "router.post('/s/:id/pay'", min: 1 },
-    { name: 'R14-06 WebDAV 安全响应头', fn: webdavHeaderViolations, files: ['server/webdav-server.js'], what: 'function buildApp', min: 1 },
+    { name: 'R14-06 WebDAV 安全响应头', fn: webdavHeaderViolations, files: ['server/webdav/app.js'], what: 'function buildApp', min: 1 },
     { name: 'R14-07 WebDAV 认证 dummyHash', fn: webdavAuthTimingViolations, files: ['server/config-store.js'], what: 'function authenticateWebdav(', min: 1 },
     /* R14-09 / R14-10 / R14-12：性能批次的「本地收口」必须落在唯一实现点上 */
     { name: 'R14-09 订单落盘唯一写端', fn: paymentPersistViolations, files: ['server/payment-orders.js'], what: 'function create(', min: 1 },

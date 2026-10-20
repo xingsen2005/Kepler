@@ -33,7 +33,7 @@ const os = require('os');
 const path = require('path');
 const test = require('node:test');
 const { pathToFileURL } = require('url');
-const { assert, assertEqual, ROOT } = require('./helpers.js');
+const { assert, assertEqual, ROOT, packageSource } = require('./helpers.js');
 
 const JS = (...p) => path.join(ROOT, 'public', 'js', ...p);
 const SERVER = (...p) => path.join(ROOT, 'server', ...p);
@@ -1117,7 +1117,7 @@ test('R36 · 写入点必须都带上上传者：mkdir / 直传 / 分片 init+co
     '文件夹分支与文件分支**各自**都要读一次上传者 —— 只改一支的表现是'
     + '「文件夹属性有创建者、文件属性永远显示 —」');
 
-  const dav = readSrc('server', 'webdav-server.js');
+  const dav = packageSource('server/webdav-server.js', 'server/webdav');
   assertEqual((dav.match(/uploaderMeta\(req\.webdavUser && req\.webdavUser\.username\)/g) || []).length, 2,
     'WebDAV 的 PUT（写入目录标记）与 MKCOL 都要带上传者，否则 WebDAV 建的一切在属性面板里都是「—」');
   assert(/writeObject\([\s\S]{0,240}?req\.webdavUser && req\.webdavUser\.username/.test(dav),

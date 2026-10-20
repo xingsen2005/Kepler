@@ -21,12 +21,24 @@ const os = require('os');
 const path = require('path');
 const test = require('node:test');
 
-const { assert, assertEqual, assertReject, ROOT } = require('./helpers');
+const { assert, assertEqual, assertReject, ROOT, packageSource } = require('./helpers');
 
 const readSrc = (rel) => fs.readFileSync(path.join(ROOT, rel), 'utf8');
 
 /** 去掉注释后的源码（防止"旧实现曾经…"这类说明性文字误伤断言） */
 const readCode = (rel) => readSrc(rel)
+  .split('\n')
+  .filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l))
+  .join('\n');
+
+/**
+ * R67：`webdav-server.js` 只剩生命周期，而 `ipGuard.guardRequest` 与
+ * `app.use(authMiddleware)` 两个标记点都搬进了 `server/webdav/app.js`。
+ * 只读入口的话 `guardAt` / `authAt` 双双变成 -1：第一条断言（`-1 >= 0`）会正确变红，
+ * 但**换成本高得多的是**「悄悄变成 -1 < -1 ⇒ 恒假」这种形态，故这里改读整包。
+ * 顺序判据仍然成立：两者同处 `app.js` 一个文件。
+ */
+const readPackageCode = (entry, pkg) => packageSource(entry, pkg)
   .split('\n')
   .filter((l) => !/^\s*(\/\/|\*|\/\*)/.test(l))
   .join('\n');
@@ -345,7 +357,7 @@ test('SEC-07 · WebDAV 复用主服务的 IP 判定（guardRequest），且早�
   const ipGuard = require(path.join(ROOT, 'server', 'ip-guard.js'));
   assert(typeof ipGuard.guardRequest === 'function', 'ip-guard 应导出 guardRequest 供 WebDAV 复用');
 
-  const code = readCode('server/webdav-server.js');
+  const code = readPackageCode('server/webdav-server.js', 'server/webdav');
   const guardAt = code.indexOf('ipGuard.guardRequest');
   const authAt = code.indexOf('app.use(authMiddleware)');
   assert(guardAt >= 0, 'WebDAV 必须挂载 IP 守卫 —— 独立端口不等于可以绕开屏蔽规则');

@@ -37,7 +37,7 @@ const path = require('path');
 const http = require('http');
 const test = require('node:test');
 const { after } = require('node:test');
-const { assert, assertEqual, ROOT, makeTempDir, request, cleanupTempDir } = require('./helpers.js');
+const { assert, assertEqual, ROOT, makeTempDir, request, cleanupTempDir, packageSource } = require('./helpers.js');
 
 const tmp = makeTempDir('s3-r37-');
 process.env.S3_DATA_DIR = tmp.dir;
@@ -513,7 +513,7 @@ const readSrc = (...p) => fs.readFileSync(path.join(ROOT, ...p), 'utf8');
 test('R37 · 接线：三个下载出口都必须过限速闸门（含最容易漏掉的 WebDAV 独立路径）', () => {
   const fsR = readSrc('server', 'routes', 'fs.js');
   const share = readSrc('server', 'share-routes.js');
-  const dav = readSrc('server', 'webdav-server.js');
+  const dav = packageSource('server/webdav-server.js', 'server/webdav');
   const ds = readSrc('server', 'download-stream.js');
 
   assert(/makeThrottle\(/.test(fsR), '① GET /fs/download 必须接限速（→ streamDownload 的 throttle 参数）');
@@ -538,7 +538,7 @@ test('R37 · 接线：三个下载出口都必须过限速闸门（含最容易�
 });
 
 test('R37 · 接线：WebDAV 只有 IP / 密钥 / 桶三层 —— 「无用户层」是**已知缺口**且必须写明', () => {
-  const dav = readSrc('server', 'webdav-server.js');
+  const dav = packageSource('server/webdav-server.js', 'server/webdav');
   const m = /const throttle = makeThrottle\(\{([\s\S]{0,400}?)\}\)/.exec(dav);
   assert(m, 'WebDAV 的 GET 分支必须调用 makeThrottle');
   assert(/ip:/.test(m[1]) && /credentialId:/.test(m[1]) && /bucketId:/.test(m[1]),

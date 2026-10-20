@@ -345,6 +345,44 @@ function checkEsmSyntaxFallback(src, file) {
   }
 }
 
+/**
+ * 读取一个「已拆包」的服务端模块的**全部源码**：入口文件 + 同名包目录下的所有 `.js`。
+ *
+ * 为什么需要这个函数：R67 起 `server/webdav-server.js` 只保留生命周期与对外 API，
+ * 协议实现搬进了 `server/webdav/`（`defs` / `util` / `listing` / `auth` / `xml` / `app`）。
+ * 而测试里有十余处是「读整个文件的源码做静态断言」，其中最危险的是**负向断言**
+ * （「不得再出现 X」）—— 若它只读 facade，`X` 搬走之后返回值依旧是「没找到」，
+ * 于是**断言依然通过而覆盖已经消失**。这比直接变红糟得多，它不会被人发现。
+ * （带**正向范围自检**的那几条会当场失败，本轮的 `R22-03` 就是这么被抓出来的。）
+ *
+ * ⚠️ 返回值是**拼接体**，顺序为「入口 + 包内文件（字母序）」，因此
+ * 「A 必须排在 B 之前」这类判据**只在两者处于同一个文件时成立**；
+ * 确实需要跨文件的顺序判据时，请显式列文件顺序而不要用这个函数。
+ *
+ * @param {string} entryRel 入口文件相对仓库根的路径，例如 `server/webdav-server.js`
+ * @param {string} pkgRel 包目录相对仓库根的路径，例如 `server/webdav`（**显式给出**：
+ *   不要从入口名推导——`webdav-server.js` 对应的目录是 `webdav` 而不是 `webdav-server`）
+ * @returns {string} 拼接后的源码
+ */
+function packageSource(entryRel, pkgRel) {
+  const entry = path.join(ROOT, entryRel);
+  assert(fs.existsSync(entry), `包入口不存在：${entryRel}`);
+  const parts = [entry];
+  const dir = path.join(ROOT, pkgRel);
+  if (fs.existsSync(dir) && fs.statSync(dir).isDirectory()) {
+    for (const f of fs.readdirSync(dir).sort()) {
+      if (f.endsWith('.js')) parts.push(path.join(dir, f));
+    }
+  }
+  /**
+   * 必须**挡掉**「目录为空」这种情况：那时返回值等于只读了入口文件，而调用方
+   * 毫无察觉 —— 与上面提到的负向断言假绿完全同型。
+   */
+  assert(parts.length >= 2,
+    `包目录 ${pkgRel} 里没有任何 .js —— 拆包断言失去对象（若确实没有拆包，请直接用 fs 读那一个文件）`);
+  return parts.map((p) => fs.readFileSync(p, 'utf8')).join('\n');
+}
+
 module.exports = {
   ROOT,
   assert, assertEqual, assertMatch, assertReject,
@@ -355,4 +393,6 @@ module.exports = {
   checkEsmSyntax, checkEsmSyntaxFallback,
   // R49：WebDAV 强制 HTTPS 且不再自动生成证书 —— 需要真实 TLS 服务的用例显式要一对
   ensureTestTls,
+  // R67：「读整个模块源码」的静态断言必须覆盖拆出去的包目录（详见函数上方的说明）
+  packageSource,
 };

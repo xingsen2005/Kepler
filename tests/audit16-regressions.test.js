@@ -35,6 +35,7 @@ const test = require('node:test');
 const { spawn } = require('node:child_process');
 
 require('./helpers'); // 兜底 S3_DATA_DIR 到临时目录（store 层不写生产 data/）
+const { packageSource } = require('./helpers');
 
 const ROOT = path.join(__dirname, '..');
 const WEBDAV_SERVER = path.join(ROOT, 'server', 'webdav-server.js');
@@ -297,7 +298,7 @@ test('D2-02 · 末档回退只服务「无请求上下文」的启动日志，�
     '有请求上下文时绝不能再等于监听地址 —— 「界面显示 localhost」就是这个等号');
 
   // 结构上再钉一道：监听地址只允许出现在 reqHost 之后（即它只能是末档兜底）
-  const src = read(WEBDAV_SERVER);
+  const src = packageSource('server/webdav-server.js', 'server/webdav');
   const idxReq = src.indexOf('const host = reqHost(req);');
   const idxFallback = src.indexOf("'localhost' : HOST}");
   assert.ok(idxReq > 0, 'serverUrl 必须靠 reqHost(req) 取请求域名');

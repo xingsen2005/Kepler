@@ -23,7 +23,7 @@ const fs = require('fs');
 const path = require('path');
 const http = require('http');
 const { test } = require('node:test');
-const { ROOT, assert, assertEqual, makeTempDir, request } = require('./helpers.js');
+const { ROOT, assert, assertEqual, makeTempDir, request, packageSource } = require('./helpers.js');
 
 const tmp = makeTempDir('s3-audit22-');
 process.env.S3_DATA_DIR = tmp.dir;
@@ -159,7 +159,8 @@ test('R22-02 · 部署脚本生成的反代片段必须**重写**而非追加 X-
 /* ==================================================================== */
 
 test('R22-03 · webdav-server.js 内不得存在裸 send(e.message)，且六个出口都接了助手', () => {
-  const src = read('server/webdav-server.js');
+  // R67：协议实现搬进了 server/webdav/，必须读**整包**，否则这条负向断言会静默失去覆盖
+  const src = packageSource('server/webdav-server.js', 'server/webdav');
   const code = withoutCommentLines(src);
 
   /* ---- 扫描范围下界自检：特征扫不到时「命中 0」与「全合规」长得一样 ---- */
@@ -190,7 +191,8 @@ test('R22-03 · webdav-server.js 内不得存在裸 send(e.message)，且六个�
 
 test('R22-04 · 文档必须写明 WebDAV 出口是否纳入「查看密码」，且与代码事实一致', () => {
   // 代码事实：WebDAV 出口不读取加密令牌 / 查看密码状态（该文件命中数为 0）
-  const webdavCode = withoutCommentLines(read('server/webdav-server.js'));
+  // R67：必须读整包 —— 「此文件不含 X」这类负向断言在拆包后若不扩范围，会一路假绿
+  const webdavCode = withoutCommentLines(packageSource('server/webdav-server.js', 'server/webdav'));
   const hasGate = /passwordSet\(\)|x-enc-token|encStore/.test(webdavCode);
   assertEqual(hasGate, false,
     '前置事实：WebDAV 出口当前不读取加密令牌（若将来接上了门禁，下面那句文档口径必须同步改）');

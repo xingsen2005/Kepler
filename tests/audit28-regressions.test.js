@@ -26,7 +26,7 @@ const os = require('os');
 const path = require('path');
 const http = require('http');
 const test = require('node:test');
-const { assert, assertEqual, ROOT } = require('./helpers');
+const { assert, assertEqual, ROOT, packageSource } = require('./helpers');
 
 const R = (...p) => path.join(ROOT, ...p);
 const readSrc = (...p) => fs.readFileSync(R(...p), 'utf8');
@@ -101,7 +101,7 @@ test('R28-02 · 单桶配额必须由服务端强制（且两层闸门都在写�
 
   // 所有写入出口两处闸门并列（凭据级 + 桶级）
   const fsSrc = readSrc('server', 'routes', 'fs.js');
-  const wdSrc = readSrc('server', 'webdav-server.js');
+  const wdSrc = packageSource('server/webdav-server.js', 'server/webdav');
   const countFs = (fsSrc.match(/await assertBucketQuota\(/g) || []).length;
   const countWd = (wdSrc.match(/assertBucketQuota\(/g) || []).length;
   // ⚠️ 这是**硬计数**：每新增一个 /fs 写入口都必须同步这里（R52 的 /fs/copy 就是靠它
@@ -365,6 +365,6 @@ test('R28-06 · 不可解析地址在 /api 下的 403 必须能辨因（不再�
   const ipSrc = readSrc('server', 'ip-guard.js');
   assertEqual((ipSrc.match(/blockTip\(/g) || []).length >= 2, true,
     'R28-06：ip-guard 内部两处（API 与 HTML）必须共用 blockTip');
-  assert(/ipGuard\.blockTip\(/.test(readSrc('server', 'webdav-server.js')),
+  assert(/ipGuard\.blockTip\(/.test(packageSource('server/webdav-server.js', 'server/webdav')),
     'R28-06：WebDAV 的 403 文案必须同样取自 ipGuard.blockTip（否则三处文案会再次分叉）');
 });

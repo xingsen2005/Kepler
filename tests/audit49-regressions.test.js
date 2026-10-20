@@ -70,7 +70,7 @@ const crypto = require('crypto');
 const { spawn } = require('child_process');
 const { pathToFileURL } = require('url');
 const test = require('node:test');
-const { assert, assertEqual, ROOT, request, waitForPort, ensureTestTls } = require('./helpers');
+const { assert, assertEqual, ROOT, request, waitForPort, ensureTestTls, packageSource } = require('./helpers');
 
 const R = (...p) => path.join(ROOT, ...p);
 const readSrc = (...p) => fs.readFileSync(R(...p), 'utf8');
@@ -867,7 +867,7 @@ test('R49-17 · 与 cos 有关的标识符 / 反馈串全部改用 s3 口径', (
     'R49-17：fs-gateway.js 里不得再出现 requireCfgCos / cosStream / cosOpts');
   assert(/function requireS3\(/.test(gw), 'R49-17：fs-gateway.js 的新名字是 requireS3');
 
-  const wd = stripComments(readSrc('server', 'webdav-server.js'));
+  const wd = stripComments(packageSource('server/webdav-server.js', 'server/webdav'));
   assert(!/function requireCos\(/.test(wd), 'R49-17：webdav-server.js 里不得再有 requireCos');
   assert(/async function requireS3\(/.test(wd), 'R49-17：webdav-server.js 的新名字是 requireS3');
 

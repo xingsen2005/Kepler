@@ -38,7 +38,7 @@ const { pipeline } = require('stream/promises');
 const COS_TMP = fs.mkdtempSync(path.join(require('os').tmpdir(), 's3-audit0-'));
 process.env.S3_DATA_DIR = COS_TMP;
 
-const { assert, assertEqual, assertReject, ROOT } = require('./helpers');
+const { assert, assertEqual, assertReject, ROOT, packageSource } = require('./helpers');
 
 const readSrc = (rel) => fs.readFileSync(path.join(ROOT, rel), 'utf8');
 
@@ -480,7 +480,7 @@ test('SEC-06 · CSP 移除 script-src unsafe-inline，并补齐 object-src/base-
  * ================================================================== */
 
 test('FUN-06/FUN-07 · WebDAV 统一挂载点守卫；网关复制处理 >5GB 对象', () => {
-  const wd = readSrc('server/webdav-server.js');
+  const wd = packageSource('server/webdav-server.js', 'server/webdav');
   // FUN-06：必须是"前置统一中间件"，而不是逐方法判断（逐方法正是漏掉 PUT 的原因）
   // R34：该中间件原先就地手写 `startsWith(MOUNT)` —— 正是那 9 处手写判据让根路径 `/` 漏判，
   // 造成 `OPTIONS /` 回 200 而 `PROPFIND /` 回 HTML 404。判据已收敛为 `inMount()`，

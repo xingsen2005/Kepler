@@ -487,7 +487,7 @@ const CASES = [
 
     {
       name: 'R9-01 · WebDAV 目录 COPY/MOVE 去掉自嵌套守卫（可复制到自身子目录 → 无界递归）',
-      file: 'server/webdav-server.js',
+      file: 'server/webdav/app.js',
       anchor: "      if ((dstKey.replace(/\\/+$/, '') + '/').startsWith(srcKey)) {",
       replacement: '      if (false) {',
       testFile: 'audit9-regressions.test.js',
@@ -542,7 +542,7 @@ const CASES = [
     },
     {
       name: 'R9-06 · WebDAV 目录 MOVE 去掉 Overwrite:F 判定（目标已存在仍静默覆盖）',
-      file: 'server/webdav-server.js',
+      file: 'server/webdav/app.js',
       /**
        * ⚠️ R14 复核修正：旧 anchor 是**一整行注释**。
        * `tests/invariants.test.js` 的 anchor 自检要先剥注释才能防住「anchor 被删、
@@ -653,7 +653,7 @@ const CASES = [
     },
     {
       name: 'R10-07 · WebDAV HEAD 对任何 Range 都宣告 206（与 GET 的退化不一致 → 拼装损坏）',
-      file: 'server/webdav-server.js',
+      file: 'server/webdav/app.js',
       anchor: '        if (rh && gateway.rangeServable(st)) {',
       replacement: '        if (rh) {',
       testFile: 'audit10-regressions.test.js',
@@ -682,7 +682,7 @@ const CASES = [
     },
     {
       name: 'R10-11 · Overwrite 判据漏掉「目标是已存在的文件」',
-      file: 'server/webdav-server.js',
+      file: 'server/webdav/listing.js',
       anchor: '  if (bare && await head(bare)) return true;',
       replacement: '  if (false && await head(bare)) return true;',
       testFile: 'audit10-regressions.test.js',
@@ -690,7 +690,7 @@ const CASES = [
     },
     {
       name: 'R10-11 · Overwrite 判据漏掉「目标是空目录（仅占位对象）」',
-      file: 'server/webdav-server.js',
+      file: 'server/webdav/listing.js',
       // ⚠ anchor 必须唯一：`if (await head(prefix)) return true;` 在 `destinationExists()`
       // 里出现**两次**（文件源分支 / 目录源分支），而 `String.replace` 只改**首处** ——
       // 只写单行 anchor 会命中文件源那处，而本用例是 `MOVE /dav/dirA/`（**目录源**），
@@ -702,7 +702,7 @@ const CASES = [
     },
     {
       name: 'R10-11 · 目录 COPY 退回「逐对象判定」（复制掉一部分才 412，目标留半成品）',
-      file: 'server/webdav-server.js',
+      file: 'server/webdav/app.js',
       // R13-04 复核后保留容器级判据（`destinationExists(..., true)` 的三种形态已覆盖
       // 「目标非空」），只是外面多了一层 `if (!overwrite) {` —— anchor 随缩进同步。
       anchor: "          if (await destinationExists(s3, cfg, dstKey, true)) {\n            return res.status(412).type('text/plain')\n              .send(`412 Precondition Failed：目标「${dstDir}」已存在且请求声明 Overwrite: F`);\n          }\n",
@@ -712,7 +712,7 @@ const CASES = [
     },
     {
       name: 'R10-12 · app.head 注册到 app.get 之后（HEAD 被 GET 吞掉 → 每次 HEAD 都下载整份对象）',
-      file: 'server/webdav-server.js',
+      file: 'server/webdav/app.js',
       // R34：这两行的挂载点判据由手写 `req.path.startsWith(MOUNT)` 收敛为 `inMount(req.path)`，
       // 锚点**随代码一起迁移**（否则本条会静默失效 —— 脚本只在跑到它时才报「锚点未命中」，
       // 而没人跑就等于没登记）。守的判据不变：head 必须注册在 get 之前。
@@ -796,7 +796,7 @@ const CASES = [
     },
     {
       name: 'R11-06 · WebDAV 文件 MOVE 到自身不再拒绝（自复制 + 删源 = 静默数据丢失）',
-      file: 'server/webdav-server.js',
+      file: 'server/webdav/app.js',
       /**
        * ⚠️ anchor 必须**在文件内唯一**：`String.replace` 只替换**首处**。
        * `if (srcKey === dstKey) {` 在目录分支（`:884`）里还有一份同款守卫，
@@ -856,7 +856,7 @@ const CASES = [
       // R11-17 ①：旧护栏只断言「不得 206」，判定退化成恒 false 照样全绿，
       // 这条变异必须靠新加的正向对照（小加密对象 HEAD 必须 206）变红。
       name: 'R11-17 · WebDAV HEAD 对任何 Range 都回 200（判定退化成恒 false）',
-      file: 'server/webdav-server.js',
+      file: 'server/webdav/app.js',
       anchor: '        if (rh && gateway.rangeServable(st)) {',
       replacement: '        if (rh && false) {',
       testFile: 'audit10-regressions.test.js',
@@ -885,7 +885,7 @@ const CASES = [
     {
       // R13-02：回滚退回"全量 created"（丢掉 fresh 过滤）→ 删掉复制前就存在的用户对象
       name: 'R13-02 · 目录 COPY 回滚退回全量 created（删掉复制前就存在的目标对象）',
-      file: 'server/webdav-server.js',
+      file: 'server/webdav/app.js',
       anchor: '          const fresh = created.filter((k) => !existedBefore.has(k));',
       replacement: '          const fresh = created.slice(); // 变异：无 fresh 过滤',
       testFile: 'audit13-regressions.test.js',
@@ -894,7 +894,7 @@ const CASES = [
     {
       // R13-03：失败后不再等在飞的 worker 落地就取快照 → 孤儿留在目标目录，日志谎报
       name: 'R13-03 · 目录 COPY 失败不再等 worker 落地（快照过早 → 目标残留孤儿）',
-      file: 'server/webdav-server.js',
+      file: 'server/webdav/app.js',
       anchor: '          await Promise.allSettled(workers);\n',
       replacement: '          // 变异：不再等在飞的 worker 落地\n',
       testFile: 'audit13-regressions.test.js',
@@ -903,7 +903,7 @@ const CASES = [
     {
       // R13-04 ①：摘掉容器级判据 → 目标非空但无同名对象时被放行（违背 RFC 4918 §9.8.4）
       name: 'R13-04 · 目录 COPY 摘掉容器级 Overwrite:F 判据（目标非空仍放行）',
-      file: 'server/webdav-server.js',
+      file: 'server/webdav/app.js',
       anchor: '          if (await destinationExists(s3, cfg, dstKey, true)) {',
       replacement: '          if (false) { // 变异：摘掉容器级判据',
       testFile: 'audit13-regressions.test.js',
@@ -912,7 +912,7 @@ const CASES = [
     {
       // R13-04 ②：摘掉键级兜底 → 容器级探测 fail-open 时同名对象被静默覆盖
       name: 'R13-04 · 目录 COPY 摘掉键级兜底（容器级 fail-open 时静默覆盖同名对象）',
-      file: 'server/webdav-server.js',
+      file: 'server/webdav/app.js',
       anchor: '          for (const t of targets) if (existedBefore.has(t.dst)) conflicts.push(t.dst);',
       replacement: '          for (const t of targets) if (false) conflicts.push(t.dst);',
       testFile: 'audit13-regressions.test.js',
@@ -1185,7 +1185,7 @@ const CASES = [
        * 静态检查跑在 `stripComments()` 之上，但让变异体「看起来像有头」会削弱这条对照的说服力。
        */
       name: 'R14-06 · WebDAV 独立实例去掉安全响应头（html/svg 内联渲染即执行脚本）',
-      file: 'server/webdav-server.js',
+      file: 'server/webdav/app.js',
       anchor: "    res.setHeader('Content-Security-Policy', \"default-src 'none'; sandbox\");\n"
         + "    res.setHeader('X-Content-Type-Options', 'nosniff');\n"
         + "    res.setHeader('Referrer-Policy', 'no-referrer');",
@@ -2399,7 +2399,7 @@ const CASES = [
     },
     {
       name: 'R21-14 · WebDAV 错误响应回显上游原始 message（泄漏请求 ID / 端点 / 密钥片段）',
-      file: 'server/webdav-server.js',
+      file: 'server/webdav/defs.js',
       anchor: '  const fromUpstream = !!e && (e.statusCode !== undefined || e.rawMessage !== undefined);\n'
         + "  if (!fromUpstream) return String((e && e.message) || '操作失败，请重试');\n"
         + '  return translateError(e).message;\n',
@@ -2453,7 +2453,7 @@ const CASES = [
     },
     {
       name: 'R22-03 · PROPFIND 出口退回裸发上游 message（泄漏请求 ID / 端点 / 密钥片段）',
-      file: 'server/webdav-server.js',
+      file: 'server/webdav/app.js',
       anchor: '      return res.status(207).send(multistatus([propResponse(hrefFor(key), item)]));\n'
         + '    } catch (e) {\n'
         + '      // R22-03：与其余同型 catch 同一口径 —— 上游原始 message 只进服务端日志\n'
@@ -2467,7 +2467,7 @@ const CASES = [
     },
     {
       name: 'R22-03 · MKCOL 出口退回裸发上游 message',
-      file: 'server/webdav-server.js',
+      file: 'server/webdav/app.js',
       anchor: '      res.status(201).end();\n'
         + '    } catch (e) {\n'
         + '      // R22-03：MKCOL 同型收口\n'
@@ -2481,7 +2481,7 @@ const CASES = [
     },
     {
       name: 'R22-03 · DELETE 出口退回裸发上游 message',
-      file: 'server/webdav-server.js',
+      file: 'server/webdav/app.js',
       anchor: "        res.status(st === 404 ? 404 : 500).type('text/plain').send(st === 404 ? '404 Not Found' : davErrorMessage(e));",
       replacement: "        res.status(st === 404 ? 404 : 500).type('text/plain').send(st === 404 ? '404 Not Found' : e.message);",
       testFile: 'audit22-regressions.test.js',
@@ -2489,7 +2489,7 @@ const CASES = [
     },
     {
       name: 'R22-03 · COPY 出口退回裸发上游 message',
-      file: 'server/webdav-server.js',
+      file: 'server/webdav/app.js',
       anchor: '        const out = st === 401 ? 502 : (st >= 400 && st < 500 ? st : 500);\n'
         + "        res.status(out).type('text/plain').send(out === 404 ? '404 Not Found' : davErrorMessage(e));",
       replacement: '        const out = st === 401 ? 502 : (st >= 400 && st < 500 ? st : 500);\n'
@@ -2808,7 +2808,7 @@ const CASES = [
     },
     {
       name: 'R25-07【WebDAV PUT·目录】· 不再过配额闸门',
-      file: 'server/webdav-server.js',
+      file: 'server/webdav/app.js',
       // R28-02：同「mkdir」—— anchor 去注释化，靠 8 空格缩进与 MKCOL/COPY 的 6 空格区分
       anchor: '        await bucketStats.assertCredentialQuota(cfg.credentialId, { addBytes: 0 });\n'
         + '        await bucketStats.assertBucketQuota(s3, cfg, { addBytes: 0 });',
@@ -2818,7 +2818,7 @@ const CASES = [
     },
     {
       name: 'R25-07【WebDAV PUT·文件】· 不再过配额闸门',
-      file: 'server/webdav-server.js',
+      file: 'server/webdav/app.js',
       anchor: '      await bucketStats.assertCredentialQuota(cfg.credentialId, { addBytes: putLen });',
       replacement: '      void 0;',
       testFile: 'audit25-regressions.test.js',
@@ -2826,7 +2826,7 @@ const CASES = [
     },
     {
       name: 'R25-07【WebDAV MKCOL】· 不再过配额闸门',
-      file: 'server/webdav-server.js',
+      file: 'server/webdav/app.js',
       anchor: "      const dirKey = key.endsWith('/') ? key : key + '/';\n"
         + '      // R25：新建集合是 0 字节对象 → `addBytes=0`\n'
         + '      await bucketStats.assertCredentialQuota(cfg.credentialId, { addBytes: 0 });',
@@ -2836,7 +2836,7 @@ const CASES = [
     },
     {
       name: 'R25-07【WebDAV COPY·MOVE】· 不再过配额闸门',
-      file: 'server/webdav-server.js',
+      file: 'server/webdav/app.js',
       anchor: '      await bucketStats.assertCredentialQuota(cfg.credentialId, { addBytes: 0 });\n'
         + '      await bucketStats.assertBucketQuota(s3, cfg, { addBytes: 0 });\n'
         + '      if (!srcIsDir) {',
@@ -3825,7 +3825,7 @@ const CASES = [
        *  - 摘掉 `/` 的写保护 → PUT / MKCOL / DELETE 在根路径上**真的动手**。
        */
       name: 'R34-01a · PROPFIND 包装退回手写前缀判据（根路径重新落到 Express 兜底 HTML 404）',
-      file: 'server/webdav-server.js',
+      file: 'server/webdav/app.js',
       anchor: "  app['propfind']('*', (req, res, next) => {\n    if (!inMount(req.path)) return next();",
       replacement: "  app['propfind']('*', (req, res, next) => {\n    if (!req.path.startsWith(MOUNT)) return next();",
       testFile: 'audit34-regressions.test.js',
@@ -3833,7 +3833,7 @@ const CASES = [
     },
     {
       name: 'R34-01b · 去掉 `OPTIONS *` 的服务级豁免（能力探测被边界答成 404，且没有 DAV 头）',
-      file: 'server/webdav-server.js',
+      file: 'server/webdav/app.js',
       anchor: "    if (req.method === 'OPTIONS' && req.path === '*') return next();\n",
       replacement: '',
       testFile: 'audit34-regressions.test.js',
@@ -3841,7 +3841,7 @@ const CASES = [
     },
     {
       name: 'R34-01c · inMount 放宽到整个根命名空间（把 FUN-06 的边界一并撤销）',
-      file: 'server/webdav-server.js',
+      file: 'server/webdav/util.js',
       anchor: "  return reqPath === '/' || reqPath === MOUNT || reqPath.indexOf(MOUNT + '/') === 0;",
       replacement: "  return reqPath.charAt(0) === '/';",
       testFile: 'audit34-regressions.test.js',
@@ -3849,7 +3849,7 @@ const CASES = [
     },
     {
       name: 'R34-01d · 前缀剥离退回字符级 startsWith（`/davx` 产生界面看不到的幽灵 key `x`）',
-      file: 'server/webdav-server.js',
+      file: 'server/webdav/util.js',
       anchor: '  if (pth === MOUNT || pth.indexOf(MOUNT + \'/\') === 0) pth = pth.slice(MOUNT.length);',
       replacement: '  if (pth.indexOf(MOUNT) === 0) pth = pth.slice(MOUNT.length);',
       testFile: 'audit34-regressions.test.js',
@@ -3857,7 +3857,7 @@ const CASES = [
     },
     {
       name: 'R34-01e · 405 兜底退回手写前缀判据（`LOCK /` 由 405 退化成 Express 默认 404）',
-      file: 'server/webdav-server.js',
+      file: 'server/webdav/app.js',
       anchor: "  app.use((req, res, next) => {\n    if (!inMount(req.path)) return next();\n    const m = String(req.method || '').toUpperCase();\n    if (WEBDAV_METHODS.has(m)) return next();",
       replacement: "  app.use((req, res, next) => {\n    if (!req.path.startsWith(MOUNT)) return next();\n    const m = String(req.method || '').toUpperCase();\n    if (WEBDAV_METHODS.has(m)) return next();",
       testFile: 'audit34-regressions.test.js',
@@ -3865,7 +3865,7 @@ const CASES = [
     },
     {
       name: 'R34-01f · 摘掉 MKCOL 的根路径写保护（`MKCOL /` 从 409 变成真的建集合）',
-      file: 'server/webdav-server.js',
+      file: 'server/webdav/app.js',
       anchor: '      const key = reqPathToKey(req.path);\n      if (!key) return res.status(409).end();',
       replacement: '      const key = reqPathToKey(req.path);',
       testFile: 'audit34-regressions.test.js',
@@ -3873,7 +3873,7 @@ const CASES = [
     },
     {
       name: 'R34-01g · 摘掉 PUT 的根路径写保护（`PUT /` 不再回 409）',
-      file: 'server/webdav-server.js',
+      file: 'server/webdav/app.js',
       anchor: "      if (!key) return res.status(409).type('text/plain').send('409 Conflict：无法上传到根路径');",
       replacement: '',
       testFile: 'audit34-regressions.test.js',
@@ -3881,7 +3881,7 @@ const CASES = [
     },
     {
       name: 'R34-01h · 摘掉 DELETE 的根路径写保护（`DELETE /` 不再回 403）',
-      file: 'server/webdav-server.js',
+      file: 'server/webdav/app.js',
       anchor: "      if (!key) return res.status(403).type('text/plain').send('403：禁止删除存储桶根');",
       replacement: '',
       testFile: 'audit34-regressions.test.js',
@@ -4535,7 +4535,7 @@ const CASES = [
       // WebDAV 的 GET 是完全独立的下发路径：漏掉这一处接线，主站限速生效、挂载盘全速 ——
       // 「限速」成了一个可以被换条路绕过的摆设。这是本轮最容易漏的一处。
       name: 'R37-05b · WebDAV 下载出口漏接限速（挂载盘成了全速旁路）',
-      file: 'server/webdav-server.js',
+      file: 'server/webdav/app.js',
       anchor: '      const throttle = makeThrottle({\n        ip: security.clientIp(req),\n        method: req.method,\n        credentialId: cfg.credentialId,\n        bucketId: cfg.bucketId,\n      });',
       replacement: '      const throttle = null;',
       testFile: 'audit37-regressions.test.js',
@@ -6524,7 +6524,7 @@ const CASES = [
     {
       // 撤掉后：WebDAV 的取值助手改回 COS 时代的老名字（改名只做了一半）。
       name: 'R49-17a · WebDAV 的 requireS3 改回 requireCos（改名半途而废）',
-      file: 'server/webdav-server.js',
+      file: 'server/webdav/listing.js',
       anchor: 'async function requireS3() {',
       replacement: 'async function requireCos() {',
       testFile: 'audit49-regressions.test.js',
@@ -9313,6 +9313,50 @@ const CASES = [
       file: 'server/routes/stats.js',
       anchor: "  if (req.authUser && req.authUser.role === 'admin') {",
       replacement: '  if (true) {',
+      testFile: 'repo-hygiene.test.js',
+      minFail: 1,
+    },
+    /* ======================= 第 67 轮：拆包不变量 ======================= *
+     * 这三条的性质与其他条目不同：它们撤销的不是「某个修复」，而是把**结构**改坏。
+     * 之所以也要登记，是因为结构坏掉时**没有任何行为测试会变红**（见 repo-hygiene 里
+     * 那三条用例上方的说明）—— 不登记就等于承认「这三条护栏没人验过」。
+     */
+    {
+      /**
+       * R67-01a：把 `xml.js` 的引用换成就地手写（孤儿化的最常见形态）。
+       *
+       * 这比「删掉 require」更真实：删掉会让运行时立即报 `propResponse is not defined`，
+       * 而**就地补两个空函数**能让所有行为测试继续通过 —— 只有「每个模块都必须被 require」
+       * 这条结构断言能发现 `xml.js` 已经没人用了。
+       */
+      name: 'R67-01a · 包内模块被就地重写（xml.js 变成没人 require 的孤儿）',
+      file: 'server/webdav/app.js',
+      anchor: "const { propResponse, multistatus } = require('./xml');",
+      replacement: "const propResponse = () => '';\nconst multistatus = () => '';",
+      testFile: 'repo-hygiene.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * R67-02a：让下层反向 require `./app` —— 依赖成环的入口。
+       *
+       * 成环的表现不是报错，而是「某个导出在启动时是 undefined」，所以只能靠结构断言抓。
+       */
+      name: 'R67-02a · 下层模块反向 require ./app（依赖成环）',
+      file: 'server/webdav/defs.js',
+      anchor: "const { translateError } = require('../s3');",
+      replacement: "const { translateError } = require('../s3');\nrequire('./app');",
+      testFile: 'repo-hygiene.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * R67-03a：在入口文件里顺手注册一条路由 —— 拆包被「磨平」的第一天。
+       */
+      name: 'R67-03a · 入口文件里重新注册路由（协议实现搬回 facade）',
+      file: 'server/webdav-server.js',
+      anchor: 'function start() { return apply(); }',
+      replacement: "function start() { app.get('*', () => {}); return apply(); }",
       testFile: 'repo-hygiene.test.js',
       minFail: 1,
     },

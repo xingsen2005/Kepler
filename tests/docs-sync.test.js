@@ -445,6 +445,63 @@ test('台账里的编号都能在代码或测试中找到引用（防止登记�
 });
 
 /**
+ * ADR（架构决策记录）：`docs/ADR/index.md` 的索引表与实际文件必须双向一致。
+ *
+ * 为什么这里要双向：索引是「人先看到的那一层」，文件是「实际存在的那一层」。
+ * 只查「列出来的都存在」会漏掉「新写的 ADR 忘了登记」（内部隐成一个孤儿文件，
+ * 十年后没人找得到）；只查「文件都登了」会漏掉「索引里留着一行已被删掉的条目」。
+ * 两者都不算难，但漏掉之后没有任何别的机制会报警，所以要凑成一对。
+ *
+ * ⚠️ 编号靠**文件名前缀**而不靠表格顺序：表格顺序应当随主题滚动整理，
+ * 若是权威写在顺序里，整理一次顺序就等于改写编号 —— 编号必须与顺序解耦。
+ */
+const ADR_DIR = 'docs/ADR';
+const ADR_SECTIONS = ['## 背景', '## 决定', '## 理由', '## 备选方案（已否决）', '## 后果与需要长期遵守的约束'];
+
+test('ADR 索引与实际文件双向一致，编号连续且每条结构完整', () => {
+  const dir = path.join(ROOT, ADR_DIR);
+  assert(fs.existsSync(dir), `${ADR_DIR}/ 不存在——本文件的 ADR 断言失去对象，应先恢复目录`);
+  const index = readDoc(path.join(ADR_DIR, 'index.md'));
+
+  // ---- 实际文件 ----
+  const files = fs.readdirSync(dir).filter((f) => /^\d{4}-.+\.md$/.test(f)).sort();
+  assert(files.length >= 5, `ADR 至少应有 5 条（当前 ${files.length}）——少于此说明解析口径已失效`);
+
+  const nums = files.map((f) => Number(f.slice(0, 4)));
+  for (let i = 0; i < nums.length; i += 1) {
+    assertEqual(nums[i], i + 1, `ADR 编号必须从 1 起连续递增，实际第 ${i + 1} 个文件的编号是 ${nums[i]}`);
+  }
+
+  // ---- 索引侧 ----
+  const block = /<!-- ADR-LIST-BEGIN -->([\s\S]*?)<!-- ADR-LIST-END -->/.exec(index);
+  assert(block, 'ADR 索引缺少 `<!-- ADR-LIST-BEGIN --> … <!-- ADR-LIST-END -->` 围栏，无法机器校验');
+  const rows = block[1].split('\n')
+    .filter((l) => /^\|\s*\d+\s*\|/.test(l))
+    .map((l) => l.split('|').map((c) => c.trim()));
+  assertEqual(rows.length, files.length,
+    `索引登记 ${rows.length} 条、实际 ${files.length} 个文件——两边必须一致。`);
+
+  const listed = new Set();
+  for (const [, num, , file] of rows) {
+    const fname = /\]\(([^)]+)\)/.exec(file);
+    assert(fname, `索引第 ${num} 行缺少文件链接：[${file}]`);
+    listed.add(fname[1]);
+    // 编号 ↔ 文件名前缀：编号列才是本表唯一的锚
+    assert(fname[1].startsWith(String(num).padStart(4, '0')),
+      `索引第 ${num} 行指向 ${fname[1]}：编号必须与文件名前缀一致`);
+    const p = path.join(dir, fname[1]);
+    assert(fs.existsSync(p), `索引指向不存在的 ADR 文件：${fname[1]}`);
+    const body = fs.readFileSync(p, 'utf8');
+    const missing = ADR_SECTIONS.filter((s) => !body.includes(s));
+    assertEqual(missing.length, 0,
+      `${fname[1]} 缺少小节：${missing.join('、')} —— ADR 的价值在于「理由与被否决的替代方案」，`
+      + '缺了就只是一段说明');
+  }
+  const orphan = files.filter((f) => !listed.has(f));
+  assertEqual(orphan.length, 0, `ADR 文件存在但索引未登记（会成为找不到的孤儿）：${orphan.join(', ')}`);
+});
+
+/**
  * 目录（TOC）是全文手工维护的锚点清单：插入或删除一个章节会让后续编号整体位移，
  * 历史上多次出现「正文改了、目录没跟着改」导致锚点全部错位。这里把
  * 「目录条目 ↔ 正文标题」做成双向断言，任何一处漏改都会立刻变红。

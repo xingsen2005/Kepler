@@ -172,3 +172,92 @@ test('R66-04 · /health 的 bucketCount / lastWriteAt 只给管理员（普通�
     await srv.close();
   }
 });
+
+/* ==================================================================== */
+/* R67 · 拆包不变量（server/webdav/ 是本仓库第一个「入口 + 包目录」形态）    */
+/* ==================================================================== */
+
+/**
+ * 为什么拆包之后必须再加这三条
+ *
+ * 把一个 1496 行的文件拆成「入口 facade + 包目录」之后，最可能悄悄坏掉的是**结构**，
+ * 而且三种坏法都不会让任何行为测试变红：
+ *
+ *  ① **孤儿文件**：把某个模块从 app.js 的 require 里删掉，代码还在、测试也还绿
+ *     （那条路径只是不再被调用），但下一次改它的人会以为它还在生效。
+ *  ② **反向依赖**：为了拿到 `buildApp` 而让 `defs.js` 去 require `./app` —— 立刻成环，
+ *     表现为**启动时某个导出是 undefined**，而不是报错。
+ *  ③ **实现搬回 facade**：拆完之后图省事把新逻辑写在入口文件里，几个月后它又变成
+ *     一个巨型文件，而这次没有任何东西会提醒你。
+ *
+ * 三条都只做**结构断言**（谁 require 谁、谁里有路由注册），不碰行为 —— 行为由既有的
+ * 1100+ 条用例管。
+ */
+const WEBDAV_DIR = path.join(ROOT, 'server', 'webdav');
+const WEBDAV_ENTRY = path.join(ROOT, 'server', 'webdav-server.js');
+const webdavFiles = () => fs.readdirSync(WEBDAV_DIR).filter((f) => f.endsWith('.js')).sort();
+
+test('R67-01 · server/webdav/ 内不得有孤儿文件（每个都必须被 require）', () => {
+  assert(fs.existsSync(WEBDAV_DIR), 'server/webdav/ 不存在 —— 拆包结构已被还原，本组断言失去对象');
+  const files = webdavFiles();
+  assert(files.length >= 5,
+    `server/webdav/ 至少应有 5 个模块（当前 ${files.length}）—— 少于此说明拆包被回退了`);
+
+  // 扫描范围：server/ 下全部 js（含包内互引）+ 入口文件
+  const sources = [];
+  const walk = (dir) => {
+    for (const e of fs.readdirSync(dir, { withFileTypes: true })) {
+      const p = path.join(dir, e.name);
+      if (e.isDirectory()) walk(p);
+      else if (e.name.endsWith('.js')) sources.push(read(p));
+    }
+  };
+  walk(path.join(ROOT, 'server'));
+  const all = sources.join('\n');
+
+  const orphan = files.filter((f) => {
+    const base = f.replace(/\.js$/, '');
+    // `require('./app')` / `require('./webdav/app')` 两种写法都算
+    return !new RegExp(`require\\(['"][^'"]*\\b${base.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}['"]\\)`).test(all);
+  });
+  assertEqual(orphan.length, 0,
+    `以下模块没有任何地方 require（拆包后遗留的孤儿）：${orphan.join(', ')}。`
+    + '删掉它，或把它接回调用链 —— 留着会让下一个人以为它还在生效');
+});
+
+test('R67-02 · 依赖方向单向：包内下层不得 require app.js（否则成环）', () => {
+  const LOWER = ['defs.js', 'util.js', 'listing.js', 'auth.js', 'xml.js'];
+  const bad = [];
+  for (const f of LOWER) {
+    const p = path.join(WEBDAV_DIR, f);
+    if (!fs.existsSync(p)) continue;
+    const src = read(p);
+    if (/require\((['"])\.\/app\1\)/.test(src)) bad.push(f);
+  }
+  assertEqual(bad.length, 0,
+    `${bad.join(', ')} 反向 require 了 ./app —— 依赖必须单向（app → 下层），`
+    + '成环的表现是「某个导出在启动时是 undefined」，而不是报错');
+
+  // 反向自检：app.js 自身确实 require 了下层（否则上一条会恒绿）
+  const appSrc = read(path.join(WEBDAV_DIR, 'app.js'));
+  const usesLower = LOWER.filter((f) => new RegExp(`require\\(['"]\\./${f.replace('.js', '')}['"]\\)`).test(appSrc));
+  assert(usesLower.length >= 3,
+    `app.js 应至少 require 3 个下层模块（当前 ${usesLower.join(',') || '无'}）—— `
+    + '若为 0，说明它自己又写了一份实现，上一条的方向判据也就失去意义');
+});
+
+test('R67-03 · 入口文件只做生命周期：不得再注册任何路由', () => {
+  const entry = read(WEBDAV_ENTRY);
+  const code = entry.split('\n').filter((l) => !/^\s*(\*|\/\/|\/\*)/.test(l)).join('\n');
+  /* 负向判据必须剥注释：本文件的说明注释里正当地提到了 `app.put(` 之类的字样 */
+  const routes = code.match(/\bapp\.(get|put|post|delete|head|options|all|use)\s*\(/g) || [];
+  assertEqual(routes.length, 0,
+    `webdav-server.js 里仍有 ${routes.length} 处路由/中间件注册（${routes.join(', ')}）—— `
+    + '协议实现必须留在 server/webdav/app.js，否则拆包会在几个月内被「顺手写回来」磨平');
+
+  /* 正向自检：真正的注册点必须仍在 app.js 里，否则「入口很干净」可以靠「哪儿都没有」达到 */
+  const appCode = read(path.join(WEBDAV_DIR, 'app.js'));
+  const appRoutes = appCode.match(/\bapp\.(get|put|post|delete|head|propfind|mkcol|options)\s*\(/g) || [];
+  assert(appRoutes.length >= 5,
+    `app.js 应至少有 5 处路由注册（当前 ${appRoutes.length}）—— 为 0 说明路由已不在它手里`);
+});

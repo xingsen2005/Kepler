@@ -28,7 +28,7 @@ const os = require('os');
 const path = require('path');
 const http = require('http');
 const { test } = require('node:test');
-const { ROOT, assert, assertEqual, assertReject, cleanupTempDir } = require('./helpers.js');
+const { ROOT, assert, assertEqual, assertReject, cleanupTempDir, packageSource } = require('./helpers.js');
 
 const TMP = fsc.mkdtempSync(path.join(os.tmpdir(), 's3-audit25-'));
 process.env.S3_DATA_DIR = TMP;
@@ -400,7 +400,7 @@ test('R25-06 · 新建存储桶入口超限必须拒绝；未超限必须放行'
 /* ==================================================================== */
 
 test('R25-07 · WebDAV 的 PUT（目录 / 文件）/ MKCOL / COPY·MOVE 都接了配额闸门', () => {
-  const code = withoutCommentLines(read('server/webdav-server.js'));
+  const code = withoutCommentLines(packageSource('server/webdav-server.js', 'server/webdav'));
 
   const putStart = code.indexOf("app.put('*'");
   const mkcolStart = code.indexOf("app[ 'MKCOL'.toLowerCase() ]");

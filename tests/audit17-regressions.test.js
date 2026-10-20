@@ -29,6 +29,7 @@ process.env.TRUST_PROXY = '1';
 process.env.HOST = 'pan.example.com';
 
 require('./helpers'); // 兜底 S3_DATA_DIR 到临时目录
+const { packageSource } = require('./helpers');
 
 const ROOT = path.join(__dirname, '..');
 const read = (p) => fs.readFileSync(p, 'utf8');
@@ -128,7 +129,7 @@ test('R17-01 · 取 IP 只有一份实现，WebDAV 复用同一套守卫判定',
     + '「请求方自称回环」）');
 
   // WebDAV 是独立 Express 实例，一旦它自己取 IP，「一处修复整体生效」就不成立
-  assert.match(read(WEBDAV), /ipGuard\.guardRequest\(req\)/,
+  assert.match(packageSource('server/webdav-server.js', 'server/webdav'), /ipGuard\.guardRequest\(req\)/,
     'WebDAV 必须复用 guardRequest，否则同一份屏蔽规则在 /dav 上仍形同虚设');
 });
 

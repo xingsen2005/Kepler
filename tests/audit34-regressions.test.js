@@ -189,7 +189,7 @@ test('R34 · 判据唯一实现点 `inMount`：`/` 与 `/dav` 同等，`/davx` �
 });
 
 test('R34 · 源码内不得再出现手写的前缀判据（9 处分散正是根路径漏判的成因）', () => {
-  const src = fs.readFileSync(path.join(ROOT, 'server', 'webdav-server.js'), 'utf8');
+  const src = require('./helpers').packageSource('server/webdav-server.js', 'server/webdav');
   // 注释里允许提到历史写法（本文件头就在解释它），因此先剥注释只查代码
   const code = src
     .replace(/\/\*[\s\S]*?\*\//g, '')
