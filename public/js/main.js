@@ -902,6 +902,28 @@ async function submitForgotReset({ identifier, code, password, confirm }, btn) {
   }
 }
 
+/**
+ * R64：分享页「登录」入口带回的跳转目标。
+ *
+ * 分享页右上角的「登录」是一条 `/?next=%2Fs%2F<id>` 链接 —— 登录成功后应当
+ * 回到那条分享链接，而不是把用户丢进管理端首页（他不一定是管理员，可能只是
+ * 想回来看自己买过的东西）。
+ *
+ * 判据刻意**只放行 `/s/<id>` 这一个形状**：
+ *  · 不做「同源相对路径」这种宽口径 —— `?next=` 是 URL 参数，若允许任意路径，
+ *    它就是一个可被外部链接利用的开放重定向（钓鱼者发一条 `/?next=/api/...`）；
+ *  · 拒绝 `//evil.com`、`/\evil.com`、绝对 URL —— 正则的首字符就钉死了单个 `/`。
+ *
+ * 非法 / 缺失时返回空串，调用方按原逻辑留在管理端。
+ */
+function takeShareNext() {
+  let raw = '';
+  try {
+    raw = new URLSearchParams(location.search).get('next') || '';
+  } catch (e) { return ''; }
+  return /^\/s\/[A-Za-z0-9_-]{1,64}$/.test(raw) ? raw : '';
+}
+
 async function doAuthSubmit() {
   const submitBtn = document.getElementById('btn-auth-submit');
   const rememberBox = document.getElementById('auth-remember');
@@ -993,6 +1015,12 @@ async function doAuthSubmit() {
       resetMainView();
       renderUserMenu();
       hideAuthOverlay();
+      /**
+       * R64：从分享页的「登录」链接过来时，登录成功即回到那条分享链接。
+       * 放在 `bootstrapApp()` **之前** —— 立刻离开，不必先拉一遍管理端数据。
+       */
+      const back = authMode === 'login' ? takeShareNext() : '';
+      if (back) { location.replace(back); return; }
       await bootstrapApp();
       const who = r.user.username;
       toast(authMode === 'init' ? '管理员账户创建成功，欢迎使用'

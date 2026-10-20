@@ -26,6 +26,21 @@
  *  - 已支付凭证用 HMAC 票据绑定「链接 + 订单」，无法被猜测或跨链接复用。
  *  - 文件名 / 对象键同样**快照**进订单：分享链接被删除后，订单管理页仍要能
  *    回答"这笔钱是为哪个文件付的"。只存 linkId 的话，删链接 = 订单失去上下文。
+ *
+ * ## R64：两个「订单号」
+ *
+ * | 字段 | 谁看得见 | 用途 |
+ * | --- | --- | --- |
+ * | `id` | 内部 | 记录主键；**同时是支付网关侧的商户订单号**（`out_trade_no` / `reference_id`） |
+ * | `orderNo` | 用户 | 36 位「时间戳 + 链接 UID + 用户 UID + 随机串」，售后与「恢复购买」的唯一凭证 |
+ *
+ * 为什么不把 `id` 直接换成长订单号：微信支付 v3 的 `out_trade_no` **最长 32 位**，
+ * 而需求要求订单号 36 位 —— 把 36 位塞进去，微信渠道会整条不可用（下单直接报参数
+ * 错误），且通知里的 `out_trade_no` 再也无法精确定位订单。两个标识各司其职：
+ * 网关只认短的那个（历史订单的 `id` 本来就是它），用户只认长的那个。
+ *
+ * `orderNo` 的生成 / 校验全部收口在 `server/order-no.js`，本模块只负责**存**与
+ * **查**（并保证同一店铺内不撞号）。
  */
 const crypto = require('crypto');
 const fs = require('fs');
@@ -34,6 +49,7 @@ const configStore = require('./config-store');
 const secureStore = require('./secure-store');
 const statsStore = require('./stats-store');
 const coalesce = require('./coalesce');
+const orderNo = require('./order-no');
 
 // 数据目录：走 data-dir.js 的唯一实现点（`S3_DATA_DIR`），与 tests/helpers.js 约定的
 // 隔离手段一致 —— 未设置时落到项目 data/，
@@ -187,13 +203,34 @@ function create({
   // R62：优惠券相关的**快照**。券可能事后被删除 / 改配置，订单必须自己记住
   // 「原价多少、优惠多少、用的是哪张券」，否则历史订单的对账信息会随券一起消失。
   originalFen, discountFen, couponCode, couponId, couponType,
+  // R64：下单人身份（已登录时非空）。「查看历史订单」按它归集；游客为空，
+  // 其订单只能凭订单号取回（见 claimForLink）。
+  userId, userName,
 }) {
   const orders = load().orders;
   const now = new Date().toISOString();
   const paid = Number(amountFen) || 0;
   const orig = Number(originalFen) > 0 ? Number(originalFen) : paid;
+  /**
+   * R64：订单号。撞号即重摇（同一毫秒 + 同一链接 + 同一账号时只有 5 位随机串
+   * 在变，62^5 ≈ 9.2e8，正常业务量下几乎不可能撞；但"几乎"不是"绝不"，
+   * 而两笔订单共用同一个取回凭证的后果是**付了钱却取回别人的订单**）。
+   */
+  let made = orderNo.compose({ linkId, userId });
+  for (let i = 0; i < 8 && orders.some((x) => x.orderNo === made.no); i++) {
+    made = orderNo.compose({ linkId, userId });
+  }
   const o = {
     id: newId(),
+    /**
+     * 36 位用户可见订单号（见 `server/order-no.js`）。它是「恢复购买」的输入，
+     * 也是用户唯一需要保存的东西 —— 与他看到的、抄下来的**逐字符相同**。
+     */
+    orderNo: made.no,
+    linkUid: made.linkUid, // 订单号里那一段的可读副本（对账 / 排障用）
+    userUid: made.userUid, // 同上；游客为按单随机的 9 位
+    userId: String(userId || ''), // R64：账号 id（游客为空串）
+    userName: String(userName || ''), // 快照用户名：账号被删后历史订单仍可读
     linkId: String(linkId),
     platform: String(platform || ''),
     amountFen: paid,
@@ -387,6 +424,105 @@ function listForLink(linkId) {
     .sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
 }
 
+/**
+ * R64：按**用户可见订单号**查找。
+ *
+ * 同时接受内部的 `id`：R64 之前的订单只有 `id`（那时页面上的「订单号」就是它），
+ * 而用户手里可能还留着那个值 —— 售后对账、恢复购买都不该因为"版本升级"而认不出来。
+ * 两者的匹配都不区分来源，因此**新旧订单号一律可用**。
+ */
+function findByOrderNo(no) {
+  const raw = String(no || '').trim();
+  if (!raw) return null;
+  const orders = load().orders;
+  /**
+   * ⚠️ **精确匹配优先**：老订单的 `id` 是 base64url，可能含 `-` / `_`，
+   * 而 `normalize()` 会把这两个字符当成分组符抹掉（新订单号只含字母数字，
+   * 抹了没影响）。若一上来就用抹过的串去查，一个恰好含 `-` 的老订单号会
+   * 永远查不到 —— 因此先按原样比一遍，再退回"抹掉分隔符"的那一遍。
+   */
+  const exact = orders.find((o) => o.orderNo === raw || o.id === raw);
+  if (exact) return exact;
+  const slim = orderNo.normalize(raw);
+  if (slim === raw) return null;
+  return orders.find((o) => o.orderNo === slim || o.id === slim) || null;
+}
+
+/**
+ * R64：某个账号的**全部订单**（含未成交的，按创建时间倒序）。
+ *
+ * 过滤口径交给调用方（分享页只要 `paid` / `refunded`）—— 这里不预设，
+ * 否则「历史订单」与「订单管理」会各有一套"什么算历史"的判据。
+ *
+ * ⚠️ 只认 `userId` 快照，**绝不**按 IP 或昵称近似归集：按 IP 会把同一出口
+ * 后面的不同人混在一起（别人买的东西出现在你的历史订单里），那是数据泄露。
+ */
+function listForUser(userId) {
+  const uid = String(userId || '');
+  if (!uid) return [];
+  return load().orders
+    .filter((o) => o.userId === uid)
+    .sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+}
+
+/**
+ * R64：「恢复购买」的唯一判定点 —— 订单号 → 可作为下载凭证的订单。
+ *
+ * 需求前提：**只有「支付成功」的订单**能取回下载权限。因此这里按顺序回答四件事：
+ *   ① 订单号存在吗（不存在 / 不属于本链接一律给**同一条**文案，避免把订单号
+ *      是否存在变成可探测的预言机）；
+ *   ② 它是**这条链接**的订单吗（权威判据是订单上的 `linkId`，不是订单号里的
+ *      `linkUid` —— 后者只是派生值，换派生口径不该让历史订单失效）；
+ *   ③ 它支付成功了吗（`pending` / `failed` / `refunded` 都拒绝，并各给一条能
+ *      指导下一步的文案）；
+ *   ④ 通过则返回订单，由路由签发该链接的支付凭证（`orderToken`）。
+ *
+ * @param {string} no 用户输入的订单号（已归一化）
+ * @param {string} linkId 当前分享链接 id
+ * @returns {{ok: boolean, reason: string, order: object|null, message: string}}
+ *   reason: '' | 'invalid' | 'mismatch' | 'pending' | 'failed' | 'refunded'
+ */
+function claimForLink(no, linkId) {
+  /**
+   * ⚠️ 这里交给 `findByOrderNo()` **原样**处理，不要先 `normalize`：
+   * 老订单的 id 是 base64url，可能含 `-` / `_`，先抹掉分隔符就再也命中不了
+   * 那笔订单（`findByOrderNo` 内部会先按原样比一遍、再退回抹掉分隔符的那遍）。
+   */
+  const o = findByOrderNo(no);
+  const target = String(linkId || '');
+  if (!o || o.linkId !== target) {
+    return {
+      ok: false,
+      reason: 'invalid',
+      order: null,
+      message: '未找到该订单号，或该订单号不属于当前分享链接。请核对后重试。',
+    };
+  }
+  if (o.status === 'paid') return { ok: true, reason: '', order: o, message: '' };
+  if (o.status === 'refunded') {
+    return {
+      ok: false,
+      reason: 'refunded',
+      order: o,
+      message: '该订单已被分享者标记为已退款，原支付凭证已失效，无法凭它取回下载权限。',
+    };
+  }
+  if (o.status === 'failed') {
+    return {
+      ok: false,
+      reason: 'failed',
+      order: o,
+      message: '该订单支付未成功，不能作为下载凭证。请完成支付后再试。',
+    };
+  }
+  return {
+    ok: false,
+    reason: 'pending',
+    order: o,
+    message: '该订单尚未支付成功。若已付款，请稍等片刻后重试；否则请先完成支付。',
+  };
+}
+
 /** 某链接已支付订单数（供管理端展示收入概况） */
 function paidCountForLink(linkId) {
   return listForLink(linkId).filter((o) => o.status === 'paid').length;
@@ -562,6 +698,12 @@ function view(o) {
   if (!o) return null;
   return {
     id: o.id,
+    /**
+     * R64：用户可见订单号。历史订单没有这个字段 ⇒ 回退到 `id`（那时页面上
+     * 显示的「订单号」就是它，用户手里留着的也是它）—— 只看 `orderNo` 会让
+     * 升级前的订单在订单管理页显示成空单元格。
+     */
+    orderNo: o.orderNo || o.id,
     linkId: o.linkId,
     platform: o.platform,
     amountFen: o.amountFen,
@@ -586,6 +728,8 @@ function view(o) {
 module.exports = {
   MAX_ORDERS_PER_LINK, MAX_ORDERS_TOTAL, PAYMENT_WRITE_DEBOUNCE_MS,
   create, get, findByTradeNo, listForLink, listAll, paidCountForLink,
+  // R64：订单号取回 —— 按用户可见订单号查找 / 按账号归集 / 「恢复购买」的唯一判定点
+  findByOrderNo, listForUser, claimForLink,
   pruneGlobal, // R8-25：导出以供测试直接驱动跨链接裁剪
   removeFailed, // R32-01：管理端「删除失效订单」（仅 failed；paid/refunded/在途 pending 不动）
   flush, // R14-09：去抖落盘的强制刷写（优雅停机 / 测试）

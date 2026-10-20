@@ -11,6 +11,21 @@
  *
  * 三种限制（有效期 / 次数 / 密码）由 share-store 统一判定，可任意组合。
  * 第四种限制「付费下载」见下方 —— 未支付 / 支付中 / 支付失败一律禁止下载。
+ *
+ * ## R64：取回下载权限的三条入口
+ *
+ * 付费链接一旦丢了「支付凭证 Cookie」（换设备、清缓存、Cookie 过期七天），
+ * 付过钱的人就再也进不去下载页 —— 旧版本只能重新付款。本轮补上两条路：
+ *
+ *  - `GET|POST /s/:id/restore`  **恢复购买**：输入订单号取回（游客的主路径，
+ *    因为他没有账号可以归集订单）；
+ *  - `GET /s/:id/history`       **查看历史订单**：已登录用户看自己的全部已购订单，
+ *    外加免费下载过的文件（只记首次，见 `download-log.js`），逐条可重新下载。
+ *
+ * 另有 `POST /s/:id/logout`：右上角「退出登录」。分享页是服务端渲染的普通文档，
+ * 发不了带 `X-Requested-With` 头的请求（`/api/auth/logout` 的 CSRF 要求），
+ * 因此这里给分享侧开一条**同源表单**可提交的退出口 —— 它仍受本文件顶部那道
+ * 「非安全方法必须同源」的校验保护。
  */
 const express = require('express');
 const { PassThrough } = require('stream');
@@ -27,6 +42,10 @@ const paymentGateway = require('./payment-gateway');
 const couponStore = require('./coupon-store');
 // R62：分享页也要能认出「已登录的人」—— 只有这样「限特定用户」与「每人一次」才成立
 const authSession = require('./auth-session');
+// R64：订单号编解码（36 位「时间戳 + 链接 UID + 用户 UID + 随机串」的唯一实现点）
+const orderNo = require('./order-no');
+// R64：免费下载记录 —— 「查看历史订单」里「免费下载的文件」的唯一来源（只记首次）
+const downloadLog = require('./download-log');
 const { getClient, p, tracked } = require('./s3');
 const { streamDownload } = require('./download-stream');
 // R51：勾选多个（或含文件夹）时的打包下发 —— 零依赖 tar.gz，见该模块文件头
@@ -139,6 +158,36 @@ const couponCookieName = (id) => 'sp_' + id + '_coupon';
  */
 const ENC_COOKIE = 'ke_enc';
 
+/**
+ * R64：把「当前访问者是谁」与「当前是哪条分享链接」贴到 `res.locals` 上。
+ *
+ * 为什么走中间件而不是给每个页面函数加参数：分享页有十来处渲染入口
+ * （信息页 / 列表页 / 支付页 / 二维码页 / 密码页 / 错误页…），而右上角的
+ * 「登录 / 退出登录」在**每一张页面**上都要出现。逐个传参意味着每加一个页面
+ * 都要记得补一次 —— 漏一处就是"某些页面右上角没有退出入口"，而这种漏
+ * 只有截图才发现。`renderPage()` 读 `res.locals` 一处即可全覆盖。
+ *
+ * ⚠️ 只做一次会话解析（内存 Map 查询），不触网、不读写磁盘，对演示页的开销可忽略。
+ */
+router.use((req, res, next) => {
+  let user = null;
+  try {
+    const token = authSession.parseToken(req);
+    const s = token ? authSession.getSession(token) : null;
+    user = s && s.user ? { id: String(s.user.id || ''), username: String(s.user.username || '') } : null;
+  } catch (e) { user = null; }
+  res.locals.shareUser = user;
+  // 路径形如 /s/<id>、/s/<id>/dl、/s/<id>/history…；取第一段
+  const m = /^\/s\/([^/]+)/.exec(String(req.path || ''));
+  res.locals.shareLinkId = m ? m[1] : '';
+  next();
+});
+
+/** 当前请求的登录用户（无会话时返回 null）—— 「已登录」的唯一判据 */
+function shareUser(req) {
+  return (req && req.res && req.res.locals && req.res.locals.shareUser) || null;
+}
+
 /** 轮询查单的最小间隔（毫秒）—— 与页面轮询间隔一致，避免被刷成网关压力 */
 const STATUS_QUERY_MIN_GAP_MS = 3000;
 const statusQueryAt = new Map(); // orderId -> 上次查单时间戳
@@ -225,9 +274,9 @@ function payerStateFor(l, req) {
  *    `validateForUse()` 里要求 `userId` 非空且命中名单，匿名访客必然被判 `wrong_user`。
  */
 function visitorIdentity(req) {
-  const token = authSession.parseToken(req);
-  const session = token ? authSession.getSession(token) : null;
-  const userId = session && session.user ? String(session.user.id || '') : '';
+  // R64：会话解析收敛到 `shareUser()`（挂在 `res.locals` 上的那一次），不再各解析一遍
+  const me = shareUser(req);
+  const userId = me ? me.id : '';
   return {
     userId,
     identity: couponStore.identityFrom({
@@ -278,6 +327,53 @@ function getCookie(req, name) {
 
 function esc(s) {
   return String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+}
+
+/* ---------------------- R64：取回下载权限的入口 ---------------------- */
+
+/**
+ * 卡片下方的入口链接 —— **付费链接才有**（需求 1 / 2）。
+ *
+ * 两条分支的判据只有一个：当前请求有没有登录会话。
+ *  · 未登录 → 「恢复购买」：凭订单号取回（游客没有账号可归集订单，只能靠号码）；
+ *  · 已登录 → 「查看历史订单」：自己的全部已购订单 + 免费下载记录。
+ *
+ * ⚠️ 位置是「卡片下方」而不是卡片内的某一处：两张入口在**所有**支付相关页面
+ * 上都要出现（含「未支付」的付费页）—— 因为丢凭证的人看到的正是**未支付**页，
+ * 而那时他最需要的恰恰是「恢复购买」。
+ */
+function paidBelowHtml(l, res) {
+  const id = esc(l.id);
+  const acct = res && res.locals ? res.locals.shareUser : null;
+  if (acct) {
+    return `<a class="tag-link" href="/s/${id}/history">查看历史订单</a>`;
+  }
+  return `<a class="tag-link" href="/s/${id}/restore">恢复购买</a>`;
+}
+
+/**
+ * 订单号展示块（需求 3②）—— 展示 + 一键复制 + 唯一凭证提示。
+ *
+ * 复制走 `public/js/share-order.js`（同源普通脚本，CSP 不允许内联脚本）；
+ * 脚本不可用时订单号本身就是可选中的文本，仍能手工抄下来。
+ */
+function orderNoBox(no) {
+  const v = String(no || '');
+  if (!v) return '';
+  return `
+      <div class="orderno-box">
+        <div class="orderno-label">订单号</div>
+        <div class="orderno-row">
+          <code class="orderno" id="order-no">${esc(v)}</code>
+          <button class="copybtn" type="button" data-copy-order="${esc(v)}">复制</button>
+        </div>
+        <div class="orderno-tip">请妥善保存：订单号是售后和取回下载权限的唯一凭证。</div>
+      </div>`;
+}
+
+/** 订单号展示块 + 复制脚本（两处都要用，合并成一个片段避免漏挂脚本） */
+function orderNoScript() {
+  return '<script src="/js/share-order.js" defer></script>';
 }
 
 /* ---------------------- R21-01：加密访问门禁 ---------------------- */
@@ -340,13 +436,19 @@ function fmtDate(iso) {
 
 /* ------------------------------ 页面模板 ------------------------------ */
 
-function renderPage(res, status, { title, head, body, wide }) {
+function renderPage(res, status, { title, head, body, wide, below }) {
   /**
    * R13-07：状态码白名单。全部调用方都传本地字面量（含 401 = 分享密码错误页，属本地语义），
    * 白名单把这份「本地性」变成机器可查的凭据 —— 上游状态若意外渗入（例如把云端错误码
    * 直接当页面状态）会被收敛成 500，而不会占用本地 401/403 语义。
    */
   const code = [200, 400, 401, 402, 403, 404, 410, 429, 503].indexOf(status) >= 0 ? status : 500;
+  const acct = (res.locals && res.locals.shareUser) || null;
+  const linkId = (res.locals && res.locals.shareLinkId) || '';
+  const accountBar = acct
+    ? `<span class="tb-user" title="${esc(acct.username)}">${esc(acct.username)}</span>
+      <form method="POST" action="/s/${esc(linkId)}/logout" class="tb-form"><button class="tb-link" type="submit">退出登录</button></form>`
+    : `<a class="tb-link" href="/${linkId ? `?next=${encodeURIComponent('/s/' + linkId)}` : ''}">登录</a>`;
   res.status(code).type('html').send(`<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
@@ -387,6 +489,11 @@ function renderPage(res, status, { title, head, body, wide }) {
   input[type=password] { width: 100%; border: 1px solid #d5dbe3; border-radius: 8px;
     padding: 11px 12px; font-size: 15px; outline: none; }
   input[type=password]:focus { border-color: #0067c0; box-shadow: 0 0 0 3px rgba(0,103,192,.12); }
+  /* R64：订单号输入框（恢复购买）。与密码框同一形态，等宽字体便于核对号码 */
+  input[type=text] { width: 100%; border: 1px solid #d5dbe3; border-radius: 8px;
+    padding: 11px 12px; font-size: 14px; outline: none;
+    font-family: Consolas, "Courier New", monospace; letter-spacing: .02em; }
+  input[type=text]:focus { border-color: #0067c0; box-shadow: 0 0 0 3px rgba(0,103,192,.12); }
   .foot { margin-top: 22px; text-align: center; color: #b3b9c2; font-size: 11px; }
   .icon-big { width: 46px; height: 46px; border-radius: 12px; margin-bottom: 16px;
     display: flex; align-items: center; justify-content: center; }
@@ -460,14 +567,68 @@ function renderPage(res, status, { title, head, body, wide }) {
   .sl-tip { color: #8a8f98; font-size: 12px; line-height: 1.7; margin: 10px 0 0; }
   /* R51：中文档名很长时，文件名那一列不能被图标与大小挤没（min-width:0 + break-all） */
   .sl-row .sl-name { overflow-wrap: anywhere; }
+  /* ---------- R64：右上角「登录 / 退出登录」 + 卡片下方的「取回下载权限」入口 ---------- */
+  /* 固定在视口右上角（需求：在整个页面的右上角）。用 fixed 而不是绝对定位在卡片里：
+     卡片宽度随 wide 变化，贴卡片右上角会让不同页面的位置漂移。 */
+  .topbar { position: fixed; top: 0; right: 0; z-index: 10; display: flex;
+    align-items: center; gap: 8px; padding: 14px 18px; font-size: 13px; line-height: 1.4; }
+  .topbar .tb-user { color: #8a8f98; max-width: 150px; overflow: hidden;
+    text-overflow: ellipsis; white-space: nowrap; }
+  .tb-form { display: inline; margin: 0; }
+  .tb-link { color: #0067c0; text-decoration: none; background: none; border: 0;
+    font: inherit; cursor: pointer; padding: 3px 6px; border-radius: 6px; }
+  .tb-link:hover { background: #e8f1fb; }
+  /* 卡片与它下方的链接同处一列：body 是 flex 居中，故外面套一层纵向容器 */
+  .page { width: 100%; display: flex; flex-direction: column; align-items: center; }
+  .below-card { width: 100%; max-width: 460px; margin-top: 14px; text-align: center; font-size: 13px; }
+  .below-card.wide { max-width: 860px; }
+  .tag-link { color: #0067c0; text-decoration: none; border-bottom: 1px dashed #9dc4e8; padding-bottom: 1px; }
+  .tag-link:hover { border-bottom-style: solid; }
+  /* 订单号：等宽字体 + 可换行（36 位在窄屏上必然折行，不许被 ellipsis 吃掉半个号码） */
+  .orderno-box { margin-top: 18px; border: 1px solid #dbe6f1; background: #f7fbff;
+    border-radius: 10px; padding: 12px 13px; }
+  .orderno-label { color: #5b6472; font-size: 12px; margin-bottom: 8px; }
+  .orderno-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .orderno { font-family: Consolas, "Courier New", monospace; font-size: 13px;
+    letter-spacing: .02em; color: #1b1b1b; word-break: break-all; flex: 1 1 190px; min-width: 0; }
+  .copybtn { flex: 0 0 auto; border: 1px solid #b9d4ea; background: #fff; color: #0067c0;
+    border-radius: 6px; padding: 4px 10px; font-size: 12px; cursor: pointer; }
+  .copybtn:hover { background: #e8f1fb; }
+  .orderno-tip { color: #b45309; font-size: 12px; line-height: 1.7; margin-top: 8px; }
+  /* 历史订单 / 恢复购买的列表行 */
+  .hs-sec { margin-top: 18px; }
+  .hs-title { font-size: 13px; color: #5b6472; margin-bottom: 8px; }
+  .hs-list { border: 1px solid #e5e8ec; border-radius: 10px; overflow: hidden; }
+  .hs-row { display: flex; align-items: flex-start; gap: 10px; padding: 11px 12px;
+    border-bottom: 1px solid #f2f4f7; font-size: 13px; }
+  .hs-row:last-child { border-bottom: 0; }
+  .hs-main { flex: 1; min-width: 0; }
+  .hs-name { word-break: break-all; line-height: 1.6; }
+  .hs-meta { color: #8a8f98; font-size: 12px; margin-top: 3px; }
+  .hs-no { margin-top: 5px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .hs-no code { font-family: Consolas, "Courier New", monospace; font-size: 12px;
+    color: #5b6472; word-break: break-all; }
+  .hs-act { flex: 0 0 auto; color: #0067c0; text-decoration: none; font-size: 13px;
+    padding: 2px 0; white-space: nowrap; }
+  .hs-act:hover { text-decoration: underline; }
+  .hs-off { flex: 0 0 auto; color: #b3b9c2; font-size: 12px; white-space: nowrap; }
+  .hs-empty { padding: 22px 12px; text-align: center; color: #8a8f98; font-size: 13px; }
+  @media (max-width: 520px) {
+    .topbar { padding: 10px 12px; }
+    .topbar .tb-user { max-width: 96px; }
+  }
 </style>
 </head>
 <body>
-  <div class="card${wide ? ' wide' : ''}">
-    <div class="brand">文件分享</div>
-    ${head || ''}
-    ${body || ''}
-    <div class="foot">注意：该链接由分享者的存储管理系统生成，任何下载行为都会被记录。</div>
+  <div class="topbar">${accountBar}</div>
+  <div class="page">
+    <div class="card${wide ? ' wide' : ''}">
+      <div class="brand">文件分享</div>
+      ${head || ''}
+      ${body || ''}
+      <div class="foot">注意：该链接由分享者的存储管理系统生成，任何下载行为都会被记录。</div>
+    </div>
+    ${below ? `<div class="below-card${wide ? ' wide' : ''}">${below}</div>` : ''}
   </div>
 </body>
 </html>`);
@@ -505,7 +666,10 @@ function statePage(res, state, l, customMsg) {
 
 /**
  * 信息页（含下载按钮）。
- * @param {object} opts {extraRows: [[label, html]], note: string, noteKind: 'ok'|'warn'}
+ * @param {object} opts {extraRows: [[label, html]], note: string, noteKind: 'ok'|'warn',
+ *                       order: object, below: string}
+ *   `order` —— R64：已支付的订单，用于展示订单号（唯一凭证）；未支付时为空。
+ *   `below` —— R64：卡片下方的「恢复购买 / 查看历史订单」入口，由 `paidBelowHtml()` 生成。
  */
 function infoPage(res, l, opts = {}) {
   const v = shareStore.view(l, { items: true });
@@ -545,7 +709,9 @@ function infoPage(res, l, opts = {}) {
         ${v.hasPassword ? '<div><span>密码保护</span><b>已启用</b></div>' : ''}
         ${extra}
       </div>
-      <a class="btn primary" href="/s/${esc(l.id)}/dl" style="text-align:center;text-decoration:none">下载文件</a>`,
+      <a class="btn primary" href="/s/${esc(l.id)}/dl" style="text-align:center;text-decoration:none">下载文件</a>
+      ${opts.order ? orderNoBox(opts.order.orderNo || opts.order.id) + orderNoScript() : ''}`,
+    below: opts.below,
   });
 }
 
@@ -609,6 +775,7 @@ function payPage(res, l, ps, available, err, note = '', coupon = null) {
         <button class="btn primary" type="submit">立即支付</button>
       </form>
       ${couponBox}`,
+    below: paidBelowHtml(l, res),
   });
 }
 
@@ -627,7 +794,7 @@ function orderMetaRows(order, extra) {
   return `
       <div><span>支付金额</span><b>¥${paymentRules.formatAmount(order.amountFen)}</b></div>
       <div><span>支付方式</span><b>${esc(p ? p.name : order.platform)}</b></div>
-      <div><span>订单号</span><b>${esc(order.id)}</b></div>
+      <div><span>订单号</span><b>${esc(order.orderNo || order.id)}</b></div>
       ${extra || ''}`;
 }
 
@@ -655,7 +822,10 @@ function payingPage(res, l, order) {
       <form method="POST" action="/s/${esc(l.id)}/pay/check">
         <button class="btn primary" type="submit">我已完成支付，立即查询</button>
       </form>
-      <script src="/js/pay-poll.js" data-link-id="${esc(l.id)}" defer></script>`,
+      ${orderNoBox(order.orderNo || order.id)}
+      <script src="/js/pay-poll.js" data-link-id="${esc(l.id)}" defer></script>
+      ${orderNoScript()}`,
+    below: paidBelowHtml(l, res),
   });
 }
 
@@ -678,7 +848,10 @@ function qrPayPage(res, l, order, charge) {
       </div>
       <div class="pay-note">二维码由本服务本地生成，有效期以${esc(p ? p.name : '微信支付')}为准；若二维码过期，请返回上一步重新发起支付。</div>
       <a class="btn ghost" href="/s/${esc(l.id)}" style="text-align:center;text-decoration:none">放弃并重新发起</a>
-      <script src="/js/pay-poll.js" data-link-id="${esc(l.id)}" defer></script>`,
+      ${orderNoBox(order.orderNo || order.id)}
+      <script src="/js/pay-poll.js" data-link-id="${esc(l.id)}" defer></script>
+      ${orderNoScript()}`,
+    below: paidBelowHtml(l, res),
   });
 }
 
@@ -696,10 +869,35 @@ function payFailedPage(res, l, order) {
         <div><span>需付金额</span><b>¥${paymentRules.formatAmount(order.amountFen)}</b></div>
       </div>
       <a class="btn primary" href="/s/${esc(l.id)}" style="text-align:center;text-decoration:none">重新支付</a>`,
+    below: paidBelowHtml(l, res),
   });
 }
 
-/** 下载被拦截（未支付 / 支付中 / 支付失败） */
+/**
+ * R64：把一次**免费**下载记进 `download-log`（「查看历史订单」里那一栏的来源）。
+ *
+ * 三条判据都在这里，调用方不再各自判断：
+ *  · 已登录 —— 游客没有稳定身份，记了也无从归集（且匿名记录的归属只能靠 IP，
+ *    那会把同一出口后的不同人混成一个人）；
+ *  · 本次确实没付费 —— 付过钱的下载属于订单，不该同时出现在"免费下载"里；
+ *  · 同一文件只记首次 —— 由 `download-log.record()` 去重（需求 2②）。
+ *
+ * 位置在**传输成功之后**（与 `markDownloaded` 同一时机）：传输中途失败的文件
+ * 不该出现在"我下载过什么"里。
+ */
+function noteFreeDownloads(req, l, files) {
+  const me = shareUser(req);
+  if (!me || !Array.isArray(files) || !files.length) return 0;
+  try {
+    return downloadLog.record({ userId: me.id, linkId: l.id, files });
+  } catch (e) {
+    return 0; // 记录失败不该影响下载本身（文件已经在传了）
+  }
+}
+
+/**
+ * 下载被拦截（未支付 / 支付中 / 支付失败） */
+
 function payBlockedPage(res, l, ps, payer) {
   const map = {
     none: { code: 402, icon: '💰', bg: '#fdf6ec', fg: '#b45309', title: '需要付费后才能下载', sub: `该文件需支付 ¥${paymentRules.formatAmount(ps.amountFen)} 后方可下载。` },
@@ -717,6 +915,7 @@ function payBlockedPage(res, l, ps, payer) {
       <p class="sub">${esc(s.sub)}${payer.state === 'none' ? '' : ''}</p>
       </div>
       <a class="btn primary" href="/s/${esc(l.id)}" style="text-align:center;text-decoration:none">${payer.state === 'pending' ? '查看支付状态' : '前往支付'}</a>`,
+    below: paidBelowHtml(l, res),
   });
 }
 
@@ -927,6 +1126,10 @@ router.get('/s/:id', async (req, res) => {
         extraRows: paidRows,
         note: '支付已完成，可直接下载。',
         noteKind: 'ok',
+        // R64：订单号是取回下载权限的唯一凭证 —— 已支付页必须给出完整号码
+        order: payer.order,
+        // R64：卡片下方的「查看历史订单 / 恢复购买」
+        below: paidBelowHtml(l, res),
       });
     }
     if (payer.state === 'pending') return payingPage(res, l, payer.order);
@@ -960,6 +1163,16 @@ router.get('/s/:id', async (req, res) => {
  * （快照上限 2000 ⇒ 最多 40 页）。
  */
 const LIST_PAGE_SIZE = 50;
+
+/**
+ * R64：历史订单页每类最多渲染多少行。
+ *
+ * 这个页面**不做分页**（它不在需求里，而分页会再拉一套 `?page=` 语义与测试）：
+ * 一个账号的已购订单通常个位数，免费下载记录也就几十条。上限的作用只是防止
+ * 「有人用脚本刷免费下载记录」把页面撑成几 MB —— 超出部分不渲染，
+ * 真实数据仍在 `download-log` 里（`MAX_RECORDS` 才是容量约束）。
+ */
+const HISTORY_MAX_ROWS = 100;
 
 /** 列表页的一行（复选框 + 类型图标 + 相对路径 + 大小） */
 function listRow(item, shown) {
@@ -1112,13 +1325,15 @@ function listPage(res, l, v, opts = {}) {
         ${pagerHtml(l, page, pages)}
         ${actions}
       </form>
+      ${opts.order ? orderNoBox(opts.order.orderNo || opts.order.id) : ''}
       ${keysJson}
-      <script src="/js/share-list.js" data-link-id="${esc(l.id)}" defer></script>`,
+      <script src="/js/share-list.js" data-link-id="${esc(l.id)}" defer></script>
+      ${opts.order ? orderNoScript() : ''}`,
+    below: opts.below,
   });
 }
 
 /* ------------------------------ 支付 ------------------------------ */
-
 /**
  * 站点对外地址 —— 支付网关回调（notify_url）与支付完成回跳（return_url）的目标。
  *
@@ -1304,8 +1519,12 @@ router.post('/s/:id/pay', asyncHandler(async (req, res) => {
     const amountFen = applied ? applied.payableFen : ps.amountFen;
     // 文件名 / 对象键 / 存储桶一并快照进订单：链接删除后订单管理页仍要能回答
     // "付的什么、来自哪个桶"（R48 的「收入统计」按桶与文件归集）
+    const buyer = shareUser(req); // R64：已登录才有账号可归集；游客为空
     order = paymentOrders.create({
       linkId: l.id, platform, amountFen,
+      // R64：下单人身份 —— 「查看历史订单」按 userId 归集，userName 只是快照
+      userId: buyer ? buyer.id : '',
+      userName: buyer ? buyer.username : '',
       // R62：原价 / 优惠 / 券信息一并快照 —— 券被删掉或改配置后，历史订单仍要
       // 能回答「这笔原价多少、优惠了多少、用的是哪张券」。
       originalFen: ps.amountFen,
@@ -1772,6 +1991,240 @@ router.post('/s/:id', asyncHandler(async (req, res) => {
   return passwordPage(res, l, true);
 }));
 
+/* ------------------- R64：恢复购买 / 历史订单 / 退出登录 ------------------- */
+
+/** 「恢复购买」输入页（游客的主路径：他没有账号可归集订单，只能凭号码取回） */
+function restorePage(res, l, opts = {}) {
+  const err = opts.error ? `<div class="warn">${esc(opts.error)}</div>` : '';
+  renderPage(res, opts.error ? 400 : 200, {
+    title: '恢复购买',
+    head: `<div class="center-head">
+      <div class="icon-big" style="background:#e8f1fb;color:#0067c0;font-size:22px">🧾</div>
+      <h1>恢复购买</h1>
+      <p class="sub">输入付款时拿到的订单号，即可取回这条分享的下载权限，<b>无需再次付费</b>。</p>
+      </div>`,
+    body: `
+      ${err}
+      <form method="POST" action="/s/${esc(l.id)}/restore" style="margin-top:16px">
+        <input type="text" name="orderNo" placeholder="请输入订单号" autofocus autocomplete="off"
+          spellcheck="false" maxlength="64">
+        <button class="btn primary" type="submit">取回下载权限</button>
+      </form>
+      <div class="pay-note">订单号是 36 位字母数字组合（区分大小写），可在支付成功页、
+        历史订单页看到，也可在付款后留意保存。只有<b>支付成功</b>的订单才能取回下载权限。</div>
+      <a class="btn ghost" href="/s/${esc(l.id)}" style="text-align:center;text-decoration:none">返回文件页</a>`,
+  });
+}
+
+/** 订单行（历史订单页）—— 已支付的可直接重新下载，已退款的只如实标注 */
+function historyOrderRow(order, link) {
+  const p = paymentProviders.platform(order.platform);
+  const money = `¥${paymentRules.formatAmount(order.amountFen)}`;
+  const refunded = order.status === 'refunded';
+  const meta = [
+    money,
+    p ? p.name : order.platform,
+    fmtDate(order.paidAt || order.createdAt),
+    refunded ? '已退款' : '',
+  ].filter(Boolean).join(' · ');
+  const act = refunded
+    ? '<span class="hs-off">凭证已失效</span>'
+    : (link
+      ? `<a class="hs-act" href="/s/${esc(order.linkId)}/dl">重新下载</a>`
+      : '<span class="hs-off">分享已删除</span>');
+  return `<div class="hs-row">
+        <div class="hs-main">
+          <div class="hs-name">${esc(order.fileName || '（未知文件）')}</div>
+          <div class="hs-meta">${esc(meta)}</div>
+          <div class="hs-no"><code>${esc(order.orderNo || order.id)}</code>
+            <button class="copybtn" type="button" data-copy-order="${esc(order.orderNo || order.id)}">复制</button></div>
+        </div>
+        ${act}
+      </div>`;
+}
+
+/** 免费下载行（同一份文件只出现一次 —— 由 `download-log.record()` 保证） */
+function historyFreeRow(rec, link) {
+  const act = link
+    ? `<a class="hs-act" href="/s/${esc(rec.linkId)}">查看分享</a>`
+    : '<span class="hs-off">分享已删除</span>';
+  return `<div class="hs-row">
+        <div class="hs-main">
+          <div class="hs-name">${esc(rec.fileName || rec.fileKey)}</div>
+          <div class="hs-meta">免费下载 · ${esc(fmtDate(rec.at))}</div>
+        </div>
+        ${act}
+      </div>`;
+}
+
+/** 历史订单页（仅已登录用户） */
+function historyPage(res, l, { user, orders, free }) {
+  const orderRows = orders.map((o) => historyOrderRow(o, shareStore.get(o.linkId))).join('');
+  const freeRows = free.map((r) => historyFreeRow(r, shareStore.get(r.linkId))).join('');
+  renderPage(res, 200, {
+    wide: true,
+    title: '历史订单',
+    head: `<div class="center-head">
+      <h1>历史订单</h1>
+      <p class="sub">账号 <b>${esc(user.username)}</b> 名下的已购订单与免费下载记录。</p>
+      </div>`,
+    body: `
+      <div class="hs-sec">
+        <div class="hs-title">已购订单（${orders.length}）</div>
+        <div class="hs-list">${orderRows || '<div class="hs-empty">还没有已支付的订单</div>'}</div>
+      </div>
+      <div class="hs-sec">
+        <div class="hs-title">免费下载（${free.length}，同一文件只记首次）</div>
+        <div class="hs-list">${freeRows || '<div class="hs-empty">还没有免费下载记录</div>'}</div>
+      </div>
+      <a class="btn ghost" href="/s/${esc(l.id)}" style="text-align:center;text-decoration:none">返回文件页</a>
+      <script src="/js/share-order.js" defer></script>`,
+  });
+}
+
+/**
+ * 分享页「退出登录」—— 与 `/api/auth/logout` 同一个语义，只是换一种携带方式。
+ *
+ * 为什么不能直接复用 `/api/auth/logout`：它挂在 `/api` 下，`csrfGuard` 要求
+ * 请求带 `X-Requested-With` 头，而分享页是一个**服务端渲染的普通文档**，
+ * 里面只能放原生 `<form>`（CSP 不允许内联脚本，也没有 fetch 的余地）。
+ * 这里改为依赖本文件顶部那道「非安全方法必须同源」的校验（Origin /
+ * Sec-Fetch-Site / Referer 三者任一即可判定），语义上等价。
+ *
+ * 只销毁**当前这一个**会话（与「退出登录」的字面含义一致）；「登出全部设备」
+ * 仍是管理端账号页的能力，不在分享页提供。
+ */
+router.post('/s/:id/logout', (req, res) => {
+  const l = shareStore.get(req.params.id);
+  const token = authSession.parseToken(req);
+  const s = token ? authSession.getSession(token) : null;
+  if (token) authSession.destroySession(token);
+  if (s && s.user) {
+    statsStore.addLog({ action: 'auth.logout', detail: `用户「${s.user.username}」在分享页退出登录` });
+  }
+  // 清除属性必须与下发时一致（Path / HttpOnly / SameSite / Secure），否则浏览器不覆盖
+  res.clearCookie(authSession.COOKIE_NAME, {
+    path: '/',
+    httpOnly: true,
+    sameSite: 'lax',
+    secure: !!security.IS_DEPLOY,
+  });
+  return res.redirect(303, l ? '/s/' + encodeURIComponent(l.id) : '/');
+});
+
+/** 恢复购买（输入页） */
+router.get('/s/:id/restore', (req, res) => {
+  const l = shareStore.get(req.params.id);
+  if (!l) return statePage(res, 'notfound');
+  const st = shareStore.status(l);
+  if (st !== 'active') return statePage(res, st, shareStore.view(l));
+  // 与非付费路由同款：先过访问密码，否则这个页面会变成"这条链接存在"的探测口
+  if (l.passwordHash && !shareStore.verifyToken(l, getCookie(req, cookieName(l.id)))) {
+    return res.redirect(303, '/s/' + l.id);
+  }
+  return restorePage(res, l);
+});
+
+/**
+ * 恢复购买（提交订单号）—— 需求 1① 的唯一落点。
+ *
+ * 判定全部收口在 `paymentOrders.claimForLink()`：订单号存在、属于本链接、
+ * **且状态是「支付成功」** 才会返回订单（需求末句「所有功能的前提是该订单号
+ * 状态为支付成功」，在这里兑现）。通过后签发的就是**正常的已支付票据**
+ * —— 与真正付完款时下发的那枚一模一样，因此后续所有下载路径（页面、`/dl`、
+ * `HEAD /dl`）都不需要为本功能加任何分支。
+ */
+router.post('/s/:id/restore', asyncHandler(async (req, res) => {
+  const l = shareStore.get(req.params.id);
+  if (!l) return statePage(res, 'notfound');
+  const st = shareStore.status(l);
+  if (st !== 'active') return statePage(res, st, shareStore.view(l));
+  if (l.passwordHash && !shareStore.verifyToken(l, getCookie(req, cookieName(l.id)))) {
+    return res.redirect(303, '/s/' + l.id);
+  }
+
+  const ip = security.clientIp(req);
+  const rl = security.orderRestoreLimiter(ip);
+  if (!rl.ok) {
+    res.setHeader('Retry-After', String(rl.retryAfter));
+    return restorePage(res, l, { error: `尝试次数过多，请 ${rl.retryAfter} 秒后重试。` });
+  }
+
+  const raw = String((req.body && req.body.orderNo) || '');
+  const no = orderNo.normalize(raw);
+  /**
+   * 形状判据只用于**快速拒绝明显不是订单号的输入**，不作为取回条件：
+   * R64 之前的老订单没有 36 位订单号，它们当年的「订单号」是 24 位记录 id，
+   * 用户手里留着的就是那个值 —— 因此把长度放宽到 8~64、只限字母数字，
+   * 真正的有效性一律交给 `claimForLink()`（查表 + 链接归属 + 支付状态）。
+   */
+  if (!/^[0-9A-Za-z_-]{8,64}$/.test(no)) {
+    return restorePage(res, l, { error: '订单号格式不正确，请核对后重新输入。' });
+  }
+
+  const r = paymentOrders.claimForLink(no, l.id);
+  if (!r.ok) {
+    statsStore.addLog({
+      action: 'share.restore', level: 'warn',
+      detail: `分享页恢复购买失败（链接 ${l.id}，原因：${r.reason}，IP：${ip}）`,
+    });
+    return restorePage(res, l, { error: r.message });
+  }
+
+  // 与正常支付流程下发**同一枚**票据：后续所有下载判定因此无需新增任何分支
+  res.cookie(payCookieName(l.id), paymentOrders.orderToken(r.order), shareCookieOptions(l.id));
+  statsStore.addLog({
+    action: 'share.restore',
+    detail: `分享页凭订单号恢复下载权限（链接 ${l.id}，订单 ${r.order.orderNo || r.order.id}，IP：${ip}）`,
+  });
+  return res.redirect(303, '/s/' + l.id);
+}));
+
+/**
+ * 查看历史订单（仅已登录用户）—— 需求 2①②。
+ *
+ * 两条数据源刻意分开：
+ *  · 已购订单 → `paymentOrders.listForUser()`（只有付费才产生订单）；
+ *  · 免费下载 → `download-log.listForUser()`（同一文件只记首次，见该模块）。
+ *
+ * 顺带为每一笔「已支付且链接仍存在」的订单**补发该链接的支付票据**：
+ * 用户在这个页面上看到「重新下载」就应该真的能下，而不是点下去被弹回付费页
+ * （票据是按链接存的 Cookie，而他可能换过设备）。退款订单**不补**——它的
+ * 凭证必须保持失效，否则「退款后仍能下载」。
+ */
+router.get('/s/:id/history', (req, res) => {
+  const l = shareStore.get(req.params.id);
+  if (!l) return statePage(res, 'notfound');
+  const st = shareStore.status(l);
+  if (st !== 'active') return statePage(res, st, shareStore.view(l));
+
+  const me = shareUser(req);
+  if (!me) {
+    // 不静默跳登录页：明确告诉用户"这里需要登录"，并给出带 next 的入口
+    return renderPage(res, 401, {
+      title: '请先登录',
+      body: `
+        <div class="center-head">
+          <div class="icon-big" style="background:#e8f1fb;color:#0067c0;font-size:22px">👤</div>
+          <h1>请先登录</h1>
+          <p class="sub">「查看历史订单」需要登录账号：订单是按账号归集的。</p>
+        </div>
+        <a class="btn primary" href="/?next=${encodeURIComponent('/s/' + l.id)}" style="text-align:center;text-decoration:none">去登录</a>
+        <a class="btn ghost" href="/s/${esc(l.id)}/restore" style="text-align:center;text-decoration:none">改用订单号恢复购买</a>`,
+    });
+  }
+
+  const all = paymentOrders.listForUser(me.id);
+  const orders = all.filter((o) => o.status === 'paid' || o.status === 'refunded').slice(0, HISTORY_MAX_ROWS);
+  for (const o of orders) {
+    if (o.status !== 'paid') continue;
+    if (!shareStore.get(o.linkId)) continue; // 链接已删除 → 票据无意义
+    res.cookie(payCookieName(o.linkId), paymentOrders.orderToken(o), shareCookieOptions(o.linkId));
+  }
+  const free = downloadLog.listForUser(me.id).slice(0, HISTORY_MAX_ROWS);
+  return historyPage(res, l, { user: me, orders, free });
+});
+
 /* ------------------------------ 下载 ------------------------------ */
 
 /**
@@ -2138,6 +2591,10 @@ router.get('/s/:id/dl', async (req, res) => {
         entries, res, openFile, bucket: l.bucket, archiveName, throttle, traffic,
       }), traffic);
       if (paidOrder) paymentOrders.markDownloaded(paidOrder.id);
+      // R64：免费下载记进「历史订单」的免费一栏（已登录才记；同一文件只记首次）
+      else {
+        noteFreeDownloads(req, l, sel.files.map((k) => ({ key: k, name: shownPaths.get(k) || k })));
+      }
       statsStore.addLog({
         action: 'share.download',
         detail: `分享打包下载 ${l.id}：${bundleStats.files} 个文件`
@@ -2163,6 +2620,8 @@ router.get('/s/:id/dl', async (req, res) => {
       // 传输**结束后**才标记已下载：传输中途失败若提前标记，
       // 管理页会显示"已下载"而用户其实没拿到文件，对账就失真了。
       if (paidOrder) paymentOrders.markDownloaded(paidOrder.id);
+      // R64：免费下载 → 「历史订单」的免费一栏（同一文件只记首次）
+      else noteFreeDownloads(req, l, [{ key: singleKey, name: shareStore.itemName(singleKey) }]);
       statsStore.addLog({ action: 'share.download', detail: `分享下载 ${singleKey}（${traffic.bytesDown} 字节，链接 ${l.id}${encMeta ? '，已解密' : ''}）` });
     }
   } catch (e) {

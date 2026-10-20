@@ -6,7 +6,7 @@
 
 以上。
 
-1. **适用版本**：v1.8.9（取自 `package.json` 的 `version`，由 `tests/docs-sync.test.js` 护栏校验）  
+1. **适用版本**：v1.9.0（取自 `package.json` 的 `version`，由 `tests/docs-sync.test.js` 护栏校验）  
 2. **渲染前提与目录兜底**：本文标题为手写 HTML（`<h1 id="develop_document-sectionN">`），目录依赖这些 `id`。若目标渲染器清洗原始 HTML 并剥离 `id`，**目录链接会失效，但目录本身仍然可用**，请按下述方式定位：
    - 目录条目本身是一份完整的章节清单，条目文字与正文标题严格一致（由 `docs-sync` 双向断言保证），按标题文字在页面内搜索即可跳到对应章节；
    - 章节编号 `develop_document-sectionN` 从 1 起**连续递增**（同样由护栏断言），因此「第 N 章」的表述在标题被剥离后仍可换算；
@@ -119,6 +119,7 @@ main/
 │   ├── payment-providers.js# 【支付】平台凭证字段定义 + 校验引擎（可扩展为真实校验）
 │   ├── payment-rules.js    # 【支付】业务规则纯函数：金额 / 渠道开关约束 / 付费是否生效
 │   ├── payment-orders.js   # 【支付】付费订单状态机与已支付票据（pending→paid|failed）
+│   ├── order-no.js         # 【R64】订单号编解码**唯一实现点**：36 位「13 位毫秒时间戳 + 9 位链接 UID + 9 位用户 UID + 5 位随机串」，base62、区分大小写；两个 UID 由 `sha256('kepler:link:'+id)` / `sha256('kepler:user:'+id)` **确定性派生**（同一链接 / 同一账号恒定），随机串用 `crypto.randomInt` 取（不用 `randomBytes % 62`，避免分布偏斜）。⚠️ 它**不是**网关商户单号：`order.id`（16 位 base64url）仍是 `out_trade_no`，因为微信支付 v3 对 `out_trade_no` 有 **≤ 32 位**硬限制
 │   ├── payment-gateway.js  # 【支付】真实支付网关：支付宝 RSA2 / 微信 APIv3 / PayPal Orders v2（查单确认，零依赖）
 │   ├── qrcode.js           # 【支付】自研二维码生成（输出 SVG，零依赖）
 │   ├── s3.js              # 【多云】客户端工厂：按 provider 分派 S3Client / AzureBlobClient + 错误翻译（R49 起全厂商同一路径）
@@ -140,6 +141,7 @@ main/
 │   ├── enc-pool.js         # 【R48】`worker_threads` 加密线程池（入口即本文件；小负载走本地、停机就地算完、出错永久降级）
 │   ├── upload-sessions.js  # 分片上传会话持久化与碎片清理
 │   ├── share-store.js      # 分享链接存储
+│   ├── download-log.js     # 【R64】免费下载台账：登录账号**首次**下载某链接某文件的记录（`(userId, linkId, fileKey)` 去重），供「查看历史订单」展示；游客不记（无稳定身份），溢出按最旧优先丢弃（`DOWNLOAD_LOG_MAX`，默认 2000）
 │   ├── invite-store.js     # 【R54③】邀请码存储：生成 / 核销 / 回滚 / 批量设置 / 删除 / 导出为纯文本（一行一个）的**唯一实现点**；落盘走**同步** `secureStore.writeJson` —— `disabled` 与 `remove()` 是**吊销**语义，异步写会在进程重启时丢掉尚未 flush 的那一次（表现：点了停用、重启后那枚码又活了）
 │   ├── coupon-store.js     # 【R62】优惠券存储：生成 / 状态判定 / 适用范围校验 / 核销台账 / 按订单回退的**唯一实现点**；金额一律整数「分」，优惠封顶到「原价 − 1 分」
 │   ├── share-routes.js     # 公开分享页与下载（/s/:id）；R51 起多条目走**分页列表 + 勾选**，单文件直传、多选/含文件夹打包
@@ -196,6 +198,7 @@ main/
 │       ├── share-status.js  # 分享链接状态判定（与服务端 status() 同序，无 DOM 依赖）
 │       ├── pay-poll.js      # 【分享页】支付结果轮询（**普通脚本，非 ESM**：需 document.currentScript 取 data-link-id）
 │       ├── share-list.js    # 【R51 分享页】列表勾选（**普通脚本，非 ESM**，同因）：选中状态按链接存 `sessionStorage` 实现**跨页累计**，提交时把其它页的勾选补成隐藏 `k` 字段；不构造下载 URL、不发请求 —— 下载走页面里的原生 `<form method=GET>`，浏览器才会给进度与「另存为」
+│       ├── share-order.js   # 【R64】分享页「订单号」一键复制（**普通脚本，非 ESM**，同因）：事件委托监听 `[data-copy-order]`，优先 `navigator.clipboard.writeText`，回退 `textarea + execCommand`，两者都不行时全选 `#order-no` 让用户自己按 Ctrl+C（复制失败也要有出路，不能静默）
 ├── tests/                  # 零依赖测试（node:test + 自研断言）
 │   ├── helpers.js          # 断言、临时目录、HTTP 请求、端口等待、ESM 语法校验
 │   ├── routes-surface.test.js  # 路由表面积护栏
@@ -264,6 +267,7 @@ main/
 │   ├── audit54c-regressions.test.js # 第五十四轮**第③步**护栏（非审计轮，续 `audit54b-regressions.test.js`：`side-foot` 新增「**邀请码设置**」+ 批量生成 / 删除 / **导出 txt（一行一个）** + 单独与批量设置**使用次数 / 过期时间 / 注册后的身份**，并把注册接口的 `invite` 模式从 R54② 的「功能尚未开放」临时口径改成**真核销**）。**24 条护栏分五层**：① **判据层**（`limits.js` 的 `normalizeInviteCode` / `parseInviteCodeInput` / `parseInviteCountInput` / `parseInviteMaxUsesInput` / `parseInviteExpiresInput` / `parseInviteNoteInput`：去全部空白 + 转大写、10 位无歧义字符集（去掉 0/O/1/I/L）、**先判 CR/LF 再归一**、数量 1~500、次数上限 `0` = 不限制且**负数必须 400**（落盘归一会把 `-1` 归成 `0` ⇒ 限制被彻底放开）、过期时间**必须晚于 now**（要立即失效有「停用」）、备注复用 `parseSmtpTextInput`）；② **存储层**（`invite-store.js`：批内与全局撞码重摇、核销四档失败**可区分**（`not_found` / `expired` / `used_up` / `disabled`）、`remaining` 为 `null` 表示不限制、回滚只删**最后一个与本用户名相同**的条目、PATCH 语义 + `disabled:false` / `maxUses:0` / `expiresAt:null` 三个假值都是**有效指令**、导出 `n` 行 + **末尾换行** + 无 BOM、脏记录（非法码 / 重复码 / null）**整条丢弃**且不静默重建）；③ **路由层**（真 HTTP：六条接口全部仅管理员 —— 未登录 401 / 普通用户 403、生成→列表→批量→删除回环、入参非法一律 400 且**不留副作用**、导出响应是**纯文本本身**（不是 JSON，也不是 JSON 包装））；④ **注册接入层**（真 HTTP：`closed` 明确拒绝且不看码、`invite` 模式「不填码 400 / 格式错 400 / 码无效 403 / 码有效成功」四档、身份取**码上的 role** 而不是站点默认、建号失败**必须回滚**、`open` 模式忽略请求体 role、以及**三步顺序**的静态断言 —— 核销必须晚于人机验证，否则成一条邀请码存在性 oracle）；⑤ **前端层**（`index.html` 侧栏入口与整页 `card-view`、`main.js` 的 `MAIN_VIEWS` / `VIEW_ENTRY` / 五个接线点与**真跑 `viewFromHash()` 的角色门控**（含对照组）、`api.js` 六个方法 + `requestText`、`invitemgr.js` 的导出形态与「状态判定不做第二份」、登录页邀请码框只在「注册 + 邀请码模式」出现）
 │   ├── azure-client.test.js # 【多云】Azure Blob 客户端护栏（起一个**自己验签**的假 Azure：Shared Key 规范串 / 列举与翻页 / 单传与 HEAD 小写头 / Range 与流式 Output / 块分片与断点续传（含「块列表响应带游标」的反例） / 异步复制轮询 / 批量删除白名单 / ACL 映射 / SAS 预签名直链 / 错误形状）
 │   ├── coupon.test.js # 【R62】优惠券护栏：判据层（券码 / 数量 / 金额 / 次数 / 时间 / 目标）/ 存储层（状态优先级、三类适用范围、总次数与每人一次、价格封顶、核销幂等与按订单回退、匿名身份）/ 关系层（订单原价·优惠·券码快照）/ 接线层（五条接口仅管理员、退款只回退非无门槛券、分享页券码入口与原价划线）
+│   ├── share-orders.test.js # 【R64】分享页取回下载权限的护栏（14 条）：订单号结构（36 位 / 13+9+9+5 分段 / UID 确定性派生）/ 唯一性与字符分布（200 次不撞号、大小写与数字都出现、游客 userUid 每次随机）/ `orderNo` 与 `id` 并存且 `id` ≤ 32 位（微信硬限制）/ `claimForLink` 四类拒绝且**同一条文案**（防订单号存在性预言机）/ 老订单凭 `id` 取回（含空格容错）/ 未登录「恢复购买」与已登录「查看历史订单」两条入口 + 右上角登录·退出登录 / 已支付页的 36 位订单号与复制按钮 / 恢复购买**签发的就是同一枚票据 Cookie**（故 `/dl` 与 `HEAD /dl` 零改动）/ 历史订单只列自己、免费下载只记首次、逐笔补发票据 / 退出登录销毁会话 / `download-log` 去重与隔离 / `orderRestoreLimiter` 第 21 次拒绝
 │   └── invariants.test.js        # 跨模块不变量的静态护栏（退出路径 / 删除判据 / 缓存键 …）
 ├── scripts/lint.js         # ESLint 包装器（未安装时降级）
 ├── README.md · Develop_Document.md · CHANGELOG.md  # 使用说明 / 开发文档 / 变更记录（据审计台账事后重建，无发布日期）
@@ -281,6 +285,7 @@ main/
     ├── ipguard.json        # IP 屏蔽规则（加密落盘）
     ├── upload-sessions.json# 分片上传会话（加密落盘）
     ├── payments.json       # 支付订单与已支付票据（加密落盘；退款记录永不裁剪）
+    ├── downloads.json      # 免费下载台账（加密落盘；R64 起）—— 只记**首次**：同一账号对同一链接同一文件重复下载不新增条目
     ├── stats.json          # 流量与请求统计
     ├── logs.jsonl          # 操作审计日志
     └── .instance.lock      # 单实例锁（含持有者 pid；崩溃残留的脏锁会被自动接管）
@@ -319,11 +324,11 @@ main/
 ```
 secret.key ─┬─派生─→ config.enc            （访问密钥 / 桶 / 用户 / 支付凭证）
             └─派生─→ enc-settings.json · enc-meta.json · links.json
-                     ipguard.json · upload-sessions.json · payments.json
+                     ipguard.json · upload-sessions.json · payments.json · downloads.json
 enc.key    ───直接─→ 云端对象里的 crypto / magic 密文（文件数据本身）
 ```
 
-- 丢 `secret.key` → 上面**七个**文件全部读不出，而不只是 `config.enc`；
+- 丢 `secret.key` → 上面**八个**文件全部读不出，而不只是 `config.enc`；
 - 丢 `enc.key` → 云端密文不可解，但 `config.enc` 等**不受影响**（两条链彼此独立）；
 - **只复制 `config.enc` 而漏了 `secret.key`**：服务会**新生成一把主密钥**，随后 `config.enc` 解密失败被判为「损坏」→ 备份为 `.corrupt-<时间戳>` 并拒绝写入，服务起不来。**不会**静默清空配置（这是刻意的保护，见「审计后的行为变更」）。此时把 `secret.key` 补回去、把 `.corrupt-*` 改回原名重启即可。
 
@@ -381,6 +386,7 @@ enc.key    ───直接─→ 云端对象里的 crypto / magic 密文（文�
 | `S3_DATA_DIR` | 未设置 | 运行时数据目录；未设置时落到项目 `data/`，测试进程可指向临时目录做数据隔离。**唯一实现点**在 `server/data-dir.js`（R49 起十个 store 不再各写一份三元表达式） |
 | `COS_DATA_DIR` | 未设置 | 【R49】**旧名，仍兼容**（命中时打印一次弃用提醒）。它被 `deploy.sh` 写进 `.env`、是**部署契约**：静默忽略会让数据目录回退到项目 `data/`，用户看到的是「配置全没了」，而真实数据其实还在原目录。新部署请用 `S3_DATA_DIR` |
 | `CAPTCHA_ENABLED` · `CAPTCHA_PROVIDER` · `CAPTCHA_SITE_KEY` · `CAPTCHA_SECRET_KEY` | 未设置 | 登录验证码的预设值；**仅当环境变量真实存在时**才写入配置，用于无界面部署时预设，不会用空值覆盖已保存的配置。`CAPTCHA_PROVIDER` 决定用哪一套，`CAPTCHA_SITE_KEY` / `CAPTCHA_SECRET_KEY` **只作用在被选中的那一套**上（两套凭证各自独立保存，见 §7.1 的 `/captcha/config`） |
+| `DOWNLOAD_LOG_MAX` | `2000` | 【R64】免费下载台账（`data/downloads.json`）的条目上限，超出按 `at` **最旧优先**丢弃。它只影响「查看历史订单」里免费下载那一段能回溯多远，不影响计费与取回付费下载权限（后者只认订单） |
 
 > 列举上限另有一个 50000 的硬性天花板（`server/limits.js` 的 `HARD_MAX`），任何调用方都不得越过。上述上限本身也受它约束。
 
@@ -1041,6 +1047,9 @@ curl -s -b cookie.txt -X POST http://127.0.0.1:3000/api/fs/upload/init \
 | GET | `/s/:id/pay/return` | 支付平台同步回跳（触发一次查单后回到分享页） |
 | POST | `/s/:id/pay/check` · `GET /s/:id/pay/status` | 主动查单 / 状态轮询（最小间隔 3 秒，防刷） |
 | POST | `/pay/notify/:platform` | 异步通知（**仅作触发器**，结果以服务端查单为准） |
+| GET/POST | `/s/:id/restore` | 【R64】**恢复购买**（匿名 + 已登录都可用）：填订单号取回下载权限。判定收敛到唯一实现点 `paymentOrders.claimForLink(no, linkId)` —— 订单**存在且属于本链接且状态为 `paid`** 才放行；成功时签发的是与真实支付**完全相同的**票据 Cookie `sp_<linkId>_pay`，因此页面判定、`GET /s/:id/dl`、`HEAD /s/:id/dl` 三处**一行都不用改**。<br>⚠️ 「订单号不存在」与「订单号不属于本链接」共用**同一条文案**（否则这个端点就成了订单号存在性预言机）；单独限流 `orderRestoreLimiter`（10 分钟 20 次） |
+| GET | `/s/:id/history` | 【R64】**查看历史订单**（需登录）：列出本账号在该链接下的付费订单（含已退款，如实标注）与**免费下载记录**（`data/downloads.json`，只记**首次**、重复下载不新增条目）。渲染时为每笔 `paid` 且链接仍存在的订单**补发**对应票据 Cookie，因此点「重新下载」不会再被送回付费墙。<br>⚠️ 只按订单上的 `userId` 快照归集，**绝不按 IP 归集**（同一出口 IP 背后可能是一整个办公室） |
+| POST | `/s/:id/logout` | 【R64】分享页右上角「退出登录」：销毁当前会话 + 清 `kepler_sid` Cookie 后 303 回原分享页。刻意是 **POST**（GET 会让任何一张 `<img src>` 都能替访客退出登录） |
 | GET | `/api/payment/orders` | 订单列表（管理员） |
 | POST | `/api/payment/orders/:id/refund` | 标记订单为已退款（管理员；仅作记账，不发起网关退款） |
 | DELETE | `/api/payment/orders/failed` | **批量删除失效订单**（仅「支付失败」；管理员；「已支付」「已退款」与支付中的订单不受影响） |
@@ -1605,7 +1614,7 @@ R22-04：本库「解密下发」共三个出口 —— 管理端 `/api/fs/downl
 | `tests/routes-surface.test.js` | 路由表面积护栏：总数基线、无丢失/无重复、敏感接口 `requireAdmin` 覆盖、路由优先级 |
 | `tests/s3-client.test.js` | S3 客户端：缓冲/流式/Range/404、分页双游标语义、SigV4 签名 host 一致性 |
 | `tests/crypto-storage.test.js` | 加密往返、XOR 等价性、原子写入、追加不整体替换（文件对象同一性探针，非墙钟阈值）、孤儿 tmp 清扫、单实例锁、IP 段判定 |
-| `tests/frontend.test.js` | 32 个前端模块 ESM 语法、import 路径存在性、转义工具复用、Windows Hello 就绪判定与错误分类、权限门控约定、角色界面分离（含「IP 地址管理」「邀请码设置」整页对普通用户隐藏）、会话切换的主视图重置、请求序号自增不得早于早退校验（结构不变量分析器，自带样例自测）、搜索的请求取消三要素（AbortController / signal 透传 / limit 与范围）、主动取消不被误报为「无法连接本地服务」（真实 ESM + fetch 打桩） |
+| `tests/frontend.test.js` | 33 个前端模块 ESM 语法、import 路径存在性、转义工具复用、Windows Hello 就绪判定与错误分类、权限门控约定、角色界面分离（含「IP 地址管理」「邀请码设置」整页对普通用户隐藏）、会话切换的主视图重置、请求序号自增不得早于早退校验（结构不变量分析器，自带样例自测）、搜索的请求取消三要素（AbortController / signal 透传 / limit 与范围）、主动取消不被误报为「无法连接本地服务」（真实 ESM + fetch 打桩） |
 | `tests/webauthn.test.js` | WebAuthn 零依赖实现：CBOR 解码、`coseToSpki` 一致性、ES256 验签（反双重哈希护栏与裸 `r\|\|s` 兼容）、authData 解析、挑战一次性、注册与认证全流程及负数路径 |
 | `tests/gzip.test.js` | 压缩判定与端到端 `Content-Encoding` 还原 |
 | `tests/payment.test.js` | 支付凭证与付费下载：字段官方命名、必填/格式/枚举校验、PEM 与 https 校验器、敏感字段不回传明文、「留空保持不变」合并语义、`registerValidator` 扩展点、开关约束与渠道三态、金额最低 0.01 元、付费生效判定、订单状态机与票据防跨链接复用、支付路由全部挂载 `requireAdmin` |
@@ -1641,7 +1650,7 @@ R22-04：本库「解密下发」共三个出口 —— 管理端 `/api/fs/downl
 
 > 文件名中的轮次编号（1 / 3 / 5 / 6 / 7 / 8 / 9 / 10 / 11 / 12 / 13 / 14 / 16 / 17 / 21 / 22 / 25 / 26 / 27 / 28 / 29 / 31 / 32 / 33 / 34 / 35 / 36 / 37 / 38 / 40 / 41 / 42 / 43 / 44 / 45 / 47 / 48 / 49 / 50 / 51 / 52 / 53 / 54）沿用审计当时的命名：若干轮次（第 2、4、15、18～20、23、24、30、39、46 轮）没有各自的独立护栏文件，其结论已并入相邻轮次或既有护栏文件，因此编号不连续——**这并不表示存在护栏缺口**。`invariants.test.js` 不属于任何一轮，它是跨轮次不变量的常驻护栏。同一轮可以有两个文件（第 14 轮即 `audit14-regressions` 管正确性、`audit14-perf` 管性能与新增原语；第 54 轮按用户确认的**三步走**拆分，第①步 `audit54-regressions` 管「站点设置」卡片、第②步 `audit54b-regressions` 管登录页注册 / 记住密码 / 忘记密码与邮箱验证码体系）。各轮护栏也不按版本切分：任何一次部署都应让全部护栏通过，不存在「某个版本只需跑其中几条」。
 
-> 共 **67 个测试文件、500+ 条用例**（计数口径：第 37 轮新增 `audit37-regressions.test.js` **26 条**、第 38 轮新增 `audit38-regressions.test.js` **31 条**；第 39 轮**没有**新的护栏文件，5 条版本对齐护栏落在既有的 `deploy-script.test.js` 内；第 40 轮新增 `audit40-regressions.test.js` **7 条**，另有 3 条「不能编辑自己」护栏并入既有的 `audit35-regressions.test.js`；第 41 轮新增 `audit41-regressions.test.js` **14 条**，前端侧另有 3 条「两套配置各自独立」护栏并入既有的 `audit31-regressions.test.js`；第 42 轮新增 `audit42-regressions.test.js` **9 条**；第 43 轮新增 `audit43-regressions.test.js` **8 条**；第 44 轮新增 `audit44-regressions.test.js` **14 条**；第 45 轮新增 `audit45-regressions.test.js` **12 条**；第 46 轮是小型修复、**未新增**护栏文件（1 条护栏并入既有的 `audit42-regressions.test.js`）；第 47 轮新增 `audit47-regressions.test.js` **20 条**；第 48 轮新增 `audit48-regressions.test.js` **22 条**；第 49 轮新增 `audit49-regressions.test.js` **9 条**（移除自签名证书 + 移除 COS 原生 API，配套 10 条反向对照）；第 50 轮新增 `audit50-regressions.test.js` **17 条**（分享页文件类型图标 / 左键框选多选 / 「链接创建成功」弹窗改版，配套 18 条反向对照）；第 51 轮新增 `audit51-regressions.test.js` **34 条**（「链接创建成功」弹窗加宽、链接一行显示完；多文件 / 文件夹分享的列表 + 勾选 + 50/页分页 + 打包 `.tar.gz`，配套 40 条反向对照）；第 52 轮新增 `audit52-regressions.test.js` **19 条**（多选（文件+文件夹）分享入口 /「移动」报成功实际没动 / 复制粘贴与冲突逐项询问 / 分享页默认全选与展示路径脱敏 / 链接结果弹窗左右等高，配套 22 条反向对照）；第 53 轮新增 `audit53-regressions.test.js` **32 条**（「发信设置」卡片与零依赖 SMTP 客户端，配套 17 条反向对照）；第 54 轮新增 `audit54-regressions.test.js` **22 条**（第①步「站点设置」卡片：站点名称 / 公开注册 / 新用户身份，配套 13 条反向对照）与 `audit54b-regressions.test.js` **30 条**（第②步：登录页注册 / 记住密码 / 忘记密码 + 邮箱验证码体系，配套 22 条反向对照）、`audit54c-regressions.test.js` **24 条**（第③步：邀请码系统 —— `side-foot`「邀请码设置」+ 批量生成 / 删除 / 导出 txt + 单独与批量设置使用次数 / 过期时间 / 身份，并把注册的 `invite` 模式改成真核销，配套 33 条反向对照）；**确切条数与通过情况请以 `npm test` 结尾的汇总行为准**）。环境性红/跳过一并说明，避免被误读成回归：`RE-03` / `R7-07` 依赖 `spawnSync`，在部分 Windows 环境恒返回 `status=null`（EBUSY）；`audit16-regressions` 有 4 条要靠 `bash` 驱动 `deploy.sh` 的 Nginx 模板断言，无 `bash` 的机器上会以「bash 不可用（ENOENT）」失败；`SCAN-SKIPLIST.md` 不在工作区时另有一条清单一致性用例按设计跳过。全部零依赖，可直接 `npm test` 运行。修改路由、前端模块或 WebAuthn 相关代码后请先运行。文件数由 `docs-sync` 护栏校验；**用例总数没有护栏**——静态统计（`grep -rhE '^\s*test\(' tests/*.test.js | wc -l`）与 runner 实际计数口径不同（后者含 `t.test()` 子测试），无法用静态方式锁定，故此处只给量级、请勿当作精确基线。
+> 共 **68 个测试文件、500+ 条用例**（计数口径：第 37 轮新增 `audit37-regressions.test.js` **26 条**、第 38 轮新增 `audit38-regressions.test.js` **31 条**；第 39 轮**没有**新的护栏文件，5 条版本对齐护栏落在既有的 `deploy-script.test.js` 内；第 40 轮新增 `audit40-regressions.test.js` **7 条**，另有 3 条「不能编辑自己」护栏并入既有的 `audit35-regressions.test.js`；第 41 轮新增 `audit41-regressions.test.js` **14 条**，前端侧另有 3 条「两套配置各自独立」护栏并入既有的 `audit31-regressions.test.js`；第 42 轮新增 `audit42-regressions.test.js` **9 条**；第 43 轮新增 `audit43-regressions.test.js` **8 条**；第 44 轮新增 `audit44-regressions.test.js` **14 条**；第 45 轮新增 `audit45-regressions.test.js` **12 条**；第 46 轮是小型修复、**未新增**护栏文件（1 条护栏并入既有的 `audit42-regressions.test.js`）；第 47 轮新增 `audit47-regressions.test.js` **20 条**；第 48 轮新增 `audit48-regressions.test.js` **22 条**；第 49 轮新增 `audit49-regressions.test.js` **9 条**（移除自签名证书 + 移除 COS 原生 API，配套 10 条反向对照）；第 50 轮新增 `audit50-regressions.test.js` **17 条**（分享页文件类型图标 / 左键框选多选 / 「链接创建成功」弹窗改版，配套 18 条反向对照）；第 51 轮新增 `audit51-regressions.test.js` **34 条**（「链接创建成功」弹窗加宽、链接一行显示完；多文件 / 文件夹分享的列表 + 勾选 + 50/页分页 + 打包 `.tar.gz`，配套 40 条反向对照）；第 52 轮新增 `audit52-regressions.test.js` **19 条**（多选（文件+文件夹）分享入口 /「移动」报成功实际没动 / 复制粘贴与冲突逐项询问 / 分享页默认全选与展示路径脱敏 / 链接结果弹窗左右等高，配套 22 条反向对照）；第 53 轮新增 `audit53-regressions.test.js` **32 条**（「发信设置」卡片与零依赖 SMTP 客户端，配套 17 条反向对照）；第 54 轮新增 `audit54-regressions.test.js` **22 条**（第①步「站点设置」卡片：站点名称 / 公开注册 / 新用户身份，配套 13 条反向对照）与 `audit54b-regressions.test.js` **30 条**（第②步：登录页注册 / 记住密码 / 忘记密码 + 邮箱验证码体系，配套 22 条反向对照）、`audit54c-regressions.test.js` **24 条**（第③步：邀请码系统 —— `side-foot`「邀请码设置」+ 批量生成 / 删除 / 导出 txt + 单独与批量设置使用次数 / 过期时间 / 身份，并把注册的 `invite` 模式改成真核销，配套 33 条反向对照）；**确切条数与通过情况请以 `npm test` 结尾的汇总行为准**）。环境性红/跳过一并说明，避免被误读成回归：`RE-03` / `R7-07` 依赖 `spawnSync`，在部分 Windows 环境恒返回 `status=null`（EBUSY）；`audit16-regressions` 有 4 条要靠 `bash` 驱动 `deploy.sh` 的 Nginx 模板断言，无 `bash` 的机器上会以「bash 不可用（ENOENT）」失败；`SCAN-SKIPLIST.md` 不在工作区时另有一条清单一致性用例按设计跳过。全部零依赖，可直接 `npm test` 运行。修改路由、前端模块或 WebAuthn 相关代码后请先运行。文件数由 `docs-sync` 护栏校验；**用例总数没有护栏**——静态统计（`grep -rhE '^\s*test\(' tests/*.test.js | wc -l`）与 runner 实际计数口径不同（后者含 `t.test()` 子测试），无法用静态方式锁定，故此处只给量级、请勿当作精确基线。
 >
 > **本节是全文唯一的用例计数口径**：其他章节提到用例条数时一律写「见「四、测试 → 1. 测试与 CI」」而**不得另写数字**——曾经「测试与 CI」写 480+、「服务端调试」写 300+，两处都是手抄数字，没有护栏，于是静静地漂移了若干个版本。散落的数字必然失同步，收敛成一个入口才不会。
 
@@ -1708,7 +1717,7 @@ R22-04：本库「解密下发」共三个出口 —— 管理端 `/api/fs/downl
 │  data/config.enc（含密钥、桶、用户）· data/secret.key · data/enc.key
 │  data/enc-settings.json · data/enc-meta.json · data/links.json · data/invites.json
 │  · data/coupons.json
-│  data/ipguard.json · data/upload-sessions.json · data/payments.json · data/stats.json · data/logs.jsonl
+│  data/ipguard.json · data/upload-sessions.json · data/payments.json · data/downloads.json · data/stats.json · data/logs.jsonl
 │  data/tls/（自备证书，R49 起不再自动生成）· data/.instance.lock
 │  全部经 atomic-write.js 落盘（tmp + rename），不存在「写了一半」的中间态
 ▼
@@ -2105,6 +2114,8 @@ curl -s -b cookie.txt http://127.0.0.1:3000/api/demo/ping
 | R61 | 用户报告的一项（非审计轮，R61；原话：「SMTP再次出错，报错提示：发送失败：网络连接异常，请检查网络后重试」） | ① **server/smtp.js**：新增 `markUserFacing()`，并在 `withSession()`（`sendMail()` 与 `verify()` **共同**的错误出口）统一给无 `status` 的错误盖上 `status = 500`；② **1 条行为护栏**（`tests/audit53-regressions.test.js` 48 → **49 条**，新增第 ⑬ 用户文案层 `R61-01`：真实 HTTP 向 `127.0.0.1:1` 发测试邮件，断言响应体点名主机与错误码、且不含「网络连接异常」）；③ **1 条反向对照**（`R61-01a` 撤掉盖戳那一步，台账 715 → **716**）；④ **版本推进**：`1.8.6` → `1.8.7`（五个落点全量同步）并推送 | **① 那句话不是 SMTP 说的**：全库只有 `server/s3.js` 的 `translateError()` 会产出「网络连接异常，请检查网络后重试」。链路是 `smtp.sendMail()` 抛出的连接错误**没有 `status`** ⇒ `apiHandler` 判 `e.status ? e : translateError(e)` ⇒ 落进**对象存储**的翻译层 ⇒ 正则命中 `ETIMEDOUT / ECONNRESET / ENOTFOUND …` ⇒ 整段替换。**② R58 刚做的详细诊断被这一层吃掉了**：R58 已经把「哪个地址、几个地址全部不可达、各自什么码、该改端口还是放行防火墙」拼好，但它在**到达界面之前**就被覆盖 —— 所以用户看到的是「和没修一样」。这正是「修在 A 层、被 B 层抹掉」的典型，**只看 smtp.js 永远查不出来**。**③ 修在唯一出口而不是每条 `throw`**：`withSession` 是 `sendMail` / `verify` 的共同边界，新增错误路径不会漏盖；`status` 取 500 与原先翻译层给出的状态码一致 ⇒ **只改文案、不改变 HTTP 语义**。**④ 判据落在真实 HTTP 响应体上**：`127.0.0.1:1` 必然 `ECONNREFUSED`（即时、不依赖外网），断言「点名主机 + 带错误码 + 不含网络连接异常」—— 而不是断言「smtp.js 里写了 status」（那只能证明写了，证明不了路由层真的用上）。**⑤ 反向对照用单行代码锚点**（`throw markUserFacing(e);` 全库唯一）：跨注释行的锚点在 `invariants` 的**双侧 `stripComments()`** 比对下会失配。 |
 | R62 | 用户提出的**八项需求**（非审计轮，R62；原话：「当前 side-foot 中已有优惠券设置一栏，完成这个功能。1、用户可单独或批量生成优惠券；2、可设置优惠券类型限制：无门槛、限特定链接（可直接选择/搜索已有的付费链接）、限特定用户；3、可设置优惠券使用限制：次数（总次数、是否为每个用户只能使用一次）、时间（开始和到期时间）；4、付费链接分享页，应添加优惠券码填写处；5、使用优惠券，分享页的价格应如此显示：原价划线变灰，优惠后价格突出显示；6、优惠券无效则弹出相应提示；7、订单管理的付费订单页，应添加原价、应付、优惠、实付、使用的优惠券；8、订单管理的付费订单页：如果处理退款且该优惠券不是无门槛优惠券，则自动设置相应的优惠券为「对该用户可重新使用」。」） | ① 新增 `server/coupon-store.js`（生成 / 状态判定 / 适用范围 / 核销台账 / 按订单回退的**唯一实现点**）+ `server/routes/coupon.js`（五条，全部 `requireAdmin`）+ `public/js/couponmgr.js` + `#couponmgr` 页面与侧栏入口；② `limits.js` 新增券码 / 数量 / 金额 / 次数 / 时间 / 目标解析器（`normalizeCouponCode` 与 `parseCouponMaxUsesInput` **复用**邀请码实现，不写第二份）；③ 分享页：`POST /s/:id/coupon` + `payPage` 价格块（原价划线 + 优惠价）+ 券码 Cookie + 独立限流 `couponLimiter`；④ 下单：金额 / 原价 / 优惠 / 券码 / 券类型**快照**进订单，建单后核销、失败即回退；⑤ 订单页：新增原价 / 应付 / 优惠 / 实付 / 优惠券五列；⑥ 退款：非无门槛券按订单号 `releaseByOrder()` 回退；⑦ **15 条行为护栏**（`tests/coupon.test.js` 五层）+ **4 条反向对照**（`R62-01a`~`R62-04a`，台账 716 → **720**）+ `routes-surface` 登记五条新路由；⑧ **版本推进**：`1.8.7` → `1.8.8`（五个落点全量同步） | **① 「类型限制」是并列三选一，不是两个可叠加的开关**：把「限链接」与「限用户」做成可同时勾选，语义会变成「两者都要满足」，而界面上几乎必然被读成「任一满足」。故 `type` 单字段三值（`any` / `links` / `users`），非当前类型的目标集合在落盘归一化时清空。**② 优惠金额必须封顶到「原价 − 1 分」**：支付网关不接受 0 元订单，而「10 元券买 6 元文件」是极常见的配置。封顶后订单页「优惠」列显示的是**这张订单上真的减掉的钱**（299 分），而不是券面额（500 分）—— 否则会出现「原价 3 + 优惠 5 = 实付 0.01」这种对不上账的组合。`R62-01a` 撤掉封顶即变红。**③ 「每人一次」与「退款可重新使用」都需要**人**这个粒度的台账**：只记 `used` 总数，两个功能都无从实现。台账记 `{ identity, orderId, usedAt }`，退款按**订单号**回退（不是按身份 —— 同一用户可能用同一张券下过多笔订单，按身份删会把他其它订单的记录一并抹掉）。**④ 身份只能分两层**：已登录 → `u:<userId>`；未登录 → `a:<sha256(IP + UA)>`。这是刻意的近似，写明「换网络 / 换设备视为另一个人」；而「限特定用户」的券要求 `userId` 非空且命中名单，匿名访客必然被判 `wrong_user` 并提示登录。**⑤ 券码校验端点必须单独限流**：10 位券码是可枚举的折扣通道；但**不能**复用 `shareLimiter` —— 输错几次券码不该把「发起支付」的预算一起消耗掉。**⑥ 未成交要还券**：券在建单时核销（否则并发能下出多笔「每人一次」的券），因此 `siteUrlFor` 失败与网关 `createCharge` 失败两条分支都必须 `releaseByOrder()`，否则用户一次都没付成、券却已用尽。**⑦ 分享页券表单必须独立于支付表单**：HTML 不允许嵌套 `<form>`，浏览器会静默丢掉内层，表现是「点应用没反应」。**⑧ 一个自己踩过的判据坑**：新写的 `normalizeCouponCode` 与 `parseCouponMaxUsesInput` 一开始是照抄邀请码的，导致 `invariants` 的两条旧 anchor 在 `limits.js` 内**各出现 2 次**（`replace` 只替首处 ⇒ 变异可能打错行）。修法不是改 anchor，而是**复用**（`const normalizeCouponCode = normalizeInviteCode`）—— 同一判据本来就不该有第二份实现。 |
 | R62b | 用户 UI 工单（R62 的追加，非审计轮，版本 `1.8.9`；原话：「付费链接界面异常：似乎是优惠券相关UI出错。优惠券输入的相关组件应这样处理：放置在『立即支付』的下方，默认折叠（显示为『使用优惠券』）。」+ 截图） | ① **分享页 `payPage`**：券码区从「价格与支付方式之间」移到**支付表单之后**（即「立即支付」下方），改用原生 `<details>` **默认折叠**成一行「使用优惠券」；只有「已选券 / 券无效」时才自动展开；券无效的提示也移进折叠区、紧跟输入框；② **CSS**：`.coupon-form .btn` 改为 `flex:0 0 auto; width:auto`，输入框 `flex:1 1 auto; min-width:0`；③ **1 条护栏**（`tests/coupon.test.js` 15 → **16 条**，`R62-16`）+ **1 条反向对照**（`R62-05a`，台账 720 → **721**）；④ **版本推进**：`1.8.8` → `1.8.9`（五个落点全量同步） | **① 截图里的「输入框一条缝」不是宽度没设，而是按钮抢空间**：`.btn` 的基础样式是 `display:block; width:100%`，在 `display:flex` 的券表单里，按钮以 100% basis 占满整行，输入框（`flex:1; min-width:0`）被合法地压到 0 —— 这类「两个都对、凑在一起就坏」的布局问题，只有在**同一条 flex 行**里才会暴露。**② 折叠用原生 `<details>/<summary>`**：分享页是服务端渲染，且 CSP 不允许内联脚本，原生折叠是这里唯一「零脚本且一定能用」的形态；不用 `hidden` + `onclick`（那需要脚本，且隐藏后无法键盘展开）。**③ 判据必须落在「渲染顺序」上**：`const couponBox = …` 定义在 `payPage` 之前，按文件位置比较会得出相反结论；故 `R62-16` 比较的是 body 模板里的**插槽** `${couponBox}` 与支付表单的先后。**④ 反向对照只改宽度**：`R62-05a` 把 `width:auto` 改回 `100%`，`fail=1` 且红的正是 `R62-16` —— 证明这条护栏真的打在「按钮与输入框抢空间」这个成因上。 |
+| R64 | 用户提出的**三项需求**（非审计轮，R64；原话：「1、如果是需要付费的文件，且当前未登录账号，则在『文件分享』卡片的下方新增一个『恢复购买』的超链接标签；① 点击『恢复购买』，让用户输入订单号，如果订单号存在且可以与当前链接匹配，则允许其重新下载而无需再次付费；② 在整个页面的右上角新增『登录』；2、如果是需要付费的文件，且当前已登录账号，则……新增『查看历史订单』……① 可以查看自己已购买的全部订单，重新下载；② 其中也显示免费下载的文件，但只展示第一次下载的记录，重复下载不计；③ 页面右上角新增『退出登录』；3、完善订单号系统；① 当前订单号仅 16 位……修改订单号格式的建议：Unix 时间戳 + 链接 UID + 用户 UID + 随机字符串……总位数 36 位及以上（13 位毫秒级时间戳、9 位链接 UID、9 位用户 UID、5 位随机字符串）；② 不论是游客还是已登录用户，都向他们展示订单号、允许其复制，并告知『订单号是售后和取回下载权限的唯一凭证』……以上功能的所有前提建立在一件事上：该订单号的状态是『支付成功』。」） | ① 新增 `server/order-no.js`（订单号编解码**唯一实现点**：36 位 = 13 时间戳 + 9 链接 UID + 9 用户 UID + 5 随机串）+ `server/download-log.js`（免费下载台账：`(userId, linkId, fileKey)` 去重，只记首次）；② `payment-orders` 新增 `orderNo` / `linkUid` / `userUid` / `userId` / `userName` 快照与 `findByOrderNo()` / `listForUser()` / **`claimForLink()`**（恢复购买的唯一判定点）；③ `share-routes` 新增 `POST /s/:id/logout`、`GET\|POST /s/:id/restore`、`GET /s/:id/history` 与 `paidBelowHtml` / `orderNoBox` 两个渲染件、右上角 `.topbar`、`noteFreeDownloads()`（两处下载成功分支）；④ 新增 `public/js/share-order.js`（订单号一键复制，普通脚本）+ `main.js` 的 `takeShareNext()`；⑤ `security.js` 新增 `orderRestoreLimiter`（10 分钟 20 次）；⑥ **14 条行为护栏**（`tests/share-orders.test.js`）+ **4 条反向对照**（`R64-01a`~`R64-04a`，台账 727 → **731**）；⑦ **版本推进**：`1.8.9` → `1.9.0`（五个落点全量同步） | **① 「36 位订单号」与「微信 32 位上限」是硬冲突，靠拆成两个号解决**：`out_trade_no` 只能是 `order.id`（16 位 base64url），订单号必须另立一个字段。若图省事把 `order.id` 直接加长，微信支付会在下单那一刻回一个与「长度」有关的参数错误，而支付宝 / PayPal 照常成功 —— 表现是「只有微信付不了」，极易被当成渠道配置问题去查一遍密钥。**② 恢复购买只签发票据，不给下载路径加分支**：分享页 / `GET /s/:id/dl` / `HEAD /s/:id/dl` 三处都只认票据 Cookie `sp_<linkId>_pay`，所以「恢复购买」只要签出**同一枚**票据即可 —— 任何「再写一个 `?restored=1` 分支」的做法都会长出第二套判据，而两套判据必然有一处先改。**③ 拒绝文案必须同形**：「订单号不存在」与「订单号不属于本链接」分开回话，这个匿名端点立刻变成**订单号存在性预言机**（36 位虽然猜不出来，但用户会拿别人的号试出「这单存在」）。故两条都回同一句，且判定收敛到 `claimForLink()` 一处。**④ 链接 UID 必须可复算，但匹配权威仍是 `linkId`**：UID 用 `sha256('kepler:link:'+id)` 派生，同一链接恒得同一 9 位串（否则订单号里那一段纯属装饰）；但**匹配只认订单上的 `linkId`** —— 派生口径将来若变化（换哈希版本），历史订单号不该因此失效。**⑤ 免费下载「只记首次」需要一个正确粒度的键**：`(userId, linkId, fileKey)`。少一个维度就会两种错法：只记 `linkId` → 甲下载过、乙打开历史订单也看到这条；只记 `userId` → 同一文件的另一条链接被并成一条。**游客不记**是刻意的：没有稳定身份，记了也无法归集，反而会让「按 IP 归集」这个错误做法显得可行。**⑥ 历史订单里点「重新下载」不能又被送回付费墙**：票据是 Cookie，而 `GET /s/:id/history` 只渲染列表 —— 于是渲染时顺带为每笔 `paid` 且链接仍存在的订单**补发**对应票据（已退款不补、链接已删不补），否则这一页的「重新下载」链接会指向一个要求付款的页面。**⑦ 分享页的 `?next=` 是开放重定向面**：`takeShareNext()` 只放行 `/^\/s\/[A-Za-z0-9_-]{1,64}$/`，且在登录成功后**只消费一次**。分享页是匿名可达的，把 `next` 原样 `location.replace()` 等于给出一个「跳到任意站点」的入口。**⑧ 两处「看起来多余、其实必需」的判据**：其一，`normalize()` **不折叠大小写**（订单号区分大小写，折叠会让两个不同订单撞成一条）；其二，`findByOrderNo()` **先原样精确匹配再退化归一化** —— 若先归一化，历史订单的 base64url `id` 里的 `-` / `_` 会被抹掉，老订单**永远查不到**（本轮实测就踩了这一次，`R64-05` 把它钉住）。**⑨ 测试侧的两处口径错误（先在探针里确认行为正确、再修断言）**：票据是通过 **Set-Cookie 响应头**下发的，用「响应体里有没有 `sp_…_pay=`」去判会**恒假**；「退出登录」的负向断言若在整页 HTML 上搜文案，会命中 CSS 注释里同样写着的那四个字 —— 判据改判 `action="/s/<id>/logout"` 是否存在。 |
+
 
 ## 6.5 同号异义的收敛方案：限定别名层
 

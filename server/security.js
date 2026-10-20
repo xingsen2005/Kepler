@@ -587,6 +587,20 @@ const backupExportLimiter = createLimiter({ name: 'backup-export', windowMs: 10 
 
 const shareViewLimiter = createLimiter({ name: 'share-view', windowMs: 10 * 60 * 1000, max: 300 });
 
+/**
+ * R64：「恢复购买」（凭订单号取回下载权限）的限流器 —— 按 **IP**，10 分钟 ≤ 20 次。
+ *
+ * 为什么必须单独一条：`POST /s/:id/restore` 是**匿名可达**的，而它的输入是一个
+ * 可枚举的字符串（订单号）。虽然 62^14 的熵让逐条猜测在做数学上不可行，但
+ * 「不可行」不该成为唯一的防线 —— 攻击者也可能拿一份泄露的订单号列表逐个试
+ * 「哪些属于这条链接」。限流把试探速率压到无意义，同时让暴力尝试在日志里可见。
+ *
+ * 阈值与 `shareLimiter`（发起支付）同为 20 次/10 分钟：两者都是匿名可达、
+ * 每次尝试都要读一遍订单表，量级一致。**刻意不共用**同一个实例 —— 与支付链路
+ * 上三个限流器不合并是同一条理由：输错几次订单号不该把「发起支付」的预算吃掉。
+ */
+const orderRestoreLimiter = createLimiter({ name: 'order-restore', windowMs: 10 * 60 * 1000, max: 20 });
+
 /* --- R54②：注册 / 找回密码 / 邮箱验证码 --- */
 
 /**
@@ -641,6 +655,7 @@ module.exports = {
   couponLimiter, // R62：优惠券校验（与 shareLimiter 分开计数）
   initLimiter, passwordLimiter, webdavAuthLimiter, shareDownloadLimiter, webdavRevealLimiter, payNotifyLimiter,
   payCheckLimiter, payStatusLimiter, shareViewLimiter,
+  orderRestoreLimiter, // R64：「恢复购买」按订单号取回（与 shareLimiter 分开计数）
   backupExportLimiter, // R38：备份导出校验账户口令的限流（与 passwordLimiter 刻意分开）
   // R54②：注册 / 忘记密码 / 重置密码 / 邮箱验证码
   registerLimiter, forgotLimiter, resetLimiter, resetLock, emailCodeLimiter,

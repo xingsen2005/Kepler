@@ -261,7 +261,7 @@ function render() {
         return `<tr data-id="${escapeHtml(o.id)}"${rowClassOf(o) ? ` class="${rowClassOf(o)}"` : ''}>
           <td class="lk-file${dimExtra}" title="${escapeHtml(o.fileKey || o.fileName)}">${escapeHtml(o.fileName || '(未记录文件名)')}</td>
           <td>${fmtLink(o)}</td>
-          <td class="ord-no-wrap${dimExtra}" title="${escapeHtml(o.tradeNo || '')}">${escapeHtml(o.id)}</td>
+          <td class="ord-no-wrap${dimExtra}" title="${escapeHtml(o.tradeNo || '')}">${escapeHtml(o.orderNo || o.id)}</td>
           <td${dim}>${disc ? escapeHtml(yuan(orig)) : '<span class="ord-dash">' + escapeHtml(yuan(orig)) + '</span>'}</td>
           <td${dim}><b style="color:#b45309">${escapeHtml(yuan(payable))}</b></td>
           <td${dim}>${disc ? `<span style="color:#047857">−${escapeHtml(yuan(disc))}</span>` : '<span class="ord-dash">—</span>'}</td>

@@ -9121,6 +9121,62 @@ const CASES = [
       testFile: 'deploy-script.test.js',
       minFail: 1,
     },
+    {
+      /*
+       * R64-01a：订单号的格式判据退化成「只要是字母数字就行」。
+       *
+       * 后果：16 位的老订单 id、甚至任意一串都能通过 `isOrderNo()`，「36 位」这条
+       * 用户需求失去约束 —— 而界面上看不出任何异常（订单号照样生成、照样能取回）。
+       */
+      name: 'R64-01a · 订单号格式判据退化成「字母数字即可」（36 位约束失效）',
+      file: 'server/order-no.js',
+      anchor: '  return v.length === ORDER_NO_LEN && /^[1-9]\\d{12}[0-9A-Za-z]{23}$/.test(v);',
+      replacement: '  return /^[0-9A-Za-z_-]+$/.test(v);',
+      testFile: 'share-orders.test.js',
+      minFail: 2,
+    },
+    {
+      /*
+       * R64-02a：`claimForLink` 把「支付成功」这条前提放宽成「付过或正在付」。
+       *
+       * 后果：需求里那句「所有前提建立在订单状态是支付成功」被悄悄破掉 ——
+       * 一个刚下单还没付款（甚至支付失败）的订单号就能换到下载权限。
+       */
+      name: 'R64-02a · 恢复购买不再要求「支付成功」（pending 也能换到下载权限）',
+      file: 'server/payment-orders.js',
+      anchor: "  if (o.status === 'paid') return { ok: true, reason: '', order: o, message: '' };",
+      replacement: "  if (o.status === 'paid' || o.status === 'pending') return { ok: true, reason: '', order: o, message: '' };",
+      testFile: 'share-orders.test.js',
+      minFail: 2,
+    },
+    {
+      /*
+       * R64-03a：免费下载台账不再去重。
+       *
+       * 后果：需求 2②「只展示第一次下载的记录，重复下载不计」失效 —— 历史订单里
+       * 同一个文件按下载次数重复出现，并且每次下载都多写一条落盘记录。
+       */
+      name: 'R64-03a · 免费下载不再去重（重复下载逐条累加）',
+      file: 'server/download-log.js',
+      anchor: '    if (seen.has(dedupe)) continue;',
+      replacement: '    if (false) continue;',
+      testFile: 'share-orders.test.js',
+      minFail: 2,
+    },
+    {
+      /*
+       * R64-04a：历史订单页不再为已支付订单补发票据。
+       *
+       * 后果：这一页的「重新下载」全都指向仍要求付款的分享页 —— 用户明明买过，
+       * 点进去还是付费墙（功能看起来"能看订单"，实际一步也走不通）。
+       */
+      name: 'R64-04a · 历史订单不补发票据（点重新下载仍回到付费墙）',
+      file: 'server/share-routes.js',
+      anchor: "    if (o.status !== 'paid') continue;",
+      replacement: '    continue;',
+      testFile: 'share-orders.test.js',
+      minFail: 1,
+    },
   ];
 
 module.exports = { runCase, CASES, parseArgs };
