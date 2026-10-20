@@ -1,0 +1,17 @@
+{
+  "//": "R66：给编辑器（VS Code / WebStorm）用的类型提示配置。零依赖、零构建 —— 不引入 TypeScript，也不改变任何运行时行为（Node 不认识这个文件）。",
+  "//checkJs": "刻意保持 false：本项目的服务端是 CommonJS、前端是原生 ESM，同一份配置要覆盖两种模块形态；全局开 checkJs 会在没有 JSDoc 的文件里报出大量噪音，反而让人关掉它。需要类型检查的文件请在**文件头**单独写 `// @ts-check`（逐文件推进，改到哪验到哪）。",
+  "compilerOptions": {
+    "target": "ES2022",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "allowJs": true,
+    "checkJs": false,
+    "noEmit": true,
+    "strict": false,
+    "resolveJsonModule": true,
+    "skipLibCheck": true,
+    "lib": ["ES2022", "DOM"]
+  },
+  "exclude": ["node_modules", "client", "data"]
+}

@@ -11,7 +11,8 @@
  *            密文结构：[用户魔数(M B)][异或(原文[M:])]，长度与原文一致
  *            原始文件头保存在本地元数据中，解密时还原
  *
- * 元数据 data/enc-meta.json：{ files: { "<bucket>|<key>": { mode, origSize, crypto|magic, createdAt } } }
+ * 元数据 data/enc-meta.json：{ files: { "<bucket>|<key>": { mode, origSize, keyId, crypto|magic, createdAt } } }
+ *  - `keyId`（R66）：这条密文是用哪一版密钥加的，老记录缺该字段时按 1 解释（见 keyIdOf）
  *  - 记录每个密文对象的解密参数（IV/TAG/盐/原始文件头/原始大小）
  *  - 重命名 / 移动 / 复制时同步迁移；删除时清理
  *
@@ -43,6 +44,44 @@ const IV_LEN = 12;
 const TAG_LEN = 16;
 const SALT_LEN = 16;
 const MAX_MAGIC_BYTES = 64;
+
+/**
+ * 密钥版本号 —— **现在只有一个值，是为将来的密钥轮换预留的**（R66）。
+ *
+ * 背景：`secret.key` / `enc.key` 一旦泄露，当前只能「全量下载 → 重新加密 → 重新上传」，
+ * 全程停机且双倍流量。之所以非这样不可，是因为**元数据里没有任何东西记录
+ * 「这条密文是用哪把密钥加的」** —— 换密钥时无法区分新旧密文，只能一次全量重写。
+ *
+ * 这里做的是低成本准备：每条新元数据盖上 `keyId`（默认 1），密文格式**一个字节都不动**。
+ * 将来真要轮换时，`keyId` 就是「这把密钥能不能丢」的唯一判据，存量数据不再需要
+ * 「先全量重写」这个前置条件。⚠️ 它**不是**轮换功能本身：读取路径目前仍只有一把密钥，
+ * `keyIdOf()` 只是把「老记录（无该字段）」统一按 1 解释。
+ */
+const CURRENT_KEY_ID = 1;
+
+/**
+ * 给元数据条目盖「用了哪把密钥」的章 —— **唯一实现点**。
+ *
+ * 为什么收成一个函数：元数据有 4 个生产点（直传 crypto / 直传 magic / 分片 crypto /
+ * 分片 magic）。逐个手写 `keyId: 1` 的话，将来新增第 5 种加密形态必然漏一个，
+ * 而漏掉的表现是「这条密文永远不知道该用哪把密钥解」—— 十年后才会炸。
+ */
+function stampKeyId(meta) {
+  if (!meta || typeof meta !== 'object') return meta;
+  meta.keyId = CURRENT_KEY_ID;
+  return meta;
+}
+
+/**
+ * 读一条元数据里的密钥版本：缺失 / 非数字 / 非正数一律按 `CURRENT_KEY_ID`（= 1）。
+ *
+ * 「老记录按 1 解释」是这一版**唯一的向后兼容承诺**：R66 之前落盘的 enc-meta 条目
+ * 没有这个字段，而那批密文确实是用 1 号密钥加的。
+ */
+function keyIdOf(meta) {
+  const n = Number(meta && meta.keyId);
+  return Number.isFinite(n) && n > 0 ? Math.floor(n) : CURRENT_KEY_ID;
+}
 const DEFAULT_MAGIC_TEXT = 'ENCRYPTED';
 const MODES = ['none', 'crypto', 'magic'];
 const TOKEN_TTL_MS = 30 * 60 * 1000;
@@ -669,10 +708,10 @@ function encryptBufferImpl(ex, bucket, key, buf) {
   if (s.mode === 'crypto') {
     const iv = crypto.randomBytes(IV_LEN);
     // 元数据先成型、密文后填：这样加密在哪个线程上做都不影响结果结构
-    const meta = {
+    const meta = stampKeyId({
       mode: 'crypto', origSize: buf.length, createdAt: iso(),
       crypto: { segments: [{ n: 1, iv: iv.toString('hex'), ctLen: buf.length }] },
-    };
+    });
     const finish = (ct, tag) => {
       meta.crypto.segments[0].tag = tag.toString('hex');
       return { data: Buffer.concat([CRYPTO_MAGIC, iv, ct, tag]), meta };
@@ -693,7 +732,7 @@ function encryptBufferImpl(ex, bucket, key, buf) {
   const M = magic.length;
   const salt = s.useSalt ? crypto.randomBytes(SALT_LEN) : null;
   const header = Buffer.from(buf.slice(0, M)); // 原始文件头（解密时还原）
-  const meta = {
+  const meta = stampKeyId({
     mode: 'magic', origSize: buf.length, createdAt: iso(),
     magic: {
       salt: salt ? salt.toString('hex') : null,
@@ -701,7 +740,7 @@ function encryptBufferImpl(ex, bucket, key, buf) {
       magicLen: M,
       sha256: crypto.createHash('sha256').update(buf).digest('hex'),
     },
-  };
+  });
   // 待异或的字节 = 去掉被魔数覆写的文件头。两条路径都先取副本，语义一致。
   const target = Buffer.from(buf.slice(M));
   const finish = (body) => ({ data: Buffer.concat([magic, body]), meta });
@@ -880,7 +919,7 @@ function buildFinalMeta(sess) {
     // FUN-11：分片**连续且完整**时给出逐片摘要，解密端点位即在确定性边界上逐个校验，
     // 使 magic 模式也具备篡改可检出能力。缺失任一分片则不声称可校验（回退旧行为）。
     const partDigests = normalisePartDigests(sess.enc.parts, sess.size, sess.chunkSize, sess.enc.magicLen);
-    return {
+    return stampKeyId({
       mode: 'magic', origSize: sess.size, createdAt: iso(),
       magic: {
         salt: sess.enc.salt || null,
@@ -889,7 +928,7 @@ function buildFinalMeta(sess) {
         integrity: partDigests ? 'parts' : 'none',
         parts: partDigests || undefined,
       },
-    };
+    });
   }
   const parts = Object.entries(sess.enc.parts || {});
   if (!parts.length) throw bad('分片上传元数据不完整（无加密分段），请取消任务后重新上传');
@@ -900,7 +939,7 @@ function buildFinalMeta(sess) {
   const segments = parts
     .map(([n, v]) => ({ n: Number(n), iv: v.iv, tag: v.tag, ctLen: v.ctLen }))
     .sort((a, b) => a.n - b.n);
-  return { mode: 'crypto', origSize: sess.size, createdAt: iso(), crypto: { segments } };
+  return stampKeyId({ mode: 'crypto', origSize: sess.size, createdAt: iso(), crypto: { segments } });
 }
 
 /* ============================ 解密流 ============================ */
@@ -1219,6 +1258,7 @@ module.exports = {
   xorBuf, fillKeystream, // PERF-03：导出以便对窗口式密钥流做差分验证
   passwordSet, checkPassword, issueToken, verifyToken,
   metaIsCorrupt,
+  CURRENT_KEY_ID, keyIdOf, // R66：密钥版本预留（写入盖章的唯一实现点 + 读取时的默认口径）
   flushMeta, flushMetaSync, metaDirty, // SEC-08：关键节点同步落盘；flushMetaSync 为退出路径（只写不建）
   _resetForTest,
 };

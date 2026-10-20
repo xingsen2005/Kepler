@@ -9258,6 +9258,64 @@ const CASES = [
       testFile: 'restore-settings.test.js',
       minFail: 1,
     },
+    {
+      /*
+       * R66-01a：CI 的安装步骤退化成 `npm install`。
+       *
+       * 后果：CI 不再严格按 lockfile 装依赖 —— 装了与锁文件不同的版本，本地绿、CI 红
+       * （或反过来）的来源就多了一条，而这条差异最难归因。判据在
+       * `repo-hygiene.test.js` 里看的是 `run:` 行本身，不是「全文出现过 npm ci」。
+       */
+      name: 'R66-01a · CI 安装步骤退化成 npm install（不再按 lockfile）',
+      file: '.github/workflows/ci.yml',
+      anchor: '        run: npm ci',
+      replacement: '        run: npm install',
+      testFile: 'repo-hygiene.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * R66-02a：测试把数据目录写死成仓库的 `data/`（R66 修掉的那个缺陷本身）。
+       *
+       * 后果：`protectData()` 的「备份→还原」保护的是本进程根本不会写的目录，
+       * 而那层保险看起来一直在。
+       */
+      name: 'R66-02a · 测试把数据目录写死成仓库 data/（隔离失效）',
+      file: 'tests/crypto-storage.test.js',
+      anchor: "const DATA = process.env.S3_DATA_DIR || path.join(ROOT, 'data');",
+      replacement: "const DATA = path.join(ROOT, 'data');",
+      testFile: 'repo-hygiene.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * R66-03a：元数据的 keyId 盖章写了个非法值。
+       *
+       * 后果：将来轮换密钥时，这批密文的密钥归属是错的 —— 而这正是「1% 成本买
+       * 10 倍选择权」的那个 1%。`keyIdOf()` 会把 0 当非法值回落到 1，所以光看
+       * 「能解密」是发现不了的，必须断言落盘值本身。
+       */
+      name: 'R66-03a · 元数据的 keyId 被写成非法值（轮换时无从判断密钥归属）',
+      file: 'server/enc-store.js',
+      anchor: '  meta.keyId = CURRENT_KEY_ID;',
+      replacement: '  meta.keyId = 0;',
+      testFile: 'crypto-storage.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * R66-04a：`/health` 的运维字段不再按角色分档（谁都拿得到）。
+       *
+       * 后果：普通用户拿到「这台实例一共几个桶」——跨用户规模信息；而 `/health`
+       * 只要求登录、不挂 requireAdmin，所以这个泄漏是**任何登录用户**都能取的。
+       */
+      name: 'R66-04a · /health 的 bucketCount 不再按角色分档（普通用户可见）',
+      file: 'server/routes/stats.js',
+      anchor: "  if (req.authUser && req.authUser.role === 'admin') {",
+      replacement: '  if (true) {',
+      testFile: 'repo-hygiene.test.js',
+      minFail: 1,
+    },
   ];
 
 module.exports = { runCase, CASES, parseArgs };

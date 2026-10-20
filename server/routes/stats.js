@@ -157,6 +157,22 @@ router.get('/health', (req, res) => {
     configured: Boolean(cfg && cfg.secretId && cfg.secretKey),
     corrupted: configStore.isCorrupted(),
   };
+  /**
+   * R66：运维诊断最常问的两件事 —— 「这台实例上到底有几个桶」与「配置最后一次
+   * 被改动是什么时候」。没有它们，排查只能去翻 `logs.jsonl`（明文、5000 条滚动、
+   * 可被本机用户编辑）或者 `stat data/config.enc` 看文件 mtime（加密落盘后
+   * 每次内容都变，但 mtime 会被任何一次重启刷掉）。
+   *
+   * ⚠️ **仅管理员可见**，这是它与上面两个字段的关键区别：`configured` / `corrupted`
+   * 是「这台实例能不能用」，普通用户也要得到这个答案；而「一共几个桶」是**跨用户**
+   * 的规模信息（普通用户只看得到 `visibleToUsers` 的那些）。`/health` 只要求登录、
+   * 不挂 `requireAdmin`（前端全局横幅与运维探针都靠它），所以这里按角色分档下发，
+   * 而不是给它单独挂管理员守卫 —— 那会让普通用户拿到 403、拿不到「服务是否可用」。
+   */
+  if (req.authUser && req.authUser.role === 'admin') {
+    out.bucketCount = cfg && Array.isArray(cfg.buckets) ? cfg.buckets.length : 0;
+    out.lastWriteAt = (cfg && cfg.updatedAt) || '';
+  }
   const secureErr = secureStore.getLastWriteError();
   if (secureErr) { out.ok = false; out.secureWriteError = secureErr; }
   const corruptFiles = secureStore.corruptList();

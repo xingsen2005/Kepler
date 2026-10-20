@@ -64,7 +64,7 @@ function spawnBashSnippet(script) {
  * A · EL8 上装 Node.js
  * ================================================================== */
 
-test('R40 · deploy.sh：RPM 系的 node 安装必须带 --allowerasing（EL8 模块包互斥的唯一解法）', async () => {
+test('R40 · deploy.sh：RPM 系的 node 安装必须带 --allowerasing（EL8 模块包互斥的唯一解法）', async (t) => {
   const src = readDeploy();
   assert(hasFn(src, 'node_pm_extra_args'),
     '必须有一个唯一实现点决定「RPM 系要不要额外参数」，而不是在两处调用点各写一份判断');
@@ -79,7 +79,18 @@ for p in dnf yum apt apk zypper; do printf '%s=%s\\n' "$p" "$(PM=$p; node_pm_ext
 printf 'unset=%s\\n' "$(unset PM; node_pm_extra_args)"
 `;
   const r = await spawnBashSnippet(probe);
-  if (r.unavailable) return; // 本机没有 bash：跳过（与环境有关，与代码对错无关）
+  /**
+   * R66：没有 bash 时**必须显式 skip**，不能 `return`。
+   *
+   * 原来的写法是 `if (r.unavailable) return;` —— 用例照样报告 `ok`，于是
+   * 「没有 bash 的机器」上这条行为断言**从未执行过却显示通过**（与「护栏假绿」
+   * 同源）。CI 在 ubuntu 上一定能跑、Windows 上万一没有 bash 也只会记一条 skip，
+   * 两种情形都不会再伪装成绿。
+   */
+  if (r.unavailable) {
+    t.skip(`本机没有 bash（${r.unavailable}），跳过 shell 行为断言；静态断言已在上方生效`);
+    return;
+  }
   const got = Object.fromEntries(
     r.out.trim().split('\n').filter((l) => l.includes('=')).map((l) => l.split('=')),
   );

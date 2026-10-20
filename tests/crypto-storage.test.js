@@ -5,16 +5,32 @@
  *  — ip-guard：CIDR 匹配与规则求值
  *  — instance-lock：单实例锁（脏锁接管 / 释放 / 活跃锁拒绝）
  *
- * 注：这些模块直接读写项目 data/ 目录，测试中通过「备份→操作→还原」保证不污染真实配置。
+ * 注：这些模块直接读写**运行时数据目录**，测试中通过「备份→操作→还原」保证不污染真实配置。
  */
 const test = require('node:test');
 const fs = require('node:fs');
 const path = require('node:path');
 const crypto = require('node:crypto');
 
+require('./helpers'); // 兜底 S3_DATA_DIR 到进程级临时目录（下一行的 require 命中同一份缓存，顺序即保证）
+
 const { assert, assertEqual, ROOT } = require('./helpers');
 
-const DATA = path.join(ROOT, 'data');
+/**
+ * 运行时数据目录 —— **必须**跟随 `S3_DATA_DIR`，不能写死 `ROOT/data`。
+ *
+ * R66 修正：这里原本是 `path.join(ROOT, 'data')`。而 `helpers.js` 已在顶层把
+ * `S3_DATA_DIR` 兜底到临时目录，于是 `enc-store` / `atomic-write` 写的全是
+ * **临时目录**里的文件，而 `protectData()` 备份 / 还原的却是仓库里那份 `data/`
+ * —— 它保护的正好是**本进程根本不会去写**的目录。这层「保险」既没有覆盖到真被
+ * 改动的文件，又让人以为隔离已经做过了。
+ *
+ * 现在两边同源：`DATA` 就是 store 真正会落的那个目录，`protectData()` 这才名实相符。
+ * 仍然保留「备份→还原」而不是改用独立临时目录：`enc.key` 是**数据目录级**的密钥
+ * （同目录下 `enc-meta.json` 的密文全靠它），换目录就等于换了一份密钥，
+ * 也就测不到「同一份密钥反复读写」这条真实路径了。
+ */
+const DATA = process.env.S3_DATA_DIR || path.join(ROOT, 'data');
 
 /* ============================ 数据目录保护 ============================ */
 
@@ -44,6 +60,39 @@ function protectData(files) {
     }
   };
 }
+
+test('R66-03 · 每条新元数据都盖上 keyId（密钥轮换的预留位）；老记录按 1 解释', async () => {
+  const restore = protectData(['enc-meta.json', 'enc-settings.json', 'enc.key']);
+  const encStore = require(path.join(ROOT, 'server', 'enc-store.js'));
+  try {
+    encStore._resetForTest();
+    encStore.updateSettings({ mode: 'crypto', password: '' });
+
+    // ① crypto 分支：新建的元数据必须带 keyId=1，且**落盘再读回**也是 1
+    //    （只在内存对象上加、忘了随 setMeta 落盘，是这条最可能的漏法）
+    const plain = Buffer.from('keyId 探针：这一段没有任何字段会随密文一起走');
+    const enc = encStore.encryptBuffer('kid-bucket', 'dir/crypto.bin', plain);
+    assertEqual(enc.meta.keyId, 1, 'crypto 分支的元数据必须盖 keyId=1');
+    encStore.setMeta('kid-bucket', 'dir/crypto.bin', enc.meta);
+    const readBack = encStore.getMeta('kid-bucket', 'dir/crypto.bin');
+    assertEqual(readBack.keyId, 1, 'keyId 必须真的落进 enc-meta.json（读回来还在）');
+
+    // ② magic 分支：4 个元数据生产点里最容易漏的就是它（另一条路径、另一段代码）
+    encStore.updateSettings({ mode: 'magic', magic: 'COSCENC01FF', password: '' });
+    const enc2 = encStore.encryptBuffer('kid-bucket', 'dir/magic.bin', Buffer.from('0123456789abcdef'));
+    assertEqual(enc2.meta.keyId, 1, 'magic 分支同样要盖章 —— 漏一个分支就等于这条密文将来没有密钥归属');
+
+    // ③ 向后兼容：R66 之前落盘的条目没有这个字段，必须仍按 1 号密钥解释
+    assertEqual(encStore.keyIdOf({ mode: 'crypto', origSize: 3 }), 1,
+      '老记录（无 keyId）必须回落到 1 —— 这批密文确实是用 1 号密钥加的');
+    assertEqual(encStore.keyIdOf({ keyId: 0 }), 1, '非法值（0）也回落，不静默当成「第 0 把密钥」');
+    assertEqual(encStore.keyIdOf({ keyId: '2' }), 2, '合法值原样读出（将来轮换时靠它区分新旧密文）');
+    assertEqual(encStore.CURRENT_KEY_ID, 1, '当前只有一把密钥');
+  } finally {
+    restore();
+    encStore._resetForTest && encStore._resetForTest();
+  }
+});
 
 /* ============================ enc-store ============================ */
 
