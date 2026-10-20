@@ -60,6 +60,9 @@ const { classifyDownloadSource } = require('./share-origin');
 const fileIcons = require('./file-icons');
 const { singleFlight } = require('./coalesce'); // R14-10：并发合并读（唯一实现点）
 const { asyncHandler } = require('./routes/_shared'); // R17-04：async 抛错交回统一错误中间件
+// R68：分享页的协议提示与协议正文。渲染与「哪几个链接可点」的判断全在这个模块里
+// （登录页走的是它的另一入口 `publicPayload()`），本文件只负责把结果拼进页面。
+const agreementView = require('./agreement-view');
 
 const router = express.Router();
 router.use(express.urlencoded({ extended: false }));
@@ -438,7 +441,7 @@ function fmtDate(iso) {
 
 /* ------------------------------ 页面模板 ------------------------------ */
 
-function renderPage(res, status, { title, head, body, wide, below }) {
+function renderPage(res, status, { title, head, body, wide, below, noNotice }) {
   /**
    * R13-07：状态码白名单。全部调用方都传本地字面量（含 401 = 分享密码错误页，属本地语义），
    * 白名单把这份「本地性」变成机器可查的凭据 —— 上游状态若意外渗入（例如把云端错误码
@@ -447,6 +450,26 @@ function renderPage(res, status, { title, head, body, wide, below }) {
   const code = [200, 400, 401, 402, 403, 404, 410, 429, 503].indexOf(status) >= 0 ? status : 500;
   const acct = (res.locals && res.locals.shareUser) || null;
   const linkId = (res.locals && res.locals.shareLinkId) || '';
+  /**
+   * R68：协议提示（**分享页的唯一取用点**）。
+   *
+   * 放在 `renderPage()` 里而不是中间件里，有两个理由：
+   *  ① 只有真的渲染一页 HTML 时才需要它 —— `GET /s/:id/dl`（下载）根本不走这里，
+   *     不该为了一份可能上万字的 Markdown 付渲染成本；
+   *  ② 渲染入口虽然多（信息页 / 列表页 / 支付页 / 密码页…），但它们**都收敛到这一个函数**，
+   *     接一次就全覆盖（与右上角「登录 / 退出登录」同一条理由）。
+   *
+   * `noNotice` 供错误页（`statePage`）关掉它：链接不存在 / 已过期 / 次数用尽这些页面上
+   * 摆一句「继续下载即代表您已阅读并同意…」是自相矛盾的。
+   *
+   * 异常**一律吞掉**：分享页是本项目唯一的对公入口，绝不能因为一段协议配置写坏了
+   * 就让所有访客看到 500。
+   */
+  let ag = null;
+  if (!noNotice) {
+    try { ag = agreementView.noticeForPage('share'); } catch (e) { ag = null; }
+  }
+  const agModals = ag ? agreementModals(ag.docs) : '';
   const accountBar = acct
     ? `<span class="tb-user" title="${esc(acct.username)}">${esc(acct.username)}</span>
       <form method="POST" action="/s/${esc(linkId)}/logout" class="tb-form"><button class="tb-link" type="submit">退出登录</button></form>`
@@ -497,6 +520,43 @@ function renderPage(res, status, { title, head, body, wide, below }) {
     font-family: Consolas, "Courier New", monospace; letter-spacing: .02em; }
   input[type=text]:focus { border-color: #0067c0; box-shadow: 0 0 0 3px rgba(0,103,192,.12); }
   .foot { margin-top: 22px; text-align: center; color: #b3b9c2; font-size: 11px; }
+  /* ---------- R68：协议提示 + 零脚本对话框（:target） ---------- */
+  /* 提示贴着 .foot 上方：两者都是「小字说明」，放在一起读起来才连贯 */
+  .ag-notice { margin-top: 16px; color: #8a8f98; font-size: 12px; line-height: 1.8; text-align: center; }
+  .ag-notice .ag-link { color: #0067c0; text-decoration: none; border-bottom: 1px dashed #9dc4e8; }
+  .ag-notice .ag-link:hover { border-bottom-style: solid; }
+  /* 默认完全不渲染；只有成为 :target 时才铺满视口。
+     ⚠️ 不能用 display:none + :target 之外的动画 —— 分享页没有脚本，见 renderPage 的说明。 */
+  .ag-modal { display: none; }
+  .ag-modal:target { display: flex; align-items: center; justify-content: center;
+    position: fixed; inset: 0; z-index: 60; padding: 20px; }
+  .ag-mask { position: absolute; inset: 0; background: rgba(15, 35, 70, .42); }
+  .ag-modal-box { position: relative; background: #fff; border-radius: 14px; width: 100%;
+    max-width: 680px; max-height: 82vh; display: flex; flex-direction: column;
+    box-shadow: 0 18px 60px rgba(15, 35, 70, .28); overflow: hidden; }
+  .ag-modal-head { display: flex; align-items: center; justify-content: space-between;
+    padding: 14px 18px; border-bottom: 1px solid #eef1f5; font-size: 14px; }
+  .ag-x { color: #8a8f98; text-decoration: none; font-size: 15px; padding: 2px 7px; border-radius: 6px; }
+  .ag-x:hover { background: #eef1f5; }
+  /* 正文区独立滚动：一份长协议不会把「关闭」按钮推到视口之外 */
+  .ag-modal-body { padding: 16px 20px; overflow-y: auto; }
+  .ag-modal-foot { padding: 10px 18px 14px; text-align: right; border-top: 1px solid #eef1f5; }
+  .ag-close { display: inline-block; padding: 8px 18px; border-radius: 8px;
+    background: #0067c0; color: #fff; text-decoration: none; font-size: 13px; }
+  .ag-close:hover { background: #005da8; }
+  /* 协议正文排版（与主站 .ag-doc 同一套层级；分享页没有主题变量，故用字面量） */
+  .ag-doc { font-size: 13px; line-height: 1.85; color: #1b1b1b; text-align: left; }
+  .ag-doc h1 { font-size: 17px; margin: 0 0 12px; }
+  .ag-doc h2 { font-size: 15px; margin: 18px 0 8px; }
+  .ag-doc h3, .ag-doc h4, .ag-doc h5, .ag-doc h6 { font-size: 13.5px; margin: 14px 0 6px; }
+  .ag-doc p { margin: 0 0 10px; }
+  .ag-doc ul, .ag-doc ol { margin: 0 0 10px; padding-left: 22px; }
+  .ag-doc li { margin: 3px 0; }
+  .ag-doc blockquote { margin: 0 0 10px; padding: 8px 12px; border-left: 3px solid #d5dbe3;
+    background: #f7f9fc; color: #5b6472; border-radius: 0 6px 6px 0; }
+  .ag-doc code { background: #f1f4f8; border-radius: 4px; padding: 1px 5px;
+    font-family: Consolas, "Courier New", monospace; font-size: 12px; }
+  .ag-doc a { color: #0067c0; }
   .icon-big { width: 46px; height: 46px; border-radius: 12px; margin-bottom: 16px;
     display: flex; align-items: center; justify-content: center; }
   /* 卡片内的标题块统一居中：金额（.pay-amount）与二维码（.qr-box）本就是居中的，
@@ -628,12 +688,46 @@ function renderPage(res, status, { title, head, body, wide, below }) {
       <div class="brand">文件分享</div>
       ${head || ''}
       ${body || ''}
+      ${ag ? `<div class="ag-notice">${ag.html}</div>` : ''}
       <div class="foot">注意：该链接由分享者的存储管理系统生成，任何下载行为都会被记录。</div>
     </div>
     ${below ? `<div class="below-card${wide ? ' wide' : ''}">${below}</div>` : ''}
   </div>
+  ${agModals}
 </body>
 </html>`);
+}
+
+/**
+ * R68：协议对话框（分享页版）—— **零脚本**实现。
+ *
+ * 分享页的 CSP 不允许内联脚本（与本项目「服务端渲染 + 零构建」的选择一致），
+ * 所以不能用 `openModal()` 那一套。这里用 CSS 的 `:target`：
+ *  - 提示里的链接是 `<a href="#ag-share-terms">`，点它就等于把该元素变成 `:target`；
+ *  - `.ag-modal` 默认 `display:none`，`:target` 时铺满视口 —— 于是「点开」= 一次纯导航；
+ *  - 关闭按钮 / 遮罩 / 右上角 ✕ 都是 `<a href="#!">`：把哈希换成一个**不存在**的锚点，
+ *    没有任何元素再匹配 `:target`，对话框自然收起。
+ *
+ * 只有**确实被提示引用到**的协议才会生成对话框（`docs` 由 `noticeForPage` 裁剪过），
+ * 因此不会出现「页面里躺着一份没人能点开的协议正文」。
+ *
+ * @param {object} docs `{ terms?: {title, html}, privacy?: {title, html} }`
+ * @returns {string} 拼好的对话框 HTML（没有正文时返回空串）
+ */
+function agreementModals(docs) {
+  const keys = ['terms', 'privacy'].filter((k) => docs && docs[k] && docs[k].html);
+  return keys.map((key) => {
+    const d = docs[key];
+    return `
+<div class="ag-modal" id="ag-share-${key}" role="dialog" aria-modal="true" aria-label="${esc(d.title)}">
+  <a class="ag-mask" href="#!" aria-label="关闭"></a>
+  <div class="ag-modal-box">
+    <div class="ag-modal-head"><b>${esc(d.title)}</b><a class="ag-x" href="#!" title="关闭" aria-label="关闭">✕</a></div>
+    <div class="ag-modal-body ag-doc">${d.html}</div>
+    <div class="ag-modal-foot"><a class="ag-close" href="#!">关闭</a></div>
+  </div>
+</div>`;
+  }).join('');
 }
 
 /**
@@ -655,6 +749,9 @@ function statePage(res, state, l, customMsg) {
   const sub = (typeof customMsg === 'string' && customMsg) ? customMsg : s.sub;
   renderPage(res, s.code, {
     title: s.title,
+    // R68：错误页不显示协议提示 —— 这一页没有任何「继续下载」的动作，
+    // 摆一句「继续下载即代表您已阅读并同意…」是自相矛盾的。
+    noNotice: true,
     body: `
       <div class="center-head">
       <div class="icon-big" style="background:${s.bg};color:${s.fg};font-size:22px">${s.icon}</div>

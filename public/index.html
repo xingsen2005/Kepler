@@ -332,6 +332,31 @@
                 </div>
               </div>
 
+              <!-- R68：三个页面各自的协议提示（是否显示 + 文案）。
+                   ⚠️ 刻意不用 ip-switch（那是「启用 / 停用某项功能」的样式，且本卡片
+                   有一条护栏专门断言它内部不得出现 ip-switch —— 站点设置没有总开关）。 -->
+              <div class="form-item">
+                <label>协议提示</label>
+                <div class="notice-row">
+                  <label class="check-line"><input type="checkbox" id="site-notice-login"> 登录页</label>
+                  <input type="text" id="site-notice-login-text" class="full" autocomplete="off" spellcheck="false"
+                    placeholder="留空 = 登录即代表您已阅读并同意&lt;a&gt;用户协议&lt;/a&gt;和&lt;a&gt;隐私协议&lt;/a&gt;">
+                </div>
+                <div class="notice-row">
+                  <label class="check-line"><input type="checkbox" id="site-notice-register"> 注册页</label>
+                  <input type="text" id="site-notice-register-text" class="full" autocomplete="off" spellcheck="false"
+                    placeholder="留空 = 继续注册则代表您已阅读并同意&lt;a&gt;用户协议&lt;/a&gt;和&lt;a&gt;隐私协议&lt;/a&gt;">
+                </div>
+                <div class="notice-row">
+                  <label class="check-line"><input type="checkbox" id="site-notice-share"> 分享页</label>
+                  <input type="text" id="site-notice-share-text" class="full" autocomplete="off" spellcheck="false"
+                    placeholder="留空 = 继续下载即代表您已阅读并同意&lt;a&gt;用户协议&lt;/a&gt;和&lt;a&gt;隐私协议&lt;/a&gt;">
+                </div>
+                <div class="hint">
+                  勾选后该页才显示提示。文案里用 <code>&lt;a&gt;…&lt;/a&gt;</code> 包住要变成链接的文字（<b>第 1 个</b>指向用户协议、<b>第 2 个</b>指向隐私协议，也可写 <code>&lt;a data-doc="privacy"&gt;</code> 指定）；<b>文案留空</b>则该页使用上面 placeholder 里那句默认文案。<b>两份协议正文本身在下方「协议设置」里编辑</b> —— 没填正文的那一份会显示成普通文字。
+                </div>
+              </div>
+
               <div id="site-msg" class="form-msg"></div>
               <div class="form-item" style="margin-top:4px">
                 <button id="btn-site-save" class="mini-btn primary">保存设置</button>
@@ -345,6 +370,7 @@
                   <li>本卡片仅管理员可见；普通用户看不到也无法修改站点设置。</li>
                   <li><b>邀请码</b>模式下，登录页会多出「邀请码」输入框；邀请码本身在左侧栏的「<b>邀请码设置</b>」里生成与管理（可批量生成、批量设置次数 / 过期时间 / 身份、批量删除，并<b>导出为 txt</b>）。</li>
                   <li>选择「邀请码」后请记得先去生成一批邀请码，否则没有人能注册进来。</li>
+                  <li><b>协议提示</b>只决定「该页显不显示那句话」以及那句话怎么写；<b>协议正文</b>（点链接后弹出的内容）在下方「<b>协议设置</b>」卡片里维护。两份正文都为空时，即使勾选了也不会显示 —— 否则访客点开的是一个空对话框。</li>
                 </ul>
               </div>
             </div>
@@ -482,6 +508,48 @@
                   <li>密码与配置一同加密存放于 <code>data/config.enc</code>；如需清除已保存的密码，请联系管理员在服务端操作（界面上「留空」只表示<b>不修改</b>）。</li>
                   <li>「启用」开关只决定<b>各功能是否会真正使用本配置发信</b>；<b>测试邮件不受该开关限制</b> —— 它是管理员手动触发的一次性动作。</li>
                   <li>本卡片仅管理员可见；普通用户看不到也无法修改发信配置。</li>
+                </ul>
+              </div>
+            </div>
+            <!-- 协议设置（仅管理员，R68）：只保存两份协议正文本身。
+                 「三个页面要不要显示协议提示 + 提示文案」刻意**不在这里** ——
+                 需求明确它归【站点设置】卡片（见上方那一卡）。这里的两个编辑框
+                 固定高度、内容超出时竖滚动，避免一份长协议把整页撑开。 -->
+            <div class="dash-card wide sysset-card" id="sysset-agreement-card">
+              <h3 class="sysset-h3"><span class="sysset-tag agr">协议</span>协议设置 <span id="agreement-status" class="lk-count"></span>
+                <button id="btn-agreement-save" class="mini-btn primary sysset-action">保存设置</button></h3>
+              <div class="enc-warn">
+                <b>简要说明</b>：这里只保存两份<b>协议正文</b>（<b>用户协议</b> / <b>隐私协议</b>）。访客在登录页、注册页、分享页点开提示里的链接时，弹出的就是这个对话框里的内容。<b>哪个页面显示提示、提示文案写什么，在「站点设置」里设置</b> —— 本卡片不重复放那几个开关。正文支持一个很小的 <b>Markdown</b> 子集（标题 <code>#</code>、列表 <code>-</code>、引用 <code>&gt;</code>、<code>**粗体**</code>、<code>`代码`</code>、<code>[文字](链接)</code>），不认识的写法按普通文字原样显示，不会丢内容。
+              </div>
+
+              <div class="form-row">
+                <div class="form-item">
+                  <label>用户协议</label>
+                  <textarea id="agreement-terms" class="ag-editor" spellcheck="false"
+                    placeholder="# 用户协议&#10;&#10;## 一、服务内容&#10;本系统提供……&#10;&#10;- 条款一&#10;- 条款二"></textarea>
+                  <div class="hint" id="agreement-terms-stat">未填写</div>
+                </div>
+                <div class="form-item">
+                  <label>隐私协议</label>
+                  <textarea id="agreement-privacy" class="ag-editor" spellcheck="false"
+                    placeholder="# 隐私协议&#10;&#10;我们收集哪些信息、如何使用、保留多久……"></textarea>
+                  <div class="hint" id="agreement-privacy-stat">未填写</div>
+                </div>
+              </div>
+
+              <div id="agreement-msg" class="form-msg"></div>
+              <div class="form-item" style="margin-top:4px">
+                <button id="btn-agreement-preview" class="mini-btn">预览渲染效果</button>
+                <span id="agreement-state" class="hint" style="margin-left:10px"></span>
+              </div>
+
+              <div class="card-note">
+                <ul class="note-list">
+                  <li>两份协议<b>各自独立</b>：只填其中一份也可以，另一份的链接会自动退化成<b>普通文字</b>（点了不会有空对话框）。两份都没填时，三个页面上的提示<b>整条不显示</b>。</li>
+                  <li>编辑框是<b>固定高度 + 竖滚动</b>的，正文再长也不会把页面撑开；文本原样保存在 <code>data/config.enc</code> 里，单份上限 <b>20000 字符</b>。</li>
+                  <li>「预览渲染效果」渲染的是<b>编辑框里当前的内容</b>（不必先保存），用的与服务端下发时<b>同一个</b>渲染器 —— 所见即访客所见。</li>
+                  <li>提示文案里用 <code>&lt;a&gt;…&lt;/a&gt;</code> 包住的词会变成链接：<b>第 1 个</b>指向用户协议、<b>第 2 个</b>指向隐私协议；想写更多链接时用 <code>&lt;a data-doc="privacy"&gt;</code> 显式指定。</li>
+                  <li>本卡片仅管理员可见；普通用户看不到也无法修改协议内容。</li>
                 </ul>
               </div>
             </div>
@@ -843,7 +911,7 @@
             <div class="dash-card wide sysset-card">
               <h3 class="sysset-h3"><span class="sysset-tag about">关于</span>关于</h3>
               <div class="about-body">
-                <p><b>Kepler 对象存储管理系统</b> Build 1.9.3</p>
+                <p><b>Kepler 对象存储管理系统</b> Build 1.9.4</p>
                 <ul class="about-list">
                   <li>开发者：邢森</li>
                   <li>项目地址：<a href="https://github.com/xingsen2005/Kepler" target="_blank">https://github.com/xingsen2005/Kepler</a></li>
@@ -1076,6 +1144,9 @@
       <div id="auth-captcha-msg" class="auth-captcha-msg" hidden></div>
       <div id="auth-error" class="auth-error" hidden></div>
       <button id="btn-auth-submit" class="auth-btn">登 录</button>
+      <!-- R68：协议提示（管理员在「站点设置」里按页开启）。HTML 由服务端渲染好
+           （先整体转义、再插入它自己生成的 <a>），见 main.js 的 renderAuthAgreement()。 -->
+      <p id="auth-agreement" class="ag-notice" hidden></p>
       <p id="auth-foot" class="auth-foot"></p>
       <!-- 三个入口互斥显隐（由 main.js 按 authMode / registration 统一决定） -->
       <p class="auth-links">

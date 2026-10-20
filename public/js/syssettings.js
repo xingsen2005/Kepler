@@ -1,6 +1,6 @@
 /** 系统设置 —— 文件加密（隐私保护）：加密方式 / 魔数 / 查看密码 / 用户管理（管理员） */
 import { API } from './api.js';
-import { toast, escapeHtml, confirmDialog, openModal, fmtTime, fmtSize, updateNotice, USER_PREVIEW_LIMIT, filterUsersByName, previewMoreState, uploadPlanNotice, FILE_CONCURRENCY_MIN, FILE_CONCURRENCY_MAX } from './util.js';
+import { toast, escapeHtml, confirmDialog, openModal, openAgreementDialog, fmtTime, fmtSize, updateNotice, USER_PREVIEW_LIMIT, filterUsersByName, previewMoreState, uploadPlanNotice, FILE_CONCURRENCY_MIN, FILE_CONCURRENCY_MAX } from './util.js';
 import { openListDialog } from './listdialog.js';
 // R37：「限速」列（四张列表卡片共用的唯一实现点）
 import { openSpeedLimitDialog, speedCellHtml } from './speedlimit.js';
@@ -43,7 +43,7 @@ function isAdmin() {
  * 换账号时就会残留上一个角色的 DOM（越权显示用户列表）。整卡按角色显隐之后，
  * 角色切换只是"显示 / 隐藏一个整块"，不存在需要还原的中间状态。
  */
-const ADMIN_ONLY_CARDS = ['sysset-site-card', 'sysset-restore-card', 'sysset-user-card', 'sysset-smtp-card', 'sysset-concurrency-card', 'sysset-lb-card', 'sysset-enc-card', 'sysset-excludes-card', 'sysset-webdav-card', 'sysset-captcha-card', 'sysset-payment-card', 'sysset-backup-card'];
+const ADMIN_ONLY_CARDS = ['sysset-site-card', 'sysset-restore-card', 'sysset-user-card', 'sysset-smtp-card', 'sysset-agreement-card', 'sysset-concurrency-card', 'sysset-lb-card', 'sysset-enc-card', 'sysset-excludes-card', 'sysset-webdav-card', 'sysset-captcha-card', 'sysset-payment-card', 'sysset-backup-card'];
 
 /** 隐藏仅管理员可见的卡片（非管理员直接不渲染其内容） */
 function setAdminCardVisible(cardId, visible) {
@@ -89,6 +89,8 @@ export function refresh() {
   loadSmtp();
   // R54：站点设置（站点名称 / 公开注册 / 新用户身份）
   loadSite();
+  // R68：协议设置（两份协议正文；三页是否显示提示在站点设置里）
+  loadAgreement();
   // R65：订单取回（取回次数上限 / 连续输错上限）
   loadRestore();
   // R48：线程并发（值随 /config 下发，这里只负责把当前值渲染进表单并刷新推导预览）
@@ -172,6 +174,16 @@ function wire() {
   // R65：订单取回（无开关，只有两个数字 + 保存）
   const retSave = document.getElementById('btn-restore-save');
   if (retSave) retSave.onclick = saveRestoreSettings;
+  // R68：协议设置（保存 + 预览）。预览打的是**编辑框里的当前内容**，不必先保存。
+  const agSave = document.getElementById('btn-agreement-save');
+  if (agSave) agSave.onclick = saveAgreementSettings;
+  const agPreview = document.getElementById('btn-agreement-preview');
+  if (agPreview) agPreview.onclick = previewAgreement;
+  // 两份正文的字符数计数（输入即更新，避免保存后才发现超了上限）
+  ['agreement-terms', 'agreement-privacy'].forEach((id) => {
+    const el = document.getElementById(id);
+    if (el) el.addEventListener('input', () => updateAgreementStat(id));
+  });
   // 分段选择（服务商 / 失败策略 / 加密方式 / 注册模式 / 新用户身份）
   ['captcha-provider', 'captcha-onerror', 'smtp-secure', 'site-registration', 'site-role'].forEach((id) => {
     const wrap = document.getElementById(id);
@@ -1033,14 +1045,40 @@ export function applySiteName(name) {
   document.title = n;
 }
 
+/**
+ * R68：三个页面的协议提示 —— `page` 与 service 侧 `limits.NOTICE_PAGES` **逐字一致**。
+ *
+ * 顺序即界面上三行的顺序（登录页 / 注册页 / 分享页），也是 `index.html` 里三个
+ * `site-notice-<page>` 控件的排列顺序。三处各写一份清单就会有一处漏改，而漏改的
+ * 表现是「勾了但保存后没生效」—— 故这里把「页面名」收敛成唯一一份。
+ */
+const SITE_NOTICE_PAGES = ['login', 'register', 'share'];
+/** 三页的中文名（状态摘要与错误提示共用，避免各处措辞不一致） */
+const SITE_NOTICE_LABEL = { login: '登录页', register: '注册页', share: '分享页' };
+
+/** 读取某一行协议提示（保存入口用） */
+function readNoticeRow(page) {
+  const cb = document.getElementById('site-notice-' + page);
+  const tx = document.getElementById('site-notice-' + page + '-text');
+  return {
+    enabled: !!(cb && cb.checked),
+    text: tx ? String(tx.value || '').trim() : '',
+  };
+}
+
 /** 读取站点表单（保存入口用） */
 function readSiteInputs() {
   const el = document.getElementById('site-name');
+  const notices = {};
+  for (const page of SITE_NOTICE_PAGES) notices[page] = readNoticeRow(page);
   const out = {
     // 空串合法 = 恢复默认站点名（服务端落盘归一时替换成默认名）
     siteName: el ? String(el.value || '').trim() : '',
     registration: chipValue('site-registration') || SITE_REGISTRATION_DEFAULT,
     defaultRole: chipValue('site-role') || SITE_ROLE_DEFAULT,
+    // R68：三页提示（是否显示 + 文案）。文案里的 `<a>…</a>` 由服务端渲染时改写，
+    // 这里**原样**提交，绝不在前端做任何标签处理。
+    notices,
   };
   return out;
 }
@@ -1061,11 +1099,24 @@ function renderSite(c) {
   if (el) el.value = c.siteName === SITE_NAME_DEFAULT ? '' : (c.siteName || '');
   chipSelect('site-registration', c.registration || SITE_REGISTRATION_DEFAULT);
   chipSelect('site-role', c.defaultRole || SITE_ROLE_DEFAULT);
+  // R68：三个页面的提示（缺项按「关 + 空文案」回填 —— 与服务端归一化同一口径）
+  const notices = (c.notices && typeof c.notices === 'object') ? c.notices : {};
+  for (const page of SITE_NOTICE_PAGES) {
+    const n = (notices[page] && typeof notices[page] === 'object') ? notices[page] : {};
+    const cb = document.getElementById('site-notice-' + page);
+    const tx = document.getElementById('site-notice-' + page + '-text');
+    if (cb) cb.checked = n.enabled === true;
+    if (tx) tx.value = typeof n.text === 'string' ? n.text : '';
+  }
   const status = document.getElementById('site-status');
   if (status) {
     const regLabel = { open: '公开注册', invite: '邀请码', closed: '关闭注册' }[c.registration] || '关闭注册';
     const roleLabel = c.defaultRole === 'admin' ? '管理员' : '普通用户';
-    status.textContent = `（${c.siteName || SITE_NAME_DEFAULT} · ${regLabel} · 新用户：${roleLabel}）`;
+    const onPages = SITE_NOTICE_PAGES.filter((p) => notices[p] && notices[p].enabled === true);
+    const noticeLabel = onPages.length
+      ? ` · 协议提示：${onPages.map((p) => SITE_NOTICE_LABEL[p]).join('/')}`
+      : ' · 协议提示：全部关闭';
+    status.textContent = `（${c.siteName || SITE_NAME_DEFAULT} · ${regLabel} · 新用户：${roleLabel}${noticeLabel}）`;
   }
 }
 
@@ -1091,6 +1142,131 @@ async function saveSiteSettings() {
     toast('站点设置已保存', { type: 'success' });
   } catch (e) {
     siteMsg('保存失败：' + (e.message || '未知错误'), 'bad');
+  }
+}
+
+/* ============================ 协议设置（仅管理员，R68） ============================ */
+
+/**
+ * 单份协议正文的字符上限 —— 与 `server/limits.js` 的 `AGREEMENT_BODY_MAX` 同一个数。
+ *
+ * 前端留一份只为了「输入时就提示」，**不构成判据**：真正拒绝超长的是服务端
+ * （`PUT /agreements/config` 会 400 并把原因带回来）。这与 `readIntInput()` 的分工一致 ——
+ * 前端只挡明显错误，绝不把值静默改成合法值。
+ */
+const AGREEMENT_BODY_MAX = 20000;
+
+function agMsg(text, cls) {
+  const msg = document.getElementById('agreement-msg');
+  if (!msg) return;
+  msg.textContent = text;
+  msg.className = 'form-msg show ' + (cls || 'ok');
+}
+
+/**
+ * 更新某一份正文的字符计数（输入时实时刷新）。
+ *
+ * 刻意显示「未填写（该协议的链接会显示为普通文字）」而不是「0 字符」：
+ * 空正文不是一个中性状态 —— 它会改变三个页面上的渲染结果，必须说清楚。
+ */
+function updateAgreementStat(id) {
+  const key = id === 'agreement-privacy' ? 'privacy' : 'terms';
+  const ta = document.getElementById(id);
+  const el = document.getElementById('agreement-' + key + '-stat');
+  if (!el) return;
+  const n = ta ? String(ta.value || '').length : 0;
+  el.textContent = n
+    ? `${n} 字符（上限 ${AGREEMENT_BODY_MAX}）${n > AGREEMENT_BODY_MAX ? ' —— 已超出，保存会被拒绝' : ''}`
+    : '未填写 —— 该协议的链接会显示为普通文字';
+}
+
+/** 读取两份正文（保存与预览共用同一入口，避免两处取值口径不同） */
+function readAgreementInputs() {
+  const t = document.getElementById('agreement-terms');
+  const p = document.getElementById('agreement-privacy');
+  return {
+    terms: t ? String(t.value || '') : '',
+    privacy: p ? String(p.value || '') : '',
+  };
+}
+
+/** 用服务端视图回填两个编辑框 */
+function renderAgreement(c) {
+  c = c || {};
+  const t = document.getElementById('agreement-terms');
+  const p = document.getElementById('agreement-privacy');
+  if (t) t.value = typeof c.terms === 'string' ? c.terms : '';
+  if (p) p.value = typeof c.privacy === 'string' ? c.privacy : '';
+  updateAgreementStat('agreement-terms');
+  updateAgreementStat('agreement-privacy');
+  const status = document.getElementById('agreement-status');
+  if (status) {
+    const tn = (c.terms || '').length;
+    const pn = (c.privacy || '').length;
+    status.textContent = tn || pn
+      ? `（用户协议 ${tn} 字符 · 隐私协议 ${pn} 字符）`
+      : '（两份均未填写）';
+  }
+}
+
+async function loadAgreement() {
+  if (!isAdmin()) return; // 普通用户连请求都不发（卡片已整卡隐藏）
+  try {
+    renderAgreement(await API.agreementConfig());
+  } catch (e) {
+    if (e && e.status === 403) return; // 非管理员：静默（卡片整体不可见）
+    const status = document.getElementById('agreement-status');
+    if (status) status.textContent = '(加载失败)';
+  }
+}
+
+async function saveAgreementSettings() {
+  if (!isAdmin()) { toast('仅管理员可修改协议设置', { type: 'error' }); return; }
+  const body = readAgreementInputs();
+  // 前端预检只挡「明显超长」，措辞与后端的 400 保持同一个意思（不另立一套文案）
+  if (body.terms.length > AGREEMENT_BODY_MAX || body.privacy.length > AGREEMENT_BODY_MAX) {
+    agMsg(`单份协议不能超过 ${AGREEMENT_BODY_MAX} 个字符`, 'bad');
+    return;
+  }
+  try {
+    const r = await API.saveAgreementConfig(body);
+    renderAgreement(r);
+    agMsg('协议设置已保存', 'ok');
+    toast('协议设置已保存', { type: 'success' });
+  } catch (e) {
+    agMsg('保存失败：' + (e.message || '未知错误'), 'bad');
+  }
+}
+
+/**
+ * 预览渲染结果（打的是编辑框里**尚未保存**的内容）。
+ *
+ * 渲染在服务端做（`POST /agreements/preview`），与访客看到的**同一个渲染器** ——
+ * 若在前端再写一份 Markdown 实现，预览与实际渲染就一定会在某个边界上分叉，
+ * 而这种分叉只有等访客看到不一样的东西才会被发现。
+ */
+async function previewAgreement() {
+  if (!isAdmin()) { toast('仅管理员可预览协议', { type: 'error' }); return; }
+  const btn = document.getElementById('btn-agreement-preview');
+  if (btn) btn.disabled = true;
+  try {
+    const r = await API.previewAgreement(readAgreementInputs());
+    const docs = (r && r.docs) || {};
+    const part = (key, title) => {
+      const d = docs[key] || {};
+      const body = d.html ? `<div class="ag-doc">${d.html}</div>`
+        : '<div class="lk-empty">（未填写 —— 指向它的链接会显示为普通文字）</div>';
+      return `<h4 class="ag-prev-title">${escapeHtml(title)}</h4>${body}`;
+    };
+    openAgreementDialog({
+      title: '协议预览（未保存）',
+      html: part('terms', '用户协议') + part('privacy', '隐私协议'),
+    });
+  } catch (e) {
+    agMsg('预览失败：' + (e.message || '未知错误'), 'bad');
+  } finally {
+    // 无论成功失败都必须恢复按钮，否则一次网络失败会让预览永久点不动
+    if (btn) btn.disabled = false;
   }
 }
 

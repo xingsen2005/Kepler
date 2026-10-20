@@ -6203,13 +6203,17 @@ const CASES = [
       name: 'R48-04a · 「线程并发」卡片未登记为管理员专属（普通用户可见可改）',
       file: 'public/js/syssettings.js',
       /**
-       * R54 / R65 同步：名单最前面又插入了 `'sysset-site-card', `（站点设置）与
-       * `'sysset-restore-card', `（订单取回），故 anchor 带上这两个新成员；
+       * R54 / R65 / R68 同步：名单最前面又插入了 `'sysset-site-card', `（站点设置）与
+       * `'sysset-restore-card', `（订单取回），R68 又在 smtp 与 concurrency 之间插了
+       * `'sysset-agreement-card', `（协议设置）—— anchor 随之带上这三个新成员；
        * 旧的写法已不在源码里 —— 不随实现迁移的话这条对照会**静默失效**
        * （既不变红也不报错，`invariants` 的 anchor 自检就是为此存在的）。
+       *
+       * 变异**只删「线程并发」这一项**（不再顺手删 smtp）：删两项会让 `audit48` 与
+       * `audit53` 同时变红，红的就不唯一了。
        */
-      anchor: "const ADMIN_ONLY_CARDS = ['sysset-site-card', 'sysset-restore-card', 'sysset-user-card', 'sysset-smtp-card', 'sysset-concurrency-card',",
-      replacement: "const ADMIN_ONLY_CARDS = ['sysset-site-card', 'sysset-restore-card', 'sysset-user-card', 'sysset-smtp-card',",
+      anchor: "const ADMIN_ONLY_CARDS = ['sysset-site-card', 'sysset-restore-card', 'sysset-user-card', 'sysset-smtp-card', 'sysset-agreement-card', 'sysset-concurrency-card',",
+      replacement: "const ADMIN_ONLY_CARDS = ['sysset-site-card', 'sysset-restore-card', 'sysset-user-card', 'sysset-smtp-card', 'sysset-agreement-card',",
       testFile: 'audit48-regressions.test.js',
       minFail: 1,
     },
@@ -7552,11 +7556,12 @@ const CASES = [
       // R53-09a：卡片可见性。不登记 ⇒ 普通用户看到卡片、点保存却被 403。
       name: 'R53-09a · 「发信设置」卡片未登记进 ADMIN_ONLY_CARDS（普通用户可见）',
       file: 'public/js/syssettings.js',
-      // R54 / R65 同步：名单前面已变成 'sysset-site-card', 'sysset-restore-card'，
-      // 故 anchor 不再从 `const ADMIN_ONLY_CARDS = ` 起算 —— 只取「smtp 紧跟在 user 之后」
-      // 这一小段（仍全文唯一），变异即把 smtp 从名单里摘掉。
-      anchor: "'sysset-user-card', 'sysset-smtp-card', 'sysset-concurrency-card',",
-      replacement: "'sysset-user-card', 'sysset-concurrency-card',",
+      // R54 / R65 / R68 同步：名单前面已变成 'sysset-site-card', 'sysset-restore-card'，
+      // 且 R68 在 smtp 与 concurrency 之间插入了 'sysset-agreement-card'，
+      // 故 anchor 不再从 `const ADMIN_ONLY_CARDS = ` 起算 —— 只取「smtp 紧跟在 user 之后、
+      // 后面接着协议设置」这一小段（仍全文唯一），变异即把 smtp 从名单里摘掉。
+      anchor: "'sysset-user-card', 'sysset-smtp-card', 'sysset-agreement-card',",
+      replacement: "'sysset-user-card', 'sysset-agreement-card',",
       testFile: 'audit53-regressions.test.js',
       minFail: 1,
     },
@@ -7779,32 +7784,41 @@ const CASES = [
       /**
        * R54-07b：把取站点名称那段挪到 checkAuth() **之后**。
        *
-       * 单步整体替换（原文里就是一个连续块），比「删除再插入」两步法稳：
-       * 少一次「anchors 是否都还在原文里」的机会。
+       * ⚠️ R68 同步：这段与 `const me = await checkAuth();` 之间**又插进了一整块**
+       * （取协议提示的 `API.agreementPublic()`，同样必须早于鉴权探测）。原先「一段
+       * 连写到底」的单步 anchor 因此不再命中 —— 而 anchor 失效**不会报错、只会静默
+       * 跳过**，`invariants` 的 anchor 自检是唯一能发现它的地方。
        *
-       * ⚠️ R54② 同步：`main.js` 那段在 try 里**多了一行**（取 `registration`），
-       * anchor 与 replacement 一并跟上。判据本身没变（仍是「必须在 checkAuth 之前取」）。
+       * 改为**两步**（删除 + 插到 checkAuth() 之后）：两步的 anchor 都只取**稳定的
+       * 短片段**（站点名称那段 / 「先探测登录态」两行），中间那块协议提示既不参与
+       * anchor 也不被移动 —— 下次谁再往这两者之间塞东西，这条对照不需要跟着改。
        */
       name: 'R54-07b · 站点名称改在 checkAuth() 之后才取（未登录的登录页拿不到）',
       file: 'public/js/main.js',
-      anchor: '  try {\n'
-        + '    const info = await API.siteInfo();\n'
-        + '    syssettings.applySiteName(info && info.siteName);\n'
-        + '    // R54②：注册模式也来自这条公开接口 —— 登录页据此决定「注册账户」入口显不显示\n'
-        + '    siteRegistration = (info && info.registration) || \'closed\';\n'
-        + '  } catch (e) { /* 拿不到就用静态标题，不影响登录；注册入口按最保守的"不显示"处理 */ }\n'
-        + '\n'
-        + '  // 先探测登录态\n'
-        + '  const me = await checkAuth();\n',
-      replacement: '  // 先探测登录态\n'
-        + '  const me = await checkAuth();\n'
-        + '\n'
-        + '  try {\n'
-        + '    const info = await API.siteInfo();\n'
-        + '    syssettings.applySiteName(info && info.siteName);\n'
-        + '    // R54②：注册模式也来自这条公开接口 —— 登录页据此决定「注册账户」入口显不显示\n'
-        + '    siteRegistration = (info && info.registration) || \'closed\';\n'
-        + '  } catch (e) { /* 拿不到就用静态标题，不影响登录；注册入口按最保守的"不显示"处理 */ }\n',
+      mutations: [
+        {
+          anchor: '  try {\n'
+            + '    const info = await API.siteInfo();\n'
+            + '    syssettings.applySiteName(info && info.siteName);\n'
+            + '    // R54②：注册模式也来自这条公开接口 —— 登录页据此决定「注册账户」入口显不显示\n'
+            + '    siteRegistration = (info && info.registration) || \'closed\';\n'
+            + '  } catch (e) { /* 拿不到就用静态标题，不影响登录；注册入口按最保守的"不显示"处理 */ }\n'
+            + '\n',
+          replacement: '',
+        },
+        {
+          anchor: '  // 先探测登录态\n  const me = await checkAuth();\n',
+          replacement: '  // 先探测登录态\n'
+            + '  const me = await checkAuth();\n'
+            + '\n'
+            + '  try {\n'
+            + '    const info = await API.siteInfo();\n'
+            + '    syssettings.applySiteName(info && info.siteName);\n'
+            + '    // R54②：注册模式也来自这条公开接口 —— 登录页据此决定「注册账户」入口显不显示\n'
+            + '    siteRegistration = (info && info.registration) || \'closed\';\n'
+            + '  } catch (e) { /* 拿不到就用静态标题，不影响登录；注册入口按最保守的"不显示"处理 */ }\n',
+        },
+      ],
       testFile: 'audit54-regressions.test.js',
       minFail: 1,
     },
@@ -8844,10 +8858,25 @@ const CASES = [
        * 于是朴素写法会把**任何**一台机器都判成「已配置」—— 导入窗口一出生就是关着的，
        * 且没有任何提示能解释「为什么全新部署也说已有配置」。
        * 实测 `fail=1`：`R38-02l` —— 红的正是开头那句「全新实例必须允许导入」。
+       *
+       * ⚠️ R68 同步：这个 `return` 后面又续了六行 `notices` 比对（三页提示的开关 + 文案），
+       * anchor 必须**把整条 return 语句整段圈住** —— 只圈前三个字段时，替换后会留下
+       * 一串以 `&&` 开头的孤儿行，变异体本身就有语法错误（那样 `fail` 来自崩溃而不是
+       * 来自这条判据，属于「变异不等价于旧实现」的假红）。
        */
       name: 'R55-B6 · siteIsDefault 退回「有值就算配过」（全新实例也被判成已配置）',
       file: 'server/config-store.js',
-      anchor: '  return x.siteName === y.siteName\n    && x.registration === y.registration\n    && x.defaultRole === y.defaultRole;',
+      anchor: '  return x.siteName === y.siteName\n'
+        + '    && x.registration === y.registration\n'
+        + '    && x.defaultRole === y.defaultRole\n'
+        + '    // R68：三页提示也算站点设置的一部分 —— 只开了一个开关、文案还空着，就不是默认状态。\n'
+        + '    // 漏掉这一行，「开了分享页提示」的实例在备份导入对话框里会被判成「全新实例」。\n'
+        + '    && x.notices.login.enabled === y.notices.login.enabled\n'
+        + '    && x.notices.login.text === y.notices.login.text\n'
+        + '    && x.notices.register.enabled === y.notices.register.enabled\n'
+        + '    && x.notices.register.text === y.notices.register.text\n'
+        + '    && x.notices.share.enabled === y.notices.share.enabled\n'
+        + '    && x.notices.share.text === y.notices.share.text;',
       replacement: '  return !(x.siteName && x.registration && x.defaultRole);',
       testFile: 'audit38-regressions.test.js',
       minFail: 1,
@@ -9358,6 +9387,199 @@ const CASES = [
       anchor: 'function start() { return apply(); }',
       replacement: "function start() { app.get('*', () => {}); return apply(); }",
       testFile: 'repo-hygiene.test.js',
+      minFail: 1,
+    },
+
+    /* ==================================================================
+     * R68：协议提示与两份协议正文（三页提示在「站点设置」，正文在「协议设置」）
+     *
+     * 每条对应的行为护栏在 `tests/agreement-settings.test.js`。这一轮的变异有个
+     * 共同点：**都不会让服务起不来**，界面上也照样能点能存 —— 唯一的症状是
+     * 「访客能打出脚本」或「点了没反应」。所以判据必须落在渲染结果与 HTTP 往返上，
+     * 而不是「源码里有没有这个词」。
+     * ================================================================== */
+    {
+      /**
+       * R68-01a：把「整段转义」换成黑名单思路的第一步 —— `<` 不再转义。
+       *
+       * 这是最常见的写法：只过滤 `<script>` 之类的危险标签，其余原样放行。
+       * 变异只动 `<` 这一行（不碰 `>`），语法照旧、页面照旧显示，只有
+       * 「正文里写了 `<img onerror=…>`」时才会在访客浏览器里真的执行。
+       */
+      name: 'R68-01a · escapeHtml 不再转义 <（退回黑名单过滤思路）',
+      // 实测 fail=2：`R68-06`（原始标签必须转义成实体）、`R68-08`（提示文案里 `<b>` 当文字）
+      file: 'server/agreement-text.js',
+      anchor: ".replace(/</g, '&lt;')",
+      replacement: ".replace(/</g, '<')",
+      testFile: 'agreement-settings.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * R68-02a：链接白名单被放宽成「只要没空白就行」。
+       *
+       * `[点我](javascript:alert(1))` 于是原样进了 `href` —— 而协议正文由管理员填写、
+       * 展示给匿名访客，等于给登录页开了一个可持久化的 XSS 入口。
+       */
+      name: 'R68-02a · 链接白名单被放宽（javascript: 直通 href）',
+      // 实测 fail=1：`R68-07` —— 正是补上的「不带括号的 javascript: / data: 必须被拒」两条（原先那条带括号的写法压根没走到白名单，实测 `fail=0`）
+      file: 'server/agreement-text.js',
+      anchor: "const SAFE_HREF_RE = /^(?:https?:\\/\\/|mailto:|\\/)[^\\s]*$/i;",
+      replacement: 'const SAFE_HREF_RE = /^[^\\s]*$/i;',
+      testFile: 'agreement-settings.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * R68-03a：正文为空的那一份**仍被做成链接**。
+       *
+       * 症状是「点开一个空白对话框并出现关闭按钮」，比起不给链接更让人以为系统坏了。
+       */
+      name: 'R68-03a · 正文为空的协议仍被做成链接（点开是空对话框）',
+      // 实测 fail=2：`R68-10`、`R68-13` —— 都是「空正文的那一份仍被做成链接」
+      file: 'server/agreement-text.js',
+      anchor: '    if (has[key]) {',
+      replacement: '    if (true) {',
+      testFile: 'agreement-settings.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * R68-04a：第二个 `<a>` 不再归到隐私协议（一律当用户协议）。
+       *
+       * 需求给的例子就是「同意<a>用户协议</a>和<a>隐私政策</a>」这种不写属性的写法，
+       * 分类一错，两个链接会指向同一份正文 —— 界面上看不出来，只能靠渲染结果断言。
+       */
+      name: 'R68-04a · 第二个 <a> 也归到用户协议（按出现顺序的分类失效）',
+      // 实测 fail=3：`R68-08`、`R68-10`、`R68-18` —— 都靠「第 2 个链接指向 privacy」这个事实
+      file: 'server/agreement-text.js',
+      anchor: "  return index === 2 ? 'privacy' : 'terms';",
+      replacement: "  return 'terms';",
+      testFile: 'agreement-settings.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * R68-05a：notices 归一化只补两页 —— 分享页从此缺键。
+       *
+       * 设置页读 `notices.share.enabled` 时拿到 `undefined`（三行输入框直接崩），
+       * 分享页那条判据也永远拿不到「开」的状态。
+       */
+      name: 'R68-05a · notices 归一化漏掉分享页（设置页读 undefined 崩溃）',
+      // 实测 fail=7：`R68-01/02/03/15/18/20/21` —— 缺页会从「默认值」「归一化」「往返」「分享页」「备份」五个方向同时炸出来
+      file: 'server/config-store.js',
+      anchor: '  for (const page of NOTICE_PAGES) {\n'
+        + '    const e = (s[page] && typeof s[page] === \'object\') ? s[page] : {};',
+      replacement: '  for (const page of [\'login\', \'register\']) {\n'
+        + '    const e = (s[page] && typeof s[page] === \'object\') ? s[page] : {};',
+      testFile: 'agreement-settings.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * R68-06a：分享页的**错误页**也把提示摆出来。
+       *
+       * 链接不存在 / 已过期 / 次数用尽的页面上写着「继续下载即代表您已同意…」——
+       * 那个页面上根本没有「继续下载」这个动作。
+       */
+      name: 'R68-06a · 分享页错误页也显示协议提示（页面上没有该动作）',
+      // 实测 fail=1：`R68-19` —— 错误页上不得出现「继续下载即代表…」
+      file: 'server/share-routes.js',
+      anchor: '    noNotice: true,',
+      replacement: '    noNotice: false,',
+      testFile: 'agreement-settings.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * R68-07a：提示文案的长度上限被放宽 10 倍。
+       *
+       * 单行输入框的 300 字上限是「这行字要摆在登录按钮下面」的版式约束；
+       * 放宽之后 400 不再被拒，前端也没有任何提示，用户只会看到按钮被挤到屏幕外。
+       */
+      name: 'R68-07a · 提示文案上限被放宽（超长不再 400 拒绝）',
+      // 实测 fail=1：`R68-15` —— 301 字文案必须 400
+      file: 'server/limits.js',
+      anchor: 'const NOTICE_TEXT_MAX = 300;',
+      replacement: 'const NOTICE_TEXT_MAX = 3000;',
+      testFile: 'agreement-settings.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * R68-08a：协议正文的长度上限被放宽 10 倍。
+       *
+       * 上限本身是「这份正文要随 `/site/agreements` 匿名下发」的约束 ——
+       * 没有上限时，一份 20 万字的协议会让每次打开登录页都先下载它。
+       */
+      name: 'R68-08a · 协议正文上限被放宽（超长不再 400 拒绝）',
+      // 实测 fail=2：`R68-14`（保存超长正文必须 400）、`R68-17`（预览同样走这条上限）
+      file: 'server/limits.js',
+      anchor: 'const AGREEMENT_BODY_MAX = 20000;',
+      replacement: 'const AGREEMENT_BODY_MAX = 200000;',
+      testFile: 'agreement-settings.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * R68-09a：备份的 `collect()` 不再采集协议正文。
+       *
+       * 这是「只备份了开关、没备份正文」的精确形态：备份范围清单里仍写着「协议设置」，
+       * 界面上看不出少了一样东西，而导入之后三页提示全在、点开全是空的。
+       * 刻意**不动 `SCOPES`** —— 否则 `audit38` 的「10 个可见项」也会一起变红，
+       * 红的就不唯一了（`minFail` 只为「应该红几条」兜底，不负责指出是哪几条）。
+       */
+      name: 'R68-09a · 备份不再采集协议正文（只备份了开关）',
+      // 实测 fail=1：`R68-21` —— 备份载荷里没有 agreements 时，往返断言直接读不到
+      file: 'server/backup.js',
+      anchor: '    agreements: sanitizeAgreements(configStore.getAgreements()),',
+      replacement: '    agreements: undefined,',
+      testFile: 'agreement-settings.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * R68-10a：公开接口把「开关」当成「显示」，不再要求「有正文」。
+       *
+       * 三页全关而正文非空时，`show` 会全部变成 true；更糟的是开关关着的页面
+       * 也会收到渲染好的提示 HTML。
+       */
+      name: 'R68-10a · 公开接口把「有正文」当成「该显示」（忽略开关）',
+      // 实测 fail=1：`R68-13` —— 未开的注册页 / 分享页也被判成「显示」
+      file: 'server/agreement-view.js',
+      anchor: '    const on = n.enabled === true && anyAvailable;',
+      replacement: '    const on = anyAvailable;',
+      testFile: 'agreement-settings.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * R68-11a：登录页提示不再区分四种形态 —— 一律按登录页渲染。
+       *
+       * `init`（创建管理员）与 `forgot`（重置密码）不是「登录 / 注册」，
+       * 在那些界面上摆一句「登录即代表您已同意…」是纯粹的误植。
+       */
+      name: 'R68-11a · 提示在「创建管理员 / 重置密码」形态下也渲染',
+      // 实测 fail=1：`R68-24` —— 那行三元表达式是「只在 login / register 渲染」的唯一实现点
+      file: 'public/js/main.js',
+      anchor: "  const page = authMode === 'login' ? 'login' : (authMode === 'register' ? 'register' : '');",
+      replacement: "  const page = 'login';",
+      testFile: 'agreement-settings.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * R68-12a：协议对话框去掉「关闭」按钮。
+       *
+       * 需求原话点名要求「有关闭按钮」。剩下右上角 ✕ 与 Esc 也能关，
+       * 所以这是「功能没坏、要求没做到」的类型 —— 只能靠结构断言钉住。
+       */
+      name: 'R68-12a · 协议对话框去掉「关闭」按钮（需求点名要求）',
+      // 实测 fail=1：`R68-25` —— 需求点名要求的「关闭」按钮不见了
+      file: 'public/js/util.js',
+      anchor: "    foot: [{ text: '关闭' }],\n",
+      replacement: '',
+      testFile: 'agreement-settings.test.js',
       minFail: 1,
     },
   ];

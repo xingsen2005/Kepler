@@ -126,7 +126,7 @@ export const API = new Proxy({}, {
 function utilShim() {
   const real = pathToFileURL(JS('util.js')).href;
   return `
-export { escapeHtml, fmtTime, fmtSize, updateNotice, filterUsersByName, USER_PREVIEW_LIMIT, previewMoreState, uploadPlanNotice, FILE_CONCURRENCY_MIN, FILE_CONCURRENCY_MAX } from '${real}';
+export { escapeHtml, fmtTime, fmtSize, updateNotice, filterUsersByName, USER_PREVIEW_LIMIT, previewMoreState, uploadPlanNotice, FILE_CONCURRENCY_MIN, FILE_CONCURRENCY_MAX, openAgreementDialog } from '${real}';
 export const toast = (m, o) => { (globalThis.__toasts = globalThis.__toasts || []).push({ m, o }); };
 export const confirmDialog = async (opts) => {
   (globalThis.__confirms = globalThis.__confirms || []).push(opts);

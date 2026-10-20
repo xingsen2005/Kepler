@@ -113,6 +113,10 @@ export const toast = (m) => { (globalThis.__toasts = globalThis.__toasts || []).
 export const escapeHtml = (s) => String(s == null ? '' : s);
 export const confirmDialog = async () => true;
 export const openModal = () => {};
+// R68：syssettings.js 新增了 openAgreementDialog 具名导入（协议设置卡片的「预览」要用它），
+// 桩必须同步 —— ESM 在链接期校验，缺一个名字就是本文件所有用例整片变红。
+// 桩里做成空实现：这几条用例守的是「验证码凭证是否被自动启用」，与对话框长什么样无关。
+export const openAgreementDialog = () => {};
 export const fmtTime = (s) => String(s || '');
 export const fmtSize = (n) => String(n);
 // R34：syssettings.js 新增了 updateNotice 具名导入 —— 沙箱里的 util 桩必须一并提供，

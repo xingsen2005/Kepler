@@ -270,6 +270,26 @@ export function openModal({ title, body, foot, wide, cls, onClose }) {
 }
 
 /**
+ * R68：协议对话框 —— 登录页 / 注册页 / 设置页「预览」三处共用。
+ *
+ * `html` 是**服务端渲染好**的正文（`server/agreement-text.js` 的输出：先整体转义、
+ * 再只插入它自己生成的标签）。因此这里用 `{ html }` 这条「显式声明可信 HTML」的
+ * 通道，而不是把字符串直接塞进 `body` —— 后者是旧调用点才有的兼容路径，
+ * 用在这里会让「这段 HTML 是谁生成的」这件事在代码里看不出来。
+ *
+ * 关闭按钮用 `foot` 里的「关闭」：`openModal` 本来就带右上角 ✕ 与 Esc / 点遮罩关闭，
+ * 这里再给一个明确的主按钮，是因为协议对话框往往很长，右上角那颗 ✕ 会被滚出视野。
+ */
+export function openAgreementDialog({ title, html }) {
+  return openModal({
+    title: title || '协议',
+    wide: true,
+    body: { html: String(html || '') },
+    foot: [{ text: '关闭' }],
+  });
+}
+
+/**
  * 确认对话框。
  *
  * message 两种形态：

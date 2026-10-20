@@ -351,6 +351,81 @@ function parseSiteNameInput(v) {
   return parseSmtpTextInput(v, SITE_NAME_MAX, '站点名称');
 }
 
+/* ============================ 协议提示 / 协议正文（R68） ============================ */
+
+/**
+ * 「协议提示」可以出现的三个页面 —— **顺序即界面顺序**（登录页 / 注册页 / 分享页）。
+ *
+ * 只在这里列一次：`config-store` 的归一化、`routes/site.js` 的入参校验、
+ * 设置页的三行开关、以及 `agreement-view.js` 的取用循环全都读它。
+ * 三处各抄一份清单，早晚会有一处漏改，而漏改的表现是「开了开关但那一页没提示」。
+ */
+const NOTICE_PAGES = ['login', 'register', 'share'];
+
+/** 三个页面的中文名（错误消息与界面标签共用，避免两处措辞不一致） */
+const NOTICE_PAGE_LABEL = { login: '登录页', register: '注册页', share: '分享页' };
+
+/**
+ * 提示文案上限 —— 300 字符。
+ *
+ * 它是登录卡片里按钮下方的一行字，超过 300 字符必然折成三四行、把「注册」入口挤出
+ * 首屏。真正的协议正文放「协议设置」卡片里，不受这个限制。
+ */
+const NOTICE_TEXT_MAX = 300;
+
+/**
+ * 单份协议正文上限 —— 20000 字符。
+ *
+ * 上限而不是不限：整份配置在 `config.enc` 里是一段加密 JSON，`config-store` 每次
+ * 写盘都要整体序列化；而 `GET /site/agreements` 要把它下发给**匿名**访客，
+ * 一条 1MB 的协议会让每个未登录用户先等一次整份下载。20000 字符 ≈ 一万字，
+ * 足够写一份带小标题的完整协议。
+ */
+const AGREEMENT_BODY_MAX = 20000;
+
+/** 归一化页面名：非法一律回到 `''`（调用方据此判断「不认识这一页」） */
+function normalizeNoticePage(v) {
+  return NOTICE_PAGES.includes(v) ? v : '';
+}
+
+/**
+ * 校验接口入参里的**提示文案**（单行）。
+ *
+ * 拒绝 CR / LF 与站点名称同一条理由：这段文字会被原样插进登录卡片与分享页的
+ * HTML，虽然渲染时整段都过转义（见 `agreement-text.js`），但「允许换行」意味着
+ * 管理员能靠一段文案把卡片撑开、把按钮挤出视口 —— 那是布局破坏，不是注入。
+ * 与 `parseSmtpTextInput` 的差别只在长度上限与错误措辞。
+ */
+function parseNoticeTextInput(v, page) {
+  const label = NOTICE_PAGE_LABEL[page] || '提示文案';
+  const raw = v == null ? '' : String(v);
+  if (/[\r\n]/.test(raw)) return { ok: false, error: `${label}的提示文案不能包含换行符` };
+  const s = raw.trim();
+  if (s.length > NOTICE_TEXT_MAX) {
+    return { ok: false, error: `${label}的提示文案不能超过 ${NOTICE_TEXT_MAX} 个字符` };
+  }
+  return { ok: true, value: s };
+}
+
+/**
+ * 校验接口入参里的**协议正文**（多行 Markdown）。
+ *
+ * 与提示文案相反：这里**允许**换行（正文本来就是多行的），只夹长度。
+ * 不校验内容格式 —— 渲染器只认一个很小的 Markdown 子集，不认识的写法按普通文字
+ * 原样显示（见 `agreement-text.js` 的说明），所以「格式写错」不会丢内容，也就
+ * 没有必要在入口处拒绝。
+ */
+function parseAgreementBodyInput(v, label) {
+  const name = label || '协议正文';
+  if (v === undefined || v === null) return { ok: true, value: '' };
+  if (typeof v !== 'string') return { ok: false, error: `${name}须为文本` };
+  const s = v.replace(/\r\n?/g, '\n');
+  if (s.length > AGREEMENT_BODY_MAX) {
+    return { ok: false, error: `${name}不能超过 ${AGREEMENT_BODY_MAX} 个字符` };
+  }
+  return { ok: true, value: s };
+}
+
 /* ============================ 邮箱（R54 第 ② 步） ============================ */
 
 /**
@@ -834,6 +909,9 @@ module.exports = {
   SITE_NAME_MAX, SITE_NAME_DEFAULT, parseSiteNameInput,
   REGISTRATION_MODES, REGISTRATION_DEFAULT, normalizeRegistrationMode,
   DEFAULT_ROLES, DEFAULT_ROLE_FALLBACK, normalizeDefaultRole,
+  // R68：协议提示（三个页面）与协议正文
+  NOTICE_PAGES, NOTICE_PAGE_LABEL, NOTICE_TEXT_MAX, AGREEMENT_BODY_MAX,
+  normalizeNoticePage, parseNoticeTextInput, parseAgreementBodyInput,
   // R54②：邮箱与验证码
   EMAIL_MAX, EMAIL_CODE_LEN, EMAIL_CODE_TTL_MS, EMAIL_CODE_MAX_ATTEMPTS, EMAIL_CODE_RESEND_MS,
   normalizeEmail, parseEmailInput,

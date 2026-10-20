@@ -616,6 +616,60 @@ td.c-date, th.c-date { width: 150px; }
 /* R54：站点设置（紫色 —— 它是设置页最靠前的一张卡，用更"标识性"的颜色） */
 .sysset-tag.site { background: #ede9fe; color: #5b21b6; }
 
+/* ---------------------- R68：协议设置 / 协议提示 ---------------------- */
+/* 暖褐 —— 与「发信」的青、「并发」的靛蓝、「站点」的紫都拉得开 */
+.sysset-tag.agr { background: #f5e6d3; color: #7c2d12; }
+
+/* 站点设置卡片里的三行「协议提示」：左边一个勾选框，右边整行给文案。
+   文案输入框必须 min-width:0 —— 否则 flex 子项不肯收缩，长文案会把卡片撑破。 */
+.notice-row { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
+.notice-row .check-line { flex: 0 0 84px; margin: 0; }
+.notice-row input[type="text"] { flex: 1 1 auto; min-width: 0; }
+
+/* 协议正文编辑框：**固定高度 + 竖滚动**。
+   需求原文「以免协议文本过长导致 UI 体验差」—— 因此不随内容长高：
+   height 固定、overflow-y 自动出竖滚动条，用户想看得更大可以手动往下拖（resize:vertical）。 */
+.ag-editor {
+  width: 100%; height: 260px; min-height: 120px; max-height: 560px; resize: vertical;
+  box-sizing: border-box; padding: 10px 12px; overflow-y: auto;
+  font-family: Consolas, "Courier New", monospace; font-size: 12.5px; line-height: 1.7;
+  color: var(--text); background: var(--ctrl-bg);
+  border: 1px solid var(--border-strong); border-radius: 8px; outline: none;
+  white-space: pre-wrap; word-break: break-word;
+}
+.ag-editor:focus { border-color: var(--accent); box-shadow: 0 0 0 3px rgba(0, 103, 192, .12); }
+
+/* 登录页 / 注册页按钮下方那一句提示 */
+.ag-notice { margin: 10px 0 0; color: var(--muted); font-size: 12px; line-height: 1.8; }
+.ag-notice .ag-link,
+.ag-doc a {
+  color: var(--accent); text-decoration: none; border-bottom: 1px dashed #9dc4e8;
+  padding-bottom: 1px; cursor: pointer;
+}
+.ag-notice .ag-link:hover,
+.ag-doc a:hover { border-bottom-style: solid; }
+
+/* 协议对话框正文（Markdown 渲染结果）。只覆盖排版，不覆盖颜色 ——
+   颜色一律走主题变量，暗色模式不必再抄一遍。 */
+.ag-doc { font-size: 13px; line-height: 1.85; color: var(--text); }
+.ag-doc h1 { font-size: 17px; margin: 0 0 12px; }
+.ag-doc h2 { font-size: 15px; margin: 18px 0 8px; }
+.ag-doc h3, .ag-doc h4, .ag-doc h5, .ag-doc h6 { font-size: 13.5px; margin: 14px 0 6px; }
+.ag-doc p { margin: 0 0 10px; }
+.ag-doc ul, .ag-doc ol { margin: 0 0 10px; padding-left: 22px; }
+.ag-doc li { margin: 3px 0; }
+.ag-doc blockquote {
+  margin: 0 0 10px; padding: 8px 12px; border-left: 3px solid var(--border-strong);
+  background: var(--surface-2); color: var(--text-2); border-radius: 0 6px 6px 0;
+}
+.ag-doc code {
+  background: var(--surface-3); border-radius: 4px; padding: 1px 5px;
+  font-family: Consolas, "Courier New", monospace; font-size: 12px;
+}
+/* 预览对话框里「用户协议 / 隐私协议」两段的隔断标题 */
+.ag-prev-title { font-size: 13px; color: var(--text-2); margin: 0 0 8px; }
+.ag-prev-title + .ag-doc { margin-bottom: 18px; }
+
 /* 登录页人机验证容器（仅服务端开启时显示） */
 .auth-captcha { margin: 4px 0 10px; }
 .auth-captcha .captcha-holder { display: flex; justify-content: center; }
@@ -1421,6 +1475,8 @@ input.full { width: 100%; }
 [data-theme="dark"] .sysset-tag.lb { background: #123024; color: #6ee7b7; }
 [data-theme="dark"] .sysset-tag.mail { background: #10333d; color: #67e8f9; }
 [data-theme="dark"] .sysset-tag.site { background: #2a2145; color: #c4b5fd; }
+/* R68：协议设置的暖褐标签（暗色下压暗，否则一整块亮黄在暗界面里非常刺眼） */
+[data-theme="dark"] .sysset-tag.agr { background: #3a2a19; color: #e8c9a0; }
 
 /* 登录卡片：外层本来就是深色渐变，卡片跟着暗下来才不刺眼（原先恒为白卡）。
    卡片用 --panel（比 --ctrl-bg 暗一档），输入框留在 --ctrl-bg，两者才有层次。 */

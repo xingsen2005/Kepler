@@ -20,6 +20,7 @@
  *   routes/webdav.js    WebDAV 服务设置
  *   routes/smtp.js      发信设置（SMTP，仅管理员；含测试邮件）
  *   routes/site.js      站点设置（R54：站点名称 / 公开注册 / 新用户身份；含公开的 /site/info）
+ *   routes/agreements.js 协议设置（R68：两份协议正文；含公开的 /site/agreements）
  *   routes/invite.js    邀请码设置（R54③：批量生成 / 设置 / 删除 / 导出 txt，全部仅管理员）
  *   routes/links.js     分享链接管理
  *   routes/fs.js        文件系统（列表 / 上传 / 下载 / 重命名 / 移动 / 删除）
@@ -58,6 +59,11 @@ router.use(require('./routes/smtp'));
 // R54：站点设置。`GET /site/info` 已登记进 index.js 的 PUBLIC_API（登录页要用站点名称设标题）；
 // 挂在 users 之后 ⇒ 不影响 `/users/me` 的注册下标（tests/routes-surface.test.js 有硬编码）。
 router.use(require('./routes/site'));
+// R68：协议设置（4 条）。`GET /site/agreements` 已登记进 index.js 的 PUBLIC_API
+//（登录页在拿到会话之前就要显示协议提示）；其余三条仅管理员。
+// 挂在 site 之后只是**就近** —— 它注册的是 `/agreements/*` 与一个 `/site/agreements` 字面量，
+// 与前后模块都不存在路径歧义（站点设置的另外两条也是字面量路径，没有 `:id`）。
+router.use(require('./routes/agreements'));
 // R65：订单取回设置（2 条，全部 requireAdmin）。只注册 `/restore/config`，
 // 与前后模块无路径歧义；**刻意不放进 `/site/*`** —— 站点设置讲的是「站点是谁」，
 // 这份设置讲的是「取回这条路径的护栏」，两者的权限与变更理由都不同。

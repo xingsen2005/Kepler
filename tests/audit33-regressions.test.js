@@ -588,6 +588,9 @@ export const confirmDialog = async (opts) => {
   (globalThis.__confirms = globalThis.__confirms || []).push(opts);
   return globalThis.__confirmResult === undefined ? true : globalThis.__confirmResult;
 };
+// R68：syssettings.js 新增了 openAgreementDialog 具名导入（协议设置卡片的「预览」要用它），
+// 桩必须同步 —— ESM 在链接期校验，缺一个名字就是本文件所有用例整片变红。
+export const openAgreementDialog = () => {};
 export const openModal = (opts) => {
   const rec = { title: opts.title, body: opts.body, foot: opts.foot || [], close: null };
   (globalThis.__modals = globalThis.__modals || []).push(rec);

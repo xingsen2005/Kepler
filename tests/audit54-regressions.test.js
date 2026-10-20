@@ -468,7 +468,15 @@ test('R54-6 · 卡片没有启用开关（需求：该功能默认开启，无�
   const i = html.indexOf('id="sysset-site-card"');
   const j = html.indexOf('id="sysset-user-card"');
   assert(i >= 0 && j > i, '需定位到站点设置卡片区块');
-  const block = html.slice(i, j);
+  /**
+   * R68：先**剥掉 HTML 注释**再判「有没有开关」。
+   *
+   * 这条断言是负向的（「不得出现 X」），而注释不是渲染出来的东西 —— 不剥的话，
+   * 一句「这里刻意不用 ip-switch」的说明就会把自己判红（本轮实际发生过）。
+   * 这与 `FACTS.md` §十五第 ② 类「`innerHTML` 判据被解释性注释满足」是同一类问题，
+   * 只是方向相反（那次是假绿，这次是假红）。
+   */
+  const block = html.slice(i, j).replace(/<!--[\s\S]*?-->/g, '');
   assert(!/ip-switch/.test(block),
     '站点设置卡片内不得出现启用开关（ip-switch）—— 它决定的是标题栏与默认身份这类必然存在的属性');
   assert(!/id="site-enabled"/.test(block), '不得存在 site-enabled 开关');

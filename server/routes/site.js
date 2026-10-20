@@ -16,12 +16,18 @@
  *
  * 站点设置**没有启用开关**：它决定的是「标题栏写什么」「新用户是什么身份」
  * 这类必然存在的属性，不存在「关闭」这个状态。界面上因此也不放 `ip-switch`。
+ *
+ * R68：`PUT /site/config` 多接受一个 `notices` 字段 —— 三页（登录 / 注册 / 分享）
+ * 各自的「协议提示：是否显示 + 文案」。**它刻意留在这里而不是协议设置卡片**：
+ * 需求要求这一项归【站点设置】，协议设置卡片只保存两份协议正文本身。
+ * 提示里那几段文字怎么变成链接、正文怎么渲染，见 `agreement-text.js`。
  */
 const { express, configStore, statsStore } = require('./_context');
 const { requireAdmin, apiHandler } = require('./_shared');
 // 入参合法性的唯一判据（与 `config-store` 的落盘归一化共用同一组来源）
 const {
   parseSiteNameInput, REGISTRATION_MODES, DEFAULT_ROLES,
+  NOTICE_PAGES, NOTICE_PAGE_LABEL, parseNoticeTextInput,
 } = require('../limits');
 
 const router = express.Router();
@@ -77,13 +83,55 @@ router.put('/site/config', requireAdmin, apiHandler(async (req, res) => {
     }
     patch.defaultRole = b.defaultRole;
   }
+  /**
+   * R68：三个页面的协议提示（是否显示 + 文案）。
+   *
+   * ⚠️ **不认识的页名一律 400**，不能静默忽略：管理员提交了 `{ notices: { home: {...} } }`
+   * 而这里假装保存成功，界面上会显示「已保存」，实际什么都没变 —— 这是最难自查的一类
+   * 反馈错误。同理 `enabled` 必须是布尔（字符串 `"false"` 会被 `!!` 当真）。
+   *
+   * 逐页合并（只给 `{ login: { enabled: true } }` 时另外两页与 login 的文案都保持原值），
+   * 由 `config-store.saveSite()` 完成 —— 这里只做合法性判定。
+   */
+  if (b.notices !== undefined) {
+    if (!b.notices || typeof b.notices !== 'object' || Array.isArray(b.notices)) {
+      throw Object.assign(new Error('协议提示须为对象'), { status: 400 });
+    }
+    const out = {};
+    for (const key of Object.keys(b.notices)) {
+      if (!NOTICE_PAGES.includes(key)) {
+        throw Object.assign(
+          new Error(`协议提示只支持 ${NOTICE_PAGES.map((p) => NOTICE_PAGE_LABEL[p]).join(' / ')} 三个页面`),
+          { status: 400 });
+      }
+      const e = b.notices[key];
+      if (!e || typeof e !== 'object' || Array.isArray(e)) {
+        throw Object.assign(new Error(`${NOTICE_PAGE_LABEL[key]}的协议提示须为对象`), { status: 400 });
+      }
+      const item = {};
+      if (e.enabled !== undefined) {
+        if (typeof e.enabled !== 'boolean') {
+          throw Object.assign(new Error(`${NOTICE_PAGE_LABEL[key]}的开关须为布尔值`), { status: 400 });
+        }
+        item.enabled = e.enabled;
+      }
+      if (e.text !== undefined) {
+        const r = parseNoticeTextInput(e.text, key);
+        if (!r.ok) throw Object.assign(new Error(r.error), { status: 400 });
+        item.text = r.value;
+      }
+      out[key] = item;
+    }
+    patch.notices = out;
+  }
 
   const saved = configStore.saveSite(patch);
   statsStore.addLog({
     action: 'config.save', level: 'info',
     detail: `管理员「${req.authUser.username}」更新站点设置`
       + `（站点名称=${saved.siteName}，公开注册=${saved.registration}`
-      + `，新用户身份=${saved.defaultRole}）`,
+      + `，新用户身份=${saved.defaultRole}`
+      + `，协议提示=${NOTICE_PAGES.filter((p) => saved.notices[p].enabled).map((p) => NOTICE_PAGE_LABEL[p]).join('/') || '全部关闭'}）`,
   });
   res.json(Object.assign({ ok: true }, view()));
 }));

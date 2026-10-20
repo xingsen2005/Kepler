@@ -363,6 +363,16 @@ export const API = {
   siteConfig: () => request('GET', '/api/site/config'),
   saveSiteConfig: (b) => request('PUT', '/api/site/config', b),
 
+  // 协议设置（R68）。`agreementPublic` 是**公开**接口 —— 登录页 / 注册页在拿到
+  // 会话之前就要显示提示并让访客点开协议正文（已登记进服务端 PUBLIC_API）。
+  // 它只回「三页显不显示 + 提示 HTML + 被引用到的协议正文」，三页全关时连正文都不下发。
+  agreementPublic: () => request('GET', '/api/site/agreements'),
+  agreementConfig: () => request('GET', '/api/agreements/config'),
+  saveAgreementConfig: (b) => request('PUT', '/api/agreements/config', b),
+  // 预览渲染的是**尚未保存**的草稿，故用 POST 把整份正文放进请求体
+  //（GET 会把它写进浏览器历史与反向代理的 access log）
+  previewAgreement: (b) => request('POST', '/api/agreements/preview', b),
+
   // 邀请码设置（R54③，**全部仅管理员**）。
   // ⚠️ `exportInvites` 走 `requestText` 而不是 `request`：响应体是纯文本本身
   //（见 `requestText` 的注释）。也**刻意是 POST**：那里是明文邀请码集合，

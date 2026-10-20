@@ -69,6 +69,13 @@ const EXPECTED = [
   // R54：站点设置。`GET /site/info` **刻意不挂** requireAdmin —— 登录页在拿到会话之前
   // 就要用站点名称设浏览器标题栏（已登记进 index.js 的 PUBLIC_API）；它只回站点名称一个字段。
   'GET /site/info', 'GET /site/config', 'PUT /site/config',
+  // R68：协议设置四条。`GET /site/agreements` **刻意不挂** requireAdmin ——
+  // 登录页 / 注册页在拿到会话之前就要显示「继续注册则代表您已阅读并同意…」
+  // 并让访客点开协议正文（已登记进 index.js 的 PUBLIC_API）；其余三条仅管理员。
+  // ⚠️ `POST /agreements/preview` 是 POST 而不是 GET：请求体是整份协议草稿，
+  // 用 GET 会把它写进浏览器历史与反向代理的 access log。
+  'GET /site/agreements',
+  'GET /agreements/config', 'PUT /agreements/config', 'POST /agreements/preview',
   // R65：订单取回设置（取回次数上限 / 连续输错上限）。两条都 requireAdmin ——
   // 它们决定的是匿名端点「恢复购买」能被试多少次，普通用户不该看到也不该改。
   'GET /restore/config', 'PUT /restore/config',
@@ -214,6 +221,10 @@ test('敏感接口均挂载 requireAdmin', () => {
     // R54：站点名称 / 公开注册 / 新用户身份都是全局设置。
     // ⚠️ `GET /site/info` 故意**不在**此列 —— 它是公开只读、只回站点名称。
     'GET /site/config', 'PUT /site/config',
+    // R68：协议正文是**对匿名访客可见**的内容（登录页要读它），改它就是改访客看到的东西；
+    // 预览接口虽然只是渲染，但它接受任意草稿并在服务端跑一遍渲染器，同样只给管理员。
+    // ⚠️ `GET /site/agreements` 故意**不在**此列 —— 它与 `/site/info` 一样是公开只读。
+    'GET /agreements/config', 'PUT /agreements/config', 'POST /agreements/preview',
     // R65：订单取回的两道护栏。放宽它们等于让匿名端点「恢复购买」可以无限次尝试
     // （`maxUses` 变成「不限制」= 一个订单号给一群人用；`maxFails` 变成不封 = 可枚举）。
     'GET /restore/config', 'PUT /restore/config',
@@ -319,6 +330,9 @@ test('自助接口不挂 requireAdmin（普通用户必须可用）', () => {
     // 误挂 requireAdmin 会让未登录的登录页永远拿不到站点名称 —— 而且这条错
     // 在界面上表现为「标题栏一直是那串硬编码」，很难联想到是服务端 401。
     'GET /site/info',
+    // R68：协议提示与正文同理 —— 未登录的登录页 / 注册页就要显示它并让访客点开。
+    // 误挂 requireAdmin 的表现是「提示永远不出现」，而设置页上那个开关明明是打开的。
+    'GET /site/agreements',
   ];
   const guardMap = new Map();
   const walk = (stack) => {

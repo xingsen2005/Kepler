@@ -3,14 +3,14 @@
  *
  * ## 一、备份范围（需求逐项对应，且**必须**与需求同序）
  *
- * 用户可见的是 10 项，真正落进 `data` 的是 9 处 —— 「负载均衡」不是独立的一份数据：
+ * 用户可见的是 11 项，真正落进 `data` 的是 10 处 —— 「负载均衡」不是独立的一份数据：
  * 它展示与编辑的是**每个 API Key 的空间上限**（`credentials[].quotaBytes`），
  * 与「API Key 管理」在 `config.enc` 里本就是**同一条记录**。刻意不另存一份，
  * 否则「同一条记录的同一个字段」会有两个来源，导入时谁覆盖谁全凭顺序。
  *
- * ⚠️ 新增条目**一律追加在末尾**（R55 追加的「发信设置」「站点设置」即在最后）：顺序
- * 就是界面上那份清单的顺序，也是 `GET /backup/status` 下发的顺序 —— 插在中间会让
- * 「本轮到底动了哪几项」在界面上看不出来。
+ * ⚠️ 新增条目**一律追加在末尾**（R55 追加的「发信设置」「站点设置」、R68 追加的
+ * 「协议设置」即在最后）：顺序就是界面上那份清单的顺序，也是 `GET /backup/status`
+ * 下发的顺序 —— 插在中间会让「本轮到底动了哪几项」在界面上看不出来。
  *
  * ## 二、刻意**不在**备份范围内的东西（每一项都有明确理由，别顺手加回来）
  *
@@ -82,6 +82,9 @@ const SCOPES = [
   // R55：发信设置（含**明文口令**）与站点设置 —— 两者都是「换了实例就得重填一遍」的配置
   { label: '发信设置', section: 'smtp' },
   { label: '站点设置', section: 'site' },
+  // R68：协议设置（两份协议正文）。它与站点设置里的「三页提示开关」是一对 ——
+  // 只备份开关不备份正文，导入后就会出现「提示挂着、点了没内容」的残缺态。
+  { label: '协议设置', section: 'agreements' },
 ];
 
 /** 实际写进 `data` 的分区（去重后 9 条） */
@@ -195,7 +198,32 @@ function sanitizeSite(s) {
     siteName: String(src.siteName == null ? '' : src.siteName),
     registration: String(src.registration == null ? '' : src.registration),
     defaultRole: String(src.defaultRole == null ? '' : src.defaultRole),
+    // R68：三页提示（是否显示 + 文案）属于站点设置，必须跟着走。
+    // 只搬 `siteName/registration/defaultRole` 的话，导入后提示开关会**静默丢失**，
+    // 而界面上「站点设置」看起来是恢复成功的 —— 文案在、开关没了，是最难发现的一种。
+    notices: sanitizeNotices(src.notices),
   };
+}
+
+/**
+ * R68：三页提示的归一化副本（导出与导入共用）。
+ *
+ * 交给 `config-store` 的归一化实现去补结构（`siteView` 就是它的出口），
+ * 这里**不重写**「哪三页 / 缺页怎么补」那套规则 —— 两处各写一份，早晚会分叉。
+ */
+function sanitizeNotices(n) {
+  const v = configStore.siteView({ site: { notices: n } }).notices;
+  return {
+    login: { enabled: boolOf(v.login.enabled), text: String(v.login.text || '') },
+    register: { enabled: boolOf(v.register.enabled), text: String(v.register.text || '') },
+    share: { enabled: boolOf(v.share.enabled), text: String(v.share.text || '') },
+  };
+}
+
+/** R68：两份协议正文的归一化副本 */
+function sanitizeAgreements(a) {
+  const v = configStore.agreementsView({ agreements: a });
+  return { terms: String(v.terms || ''), privacy: String(v.privacy || '') };
 }
 
 /**
@@ -269,8 +297,10 @@ function collect() {
     },
     // R55：发信设置（走 getSmtp —— 含明文口令，见 sanitizeSmtp 的说明）
     smtp: sanitizeSmtp(configStore.getSmtp()),
-    // R55：站点设置（站点名称 / 公开注册 / 新用户身份）
+    // R55：站点设置（站点名称 / 公开注册 / 新用户身份 + R68 的三页提示）
     site: sanitizeSite(configStore.getSite()),
+    // R68：协议设置（两份协议正文）
+    agreements: sanitizeAgreements(configStore.getAgreements()),
   };
 }
 
@@ -315,6 +345,8 @@ function isEmptyData(data) {
   // 会让任何一台机器都判成「已配置」，导入窗口一开就是关着的；而漏判则会在导入时静默覆盖。
   if (!configStore.smtpIsDefault(data.smtp)) return false;
   if (!configStore.siteIsDefault(data.site)) return false;
+  // R68：协议正文的默认值就是**空串**，判据在 config-store 里（两份都空才算没配过）
+  if (!configStore.agreementsIsDefault(data.agreements)) return false;
   return true;
 }
 
@@ -529,12 +561,20 @@ function apply(data) {
 
   // ⑨ 站点设置（R55）。saveSite 是严格 PATCH，三个字段全给即整段覆盖；
   // 空串 / 缺省由 normalizeSiteInto 换成默认值（与「从没配过」逐字同形）。
+  // ⚠️ R68：`notices` 也必须整段给出 —— 只给三个字段的话，导入是「覆盖」语义，
+  // 目标实例上原有的提示开关会被原样留着（新旧两份配置混在一起）。
   const st = data.site || {};
   configStore.saveSite({
     siteName: String(st.siteName == null ? '' : st.siteName),
     registration: String(st.registration == null ? '' : st.registration),
     defaultRole: String(st.defaultRole == null ? '' : st.defaultRole),
+    notices: sanitizeNotices(st.notices),
   });
+
+  // ⑩ 协议设置（R68）：两份正文整段覆盖。缺省段落 = 空串（导入后协议为空，
+  // 所有指向它的链接退化成纯文字 —— 这是「载荷里没有」最诚实的表现，不做任何猜测）
+  const ag = sanitizeAgreements(data.agreements);
+  configStore.saveAgreements({ terms: ag.terms, privacy: ag.privacy });
 
   configStore.flush();
   return summarize(collect());

@@ -1,6 +1,6 @@
 /** 应用入口 —— 全局状态、工具栏、状态栏、视图调度 */
 import { API, setWriteObserver } from './api.js';
-import { toast, fmtSize, openModal, escapeHtml, confirmDialog, showQuotaDialog, banNotice } from './util.js';
+import { toast, fmtSize, openModal, openAgreementDialog, escapeHtml, confirmDialog, showQuotaDialog, banNotice } from './util.js';
 import { explorer } from './explorer.js';
 import { filetype } from './filetype.js';
 import { ops } from './ops.js';
@@ -282,6 +282,19 @@ async function init() {
     siteRegistration = (info && info.registration) || 'closed';
   } catch (e) { /* 拿不到就用静态标题，不影响登录；注册入口按最保守的"不显示"处理 */ }
 
+  /**
+   * R68：协议提示与协议正文（**公开接口**，同样必须在鉴权探测之前拉 —— 未登录的
+   * 登录页就要显示它）。失败静默：提示整条不出现，登录流程照常。
+   *
+   * 刻意**不与 `/site/info` 合并成一次请求**：`/site/info` 的返回值有硬性约束
+   * （`audit54` 断言它恰好只有 `ok` / `siteName` / `registration` 三个键 —— 匿名接口
+   * 上「能少给就少给」），而协议正文可能有几万字，把两者绑在一起等于让每次启动
+   * 都先下载一份协议。
+   */
+  try {
+    agreementInfo = await API.agreementPublic();
+  } catch (e) { agreementInfo = null; }
+
   // 先探测登录态
   const me = await checkAuth();
   App.state.authReady = true;
@@ -348,6 +361,58 @@ let resendTimer = null;
  * 默认取最保守的 `closed`：拿不到配置时不摆一个点了必然失败的「注册」入口。
  */
 let siteRegistration = 'closed';
+
+/**
+ * R68：公开接口 `/api/site/agreements` 的返回值（三页提示 + 被引用到的协议正文）。
+ *
+ * 结构：`{ show: {login,register,share}, notices: {…html}, docs: {terms?,privacy?} }`。
+ * 拿不到时保持 `null` —— 此时登录页只是不显示那句提示，其它一切照常
+ *（协议提示不是登录的前置条件，更不能因为一个可选请求失败就把人挡在门外）。
+ */
+let agreementInfo = null;
+
+/**
+ * 把提示渲染进登录卡片（R68）。
+ *
+ * 「哪一页显示哪一句」完全由服务端下发的 `show` 决定，前端**不重新判断**
+ * 「开关 + 有没有正文」这两件事 —— 那套判断只在 `server/agreement-view.js` 里有一份。
+ * 前端一旦自己再算一遍，就会出现「服务端说不显示、前端却显示了半句」这类分叉。
+ *
+ * 三种形态下都显式复位：`init`（创建管理员）与 `forgot`（重置密码）不是需求里的
+ * 「注册页 / 登录页」，因此一律不显示；只在 login / register 两种形态下按开关决定。
+ */
+function renderAuthAgreement() {
+  const el = document.getElementById('auth-agreement');
+  if (!el) return;
+  el.hidden = true;
+  el.textContent = '';
+  const info = agreementInfo;
+  if (!info || !info.show) return;
+  const page = authMode === 'login' ? 'login' : (authMode === 'register' ? 'register' : '');
+  if (!page || !info.show[page]) return;
+  const html = (info.notices && info.notices[page]) || '';
+  if (!html) return;
+  el.innerHTML = html; // 服务端渲染的可信 HTML（先整体转义再插入自带标签）
+  el.hidden = false;
+  el.querySelectorAll('a.ag-link').forEach((a) => {
+    a.addEventListener('click', (e) => {
+      // 不跳锚点：登录页没有 `#ag-login-terms` 这个目标，跳了只会把卡片滚走
+      e.preventDefault();
+      openAgreementFromLink(a.dataset.doc);
+    });
+  });
+}
+
+/** 打开一份协议（`docKey` = `terms` / `privacy`） */
+function openAgreementFromLink(docKey) {
+  const key = docKey === 'privacy' ? 'privacy' : 'terms';
+  const d = (agreementInfo && agreementInfo.docs && agreementInfo.docs[key]) || null;
+  if (!d || !d.html) return; // 正文缺失：链接本来就不会被渲染成可点的（服务端保证）
+  openAgreementDialog({
+    title: d.title || (key === 'privacy' ? '隐私协议' : '用户协议'),
+    html: `<div class="ag-doc">${d.html}</div>`,
+  });
+}
 
 /**
  * 「记住密码」的本机痕迹。
@@ -591,6 +656,8 @@ function showAuthOverlay() {
   // R57：第二步那颗「重新发送验证码」的文案/可用性由 `resendLeft` 推出来 —— 重绘后必须重新渲染一次，
   // 否则它会被 HTML 的初始文案"复原"，用户就能在冷却期内连点（服务端会拒，界面先骗了他一次）。
   renderResendBtn();
+  // R68：协议提示（登录 / 注册两种形态各自受站点设置里的开关控制）
+  renderAuthAgreement();
 
   setTimeout(() => {
     // 忘记密码第二步：焦点落在验证码框（第一步已填的标识不必再点）

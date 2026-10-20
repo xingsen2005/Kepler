@@ -303,7 +303,7 @@ const resetGlobals = (extra) => {
 function utilStub() {
   const real = pathToFileURL(JS('util.js')).href;
   return `
-export { escapeHtml, fmtTime, fmtSize, matchesQuery, previewMoreState, ownerText, propertyBodyHtml, filterUsersByName, USER_PREVIEW_LIMIT, updateNotice, banNotice, uploadPlanNotice, FILE_CONCURRENCY_MIN, FILE_CONCURRENCY_MAX } from '${real}';
+export { escapeHtml, fmtTime, fmtSize, matchesQuery, previewMoreState, ownerText, propertyBodyHtml, filterUsersByName, USER_PREVIEW_LIMIT, updateNotice, banNotice, uploadPlanNotice, FILE_CONCURRENCY_MIN, FILE_CONCURRENCY_MAX, openAgreementDialog } from '${real}';
 export const toast = (m, o) => { (globalThis.__toasts = globalThis.__toasts || []).push({ m, o }); };
 export const confirmDialog = async (opts) => {
   (globalThis.__confirms = globalThis.__confirms || []).push(opts);

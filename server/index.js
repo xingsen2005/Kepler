@@ -165,6 +165,11 @@ app.use(ipGuard.middleware);
 const PUBLIC_API = new Set([
   '/auth/login', '/auth/login/webauthn', '/auth/me', '/auth/init', '/captcha/public', '/site/info',
   '/auth/register', '/auth/forgot', '/auth/reset',
+  // R68：协议提示 + 协议正文。登录页 / 注册页在**拿到会话之前**就要显示「继续注册则
+  // 代表您已阅读并同意…」并让访客点开协议正文；分享页虽然由服务端直接渲染、
+  // 不走这条接口，但未登录访客在主站登录页同样要能读到它。返回值受
+  // `agreement-view.publicPayload()` 控制：三页全关时连一份正文都不会下发。
+  '/site/agreements',
 ]);
 app.use('/api', (req, res, next) => {
   // CSRF：非安全方法必须携带同源自定义头 X-Requested-With（S8）

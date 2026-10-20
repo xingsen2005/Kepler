@@ -36,6 +36,8 @@ const {
   // R65：订单取回的两个上限（读盘兜底与入参校验同源于 limits.js）
   RESTORE_USES_DEFAULT, RESTORE_USES_MIN, RESTORE_USES_MAX,
   RESTORE_FAILS_DEFAULT, RESTORE_FAILS_MIN, RESTORE_FAILS_MAX,
+  // R68：协议提示的三个页面（归一化只认这三页，顺序即界面顺序）
+  NOTICE_PAGES,
 } = require('./limits');
 
 /**
@@ -225,6 +227,22 @@ const DEFAULT_CONFIG = {
     siteName: SITE_NAME_DEFAULT, // 浏览器标题栏 + 邮件发件人显示名的兜底
     registration: 'closed', // 'open' | 'invite' | 'closed'
     defaultRole: 'user', // 新注册用户直接赋予的身份
+    // R68：三个页面各自的「协议提示」（是否显示 + 文案）。**默认三页全关** ——
+    // 协议正文默认是空的，开关默认打开的话，管理员填完正文的一瞬间三条提示会同时
+    // 出现在访客面前，而那时他还没看过渲染结果。
+    notices: {
+      login: { enabled: false, text: '' },
+      register: { enabled: false, text: '' },
+      share: { enabled: false, text: '' },
+    },
+    updatedAt: '',
+  },
+  // R68：两份协议正文（Markdown 源文本）。**与站点设置分开两段** ——
+  // 站点设置讲「站点是谁、注册开不开」，协议设置讲「访客要同意什么」，
+  // 两者的卡片、权限理由、变更节奏都不同（协议会被法务单独改）。
+  agreements: {
+    terms: '', // 用户协议
+    privacy: '', // 隐私协议
     updatedAt: '',
   },
   // R65：订单取回（按订单号取回下载权限）。**没有启用开关** —— 需求明确「默认持久化」，
@@ -428,6 +446,53 @@ function normalizeSiteInto(cfg) {
     siteName: name || SITE_NAME_DEFAULT,
     registration: normalizeRegistrationMode(src.registration),
     defaultRole: normalizeDefaultRole(src.defaultRole),
+    // R68：三页提示必须**逐页补齐**。缺页时给「关 + 空文案」而不是 undefined ——
+    // 设置页会按键名逐页读取，`undefined.enabled` 会让整张卡片渲染失败。
+    notices: normalizeNoticesInto(src.notices),
+    updatedAt: typeof src.updatedAt === 'string' ? src.updatedAt : '',
+  };
+}
+
+/**
+ * R68：就地归一「三个页面的协议提示」（唯一实现点）。
+ *
+ * 判据只有两条，且都**不信任入参**：
+ *  - `enabled` 必须是字面量 `true` 才算开 —— 历史配置 / 手改 JSON 里出现字符串
+ *    `"false"` 时，`!!"false"` 为真，会把一个关掉的开关打开；
+ *  - `text` 只接受字符串，其它一律当空串（空串的语义是「用该页的默认文案」，
+ *    由 `agreement-text.js` 决定默认文案，这里不复制一份）。
+ *
+ * ⚠️ 不认识**多出来的页名**直接丢弃：留着它们会让「保存」把一份早已废弃的配置
+ * 一直写回去，而界面上看不到、也删不掉。
+ *
+ * @param {object|undefined} src 待判定的 notices 段（可缺省）
+ * @returns {{login:object, register:object, share:object}}
+ */
+function normalizeNoticesInto(src) {
+  const s = (src && typeof src === 'object') ? src : {};
+  const out = {};
+  for (const page of NOTICE_PAGES) {
+    const e = (s[page] && typeof s[page] === 'object') ? s[page] : {};
+    out[page] = {
+      enabled: e.enabled === true,
+      text: typeof e.text === 'string' ? e.text.trim() : '',
+    };
+  }
+  return out;
+}
+
+/**
+ * R68：就地归一 `cfg.agreements`（唯一实现点，四处都调它）。
+ *
+ * 与 `normalizeSiteInto()` 同一套路数（读盘 / 部分写入 / 内部读 / 对外视图各一次）。
+ * 正文**不做 trim**：Markdown 里行首空格是有意义的（缩进即代码块），
+ * 整段剪掉首尾空白反而会把作者排好的版式改掉。
+ */
+function normalizeAgreementsInto(cfg) {
+  const src = (cfg && cfg.agreements && typeof cfg.agreements === 'object') ? cfg.agreements : {};
+  cfg.agreements = {
+    terms: typeof src.terms === 'string' ? src.terms : '',
+    privacy: typeof src.privacy === 'string' ? src.privacy : '',
     updatedAt: typeof src.updatedAt === 'string' ? src.updatedAt : '',
   };
 }
@@ -508,6 +573,9 @@ function normalize(raw) {
   // R65：订单取回的两个上限。历史配置没有这一段 —— 补齐为默认值（3 次 / 5 次），
   // 而不是「缺失即不限制」：不限制等于把订单号变成万能凭证。
   normalizeRestoreInto(cfg);
+  // R68：两份协议正文。历史配置没有这一段 —— 补齐为空串（= 未填写），
+  // 空正文的协议不会被渲染成链接（见 `agreement-text.js` 的 `renderNotice`）。
+  normalizeAgreementsInto(cfg);
   if (!cfg.webdav || typeof cfg.webdav !== 'object') cfg.webdav = { enabled: false, accounts: [] };
   if (typeof cfg.webdav.enabled !== 'boolean') cfg.webdav.enabled = false;
   if (!Array.isArray(cfg.webdav.accounts)) cfg.webdav.accounts = [];
@@ -728,6 +796,9 @@ function save(partial) {
   normalizeSmtpInto(cur);
   // R54：site 同理（顶层键替换 ⇒ 半截对象会让站点名变成 undefined，标题栏与邮件都受影响）
   normalizeSiteInto(cur);
+  // R68：agreements 同理（顶层键替换 ⇒ 只写 terms 的一次保存会让 privacy 变成 undefined，
+  // 渲染器随即把「隐私协议」链接退化成纯文字，而界面上看不出任何异常）
+  normalizeAgreementsInto(cur);
   return persist(cur);
 }
 
@@ -1736,9 +1807,12 @@ function getSite() {
 /**
  * 保存站点设置（部分更新，**严格 PATCH**：未给出的字段保持原值）。
  *
- * 三个字段都可改：
+ * 字段：
  *  - `siteName`：空串合法，落盘归一时会换成默认站点名（界面上「留空恢复默认」）；
- *  - `registration` / `defaultRole`：非法值由路由层先挡在 400，这里只做兜底归一。
+ *  - `registration` / `defaultRole`：非法值由路由层先挡在 400，这里只做兜底归一；
+ *  - `notices`（R68）：**逐页**合并 —— 只带 `{ login: { enabled } }` 时，
+ *    `login.text` 与另外两页都保持原样。整体替换会让「只翻一下开关」把文案清空，
+ *    而界面上还留着刚才那段文字（前端回填的是服务端返回值，于是会看到文案消失）。
  */
 function saveSite(patch) {
   const cfg = requireStore();
@@ -1749,6 +1823,7 @@ function saveSite(patch) {
       siteName: p.siteName !== undefined ? p.siteName : prev.siteName,
       registration: p.registration !== undefined ? p.registration : prev.registration,
       defaultRole: p.defaultRole !== undefined ? p.defaultRole : prev.defaultRole,
+      notices: mergeNotices(prev.notices, p.notices),
       updatedAt: new Date().toISOString(),
     },
   };
@@ -1756,6 +1831,27 @@ function saveSite(patch) {
   cfg.site = shadow.site;
   persist(cfg);
   return getSite();
+}
+
+/**
+ * R68：把一次提交的 `notices` 合并到上一版之上（**逐页、逐字段**）。
+ *
+ * 未提到的页面 / 字段原样保留；`enabled` 只认布尔（字符串 `"false"` 不当真），
+ * `text` 只认字符串。非法值在这里**静默保留原值**而不是拒绝 —— 拒绝是路由层的
+ * 职责（`routes/site.js` 会先 400），这里只兜住「直接调 store 的调用方」。
+ */
+function mergeNotices(prev, incoming) {
+  const base = normalizeNoticesInto(prev);
+  const src = (incoming && typeof incoming === 'object') ? incoming : {};
+  const out = {};
+  for (const page of NOTICE_PAGES) {
+    const e = (src[page] && typeof src[page] === 'object') ? src[page] : {};
+    out[page] = {
+      enabled: typeof e.enabled === 'boolean' ? e.enabled : base[page].enabled,
+      text: typeof e.text === 'string' ? e.text.trim() : base[page].text,
+    };
+  }
+  return out;
 }
 
 /**
@@ -1773,6 +1869,9 @@ function siteView(cfg) {
     siteName: s.siteName,
     registration: s.registration,
     defaultRole: s.defaultRole,
+    // R68：三个页面的「是否显示 + 文案」随站点设置一起下发（设置页要回填这三行）。
+    // 这里给的是**深拷贝**：`normalizeSiteInto` 每次都新建对象，故返回值不与缓存共享引用。
+    notices: s.notices,
     updatedAt: s.updatedAt,
   };
 }
@@ -1829,6 +1928,58 @@ function restoreView(cfg) {
   return { maxUses: r.maxUses, maxFails: r.maxFails, updatedAt: r.updatedAt };
 }
 
+/* ============================ 协议正文（R68） ============================ */
+
+/**
+ * 读取两份协议正文（**服务端内部**使用）。
+ *
+ * 返回值永远结构完整：磁盘上没有这一段时得到两个空串（= 未填写）。
+ * 「空正文」不是错误状态 —— 渲染器据此把对应的链接退化成纯文字
+ * （见 `agreement-text.js` 的 `renderNotice`），而不是弹出一个空对话框。
+ */
+function getAgreements() {
+  const cfg = load();
+  const shadow = { agreements: cfg ? cfg.agreements : undefined };
+  normalizeAgreementsInto(shadow);
+  return shadow.agreements;
+}
+
+/**
+ * 保存协议正文（**严格 PATCH**：只写给出的那一份）。
+ *
+ * 空串合法 —— 它的语义是「清空这一份协议」，此时所有指向它的链接都会退化成纯文字。
+ * 长度上限由路由层先挡在 400（`parseAgreementBodyInput`），这里只兜底归一。
+ */
+function saveAgreements(patch) {
+  const cfg = requireStore();
+  const prev = getAgreements();
+  const p = patch || {};
+  const shadow = {
+    agreements: {
+      terms: p.terms !== undefined ? p.terms : prev.terms,
+      privacy: p.privacy !== undefined ? p.privacy : prev.privacy,
+      updatedAt: new Date().toISOString(),
+    },
+  };
+  normalizeAgreementsInto(shadow);
+  cfg.agreements = shadow.agreements;
+  persist(cfg);
+  return getAgreements();
+}
+
+/**
+ * 协议正文的**对外视图**（唯一实现点）：设置页回填用，字段与内部同名。
+ *
+ * 正文本身对匿名访客也是可见的（登录页要能读它），因此这里没有需要裁剪的机密；
+ * 抽一个视图函数的理由仍是「哪些字段对外可见只允许有一处答案」。
+ */
+function agreementsView(cfg) {
+  const shadow = { agreements: (cfg && cfg.agreements) || undefined };
+  normalizeAgreementsInto(shadow);
+  const a = shadow.agreements;
+  return { terms: a.terms, privacy: a.privacy, updatedAt: a.updatedAt };
+}
+
 /* ============================ 「是否仍是默认值」判据（R55） ============================ */
 
 /**
@@ -1878,7 +2029,31 @@ function siteIsDefault(site) {
   const y = b.site;
   return x.siteName === y.siteName
     && x.registration === y.registration
-    && x.defaultRole === y.defaultRole;
+    && x.defaultRole === y.defaultRole
+    // R68：三页提示也算站点设置的一部分 —— 只开了一个开关、文案还空着，就不是默认状态。
+    // 漏掉这一行，「开了分享页提示」的实例在备份导入对话框里会被判成「全新实例」。
+    && x.notices.login.enabled === y.notices.login.enabled
+    && x.notices.login.text === y.notices.login.text
+    && x.notices.register.enabled === y.notices.register.enabled
+    && x.notices.register.text === y.notices.register.text
+    && x.notices.share.enabled === y.notices.share.enabled
+    && x.notices.share.text === y.notices.share.text;
+}
+
+/**
+ * R68：协议正文是否**仍是空的**（备份「全新实例」判据用）。
+ *
+ * 与 `siteIsDefault()` 不同，这一段的默认值就是**空串**，所以判据可以写得直白：
+ * 两份都为空 ⇒ 没配过。刻意**不用**「长度是否相等」之类看似更聪明的写法 ——
+ * 协议正文是自由文本，任何基于内容的启发式都只是给未来埋一个解释不清的边界。
+ *
+ * @param {object|undefined} a 待判定的协议正文段（可缺省）
+ * @returns {boolean} true = 两份协议都没填
+ */
+function agreementsIsDefault(a) {
+  const shadow = { agreements: a };
+  normalizeAgreementsInto(shadow);
+  return shadow.agreements.terms === '' && shadow.agreements.privacy === '';
 }
 
 /* ============================ 登录人机验证配置 ============================ */
@@ -2722,8 +2897,11 @@ module.exports = {
   getSite, saveSite, siteView,
   // R65：订单取回（同一订单号可成功取回几次 / 同一 IP 连续输错几次封 24 小时）
   getRestore, saveRestore, restoreView,
+  // R68：两份协议正文（用户协议 / 隐私协议）—— 无机密，agreementsView 整段下发；
+  // 「三页是否显示提示」不在这里，它是站点设置的一部分（siteView.notices）
+  getAgreements, saveAgreements, agreementsView,
   // R55：「是否仍是默认值」判据 —— 供配置备份的「全新实例」闸门（backup.isEmptyData）使用
-  smtpIsDefault, siteIsDefault,
+  smtpIsDefault, siteIsDefault, agreementsIsDefault,
   getCaptcha, saveCaptcha,
   // 支付平台凭证（仅基础配置与合法性校验）
   getPayment, savePayment, clearPayment, setPaymentEnabled, setChannelEnabled, setPaymentSiteUrl,
