@@ -36,7 +36,7 @@ function syntaxOk(src) {
 }
 
 test('前端模块数量符合预期（未意外增删）', () => {
-  assertEqual(MODULES.length, 34, `public/js 模块数应为 34，实际 ${MODULES.length}（新增/删除模块时请同步此基线）`);
+  assertEqual(MODULES.length, 35, `public/js 模块数应为 35，实际 ${MODULES.length}（新增/删除模块时请同步此基线）`);
   assert(MODULES.includes('webauthn.js'), '应包含 webauthn.js（Windows Hello 前端模块）');
   assert(MODULES.includes('profile.js'), '应包含 profile.js（「编辑资料」自助弹窗）');
   assert(MODULES.includes('ordermgr.js'), '应包含 ordermgr.js（订单管理页）');
@@ -53,6 +53,10 @@ test('前端模块数量符合预期（未意外增删）', () => {
   assert(MODULES.includes('share-list.js'), '应包含 share-list.js（分享页列表勾选，R51 —— **普通脚本**，不是 ESM）');
   assert(MODULES.includes('share-order.js'), '应包含 share-order.js（分享页订单号一键复制，R64 —— **普通脚本**，不是 ESM：分享页 CSP 不允许内联脚本）');
   assert(MODULES.includes('pwa.js'), '应包含 pwa.js（PWA 接线：SW 注册 + 「安装到桌面」入口，R70）');
+  // R73：锚点导航栏独立成模块 —— 它要能被**单独加载并真实执行**来验证
+  // 「锚点与卡片一致」，塞在 syssettings.js 里就牵动 main.js 的整张模块图，没法单测
+  assert(MODULES.includes('anchornav.js'),
+    '应包含 anchornav.js（系统设置页卡片锚点导航栏，R73 —— 独立成模块以便真实执行验证）');
 });
 
 for (const f of MODULES) {

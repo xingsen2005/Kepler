@@ -6203,8 +6203,9 @@ const CASES = [
       name: 'R48-04a · 「线程并发」卡片未登记为管理员专属（普通用户可见可改）',
       file: 'public/js/syssettings.js',
       /**
-       * R54 / R65 / R68 同步：名单最前面又插入了 `'sysset-site-card', `（站点设置）与
-       * `'sysset-restore-card', `（订单取回），R68 又在 smtp 与 concurrency 之间插了
+       * R54 / R65 / R68 / R73 同步：名单最前面是 `'sysset-site-card', `（站点设置）、
+       * `'sysset-user-card', `（用户管理）与 `'sysset-restore-card', `（订单取回，R73 起排在用户管理之后），
+       * R68 又在 smtp 与 concurrency 之间插了
        * `'sysset-agreement-card', `（协议设置）—— anchor 随之带上这三个新成员；
        * 旧的写法已不在源码里 —— 不随实现迁移的话这条对照会**静默失效**
        * （既不变红也不报错，`invariants` 的 anchor 自检就是为此存在的）。
@@ -6212,8 +6213,8 @@ const CASES = [
        * 变异**只删「线程并发」这一项**（不再顺手删 smtp）：删两项会让 `audit48` 与
        * `audit53` 同时变红，红的就不唯一了。
        */
-      anchor: "const ADMIN_ONLY_CARDS = ['sysset-site-card', 'sysset-restore-card', 'sysset-user-card', 'sysset-smtp-card', 'sysset-agreement-card', 'sysset-concurrency-card',",
-      replacement: "const ADMIN_ONLY_CARDS = ['sysset-site-card', 'sysset-restore-card', 'sysset-user-card', 'sysset-smtp-card', 'sysset-agreement-card',",
+      anchor: "const ADMIN_ONLY_CARDS = ['sysset-site-card', 'sysset-user-card', 'sysset-restore-card', 'sysset-smtp-card', 'sysset-agreement-card', 'sysset-concurrency-card',",
+      replacement: "const ADMIN_ONLY_CARDS = ['sysset-site-card', 'sysset-user-card', 'sysset-restore-card', 'sysset-smtp-card', 'sysset-agreement-card',",
       testFile: 'audit48-regressions.test.js',
       minFail: 1,
     },
@@ -7550,12 +7551,12 @@ const CASES = [
       // R53-09a：卡片可见性。不登记 ⇒ 普通用户看到卡片、点保存却被 403。
       name: 'R53-09a · 「发信设置」卡片未登记进 ADMIN_ONLY_CARDS（普通用户可见）',
       file: 'public/js/syssettings.js',
-      // R54 / R65 / R68 同步：名单前面已变成 'sysset-site-card', 'sysset-restore-card'，
+      // R54 / R65 / R68 / R73 同步：名单前面是 'sysset-site-card', 'sysset-user-card', 'sysset-restore-card'，
       // 且 R68 在 smtp 与 concurrency 之间插入了 'sysset-agreement-card'，
       // 故 anchor 不再从 `const ADMIN_ONLY_CARDS = ` 起算 —— 只取「smtp 紧跟在 user 之后、
       // 后面接着协议设置」这一小段（仍全文唯一），变异即把 smtp 从名单里摘掉。
-      anchor: "'sysset-user-card', 'sysset-smtp-card', 'sysset-agreement-card',",
-      replacement: "'sysset-user-card', 'sysset-agreement-card',",
+      anchor: "'sysset-restore-card', 'sysset-smtp-card', 'sysset-agreement-card',",
+      replacement: "'sysset-restore-card', 'sysset-agreement-card',",
       testFile: 'audit53-regressions.test.js',
       minFail: 1,
     },
@@ -10182,6 +10183,125 @@ const CASES = [
       anchor: '  return ensureSetupToken();',
       replacement: "  return '';",
       testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
+
+    /* ==================== R73：设置页四项界面改进 ==================== */
+    {
+      /**
+       * 撤掉后：「订单取回」回到「用户管理」之上 —— 它管的是「已付款的人能怎么用
+       * 订单号」，放在账户管理旁边才连得上；挪回去后本轮的位置判据立刻变红。
+       *
+       * 两步变异（anchor 都必须在**原文**里已存在，见 R53-09b 的踩坑说明）：
+       * ① 摘掉卡片自己的 id；② 把同一个 id 挂到「用户管理」卡片之前 ⇒ 下标反转。
+       */
+      name: 'R73-01a · 「订单取回」被挪回「用户管理」之上（位置不对）',
+      file: 'public/index.html',
+      mutations: [
+        { anchor: 'id="sysset-restore-card"', replacement: 'data-r73-moved="sysset-restore-card"' },
+        {
+          anchor: '            <div class="dash-card wide sysset-card" id="sysset-user-card">\n',
+          replacement: '            <span id="sysset-restore-card"></span>\n'
+            + '            <div class="dash-card wide sysset-card" id="sysset-user-card">\n',
+        },
+      ],
+      testFile: 'settings-ux.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * 撤掉后：锚点把**隐藏的**卡片也列进去 —— 管理员看不出问题，但普通用户那边
+       * 被 `ADMIN_ONLY_CARDS` 整卡隐藏的卡片会留下一个点了滚不过去的锚点。
+       * 判据：R73-03（锚点数 == 可见卡片数，且跳过 hidden）。
+       */
+      name: 'R73-02a · 锚点栏把隐藏的卡片也列进去（点了个不存在的卡片）',
+      file: 'public/js/anchornav.js',
+      anchor: "const cards = Array.from(sec.querySelectorAll('.sysset-card')).filter((c) => !c.hidden);",
+      replacement: "const cards = Array.from(sec.querySelectorAll('.sysset-card'));",
+      testFile: 'settings-ux.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * 撤掉后：滚动不再减掉锚点栏高度 —— 卡片标题会被那条 sticky 栏压住，
+       * 表现为「点了像没定位」。这是本轮最容易被写漏的一处算术。
+       * 判据：R73-06（scrollTop == 卡片位置 − 栏高 − 间距）。
+       */
+      name: 'R73-03a · 滚动不减锚点栏高度（卡片标题被 sticky 栏盖住）',
+      file: 'public/js/anchornav.js',
+      anchor: '  const top = Math.max(0, sec.scrollTop + (cr.top - sr.top) - barH - 10);',
+      replacement: '  const top = Math.max(0, sec.scrollTop + (cr.top - sr.top));',
+      testFile: 'settings-ux.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * 撤掉后：只剩一张卡片（普通用户只看到「关于」）也要摆一条导航栏 ——
+       * 一条只指向「关于」的导航是纯噪音。判据：R73-04。
+       */
+      name: 'R73-04a · 只剩一张卡片时仍显示导航栏（普通用户看到一条空导航）',
+      file: 'public/js/anchornav.js',
+      anchor: '  if (cards.length < 2) {',
+      replacement: '  if (cards.length < 1) {',
+      testFile: 'settings-ux.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * 撤掉后：标题直接取 `h3.textContent` —— 徽章（「站点」）、状态计数与
+       * 「保存」按钮的文案会一起被拼进锚点里。判据：R73-05。
+       */
+      name: 'R73-05a · 锚点标题不摘徽章与按钮（标题变成「站点站点设置 保存」）',
+      file: 'public/js/anchornav.js',
+      anchor: "  c.querySelectorAll('.sysset-tag, .lk-count, .sysset-action, button, input, label').forEach((n) => n.remove());",
+      replacement: '',
+      testFile: 'settings-ux.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * 撤掉后：非 .json 也会被读进内存再解析 —— 备份里含密钥明文，不该去
+       * 「猜」用户塞进来的东西。判据：R73-13（断言 FileReader 根本没被调用）。
+       */
+      name: 'R73-06a · 非 .json 文件也被读取解析（门禁在读文件之后）',
+      file: 'public/js/backupcfg.js',
+      anchor: '      if (!isBackupJsonFile(name)) {',
+      replacement: '      if (false) {',
+      testFile: 'settings-ux.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * 撤掉后：三种失败（空 / 非法 JSON / 缺 code）塌成同一句「文件不对」——
+       * 用户无从判断是该换文件、还是这份备份本就坏了。判据：R73-11。
+       *
+       * 两步变异，中间态语法须自洽（两次都是整句 return 的替换）。
+       */
+      name: 'R73-07a · 三种解析失败塌成同一句提示（无法判断该怎么办）',
+      file: 'public/js/backupcfg.js',
+      mutations: [
+        {
+          anchor: "  if (!raw) return { ok: false, reason: '这个文件是空的' };",
+          replacement: "  if (!raw) return { ok: false, reason: '文件不对' };",
+        },
+        {
+          anchor: "    return { ok: false, reason: '不是有效的 JSON —— 文件无法解析，请确认它没有被编辑器改坏' };",
+          replacement: "    return { ok: false, reason: '文件不对' };",
+        },
+      ],
+      testFile: 'settings-ux.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * 撤掉后：初始化页又写回「创建管理员账户」—— R71 起这一页建的是根用户，
+       * 说成管理员会让用户误判自己能管到哪一层。判据：R73-16。
+       */
+      name: 'R73-08a · 初始化页改回「创建管理员账户」（根用户口径回退）',
+      file: 'public/js/main.js',
+      anchor: "    title.textContent = '创建根用户账户';",
+      replacement: "    title.textContent = '创建管理员账户';",
+      testFile: 'settings-ux.test.js',
       minFail: 1,
     },
   ];

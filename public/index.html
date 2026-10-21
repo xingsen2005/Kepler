@@ -316,6 +316,12 @@
 
         <!-- 系统设置 -->
         <section id="systemsettings" class="card-view" hidden>
+          <!-- R73：卡片锚点导航栏（紧贴工具栏下方）。
+               ⚠️ 内容**不写死在这里** —— 由 `syssettings.js` 的 `buildAnchorBar()`
+               扫描本页实际的 `.sysset-card` 现生成。写死一份列表必然与卡片脱同步：
+               新增 / 移动 / 按角色隐藏卡片时，这里会静默地指向错位或已不存在的卡片。
+               普通用户（只见「关于」一张卡）看到的锚点也自动只有一项。 -->
+          <nav id="sysset-anchorbar" class="sysset-anchorbar" aria-label="设置卡片导航" hidden></nav>
           <div class="dash-grid">
             <!-- 站点设置（仅管理员）：站点名称 / 公开注册 / 新用户身份（R54）。
                  刻意**没有启用开关** —— 它决定的是「标题栏写什么」「新用户是什么身份」
@@ -394,9 +400,33 @@
                 </ul>
               </div>
             </div>
+            <!-- 用户管理（仅管理员可见；普通用户此卡片整体隐藏，改由账户菜单「编辑资料」自助） -->
+            <div class="dash-card wide sysset-card" id="sysset-user-card">
+              <h3 class="sysset-h3"><span class="sysset-tag">用户</span><span id="sysset-user-title">用户管理</span> <span id="user-count" class="lk-count"></span>
+                <button id="btn-user-add" class="mini-btn primary sysset-action">＋ 添加用户</button></h3>
+              <div class="enc-warn" id="sysset-user-intro">
+                <b>简要说明</b>：管理系统登录账户与权限。账户分三层：<b>根用户</b>可管理包括其他管理员在内的所有账户；<b>管理员</b>仅能管理<b>普通用户</b>（尝试编辑或删除管理员会被拒绝并记一条审计日志）；普通用户仅可登录使用，无法进入用户管理。系统始终保留<b>至少一个根用户</b>，且不能删除当前登录账户。管理员还可<b>封禁</b>用户：填写封禁原因、选择到期时间后，该账户<b>立即</b>失去登录能力（在线会话同步失效），被封用户登录时会看到封禁原因与解封时间；到期自动解除，也可随时点「解封」立即恢复。卡片列表<b>最多显示前 10 位</b>用户，更多时点「显示全部」打开对话框 —— 那里有滚动列表与搜索框，操作按钮与卡片完全一致。
+              </div>
+              <div id="user-table" class="user-table"></div>
+              <div class="list-more" id="user-more" hidden>
+                <button id="btn-user-all" class="mini-btn" type="button">显示全部</button>
+                <span class="list-more-hint" id="user-more-hint"></span>
+              </div>
+              <div class="card-note">
+                <ul class="note-list">
+                  <li>用户数据加密存储于本地配置（<code>data/config.enc</code>），密码经 scrypt 加盐哈希保存，任何接口均不回传密码哈希。</li>
+                  <li>会话默认 24 小时有效，服务重启后需重新登录。</li>
+                  <li>新增用户默认角色为普通用户，可随时调整。<b>根用户</b>这一档不出现在任何下拉里 —— 它由部署后创建的第一个账户获得，不可授予也不可撤销；管理员与根用户都能进入本卡片，但管理员只能管理普通用户。</li>
+                  <li>封禁原因是<b>必填项</b>，会原样展示给被封用户；到期时间留空表示<b>永久封禁</b>，须手动解封。不能封禁自己（避免把系统里最后一个能管事的账户锁在门外）。</li>
+                  <li>用户数超过 10 位时，卡片只列出前 10 位，其余用户点「显示全部」查看：对话框内可<b>按用户名搜索</b>、列表<b>独立滚动</b>，且每行的编辑 / 封禁 / 删除按钮与卡片完全一致。</li>
+                </ul>
+              </div>
+            </div>
             <!-- 订单取回（仅管理员，R65）：两道护栏，**没有启用开关**。
                  需求明确「默认持久化」—— 关掉取回次数等于让订单号变成无限制的凭证，
-                 关掉错误上限等于对匿名端点开放无限次猜测。 -->
+                 关掉错误上限等于对匿名端点开放无限次猜测。
+                 R73：位置由「站点设置与用户管理之间」下移到「用户管理之下」—— 它管的是
+                 「已付款的人能怎么用订单号」，紧挨账户管理更合逻辑；移动只换 DOM 次序，不换内容。 -->
             <div class="dash-card wide sysset-card" id="sysset-restore-card">
               <h3 class="sysset-h3"><span class="sysset-tag site">取回</span>订单取回 <span id="restore-status" class="lk-count"></span></h3>
               <div class="enc-warn">
@@ -428,28 +458,6 @@
                   <li>解封在左侧栏的「<b>IP 地址管理</b>」→「订单取回封禁」里操作（可单个解封），封禁 24 小时后也会<b>自动解除</b>。</li>
                   <li>本卡片<b>没有启用开关</b>：两个值落盘即生效，重启后依然保持。</li>
                   <li>这一页同时受<b>频率</b>限流约束（每个 IP 每 10 分钟 20 次），两者互不替代：限流防刷、这里的上限防猜。</li>
-                </ul>
-              </div>
-            </div>
-            <!-- 用户管理（仅管理员可见；普通用户此卡片整体隐藏，改由账户菜单「编辑资料」自助） -->
-            <div class="dash-card wide sysset-card" id="sysset-user-card">
-              <h3 class="sysset-h3"><span class="sysset-tag">用户</span><span id="sysset-user-title">用户管理</span> <span id="user-count" class="lk-count"></span>
-                <button id="btn-user-add" class="mini-btn primary sysset-action">＋ 添加用户</button></h3>
-              <div class="enc-warn" id="sysset-user-intro">
-                <b>简要说明</b>：管理系统登录账户与权限。管理员可添加、编辑、删除用户并配置角色权限；普通用户仅可登录使用，无法进入用户管理。系统至少保留一个管理员，且不能删除当前登录账户。管理员还可<b>封禁</b>用户：填写封禁原因、选择到期时间后，该账户<b>立即</b>失去登录能力（在线会话同步失效），被封用户登录时会看到封禁原因与解封时间；到期自动解除，也可随时点「解封」立即恢复。卡片列表<b>最多显示前 10 位</b>用户，更多时点「显示全部」打开对话框 —— 那里有滚动列表与搜索框，操作按钮与卡片完全一致。
-              </div>
-              <div id="user-table" class="user-table"></div>
-              <div class="list-more" id="user-more" hidden>
-                <button id="btn-user-all" class="mini-btn" type="button">显示全部</button>
-                <span class="list-more-hint" id="user-more-hint"></span>
-              </div>
-              <div class="card-note">
-                <ul class="note-list">
-                  <li>用户数据加密存储于本地配置（<code>data/config.enc</code>），密码经 scrypt 加盐哈希保存，任何接口均不回传密码哈希。</li>
-                  <li>会话默认 24 小时有效，服务重启后需重新登录。</li>
-                  <li>新增用户默认角色为普通用户，可随时调整；角色为「管理员」的账户可进入系统设置中的用户管理。</li>
-                  <li>封禁原因是<b>必填项</b>，会原样展示给被封用户；到期时间留空表示<b>永久封禁</b>，须手动解封。管理员不能封禁自己（避免把系统里最后一个可用管理员锁在门外）。</li>
-                  <li>用户数超过 10 位时，卡片只列出前 10 位，其余用户点「显示全部」查看：对话框内可<b>按用户名搜索</b>、列表<b>独立滚动</b>，且每行的编辑 / 封禁 / 删除按钮与卡片完全一致。</li>
                 </ul>
               </div>
             </div>
@@ -932,7 +940,7 @@
             <div class="dash-card wide sysset-card">
               <h3 class="sysset-h3"><span class="sysset-tag about">关于</span>关于</h3>
               <div class="about-body">
-                <p><b>Kepler 对象存储管理系统</b> Build 1.9.8</p>
+                <p><b>Kepler 对象存储管理系统</b> Build 1.9.9</p>
                 <ul class="about-list">
                   <li>开发者：邢森</li>
                   <li>项目地址：<a href="https://github.com/xingsen2005/Kepler" target="_blank" rel="noopener noreferrer">https://github.com/xingsen2005/Kepler</a></li>
@@ -1155,11 +1163,14 @@
           <input id="auth-invite" type="text" maxlength="32" autocomplete="off"
             spellcheck="false" placeholder="请输入 10 位邀请码">
         </div>
-        <!-- R69：部署模式下首次初始化必须出示「安装令牌」（首启生成、写 data/setup-token.txt、并在启动日志打印） -->
+        <!-- R69：部署模式下首次初始化必须出示「安装令牌」。
+             R72 起它由服务端**启动即生成**并落盘到数据目录下的 setup-token.txt；
+             部署完成时打印在收尾信息里、`kepler` 管理菜单顶部也会再显示一次
+             —— 因此这里的指引指向那两处 + 文件本身，不再只说「见启动日志」。 -->
         <div class="form-item" id="auth-setup-item" hidden>
-          <label for="auth-setup">安装令牌 <span class="hint" style="margin-left:6px">见服务端启动日志</span></label>
+          <label for="auth-setup">安装令牌 <span class="hint" style="margin-left:6px">部署完成信息 / kepler 菜单 / 服务器上的 setup-token.txt</span></label>
           <input id="auth-setup" type="text" maxlength="64" autocomplete="off" spellcheck="false"
-            placeholder="粘贴服务器启动日志里的安装令牌">
+            placeholder="粘贴部署完成时给出的安装令牌">
         </div>
         <div class="form-item" id="auth-remember-item">
           <label class="check-line"><input id="auth-remember" type="checkbox"> 记住用户名</label>

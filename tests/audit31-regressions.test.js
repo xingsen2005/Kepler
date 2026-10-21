@@ -185,6 +185,9 @@ function makeSandbox({ withSyssettings = false } = {}) {
     // R38：syssettings.js 又 import 了 './backupcfg.js'（「备份配置」卡片）—— 同一条链接期
     // 规则。同样必须拷**真实**的那一份（它只从 api.js 取 API、从 util.js 取 toast / openModal）。
     fs.copyFileSync(JS('backupcfg.js'), path.join(dir, 'backupcfg.js'));
+    // R73：syssettings.js 又 import 了 './anchornav.js'（卡片锚点导航栏）—— 同一条链接期
+    // 规则。它不 import 任何东西（只用全局 document），拷真实的那一份即可。
+    fs.copyFileSync(JS('anchornav.js'), path.join(dir, 'anchornav.js'));
   } else {
     w('payment-logos.js', PAYLOGOS_STUB);
     fs.copyFileSync(JS('paysettings.js'), path.join(dir, 'paysettings.js'));

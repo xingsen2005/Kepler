@@ -355,7 +355,7 @@ async function bootstrapApp() {
 /**
  * 认证遮罩的四种形态（R54② 从两种扩到四种）：
  *   · `login`    输入用户名 + 密码登录
- *   · `init`     首次使用，创建管理员账户
+ *   · `init`     首次使用，创建**根用户**账户（R71 起）
  *   · `register` 注册新账户（仅当站点设置为「公开注册」时才给入口）
  *   · `forgot`   忘记密码 —— 两步：① 填「用户名或邮箱」发码 ② 填验证码 + 新密码
  */
@@ -397,7 +397,7 @@ let agreementInfo = null;
  * 「开关 + 有没有正文」这两件事 —— 那套判断只在 `server/agreement-view.js` 里有一份。
  * 前端一旦自己再算一遍，就会出现「服务端说不显示、前端却显示了半句」这类分叉。
  *
- * 三种形态下都显式复位：`init`（创建管理员）与 `forgot`（重置密码）不是需求里的
+ * 三种形态下都显式复位：`init`（创建根用户）与 `forgot`（重置密码）不是需求里的
  * 「注册页 / 登录页」，因此一律不显示；只在 login / register 两种形态下按开关决定。
  */
 function renderAuthAgreement() {
@@ -499,7 +499,9 @@ async function checkAuth() {
     App.state.user = null;
     if (r.initialized === false) {
       authMode = 'init';
-      // R69：部署模式下首次初始化必须出示「安装令牌」（服务端生成，只出现在启动日志里）
+      // R69：部署模式下首次初始化必须出示「安装令牌」。
+      // R72：令牌改为服务端**启动即生成**，且部署完成信息 / `kepler` 菜单都会显示它
+      // —— 不再只有启动日志一处。
       setupTokenRequired = r.setupTokenRequired === true;
     } else {
       authMode = 'login';
@@ -548,7 +550,7 @@ function showAuthOverlay() {
   // 清空输入（密码/验证码始终清空；用户名在勾选过「记住用户名」时回填）
   const saved = loadRemember();
   if (rememberBox) rememberBox.checked = saved.mode === REMEMBER_MODE.USERNAME;
-  // 创建管理员与注册时「记住用户名」没有意义（用户名是刚起的），忘记密码也不适用
+  // 创建根用户与注册时「记住用户名」没有意义（用户名是刚起的），忘记密码也不适用
   if (rememberItem) rememberItem.hidden = isInit || isRegister || isForgot;
   userInput.value = saved.mode === REMEMBER_MODE.USERNAME ? (saved.username || '') : '';
   // R69：密码**从不**回填 —— 本机不再保存任何形式的密码
@@ -583,15 +585,22 @@ function showAuthOverlay() {
   userInput.placeholder = isForgot ? '请输入用户名或已绑定的邮箱' : '请输入用户名';
 
   if (isInit) {
-    title.textContent = '创建管理员账户';
-    sub.textContent = '首次使用，请创建管理员账户以初始化系统';
+    /**
+     * R71 起这一页建的是**根用户**，不是管理员 —— 界面必须照实说。
+     *
+     * 继续把这一页写成「管理员」的后果不是措辞不准，而是**误导用户对权限的预期**：
+     * 他会以为自己只是个管理员，随后发现可以删掉别的管理员，或反过来在某个界面上
+     * 找不到「为什么我不能改那个人」的解释。角色名是这三层权限唯一的对外口径。
+     */
+    title.textContent = '创建根用户账户';
+    sub.textContent = '首次使用，请创建根用户账户以初始化系统';
     userLabel.textContent = '用户名';
     pwLabel.textContent = '密码';
     confirmLabel.textContent = '确认密码';
     confirmItem.hidden = false;
     codeItem.hidden = true;
     submitBtn.textContent = '创建并登录';
-    foot.textContent = '管理员账户拥有全部权限，包括用户管理与系统配置';
+    foot.textContent = '根用户拥有最高权限：可管理包括其他管理员在内的所有账户；管理员仅能管理普通用户';
   } else if (isRegister) {
     // R54③：本站为「邀请码」模式时，注册必须填邀请码 —— 输入框与说明一起切换，
     // 否则用户会填完用户名密码才从服务端那里知道还差一个码
@@ -1029,7 +1038,12 @@ async function doAuthSubmit() {
   const setupTokenEl = document.getElementById('auth-setup');
   const setupToken = setupTokenEl ? setupTokenEl.value.trim() : '';
   if (authMode === 'init' && setupTokenRequired && !setupToken) {
-    showAuthError('请输入安装令牌（见服务端启动日志）');
+    /**
+     * R72 起这串令牌不再只能翻启动日志 —— 部署完成的信息里会直接打印，
+     * `kepler` 管理菜单顶部也会显示。只写「见启动日志」会让人去翻一个
+     * 未必有权限看的地方（Docker / systemd 的日志对不少部署者并不顺手）。
+     */
+    showAuthError('请输入安装令牌（部署完成信息或 kepler 菜单里有，也可看服务器数据目录下的 setup-token.txt）');
     return;
   }
   // 人机验证：开启时必须已完成校验（token 由组件回调产出，服务端会回源复核）
@@ -1098,7 +1112,8 @@ async function doAuthSubmit() {
       if (back) { location.replace(back); return; }
       await bootstrapApp();
       const who = r.user.username;
-      toast(authMode === 'init' ? '管理员账户创建成功，欢迎使用'
+      // R71：这一支建的是根用户 —— 说成「管理员」会让用户误判自己能管到哪一层
+      toast(authMode === 'init' ? '根用户账户创建成功，欢迎使用'
         : (isRegister ? `注册成功，欢迎使用，${who}` : `欢迎回来，${who}`), { type: 'success' });
     }
   } catch (e) {

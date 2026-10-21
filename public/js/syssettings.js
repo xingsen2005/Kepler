@@ -9,6 +9,8 @@ import { registerWindowsHello, webauthnReadiness } from './webauthn.js';
 import { loadPayment, resetPaymentView } from './paysettings.js';
 // R38：备份配置卡片（实时码 + 导出 / 导入）
 import { refresh as refreshBackup, reset as resetBackup } from './backupcfg.js';
+// R73：卡片锚点导航栏（独立模块，便于单独加载与真实执行验证）
+import { buildAnchorBar, syncAnchorActive, onAnchorScroll } from './anchornav.js';
 
 let wired = false;
 let current = null; // 服务端当前生效设置
@@ -43,7 +45,7 @@ function isAdmin() {
  * 换账号时就会残留上一个角色的 DOM（越权显示用户列表）。整卡按角色显隐之后，
  * 角色切换只是"显示 / 隐藏一个整块"，不存在需要还原的中间状态。
  */
-const ADMIN_ONLY_CARDS = ['sysset-site-card', 'sysset-restore-card', 'sysset-user-card', 'sysset-smtp-card', 'sysset-agreement-card', 'sysset-concurrency-card', 'sysset-lb-card', 'sysset-enc-card', 'sysset-excludes-card', 'sysset-webdav-card', 'sysset-captcha-card', 'sysset-payment-card', 'sysset-backup-card'];
+const ADMIN_ONLY_CARDS = ['sysset-site-card', 'sysset-user-card', 'sysset-restore-card', 'sysset-smtp-card', 'sysset-agreement-card', 'sysset-concurrency-card', 'sysset-lb-card', 'sysset-enc-card', 'sysset-excludes-card', 'sysset-webdav-card', 'sysset-captcha-card', 'sysset-payment-card', 'sysset-backup-card'];
 
 /** 隐藏仅管理员可见的卡片（非管理员直接不渲染其内容） */
 function setAdminCardVisible(cardId, visible) {
@@ -76,6 +78,8 @@ export function refresh() {
       tip.textContent = '普通用户仅可管理由管理员分配的存储桶。用户管理、文件加密、上传排除、WebDAV 服务、登录验证、支付设置等功能是否可操作由管理员决定。';
       sec.appendChild(tip);
     }
+    // 普通用户只剩「关于」一张卡 —— buildAnchorBar 会据此把整条导航收起
+    buildAnchorBar();
     return;
   }
 
@@ -110,11 +114,19 @@ export function refresh() {
   // R38：备份配置（实时码 / 导出 / 导入）。卡片非管理员整卡隐藏，
   // 故放在管理员分支里 —— 普通用户不会为它发一个注定 403 的请求。
   refreshBackup();
+
+  // R73：卡片显隐尘埃落定之后再生成锚点 —— 早一步会把隐藏中的卡片也列进去
+  buildAnchorBar();
+  syncAnchorActive();
 }
 
 function wire() {
   if (wired) return;
   wired = true;
+  // R73：锚点高亮跟随滚动。绑在 `#systemsettings` 上而不是 window ——
+  // 它自己才是滚动容器（.card-view），绑 window 收不到这个容器的滚动。
+  const secEl = document.getElementById('systemsettings');
+  if (secEl) secEl.addEventListener('scroll', onAnchorScroll, { passive: true });
   const save = document.getElementById('btn-enc-save');
   if (save) save.onclick = saveSettings;
   const saveEx = document.getElementById('btn-excludes-save');

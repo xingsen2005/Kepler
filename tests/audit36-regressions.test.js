@@ -381,6 +381,9 @@ function makeFeSandbox(realFiles) {
   if (!realFiles.includes('speedlimit.js')) fs.copyFileSync(JS('speedlimit.js'), path.join(dir, 'speedlimit.js'));
   // R38：syssettings.js 还 import 了 './backupcfg.js'（「备份配置」卡片），同一条链接期规则。
   if (!realFiles.includes('backupcfg.js')) fs.copyFileSync(JS('backupcfg.js'), path.join(dir, 'backupcfg.js'));
+  // R73：syssettings.js 还 import 了 './anchornav.js'（卡片锚点导航栏），同一条链接期规则。
+  // 它不 import 任何东西（只用全局 document），拷真实的那一份即可。
+  if (!realFiles.includes('anchornav.js')) fs.copyFileSync(JS('anchornav.js'), path.join(dir, 'anchornav.js'));
   return dir;
 }
 

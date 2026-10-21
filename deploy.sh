@@ -3996,8 +3996,8 @@ manage_menu() {
       log "  ${C_BOLD}安装令牌${C_RESET}：${C_DIM}（无 —— 已完成初始化，或本机以回环地址运行，不需要它）${C_RESET}"
     fi
     log "  1) 重新安装（保留数据与配置）"
-    log "  2) 修改初始管理员用户名"
-    log "  3) 修改初始管理员密码"
+    log "  2) 修改初始账户（根用户）用户名"
+    log "  3) 修改初始账户（根用户）密码"
     log "  4) 修改应用端口"
     log "  5) 卸载（清理服务、应用与数据）"
     log "  0) 退出"
@@ -4267,7 +4267,7 @@ print_summary() {
   log "    5. 应用内开启 WebDAV 后，界面会显示客户端要填的地址（.env 中 WEBDAV_PUBLIC_URL + /dav/）；"
   log "       Nginx 已默认反代 /dav 到应用内置的 ${WEBDAV_PORT} 端口，无需手工改配置，${C_BOLD}也不需要把 ${WEBDAV_PORT} 暴露到公网${C_RESET}。"
   log "       若该端口已被占用，用 ${C_BOLD}WEBDAV_PORT=<其它端口>${C_RESET} 重跑本脚本，.env 与 Nginx 会一起改。"
-  log "    6. 终端执行 ${C_BOLD}kepler${C_RESET} 可打开管理菜单：重装、修改初始管理员用户名/密码、修改端口或卸载；"
+  log "    6. 终端执行 ${C_BOLD}kepler${C_RESET} 可打开管理菜单：重装、修改初始账户（根用户）用户名/密码、修改端口或卸载；"
   log "       菜单顶部会显示${C_BOLD}安装令牌${C_RESET}（还没初始化完时才显示，可直接抄走）。"
   log "    7. 重新执行本脚本可升级部署：会重新拉取源码并同步配置，数据目录不会被触碰。"
   if ((${#todos[@]} > 0)); then

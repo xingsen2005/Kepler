@@ -425,17 +425,23 @@ test('R65-09 · IP 地址管理：GET /ipguard 带封禁列表；解封立即生
  * ⑦ 前端与静态：卡片位置、无开关、管理员专属、解封入口
  * ================================================================== */
 
-test('R65-10 · 前端：卡片位于「站点设置」与「用户管理」之间、无开关、进管理员清单', () => {
+test('R65-10 · 前端：卡片位于「用户管理」之下、无开关、进管理员清单', () => {
   const html = fs.readFileSync(path.join(ROOT, 'public', 'index.html'), 'utf8');
   const site = html.indexOf('id="sysset-site-card"');
   const restore = html.indexOf('id="sysset-restore-card"');
   const user = html.indexOf('id="sysset-user-card"');
-  assert(site > 0 && restore > 0 && user > 0, '三张卡片都应存在');
-  assert(site < restore && restore < user,
-    '「订单取回」必须排在「站点设置」与「用户管理」之间（需求原文：在两者之间新增）');
+  const smtp = html.indexOf('id="sysset-smtp-card"');
+  assert(site > 0 && restore > 0 && user > 0 && smtp > 0, '四张卡片都应存在');
+  /**
+   * R73 起位置变了：原先需求是「在站点设置与用户管理之间新增」，
+   * 现在改为「移到用户管理卡片下方」—— 它管的是「已付款的人能怎么用订单号」，
+   * 紧挨账户管理更合逻辑。判据同步改成 站点 → 用户 → 取回 → 发信。
+   */
+  assert(site < user && user < restore && restore < smtp,
+    `「订单取回」必须紧跟在「用户管理」之下，实际下标 ${site}/${user}/${restore}/${smtp}`);
 
   // 需求 4：没有开关 —— 卡片内不得出现开关控件（ip-switch / checkbox / "启用"按钮）
-  const block = html.slice(restore, user);
+  const block = html.slice(restore, smtp);
   assert(!/ip-switch/.test(block), '该卡片不应有启用开关');
   assert(!/<input[^>]+type="checkbox"/.test(block), '该卡片不应有勾选框（需求：不需要开关）');
   assert(/id="restore-max-uses"/.test(block), '缺少「取回次数限制」输入框');

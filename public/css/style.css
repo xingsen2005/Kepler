@@ -527,6 +527,12 @@ td.c-date, th.c-date { width: 150px; }
   #upload-drawer { right: 8px; width: calc(100vw - 16px); }
   .tb-btn span { display: none; }
   .op-btn { padding: 0 8px; }
+  /* R73：窄屏下锚点栏改为横向滚动 —— 十几张卡片换行会把它撑成三行，
+     比它本要省下的空间还多；横向滑动才是这一屏该有的形态。 */
+  .sysset-anchorbar {
+    flex-wrap: nowrap; overflow-x: auto; overflow-y: hidden;
+    scrollbar-width: thin; -webkit-overflow-scrolling: touch;
+  }
 }
 @media (max-width: 560px) {
   #statusbar .st-item.hide-sm { display: none; }
@@ -593,6 +599,31 @@ td.c-date, th.c-date { width: 150px; }
 .lk-empty { color: var(--muted); font-size: 13px; padding: 26px 10px; text-align: center; line-height: 1.8; }
 
 /* ============================ 系统设置页 ============================ */
+
+/* ---------------------- R73：卡片锚点导航栏 ---------------------- */
+/* `#systemsettings` 自己是滚动容器（.card-view），所以 sticky 的参照就是它：
+   负 margin 抹掉容器左右各 16px 的内边距做成一条通栏，top 取同样的负值让
+   吸附后严丝合缝压在容器上沿（否则会露出一道 16px 的空白）。 */
+.sysset-anchorbar {
+  position: sticky; top: -16px; z-index: 5;
+  margin: -16px -16px 14px; padding: 8px 14px;
+  display: flex; flex-wrap: wrap; gap: 6px;
+  background: var(--panel); border-bottom: 1px solid var(--border);
+}
+/* `display:flex` 会盖掉 `[hidden]` 默认的 `display:none` —— 不显式写回，
+   「普通用户收起整条导航」会失效，表现为一条空的白横条。 */
+.sysset-anchorbar[hidden] { display: none; }
+.sysset-anchor-link {
+  font-size: 12px; line-height: 18px; padding: 4px 11px; border-radius: 999px;
+  color: var(--text-2); background: var(--surface-3);
+  border: 1px solid transparent; cursor: pointer;
+  white-space: nowrap; text-decoration: none; flex: none;
+}
+.sysset-anchor-link:hover { color: var(--accent); background: var(--accent-weak); }
+.sysset-anchor-link.active {
+  color: #fff; background: var(--accent); border-color: var(--accent);
+}
+
 .sysset-card { padding: 18px 20px; }
 .sysset-h3 {
   font-size: 14px; font-weight: 600; margin-bottom: 12px; display: flex; align-items: center; gap: 8px;
@@ -1055,6 +1086,11 @@ input.full { width: 100%; }
 .dialog.backup-dialog { width: min(560px, 94vw); }
 /* 导入按钮在「已有配置」的实例上禁用：disabled 的元素必须看得出来不能点 */
 .backup-actions .mini-btn:disabled { opacity: .5; cursor: not-allowed; }
+/* R73：本地文件选择行（按钮 + 「已读取：xxx」）。长文件名必须能截断，
+   否则一个深目录里的文件名会把对话框撑出横向滚动。 */
+.bk-file-row { display: flex; align-items: center; gap: 8px; margin-top: 6px; flex-wrap: wrap; }
+.bk-file-name { font-size: 12px; color: var(--text-2); min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.bk-file-name.ok { color: var(--ok); }
 
 /* ------------------------- WebDAV 服务 ------------------------- */
 .wd-url-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }

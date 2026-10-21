@@ -173,6 +173,11 @@ function openExportDialog(mode) {
     <div class="form-item"><label>再输一次备份密码</label>
       <input id="bk-backup-pass2" class="sl-input bk-input" type="password" autocomplete="new-password"
         placeholder="重复输入"></div>
+    <div class="form-item"><label>文件名（可选）</label>
+      <input id="bk-file-name" class="sl-input bk-input" type="text" autocomplete="off" spellcheck="false"
+        placeholder="留空则用默认名 kepler-config-backup-<指纹>.json">
+      <div class="hint">保存为 <b>.json</b>：留空用默认名；填了就以它为准（自动补 <code>.json</code> 后缀）。
+        支持「另存为」对话框的浏览器会弹出<b>让你选保存位置</b>，不支持的直接按下载设置落到默认目录。</div></div>
     <div class="sl-err" id="bk-err" hidden></div>
     <div class="sl-note">导出码只含<b>备份范围内</b>的 10 项配置；用户列表、分享链接、订单、
       <b>邀请码</b>（条数可能过多，故不备份）与各类密钥文件
@@ -196,6 +201,7 @@ function openExportDialog(mode) {
           const account = wrap.querySelector('#bk-account-pass').value;
           const bp = wrap.querySelector('#bk-backup-pass').value;
           const bp2 = wrap.querySelector('#bk-backup-pass2').value;
+          const nameField = wrap.querySelector('#bk-file-name');
           if (!account) return fail('请输入账户密码');
           if (!bp) return fail('请设置备份密码');
           if (bp !== bp2) return fail('两次输入的备份密码不一致');
@@ -204,7 +210,8 @@ function openExportDialog(mode) {
           try {
             const r = await API.backupExport(account, bp);
             close(null);
-            deliver(r.code, r.fingerprint, mode);
+            // R73：把用户填的文件名一起带过去（留空则由 deliver 用默认名）
+            deliver(r.code, r.fingerprint, mode, nameField ? nameField.value : '');
           } catch (e) {
             fail(e.message);
           } finally {
@@ -216,8 +223,8 @@ function openExportDialog(mode) {
   });
 }
 
-/** 拿到导出码之后的落地：复制到剪贴板，或下载成 .json */
-async function deliver(code, fingerprint, mode) {
+/** 拿到导出码之后的落地：复制到剪贴板，或存成 .json */
+async function deliver(code, fingerprint, mode, customName) {
   if (mode === 'copy') {
     const ok = await copyText(code);
     toast(ok ? '导出码已复制（请连同备份密码一起妥善保存）' : '复制失败，请改为「导出为 JSON」',
@@ -233,8 +240,19 @@ async function deliver(code, fingerprint, mode) {
     passwordHint: '导入时需要输入导出时设置的备份密码',
     code,
   }, null, 2);
-  downloadJson(`kepler-config-backup-${fingerprint}.json`, payload);
-  toast('已导出 JSON（备份密码未写入文件，请自行保存）', { type: 'success' });
+  // R73：文件名可由用户指定；保存位置在支持的浏览器上由「另存为」对话框决定
+  const filename = backupFileName(fingerprint, customName);
+  try {
+    const saved = await saveJsonFile(filename, payload);
+    toast(saved.picked
+      ? `已保存到 ${saved.name}（备份密码未写入文件，请自行保存）`
+      : `已导出 ${saved.name}（备份密码未写入文件，请自行保存）`, { type: 'success' });
+  } catch (e) {
+    // AbortError = 用户在「另存为」里点了取消：不是失败，不该报错吓人
+    if (!e || e.name !== 'AbortError') {
+      toast('保存失败：' + (e && e.message ? e.message : '未知错误'), { type: 'error', duration: 6000 });
+    }
+  }
 }
 
 async function copyText(text) {
@@ -272,6 +290,136 @@ function downloadJson(filename, text) {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
+/* ------------------------------ R73：本地 JSON 文件 ------------------------------ */
+
+/**
+ * 是否 .json 文件（只看扩展名，大小写不敏感）。
+ *
+ * ⚠️ 为什么**只**看扩展名就敢拒：`file.type` 在 Windows 上经常是空串（系统没登记
+ * 该扩展名的 MIME 时），拿它当判据会把正常的 .json 挡在门外；而反过来，一个改了
+ * 后缀的文件即使 MIME 是对的，内容也未必是我们能认的备份。所以策略是
+ * **扩展名做门禁、内容做校验**：不是 .json 直接不读（备份里含密钥明文，
+ * 不该去「猜」用户塞进来的东西），是 .json 再解析并按字段确认。
+ */
+export function isBackupJsonFile(name) {
+  return /\.json$/i.test(String(name == null ? '' : name).trim());
+}
+
+/**
+ * 解析备份文件正文，取出导出码。
+ *
+ * 三级失败各自给**不同的**提示 —— 都归成一句「文件不对」的话，用户无从判断是该
+ * 换文件、还是该先把它转成 JSON、还是这份备份本来就是坏的。
+ *
+ * @returns {{ok: true, code: string, fingerprint: string} | {ok: false, reason: string}}
+ */
+export function parseBackupFile(text) {
+  const raw = String(text == null ? '' : text).trim();
+  if (!raw) return { ok: false, reason: '这个文件是空的' };
+  let data;
+  try {
+    data = JSON.parse(raw);
+  } catch (e) {
+    return { ok: false, reason: '不是有效的 JSON —— 文件无法解析，请确认它没有被编辑器改坏' };
+  }
+  if (!data || typeof data !== 'object' || Array.isArray(data)) {
+    return { ok: false, reason: '文件内容不是配置备份（顶层应当是一个对象）' };
+  }
+  const code = String(data.code == null ? '' : data.code).trim();
+  if (!code) {
+    return {
+      ok: false,
+      reason: '这是一份 JSON，但里面没有导出码（缺少 code 字段）—— 请确认选的是 Kepler「导出为 JSON」得到的那个文件',
+    };
+  }
+  return { ok: true, code, fingerprint: String(data.fingerprint || '') };
+}
+
+/** 导入时接受的最大文件（备份 JSON 通常几十 KB；超了基本是选错文件） */
+const MAX_BACKUP_FILE = 5 * 1024 * 1024;
+
+/**
+ * 打开系统文件选择器，取回一个备份文件里的导出码。
+ *
+ * @returns {Promise<null | {name: string, code: string} | {name: string, error: string}>}
+ *   `null` = 用户取消了选择（不是错误，不提示）
+ */
+export function pickBackupFile() {
+  return new Promise((resolve) => {
+    const input = document.createElement('input');
+    input.type = 'file';
+    input.accept = '.json,application/json';
+    input.style.display = 'none';
+    document.body.appendChild(input);
+    let settled = false;
+    const cleanup = () => { try { document.body.removeChild(input); } catch (e) { /* 已移除 */ } };
+    const done = (v) => { if (settled) return; settled = true; cleanup(); resolve(v); };
+    input.addEventListener('change', () => {
+      const f = input.files && input.files[0];
+      if (!f) return done(null);
+      const name = String(f.name || '');
+      // ① 扩展名门禁：不是 .json 连内容都不读
+      if (!isBackupJsonFile(name)) {
+        return done({ name, error: `只接受 .json 文件：这个文件是「${name}」，已拒绝、未读取其内容` });
+      }
+      if (f.size > MAX_BACKUP_FILE) {
+        return done({ name, error: '文件过大（超过 5 MB），不像一份配置备份' });
+      }
+      const reader = new FileReader();
+      reader.onerror = () => done({ name, error: '读取文件失败，请重试' });
+      reader.onload = () => {
+        const parsed = parseBackupFile(reader.result);
+        done(parsed.ok ? { name, code: parsed.code } : { name, error: parsed.reason });
+      };
+      reader.readAsText(f);
+    });
+    input.click();
+  });
+}
+
+/**
+ * 导出文件名（允许自定义；一定以 .json 收尾）。
+ *
+ * 非法文件名字符一律换成 `_` —— Windows 的 `:` `*` `?` 这类字符会让下载直接失败，
+ * 而失败发生在浏览器层，界面上什么也不会提示，用户只看到「点了没反应」。
+ */
+export function backupFileName(fingerprint, custom) {
+  const fp = String(fingerprint || '').replace(/[^A-Za-z0-9_-]/g, '') || 'config';
+  const base = String(custom == null ? '' : custom).trim()
+    .replace(/\\/g, '_').replace(/\//g, '_').replace(/\.json$/i, '')
+    .replace(/[:*?"<>|]/g, '_').trim();
+  return base ? `${base}.json` : `kepler-config-backup-${fp}.json`;
+}
+
+/**
+ * 把导出码落到用户指定的本地文件。
+ *
+ * 优先 `showSaveFilePicker`（File System Access API）—— 它能真的让用户**选目录与文件名**，
+ * 这才是「自行选择本地文件」；不支持时（Safari / Firefox / 非安全上下文）回落到
+ * `a[download]`，由浏览器的下载设置决定落点，行为与改动前一致。
+ */
+async function saveJsonFile(filename, text) {
+  if (typeof window !== 'undefined' && typeof window.showSaveFilePicker === 'function') {
+    try {
+      const handle = await window.showSaveFilePicker({
+        suggestedName: filename,
+        types: [{ description: 'Kepler 配置备份', accept: { 'application/json': ['.json'] } }],
+      });
+      const w = await handle.createWritable();
+      await w.write(text);
+      await w.close();
+      return { name: handle.name || filename, picked: true };
+    } catch (e) {
+      // 用户在保存对话框里点了取消：交给下面的回落去处理会变成「又下一次」，
+      // 因此这里直接向上抛，由调用方决定是否提示。
+      if (e && e.name === 'AbortError') throw e;
+      // 其它原因（权限 / 不支持的目录）→ 回落到普通下载，不让用户卡住
+    }
+  }
+  downloadJson(filename, text);
+  return { name: filename, picked: false };
+}
+
 /* ------------------------------ 导入 ------------------------------ */
 
 /**
@@ -290,7 +438,18 @@ function openImportDialog() {
     </div>
     <div class="form-item"><label>导出码</label>
       <textarea id="bk-import-code" class="backup-code" spellcheck="false"
-        placeholder="粘贴「导出」得到的那串 KEPLER-CONFIG-SEALED-V1.… 代码"></textarea></div>
+        placeholder="粘贴「导出」得到的那串 KEPLER-CONFIG-SEALED-V1.… 代码，或点下面从本地选一个备份文件"></textarea>
+      <div class="bk-file-row">
+        <button id="bk-import-pick" class="mini-btn" type="button">选择 JSON 文件…</button>
+        <span id="bk-import-file" class="bk-file-name"></span>
+      </div>
+      <div class="hint">也可以直接<b>从本地选文件</b>（就是「导出为 JSON…」存下来的那一份），
+        选中后导出码会自动填进上面的框。<br>
+        <b>非 .json 文件一律拒绝，连内容都不读</b> —— 后缀是 <code>.txt</code> /
+        <code>.zip</code> / 其它，或被改过后缀的，会直接提示「只接受 .json 文件」；
+        文件本身不会上传到服务器，读取全在浏览器本地完成。<br>
+        后缀对但内容不是备份（不是合法 JSON，或缺少 <code>code</code> 字段）会分别提示
+        「不是有效的 JSON」/「里面没有导出码」 —— 三种情况分开说，便于判断该换文件还是这份已损坏。</div></div>
     <div class="form-item"><label>备份密码</label>
       <input id="bk-import-pass" class="sl-input bk-input" type="password" autocomplete="off"
         placeholder="导出时设置的备份密码"></div>
@@ -300,6 +459,24 @@ function openImportDialog() {
     const box = wrap.querySelector('#bk-import-err');
     if (box) { box.textContent = msg; box.hidden = false; }
   };
+
+  // R73：本地文件入口。取消选择（null）不提示；被拒/解析失败才提示。
+  const pick = wrap.querySelector('#bk-import-pick');
+  if (pick) {
+    pick.onclick = async () => {
+      const label = wrap.querySelector('#bk-import-file');
+      const r = await pickBackupFile();
+      if (!r) return; // 用户取消
+      if (r.error) {
+        if (label) { label.textContent = ''; label.classList.remove('ok'); }
+        return fail(r.error);
+      }
+      wrap.querySelector('#bk-import-code').value = r.code;
+      if (label) { label.textContent = `已读取：${r.name}`; label.classList.add('ok'); }
+      const box = wrap.querySelector('#bk-import-err');
+      if (box) { box.hidden = true; box.textContent = ''; }
+    };
+  }
 
   openModal({
     title: '导入配置',
