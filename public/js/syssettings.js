@@ -1,6 +1,6 @@
 /** 系统设置 —— 文件加密（隐私保护）：加密方式 / 魔数 / 查看密码 / 用户管理（管理员） */
 import { API } from './api.js';
-import { toast, escapeHtml, confirmDialog, openModal, openAgreementDialog, fmtTime, fmtSize, updateNotice, USER_PREVIEW_LIMIT, filterUsersByName, previewMoreState, uploadPlanNotice, FILE_CONCURRENCY_MIN, FILE_CONCURRENCY_MAX } from './util.js';
+import { toast, escapeHtml, confirmDialog, openModal, openAgreementDialog, fmtTime, fmtSize, updateNotice, USER_PREVIEW_LIMIT, filterUsersByName, previewMoreState, uploadPlanNotice, FILE_CONCURRENCY_MIN, FILE_CONCURRENCY_MAX, isStaffRole, roleLabel } from './util.js';
 import { openListDialog } from './listdialog.js';
 // R37：「限速」列（四张列表卡片共用的唯一实现点）
 import { openSpeedLimitDialog, speedCellHtml } from './speedlimit.js';
@@ -29,7 +29,7 @@ const MODE_LABEL = { none: '不加密', crypto: 'crypto（AES-256-GCM）', magic
 
 /** 渲染期角色判断（真正的强制校验在服务端；此处仅避免发起注定 403 的请求与闪现错误） */
 function isAdmin() {
-  return !!(App.state.user && App.state.user.role === 'admin');
+  return isStaffRole(App.state.user && App.state.user.role);
 }
 
 /**
@@ -1472,6 +1472,19 @@ function banBadge(u) {
  * 因此它只接受「要渲染哪些用户」，渲染进哪个容器由调用方决定。
  */
 function userTableHtml(users, currentId) {
+  /**
+   * R71：**「管理员只能管理普通用户」在界面上的落地点**。
+   *
+   * 判据只看「当前登录者是不是根用户」+「目标那一行的角色」，与服务端
+   * `roles.canManageUser()` 同口径。管理员看到的他人 admin / root 行里，编辑 / 封禁 /
+   * 删除三个按钮一律 `disabled` 并带说明性 `title` —— 刻意不渲染成「可点但报错」：
+   * 用户点下去拿到 403 只会以为是系统故障，而灰掉的按钮 + 提示能直接回答「为什么不让我点」。
+   *
+   * ⚠️ 这只是第一层。真正的边界在 `routes/users.js` 的 `denyIfCannotManage()`：
+   * 直接打接口（改地址栏、用 curl）一样会被 403 挡住。
+   */
+  const meRole = (App.state.user && App.state.user.role) || '';
+  const iAmRoot = meRole === 'root';
   return `
     <table class="lk-table user-tbl">
       <thead><tr>
@@ -1480,28 +1493,36 @@ function userTableHtml(users, currentId) {
       <tbody>
         ${users.map((u) => {
           const isSelf = u.id === currentId;
-          const roleBadge = u.role === 'admin'
-            ? '<span class="lk-badge admin">管理员</span>'
-            : '<span class="lk-badge">普通用户</span>';
+          const roleBadge = u.role === 'root'
+            ? '<span class="lk-badge root" title="根用户：系统创建的第一个账户，角色不可授予、不可撤销">根用户</span>'
+            : (u.role === 'admin'
+              ? '<span class="lk-badge admin">管理员</span>'
+              : '<span class="lk-badge">普通用户</span>');
           const selfMark = isSelf ? '<span class="lk-badge self" style="margin-left:6px">当前账户</span>' : '';
           const helloBadge = u.webauthnEnabled
             ? '<span class="lk-badge ok" title="已启用：登录时需通过 Windows Hello 验证">已启用</span>'
             : '<span class="bk-sub">未启用</span>';
+          /**
+           * 越权不可为：目标不是普通用户，而当前登录者不是根用户。
+           * 自己那一行不参与这条判定（自己不是「他人」，且下面另有自保护）。
+           */
+          const denied = !isSelf && !iAmRoot && u.role !== 'user';
+          const denyTitle = `管理员只能管理普通用户：该账户是${roleLabel(u.role)}，仅根用户可管理`;
           // R40：自己那一行**不渲染**「编辑」按钮（需求：管理员不能在「用户管理」里编辑自己）。
           // 与封禁/删除同一条思路 —— 这张卡片管的是「别的账户」。自己的资料走账户菜单的
           // 「编辑资料」（profile.js），那里同样能改用户名 / 密码 / Windows Hello，能力不缺。
           // 刻意「不渲染」而不是 disabled：留一个永远点不动的按钮，只会让人以为是坏了。
           const editBtn = isSelf ? ''
-            : `<button class="mini-btn" data-act="edit" data-id="${escapeHtml(u.id)}" type="button">编辑</button>`;
+            : `<button class="mini-btn" data-act="edit" data-id="${escapeHtml(u.id)}" type="button"${denied ? ` disabled title="${escapeHtml(denyTitle)}"` : ''}>编辑</button>`;
           // 删除按钮：自己的行禁用（不能删除当前登录账户）
-          const delBtn = `<button class="mini-btn danger" data-act="del" data-id="${escapeHtml(u.id)}" type="button" ${isSelf ? 'disabled title="不能删除当前登录账户"' : ''}>删除</button>`;
+          const delBtn = `<button class="mini-btn danger" data-act="del" data-id="${escapeHtml(u.id)}" type="button" ${isSelf ? 'disabled title="不能删除当前登录账户"' : (denied ? `disabled title="${escapeHtml(denyTitle)}"` : '')}>删除</button>`;
           // R33：封禁 / 解封。自己的行不给按钮（服务端也会 400 拦下自封禁）——
           // 否则管理员一不小心就把自己锁在系统外，且没有任何人能帮他解开。
           const banned = (u.ban || {}).state === 'active';
           const banBtn = isSelf ? ''
             : (banned
-              ? `<button class="mini-btn" data-act="unban" data-id="${escapeHtml(u.id)}" type="button" title="立即解除封禁，该账户可立刻重新登录">解封</button>`
-              : `<button class="mini-btn danger" data-act="ban" data-id="${escapeHtml(u.id)}" type="button" title="设置封禁原因与到期时间">封禁</button>`);
+              ? `<button class="mini-btn" data-act="unban" data-id="${escapeHtml(u.id)}" type="button" title="${denied ? escapeHtml(denyTitle) : '立即解除封禁，该账户可立刻重新登录'}"${denied ? ' disabled' : ''}>解封</button>`
+              : `<button class="mini-btn danger" data-act="ban" data-id="${escapeHtml(u.id)}" type="button" title="${denied ? escapeHtml(denyTitle) : '设置封禁原因与到期时间'}"${denied ? ' disabled' : ''}>封禁</button>`);
           return `<tr>
             <td><b>${escapeHtml(u.username)}</b>${selfMark}</td>
             <td class="lk-email">${u.email
@@ -1772,8 +1793,14 @@ function showUserForm(user) {
     toast('仅管理员可编辑用户', { type: 'warn' });
     return;
   }
-  // 角色选择：仅管理员且非自己时可改（防止管理员把自己降级后失去管理能力）
-  const canEditRole = admin && !isSelf;
+  /**
+   * R71：**角色只有根用户能改**，且不能改自己（防止把自己降级后失去管理能力）。
+   *
+   * 「管理员能改角色」等于「管理员能授予角色」—— 他可以把普通用户提成管理员
+   * （= 添加管理员，需求禁止），也可以把自己这级账户降级后再删除（两步越权）。
+   * 因此管理员看到的角色是**只读文本**，不是下拉框。
+   */
+  const canEditRole = admin && !isSelf && App.state.user && App.state.user.role === 'root';
   const helloEnabled = !!(isEdit && user.webauthnEnabled);
 
   // Windows Hello 自助开关**只在自己编辑自己时**出现。
@@ -1817,12 +1844,19 @@ function showUserForm(user) {
         <option value="user" ${isEdit && user.role === 'user' ? 'selected' : ''}>普通用户</option>
         <option value="admin" ${isEdit && user.role === 'admin' ? 'selected' : ''}>管理员</option>
       </select>
-      <div class="hint">管理员可访问用户管理与系统全部功能；普通用户仅可登录使用文件操作。</div>
+      <div class="hint">
+        管理员可访问用户管理与系统全部功能，但<b>只能管理普通用户</b>；普通用户仅可登录使用文件操作。
+        「根用户」只属于系统创建的第一个账户，<b>不可授予、不可撤销</b>，故不在此列出。
+      </div>
     </div>` : (isEdit ? `
     <div class="form-item">
       <label>角色</label>
-      <input type="text" value="${user.role === 'admin' ? '管理员' : '普通用户'}" disabled>
-      <div class="hint">不能修改自己的角色（防止失去管理权限）。如需调整请联系其他管理员。</div>
+      <input type="text" value="${roleLabel(user.role)}" disabled>
+      <div class="hint">${isEdit && user.role === 'root'
+        ? '根用户的角色不可变更（既不可授予，也不可撤销）。'
+        : (isSelf
+          ? '不能修改自己的角色（防止失去管理权限）。'
+          : '只有根用户可以调整角色。如需新增管理员，请联系根用户。')}</div>
     </div>` : '')}
     ${isEdit ? (isSelf ? `
     <div class="form-item">

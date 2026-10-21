@@ -9341,7 +9341,7 @@ const CASES = [
        */
       name: 'R66-04a · /health 的 bucketCount 不再按角色分档（普通用户可见）',
       file: 'server/routes/stats.js',
-      anchor: "  if (req.authUser && req.authUser.role === 'admin') {",
+      anchor: "  if (req.authUser && roles.isStaff(req.authUser.role)) {",
       replacement: '  if (true) {',
       testFile: 'repo-hygiene.test.js',
       minFail: 1,
@@ -10053,6 +10053,135 @@ const CASES = [
       anchor: '<rect width="1024" height="1024" rx="228" fill="#FFFFFF"/>',
       replacement: '<!-- 白底已移除 -->',
       testFile: 'audit70-pwa.test.js',
+      minFail: 1,
+    },
+    /* ============================ R71：根用户与管理员越权边界 ============================ */
+    {
+      /**
+       * 撤掉后：「A 能不能管 B」退化成「只要不是普通用户就能管」⇒ 管理员之间又能
+       * 互相删除 / 编辑 / 封禁，也就是本轮要修的漏洞原样回来。
+       * 判据：`R71 · 判据：「谁管谁」的矩阵`。
+       */
+      name: 'R71-01a · canManageUser 让管理员也能管管理员（越权回来）',
+      file: 'server/roles.js',
+      anchor: "  if (actorRole === ADMIN) return normalizeStoredRole(targetRole) === USER;",
+      replacement: '  if (actorRole === ADMIN) return true;',
+      testFile: 'root-role.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * 撤掉后：删除路由不再判定越权 —— 请求能走到底，目标真的被删。
+       * 判据：`R71 · 路由：管理员删除**另一个管理员** ⇒ 403，且目标一字节未改`。
+       */
+      name: 'R71-02a · 删除路由撤掉越权判定（管理员可删管理员）',
+      file: 'server/routes/users.js',
+      anchor: "    if (denyIfCannotManage(req, res, target, '删除')) return;",
+      replacement: '    // （变异：删掉越权判定）',
+      testFile: 'root-role.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * 撤掉后：封禁（软删除）不再受同一道闸门约束 ⇒ 修好了删除却留着封禁，
+       * 越权只是换了个按钮。判据：`R71 · 路由：管理员编辑 / 封禁 / 强制登出管理员或根用户 ⇒ 一律 403`。
+       */
+      name: 'R71-02b · 封禁路由撤掉越权判定（管理员可封管理员/根用户）',
+      file: 'server/routes/users.js',
+      anchor: "    if (denyIfCannotManage(req, res, target, '封禁')) return;",
+      replacement: '    // （变异：删掉越权判定）',
+      testFile: 'root-role.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * 撤掉后：第一个账户不再被强制成根用户（请求 admin 就得到 admin）⇒
+       * 全新实例没有根用户，而该角色不可再授予 ⇒ 系统永久失去最高权限。
+       * 判据：`R71 · 存储：空库的第一个账户**强制**成为根用户`。
+       */
+      name: 'R71-03a · 空库不再强制第一个账户为根用户',
+      file: 'server/config-store.js',
+      anchor: '  if (!Array.isArray(cfg.users) || cfg.users.length === 0) return roles.ROOT;',
+      replacement: '  if (false) return roles.ROOT;',
+      testFile: 'root-role.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * 撤掉后：`requireAdmin` 只认 `admin` ⇒ 根用户在每一个管理接口上都拿到 403，
+       * 而前端也按同一判据隐藏入口（「登录后什么都没有」）。
+       * 判据：`R71 · 路由：根用户通过 requireAdmin 进入管理接口（GET /users 返回全部）`。
+       */
+      name: 'R71-04a · requireAdmin 退回只认 admin（根用户被当成普通用户）',
+      file: 'server/routes/_shared.js',
+      anchor: "  if (!u || !roles.isStaff(u.role)) {",
+      replacement: "  if (!u || u.role !== 'admin') {",
+      testFile: 'root-role.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * 撤掉后：读盘白名单不认 `root` ⇒ 每次 load 都把根用户降级成 user
+       * （配置里还是 root，鉴权与界面都按 user），属不可逆的静默降级。
+       * 判据：`R71 · 存储：已有 root 时读盘不得把它降级，也不会把别人补成根用户`。
+       */
+      name: 'R71-05a · 读盘归一不认 root（读一次降一级）',
+      file: 'server/roles.js',
+      anchor: '  return STORED_ROLES.includes(role) ? role : USER;',
+      replacement: "  return ['admin', 'user'].includes(role) ? role : USER;",
+      testFile: 'root-role.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * 撤掉后：用户表格不再按角色门控按钮 ⇒ 管理员看到的「删除」是可点的，
+       * 点下去才 403（用户会当成系统故障）。判据：`R71 · 前端：用户管理表格…`。
+       */
+      name: 'R71-06a · 用户表格撤掉按钮门控（他人管理员行可点删除）',
+      file: 'public/js/syssettings.js',
+      anchor: "          const denied = !isSelf && !iAmRoot && u.role !== 'user';",
+      replacement: "          const denied = false;",
+      testFile: 'root-role.test.js',
+      minFail: 1,
+    },
+    /* ======================= 第 72 轮：安装令牌可见性 ======================= */
+    {
+      /**
+       * 撤掉后：收尾信息里没有令牌那一行（文件其实还在、服务端也照常校验），
+       * 用户装完只能去翻 journalctl —— 正是本轮要修的那个「信息不对称」。
+       * 判据：`R72 · 安装令牌：收尾信息里原样打印，没有令牌时不编造`。
+       */
+      name: 'R72-01a · 收尾信息不再打印安装令牌',
+      file: 'deploy.sh',
+      anchor: '    log "  ${C_BOLD}安装令牌${C_RESET}：${C_CYAN}${setup_token}${C_RESET}"',
+      replacement: '    true',
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * 撤掉后：`kepler` 菜单顶部不再显示令牌 —— 用户过两天回来重装/改密码，
+       * 就再也找不到那串只在「还没初始化」时才需要的东西。
+       * 判据：`R72 · 安装令牌：管理菜单顶部显示，初始化完成（文件消失）后不再显示`。
+       */
+      name: 'R72-02a · 管理菜单不再显示安装令牌',
+      file: 'deploy.sh',
+      anchor: '      log "  ${C_BOLD}安装令牌${C_RESET}：${C_CYAN}${tk}${C_RESET}"',
+      replacement: '      true',
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * 撤掉后：令牌退回「等到第一次需要才生成」⇒ 部署脚本打印收尾信息时文件还不存在，
+       * 收尾信息与管理菜单同时失去意义（这正是 R72 之前的形态）。
+       * 判据：`R72 · 服务端：启动即生成安装令牌（不必等页面探活），幂等且初始化后不再生成`。
+       */
+      name: 'R72-03a · 服务端不再在启动时预生成安装令牌',
+      file: 'server/routes/auth.js',
+      anchor: '  return ensureSetupToken();',
+      replacement: "  return '';",
+      testFile: 'deploy-script.test.js',
       minFail: 1,
     },
   ];

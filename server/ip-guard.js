@@ -23,6 +23,8 @@ const shareStore = require('./share-store');
 const secureStore = require('./secure-store');
 // R17-01：取客户端 IP 的唯一实现点（含 X-Forwarded-For 解析与「值是否来自转发头」）
 const security = require('./security');
+// R71：当前桶解析要按「是否管理层」取管理员视图（根用户不能被当成普通用户回退到可见桶）
+const roles = require('./roles');
 
 // 数据目录：与 stats-store / payment-orders / enc-store / share-store 同走 data-dir.js
 // 的唯一实现点（`S3_DATA_DIR`）—— 未设置时落到项目 data/，测试进程可指向临时目录
@@ -807,7 +809,7 @@ function resolveBucketId(req) {
     // 而不是直接读全局 cfg.activeBucketId。
     const { bucketId, role } = sessionBucketOf(req);
     try {
-      const { activeBucketId } = configStore.listBucketsFor(role === 'admin' ? 'admin' : 'user', bucketId);
+      const { activeBucketId } = configStore.listBucketsFor(roles.isStaff(role) ? 'admin' : 'user', bucketId);
       return activeBucketId || null;
     } catch (e) {
       const b = cfg.buckets.find((x) => x.id === cfg.activeBucketId) || cfg.buckets[0];

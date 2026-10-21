@@ -97,9 +97,12 @@ async function api(method, urlPath, { as = 'admin', body } = {}) {
     app.use(express.json());
     app.use((req, _res, next) => {
       const who = String(req.headers['x-test-as'] || 'admin');
+      // R71：多一档「根用户」身份 —— 封禁 / 删除管理员这件事自本轮起只归根用户
       req.authUser = who === 'admin'
         ? { id: 'admin-self', username: 'admin', role: 'admin' }
-        : { id: 'other', username: who.replace(/^user:/, ''), role: 'user' };
+        : (who.startsWith('root:')
+          ? { id: 'root-self', username: who.slice('root:'.length), role: 'root' }
+          : { id: 'other', username: who.replace(/^user:/, ''), role: 'user' });
       next();
     });
     app.use('/api', userRoutes);
@@ -305,15 +308,24 @@ test('R33 · 路由：普通用户不得封禁 / 解封（403，且破坏不得�
   configStore.clearUserBan(id);
 });
 
-test('R33 · 路由：可以封禁"另一个管理员"（封禁不设"至少保留一个管理员"限制的理由）', async () => {
-  // 请求头里的身份恒为管理员（见 api() 的中间件），且它**不能封自己**（下一用例验证）。
-  // 因此无论封谁，发起者本人始终是未被封禁的管理员 ⇒ 系统永远还剩至少一个可用管理员，
-  // 不需要像删除 / 降级那样加 adminCount 保护（那两者确实可能把系统锁死）。
+test('R33/R71 · 路由：封禁"另一个管理员"只归根用户（管理员一律 403）', async () => {
+  // R33 的原口径是「管理员可以封禁另一个管理员」；R71 引入根用户后收紧了这件事 ——
+  // 封禁是**软删除**（目标立刻失去登录能力），属「管理管理员」，与删除同归根用户。
+  // 但 R33 那条「封禁不设『至少保留一个管理员』限制」的理由仍然成立：
+  // 发起者不能封自己，所以封谁都不会让系统失去全部可用管理员。
   const otherAdmin = await mkUser('r33-b4', 'admin');
-  const r = await api('POST', `/api/users/${otherAdmin}/ban`, {
-    body: { reason: '封禁另一个管理员', until: Date.now() + 3600000 },
+
+  const denied = await api('POST', `/api/users/${otherAdmin}/ban`, {
+    as: 'admin', body: { reason: '管理员越权封禁', until: Date.now() + 3600000 },
   });
-  assertEqual(r.status, 200, `封禁其他管理员应成功，实际 ${r.status}（${r.raw}）`);
+  assertEqual(denied.status, 403, `管理员封禁管理员应 403，实际 ${denied.status}（${denied.raw}）`);
+  assertEqual(configStore.banInfo(configStore.findUserRawById(otherAdmin)).state, 'none',
+    '403 之后目标必须仍然未被封禁 —— 判定要在写操作之前');
+
+  const r = await api('POST', `/api/users/${otherAdmin}/ban`, {
+    as: 'root:owner', body: { reason: '封禁另一个管理员', until: Date.now() + 3600000 },
+  });
+  assertEqual(r.status, 200, `根用户封禁其他管理员应成功，实际 ${r.status}（${r.raw}）`);
   assertEqual(configStore.banInfo(configStore.findUserRawById(otherAdmin)).state, 'active', '目标应被封禁');
   configStore.clearUserBan(otherAdmin);
 });
@@ -582,6 +594,9 @@ export const API = new Proxy({}, {
 
 /** `util.js` 桩：toast / confirmDialog / openModal 都记录下来，便于断言"提示了什么""弹了什么" */
 const UTIL_STUB = `
+// R71：根用户与管理员同级 —— 桩必须提供真实实现（否则 ESM 链接期就整片变红）
+export function isStaffRole(role) { return role === 'admin' || role === 'root'; }
+export function roleLabel(role) { return role === 'root' ? '根用户' : (role === 'admin' ? '管理员' : '普通用户'); }
 export const toast = (m, o) => { (globalThis.__toasts = globalThis.__toasts || []).push({ m, o }); };
 export const escapeHtml = (s) => String(s == null ? '' : s);
 export const confirmDialog = async (opts) => {

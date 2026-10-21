@@ -50,6 +50,8 @@ const fs = require('fs');
 const path = require('path');
 const configStore = require('./config-store');
 const secureStore = require('./secure-store');
+// R71：分享链接的「看全部 / 管全部」判据 = 是否管理层（根用户与管理员同级）
+const roles = require('./roles');
 // R37：限速值的唯一判据在 limits.js（无 require 的叶子模块）——
 // share-store 与 config-store 都要用它写盘，而 throttle.js 反过来要 require 两者。
 const { normalizeSpeedLimit } = require('./limits');
@@ -339,14 +341,14 @@ function list() {
  */
 function listFor(role, username) {
   const all = load().links.map(view);
-  if (role === 'admin') return all;
+  if (roles.isStaff(role)) return all;
   return all.filter((l) => l.createdBy && l.createdBy === username);
 }
 
 /** 判断某用户是否有权操作指定链接（管理员任意；普通用户仅限自己创建的） */
 function canManage(link, role, username) {
   if (!link) return false;
-  if (role === 'admin') return true;
+  if (roles.isStaff(role)) return true;
   return Boolean(link.createdBy) && link.createdBy === username;
 }
 

@@ -127,6 +127,9 @@ function utilShim() {
   const real = pathToFileURL(JS('util.js')).href;
   return `
 export { escapeHtml, fmtTime, fmtSize, updateNotice, filterUsersByName, USER_PREVIEW_LIMIT, previewMoreState, uploadPlanNotice, FILE_CONCURRENCY_MIN, FILE_CONCURRENCY_MAX, openAgreementDialog } from '${real}';
+// R71：根用户与管理员同级 —— 桩必须提供真实实现（否则 ESM 链接期就整片变红）
+export function isStaffRole(role) { return role === 'admin' || role === 'root'; }
+export function roleLabel(role) { return role === 'root' ? '根用户' : (role === 'admin' ? '管理员' : '普通用户'); }
 export const toast = (m, o) => { (globalThis.__toasts = globalThis.__toasts || []).push({ m, o }); };
 export const confirmDialog = async (opts) => {
   (globalThis.__confirms = globalThis.__confirms || []).push(opts);

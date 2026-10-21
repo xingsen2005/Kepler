@@ -5,7 +5,7 @@
  * 本页只保留存储桶自身的「屏蔽海外 IP」开关列（那是**桶的属性**，不是 IP 规则）。
  */
 import { API } from './api.js';
-import { toast, confirmDialog, openModal, escapeHtml, fmtSize, fmtTime, matchesQuery, previewMoreState } from './util.js';
+import { toast, confirmDialog, openModal, escapeHtml, fmtSize, fmtTime, matchesQuery, previewMoreState, isStaffRole } from './util.js';
 import { openListDialog, providerSelectOptions, buildTransferBox } from './listdialog.js';
 // R37：「限速」列（四张列表卡片共用的唯一实现点）
 import { openSpeedLimitDialog, speedCellHtml } from './speedlimit.js';
@@ -351,7 +351,7 @@ async function toggleBucketEnabled(row, want) {
 
 /** 当前登录用户是否为管理员（权限按钮仅管理员可见） */
 function isAdmin() {
-  return !!(App.state.user && App.state.user.role === 'admin');
+  return isStaffRole(App.state.user && App.state.user.role);
 }
 
 /* ------------------------------ 通用：手输桶名确认弹窗 ------------------------------ */

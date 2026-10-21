@@ -1,16 +1,29 @@
 /**
  * 路由：用户管理
  *
- * 权限模型（两层）：
- *  1. **管理员**：可查看全部用户、增删改任意用户、调整角色与权限、强制登出。
- *  2. **普通用户**：仅能查看与修改**自己**的资料（用户名 / 密码）。
+ * 权限模型（三层，R71）：
+ *  0. **根用户**（`root`）：系统部署完成后创建的第一个账户，角色**不可授予、不可撤销**。
+ *     可对任意用户（含管理员与其他根用户）执行增删改、封禁、强制登出。
+ *  1. **管理员**（`admin`）：可查看全部用户，但**只能管理普通用户** —— 对管理员与
+ *     根用户的编辑 / 删除 / 封禁 / 强制登出一律 403。也不能创建管理员、不能调整角色
+ *     （「改角色」= 授予角色，等价于「添加管理员」）。
+ *  2. **普通用户**：仅能查看与修改**自己**的资料（用户名 / 密码 / 邮箱）。
  *     - `GET /users` 对普通用户只返回自己一条记录，不泄露其他账户信息；
  *     - 修改他人、调整角色、新建/删除用户一律 403。
  *
- * 前端隐藏入口只是第一层，本模块的接口层校验才是真正的边界。
+ * 前端隐藏入口只是第一层，本模块的接口层校验才是真正的边界。两层边界**必须分开写**：
+ * `requireAdmin`（能不能用「用户管理」这个功能）与 `assertCanManageUser`（能管谁）。
+ * 旧实现只有前者，于是「管理员」这个角色既表示「能进用户管理」，又隐含「能管任何人」——
+ * 管理员之间可以互相删除的越权漏洞正是由此而来。
  */
 const { express, configStore, statsStore, authSession, emailCode } = require('./_context');
 const { requireAdmin, sendError } = require('./_shared');
+/**
+ * R71：角色语义的唯一事实源。本文件**不得**再出现 `role === 'admin'` 这类字面量比较 ——
+ * 越权判据一旦散在多个 if 里，漏掉任何一处（例如新加的「强制登出」）都不会报错，
+ * 只会让加固看起来已经生效。
+ */
+const roles = require('../roles');
 // R37：限速入参合法性的唯一判据（与配额同款——非法值必须 400，不能被归一化成 0 = 不限速）
 // R54②：邮箱的入参判据与归一化（`normalizeEmail` 与 `config-store` 落盘兜底同源）
 const { parseSpeedLimitInput, parseEmailInput, normalizeEmail } = require('../limits');
@@ -18,7 +31,53 @@ const { parseSpeedLimitInput, parseEmailInput, normalizeEmail } = require('../li
 const router = express.Router();
 
 function isAdmin(req) {
-  return Boolean(req.authUser && req.authUser.role === 'admin');
+  // R71：「管理层」= 管理员或根用户（根用户继承管理员的全部能力）
+  return Boolean(req.authUser && roles.isStaff(req.authUser.role));
+}
+
+/**
+ * 目标用户的**实时**记录（角色只信存储，不信请求体）。
+ * 不存在时已回写 404，调用方直接 `return`。
+ */
+function loadTargetUser(req, res) {
+  const target = configStore.getUserById(req.params.id);
+  if (!target) {
+    res.status(404).json({ error: '用户不存在' });
+    return null;
+  }
+  return target;
+}
+
+/**
+ * R71：**「谁能管谁」的唯一接口层判定点**（编辑 / 删除 / 封禁 / 解封 / 强制登出共用）。
+ *
+ * 为什么必须收成一个函数：这五条路由原本各自只挂 `requireAdmin`，也就是「是管理员
+ * 就能管任何人」。要修的漏洞恰恰在**这一层缺了一句判定**，而修法是给五处都补上 ——
+ * 散着写就必然出现「改了删除、漏了封禁」（封禁等于软删除，同样是越权）。
+ *
+ * 被拒绝时的**预期行为**（护栏逐条钉住，见 `tests/root-role.test.js`）：
+ *  1. 响应 `403` + `{ error: '管理员只能管理普通用户：目标账户是管理员，该操作仅根用户可执行' }`；
+ *  2. **目标账户一个字节都不改**（不删除、不改角色、不写封禁、不吊销会话）——
+ *     判定必须在任何写操作**之前**，事后回滚不算数；
+ *  3. 侧栏看不到其他人的变化：管理员仍能在 `GET /users` 里看到该账户，说明它没被删；
+ *  4. 留一条 `users.denied`（level=warn）审计日志：谁、对谁、想做什么。
+ *     拒绝也要留痕 —— 否则「有人反复尝试删除根用户」这件事在日志里完全不可见。
+ *
+ * @returns {boolean} `true` = 已回写 403，调用方必须立即 return
+ */
+function denyIfCannotManage(req, res, target, action) {
+  const actor = req.authUser || {};
+  if (roles.canManageUser(actor.role, target.role)) return false;
+  statsStore.addLog({
+    action: 'users.denied',
+    level: 'warn',
+    detail: `${roles.roleLabel(actor.role)}「${actor.username || '(未知)'}」尝试${action}`
+      + `${roles.roleLabel(target.role)}「${target.username}」被拒绝（管理员只能管理普通用户）`,
+  });
+  res.status(403).json({
+    error: `管理员只能管理普通用户：目标账户是${roles.roleLabel(target.role)}，该操作仅根用户可执行`,
+  });
+  return true;
 }
 
 /**
@@ -204,6 +263,22 @@ router.get('/users', (req, res) => {
 router.post('/users', requireAdmin, async (req, res) => {
   try {
     const b = req.body || {};
+    /**
+     * R71：**新建账户的角色也要过越权闸门**。
+     *
+     * 旧实现把 `b.role` 原样透给 `configStore.addUser()`，于是任何管理员都能
+     * `POST /users { role: 'admin' }` 造一个与自己同级、且自己**无权管理**的账户。
+     * 需求把「添加管理员」明确划给根用户，所以这里逐档判定：
+     *  - 请求 `root` ⇒ 403（任何人都不能授予，根用户自己也不行）；
+     *  - 请求 `admin` ⇒ 仅根用户；管理员一律 403；
+     *  - 不传 / 传 `user` ⇒ 保持原行为。
+     */
+    if (b.role === roles.ROOT) {
+      return res.status(403).json({ error: '根用户角色不可授予：它只属于系统创建的第一个账户' });
+    }
+    if (b.role === roles.ADMIN && !roles.canAssignRole(req.authUser && req.authUser.role)) {
+      return res.status(403).json({ error: '仅根用户可创建管理员账户' });
+    }
     if (b.confirmPassword !== undefined && String(b.confirmPassword) !== String(b.password || '')) {
       return res.status(400).json({ error: '两次输入的密码不一致' });
     }
@@ -243,8 +318,8 @@ router.post('/users', requireAdmin, async (req, res) => {
     });
     statsStore.addLog({
       action: 'users.create',
-      detail: `管理员「${req.authUser.username}」新增用户「${user.username}」`
-        + `（${user.role === 'admin' ? '管理员' : '普通用户'}${email ? `，邮箱：${email}` : ''}）`,
+      detail: `${roles.roleLabel(req.authUser.role)}「${req.authUser.username}」新增用户「${user.username}」`
+        + `（${roles.roleLabel(user.role)}${email ? `，邮箱：${email}` : ''}）`,
     });
     res.json({ ok: true, user });
   } catch (e) {
@@ -255,7 +330,37 @@ router.post('/users', requireAdmin, async (req, res) => {
 // 编辑用户（用户名 / 密码留空不改 / 角色 / 权限）
 router.put('/users/:id', requireAdmin, async (req, res) => {
   try {
+    const target = loadTargetUser(req, res);
+    if (!target) return;
+    /**
+     * R71：**越权判定必须排在所有写操作之前**。
+     *
+     * 目标角色取自存储（`target.role`），不是请求体里的 `b.role` —— 后者是「想改成
+     * 什么」，拿它当现状就等于让「把我自己这级的账户改成 user 再删」绕开所有判定。
+     *
+     * 「编辑自己」不经过这条判定：管理员在用户管理里点自己那一行时（前端已不渲染
+     * 该按钮，但直接调接口仍可能发生）他改的是**自己的**资料，不构成对他人的越权；
+     * 角色字段另有 `canAssignRole` 闸门兜住，不可能借此提权。
+     */
+    const isSelf = target.id === (req.authUser && req.authUser.id);
+    if (!isSelf && denyIfCannotManage(req, res, target, '编辑')) return;
     const b = req.body || {};
+    /**
+     * R71：**角色字段的闸门**。
+     *
+     * 「调整角色」= 授予角色。允许管理员改角色，他就既能把普通用户提成管理员
+     * （等价于「添加管理员」，绕过 `POST /users` 上的同一道闸门），也能把自己这级
+     * 账户降级后再删除（两步越权）。因此：非根用户提交 `role` 一律 403；
+     * 提交 `root` 则谁都 403（不可授予）。
+     */
+    if (b.role !== undefined) {
+      if (b.role === roles.ROOT) {
+        return res.status(403).json({ error: '根用户角色不可授予：它只属于系统创建的第一个账户' });
+      }
+      if (!roles.canAssignRole(req.authUser && req.authUser.role)) {
+        return res.status(403).json({ error: '仅根用户可调整用户角色' });
+      }
+    }
     if (b.password !== undefined && b.password !== '' && b.confirmPassword !== undefined &&
       String(b.confirmPassword) !== String(b.password)) {
       return res.status(400).json({ error: '两次输入的密码不一致' });
@@ -296,13 +401,13 @@ router.put('/users/:id', requireAdmin, async (req, res) => {
     const user = await configStore.updateUser(req.params.id, patch);
     const parts = [];
     if (patch.username) parts.push('修改用户名');
-    if (patch.role) parts.push(`调整为${user.role === 'admin' ? '管理员' : '普通用户'}`);
+    if (patch.role) parts.push(`调整为${roles.roleLabel(user.role)}`);
     if (patch.permissions) parts.push('更新权限');
     if (patch.password) parts.push('重置密码');
     if (patch.speedLimit !== undefined) parts.push(patch.speedLimit ? '设置下载限速' : '取消下载限速');
     // 注意用 `!== undefined` 而不是真值判断：解绑（`''`）同样是"改了"
     if (patch.email !== undefined) parts.push(patch.email ? '设置邮箱' : '解绑邮箱');
-    statsStore.addLog({ action: 'users.update', detail: `管理员「${req.authUser.username}」编辑用户「${user.username}」（${parts.join('，') || '无变更'}）` });
+    statsStore.addLog({ action: 'users.update', detail: `${roles.roleLabel(req.authUser.role)}「${req.authUser.username}」编辑用户「${user.username}」（${parts.join('，') || '无变更'}）` });
 
     // SEC-02：凡改变「身份 / 权限 / 凭据」的编辑，都必须让该用户的既有会话立即失效。
     //  - 改名：会话里缓存的用户名已过期；
@@ -313,7 +418,7 @@ router.put('/users/:id', requireAdmin, async (req, res) => {
     if (sensitive) {
       const n = authSession.destroyUserSessions(user.id);
       if (n > 0) {
-        statsStore.addLog({ action: 'users.logout', level: 'warn', detail: `管理员「${req.authUser.username}」变更了用户「${user.username}」的凭据/权限，其 ${n} 个会话已失效` });
+        statsStore.addLog({ action: 'users.logout', level: 'warn', detail: `${roles.roleLabel(req.authUser.role)}「${req.authUser.username}」变更了用户「${user.username}」的凭据/权限，其 ${n} 个会话已失效` });
       }
       return res.json({ ok: true, user, sessionsRevoked: n });
     }
@@ -324,7 +429,7 @@ router.put('/users/:id', requireAdmin, async (req, res) => {
 });
 
 /**
- * 封禁用户（仅管理员，R33）。
+ * 封禁用户（仅管理员，R33；R71 起管理员只能封禁普通用户）。
  *
  * 请求体：`{ reason, until }` —— `until` 为 epoch 毫秒（前端由 `datetime-local`
  * 换算而来），缺省 / 空 = 永久封禁。校验（原因必填、长度、时间格式）全部收在
@@ -335,14 +440,18 @@ router.put('/users/:id', requireAdmin, async (req, res) => {
  * 封禁不允许作用于自己（下一行的自保护），因此发起者本人必然是未被封禁的管理员，
  * 封谁都不会让系统失去全部可用管理员。删除 / 降级则可能作用在**自己以外的**最后一个
  * 管理员上（自己还在，但对方被删后可能只剩自己，也可能自己没有管理权限），故需保护。
+ *
+ * ⚠️ R71：**封禁是「软删除」**（目标立刻失去登录能力），所以它同样受
+ * 「管理员只能管理普通用户」约束 —— 否则修好了删除却留下封禁，越权只是换了个按钮。
  */
 router.post('/users/:id/ban', requireAdmin, (req, res) => {
   try {
-    const target = configStore.getUserById(req.params.id);
-    if (!target) return res.status(404).json({ error: '用户不存在' });
+    const target = loadTargetUser(req, res);
+    if (!target) return;
     if (target.id === req.authUser.id) {
       return res.status(400).json({ error: '不能封禁当前登录的账户' });
     }
+    if (denyIfCannotManage(req, res, target, '封禁')) return;
     const b = req.body || {};
     const user = configStore.setUserBan(target.id, { reason: b.reason, until: b.until });
     /**
@@ -353,7 +462,7 @@ router.post('/users/:id/ban', requireAdmin, (req, res) => {
     const n = authSession.destroyUserSessions(target.id);
     statsStore.addLog({
       action: 'users.ban', level: 'warn',
-      detail: `管理员「${req.authUser.username}」封禁用户「${user.username}」`
+      detail: `${roles.roleLabel(req.authUser.role)}「${req.authUser.username}」封禁用户「${user.username}」`
         + `（原因：${user.ban.reason}；解封时间：${user.ban.until || '永久'}），其 ${n} 个会话已失效`,
     });
     res.json({ ok: true, user, sessionsRevoked: n });
@@ -365,8 +474,10 @@ router.post('/users/:id/ban', requireAdmin, (req, res) => {
 // 解除封禁（仅管理员，R33）：立即恢复登录，无需等到期时间
 router.post('/users/:id/unban', requireAdmin, (req, res) => {
   try {
-    const target = configStore.getUserById(req.params.id);
-    if (!target) return res.status(404).json({ error: '用户不存在' });
+    const target = loadTargetUser(req, res);
+    if (!target) return;
+    // R71：「解封」同样是管理动作，必须与封禁同口径（否则管理员能悄悄解掉根用户的封禁状态）
+    if (denyIfCannotManage(req, res, target, '解封')) return;
     /**
      * 「有没有被封」的唯一判据是 `banInfo()`：已到期的封禁（state='expired'）也算
      * "封过"，允许管理员显式把标记清干净；只有从未封禁过才拒绝 —— 否则一个
@@ -378,7 +489,7 @@ router.post('/users/:id/unban', requireAdmin, (req, res) => {
     const user = configStore.clearUserBan(target.id);
     statsStore.addLog({
       action: 'users.unban', level: 'warn',
-      detail: `管理员「${req.authUser.username}」解除了用户「${user.username}」的封禁`,
+      detail: `${roles.roleLabel(req.authUser.role)}「${req.authUser.username}」解除了用户「${user.username}」的封禁`,
     });
     res.json({ ok: true, user });
   } catch (e) {
@@ -386,31 +497,48 @@ router.post('/users/:id/unban', requireAdmin, (req, res) => {
   }
 });
 
-// 删除用户（禁止删除自己；系统至少保留一个管理员）
+/**
+ * 删除用户。
+ *
+ * 两道保护，**顺序不能换**：
+ *  ① 自保护（400）—— 谁都不能删自己，否则会把自己锁在系统外；
+ *  ② 越权判定（403）—— 管理员只能删普通用户。R71 之前这一步**根本不存在**，
+ *     于是任何管理员都能删掉其他管理员，甚至删掉根用户 ⇒ 最高权限账户被下属清除。
+ *
+ * 注意判定排在 `removeUser()` **之前**：403 之后目标用户必须原封不动地还在库里，
+ * 且其会话不能被吊销（会话被踢也是破坏，只是看不见）。
+ */
 router.delete('/users/:id', requireAdmin, (req, res) => {
   try {
-    const target = configStore.getUserById(req.params.id);
-    if (!target) return res.status(404).json({ error: '用户不存在' });
+    const target = loadTargetUser(req, res);
+    if (!target) return;
     if (target.id === req.authUser.id) {
       return res.status(400).json({ error: '不能删除当前登录的账户' });
     }
+    if (denyIfCannotManage(req, res, target, '删除')) return;
     configStore.removeUser(req.params.id);
     // SEC-02：账户已删除，其会话必须立即失效，否则被删除者仍能继续读写对象存储。
     const n = authSession.destroyUserSessions(target.id);
-    statsStore.addLog({ action: 'users.delete', level: 'warn', detail: `管理员「${req.authUser.username}」删除用户「${target.username}」（${n} 个会话已失效）` });
+    statsStore.addLog({ action: 'users.delete', level: 'warn', detail: `${roles.roleLabel(req.authUser.role)}「${req.authUser.username}」删除用户「${target.username}」（${n} 个会话已失效）` });
     res.json({ ok: true, sessionsRevoked: n });
   } catch (e) {
     sendError(res, e);
   }
 });
 
-// 管理员强制登出指定用户的全部会话（S11）
+/**
+ * 管理员强制登出指定用户的全部会话（S11）。
+ *
+ * R71：同样是管理动作 —— 允许管理员踢掉根的会话，等于给了一个「让最高权限账户
+ * 随时掉线」的骚扰通道（并且是可重复的），故与删除 / 封禁同口径。
+ */
 router.post('/users/:id/logout', requireAdmin, (req, res) => {
   try {
-    const target = configStore.getUserById(req.params.id);
-    if (!target) return res.status(404).json({ error: '用户不存在' });
+    const target = loadTargetUser(req, res);
+    if (!target) return;
+    if (denyIfCannotManage(req, res, target, '强制登出')) return;
     const n = authSession.destroyUserSessions(target.id);
-    statsStore.addLog({ action: 'users.logout', level: 'warn', detail: `管理员「${req.authUser.username}」强制登出用户「${target.username}」（${n} 个会话）` });
+    statsStore.addLog({ action: 'users.logout', level: 'warn', detail: `${roles.roleLabel(req.authUser.role)}「${req.authUser.username}」强制登出用户「${target.username}」（${n} 个会话）` });
     res.json({ ok: true, sessions: n });
   } catch (e) {
     sendError(res, e);

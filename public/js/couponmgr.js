@@ -21,7 +21,7 @@
  */
 import { API } from './api.js';
 import {
-  toast, confirmDialog, openModal, escapeHtml, fmtTime, matchesQuery, previewMoreState,
+  toast, confirmDialog, openModal, escapeHtml, fmtTime, matchesQuery, previewMoreState, roleLabel,
 } from './util.js';
 import { openListDialog, buildTransferBox } from './listdialog.js';
 
@@ -433,7 +433,7 @@ function openGenerate() {
   function ensureUserPicker() {
     if (userPicker) return userPicker;
     userPicker = buildTransferBox({
-      items: usersAll.map((u) => ({ id: u.id, label: u.username || u.id, sub: u.role === 'admin' ? '管理员' : '普通用户' })),
+      items: usersAll.map((u) => ({ id: u.id, label: u.username || u.id, sub: roleLabel(u.role) })),
       selectedIds: [],
       leftTitle: '可选用户', rightTitle: '已选用户',
       filterLabels: { all: '全部', left: '未选', right: '已选' },

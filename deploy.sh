@@ -3839,9 +3839,11 @@ async function main() {
   // "abc123" 连着引号），JSON.parse 会把引号「解码」掉，用户拿原密码就登不上了。
   const value = input.replace(/\r?\n$/, '');
   const admins = store.listUsers()
-    .filter((user) => user.role === 'admin')
+    // R71：「初始管理员」现在是**根用户**（空库的第一个账户由 /auth/init 建为 root），
+    // 故这里必须认 root，否则部署后立刻 `--admin-user` 会报「尚未创建初始管理员」。
+    .filter((user) => user.role === 'root' || user.role === 'admin')
     .sort((a, b) => String(a.createdAt || '').localeCompare(String(b.createdAt || '')));
-  if (!admins.length) throw new Error('尚未创建初始管理员，请先打开网页完成首次初始化');
+  if (!admins.length) throw new Error('尚未创建初始管理员（根用户），请先打开网页完成首次初始化');
   const patch = field === 'username' ? { username: value } : { password: value };
   const user = await store.updateUser(admins[0].id, patch);
   await store.flush();
@@ -3984,6 +3986,15 @@ manage_menu() {
   while true; do
     log ""
     log "${C_BOLD}Kepler 管理菜单${C_RESET}"
+    # 安装令牌（R72）：每次进菜单都重新读文件，不缓存 —— 初始化成功后服务端会删掉它，
+    # 缓存下来就会继续显示一串已经失效的凭据（用户照着填只会得到 403）。
+    local tk=""
+    if tk="$(setup_token_read)"; then
+      log "  ${C_BOLD}安装令牌${C_RESET}：${C_CYAN}${tk}${C_RESET}"
+      log "  ${C_DIM}首次初始化管理员时填写（一次性，成功后自动失效；文件 $(setup_token_path)）${C_RESET}"
+    else
+      log "  ${C_BOLD}安装令牌${C_RESET}：${C_DIM}（无 —— 已完成初始化，或本机以回环地址运行，不需要它）${C_RESET}"
+    fi
     log "  1) 重新安装（保留数据与配置）"
     log "  2) 修改初始管理员用户名"
     log "  3) 修改初始管理员密码"
@@ -4120,6 +4131,34 @@ do_uninstall() {
 # ------------------------------------------------------------------------------
 TOTAL_STEPS=10
 
+# ------------------------------------------------------------------------------
+# 13.5 安装令牌（部署模式首次初始化用）
+# ------------------------------------------------------------------------------
+# 部署模式下 `POST /auth/init` 必须带「安装令牌」（R69 H-2）。令牌由**服务端**在启动时
+# 生成、落到 `${DATA_DIR}/setup-token.txt`（0600），初始化成功后自己删掉。
+#
+# 但部署脚本过去完全不认它：收尾信息里只有一句「首次打开页面会进入初始化流程」，
+# 而页面那一栏要填的正是这串令牌 —— 用户只能去翻 journalctl / docker logs。
+# 从 R72 起，服务端启动即生成（不再等页面探活），脚本这边**只做读**，把它印在
+# 收尾信息与管理菜单里。
+#
+# ⚠️ 生成逻辑绝不在这里复制一份：两处各自 `randomBytes` = 两枚不同的令牌，
+# 用户照打印的那枚去初始化必然 403，而且现象极像「令牌功能坏了」。
+setup_token_path() {
+  printf '%s/setup-token.txt' "${DATA_DIR:-${INSTALL_DIR}/data}"
+}
+
+# 读出令牌（去掉可能的换行）；文件不存在 / 为空 / 无权限时返回非零。
+# 只读一份文件，不缓存：初始化成功后服务端会删掉它，菜单每次进来都应反映最新状态。
+setup_token_read() {
+  local file token=""
+  file="$(setup_token_path)"
+  [[ -r "$file" ]] || return 1
+  token="$(tr -d '\r\n' <"$file" 2>/dev/null || true)"
+  [[ -n "$token" ]] || return 1
+  printf '%s' "$token"
+}
+
 print_summary() {
   local scheme="https"; [[ "$TLS_MODE" == "none" ]] && scheme="http"
   local ext_port="$HTTPS_PORT"; [[ "$scheme" == "http" ]] && ext_port="$HTTP_PORT"
@@ -4153,6 +4192,23 @@ print_summary() {
     log "  ${C_BOLD}访问地址${C_RESET}：${C_CYAN}${url}${C_RESET}"
   else
     log "  ${C_BOLD}访问地址${C_RESET}：${C_CYAN}${url}${C_RESET}  ${C_YELLOW}（应用当前未就绪，修好后才能打开）${C_RESET}"
+  fi
+  log ""
+  # 安装令牌（R72）：只在「部署模式 + 尚未初始化」时存在 —— 初始化成功后服务端会删掉它。
+  # 这一段必须紧跟访问地址：用户下一步就是打开页面，而那一栏要填的正是这串令牌。
+  local setup_token="" setup_token_file
+  setup_token_file="$(setup_token_path)"
+  setup_token="$(setup_token_read)" || setup_token=""
+  if [[ -n "$setup_token" ]]; then
+    log "  ${C_BOLD}安装令牌${C_RESET}：${C_CYAN}${setup_token}${C_RESET}"
+    log "    ${C_DIM}首次打开页面创建管理员时要填这一串（一次性；初始化成功后自动失效，文件也会被删掉）。${C_RESET}"
+    log "    ${C_DIM}文件 ${setup_token_file}　随时再看：kepler（管理菜单顶部）${C_RESET}"
+  elif [[ "${SERVICE_READY:-0}" == "1" ]]; then
+    log "  ${C_BOLD}安装令牌${C_RESET}：${C_DIM}（当前没有 —— 已完成初始化，或本次以回环地址运行，不需要它）${C_RESET}"
+  else
+    log "  ${C_BOLD}安装令牌${C_RESET}：${C_YELLOW}（服务未就绪，暂时读不到）${C_RESET}"
+    log "    ${C_DIM}服务起来后由它自己生成，位置 ${setup_token_file}${C_RESET}"
+    log "    ${C_DIM}也可以稍后执行 kepler，在管理菜单顶部查看${C_RESET}"
   fi
   log ""
   log "  ${C_BOLD}常用维护命令${C_RESET}"
@@ -4201,7 +4257,8 @@ print_summary() {
   fi
   log ""
   log "  ${C_BOLD}后续说明${C_RESET}"
-  log "    1. 首次打开页面会进入初始化流程，创建${C_BOLD}管理员账号${C_RESET}并登录。"
+  log "    1. 首次打开页面会进入初始化流程，创建${C_BOLD}管理员账号${C_RESET}并登录（该账户就是${C_BOLD}根用户${C_RESET}）；"
+  log "       部署模式（对外提供服务）下这一栏还要填${C_BOLD}安装令牌${C_RESET}，就是上面那串，初始化成功后自动失效。"
   log "    2. 在「系统设置 → 访问密钥管理」选择服务商并填入密钥，再到「存储桶」添加桶。"
   log "    3. ${C_BOLD}务必定期备份数据目录${C_RESET}：${DATA_DIR}"
   log "       其中含 AES 主密钥与全部云厂商密钥 —— 丢失后已加密文件无法解密，且不可恢复。"
@@ -4210,7 +4267,8 @@ print_summary() {
   log "    5. 应用内开启 WebDAV 后，界面会显示客户端要填的地址（.env 中 WEBDAV_PUBLIC_URL + /dav/）；"
   log "       Nginx 已默认反代 /dav 到应用内置的 ${WEBDAV_PORT} 端口，无需手工改配置，${C_BOLD}也不需要把 ${WEBDAV_PORT} 暴露到公网${C_RESET}。"
   log "       若该端口已被占用，用 ${C_BOLD}WEBDAV_PORT=<其它端口>${C_RESET} 重跑本脚本，.env 与 Nginx 会一起改。"
-  log "    6. 终端执行 ${C_BOLD}kepler${C_RESET} 可打开管理菜单：重装、修改初始管理员用户名/密码、修改端口或卸载。"
+  log "    6. 终端执行 ${C_BOLD}kepler${C_RESET} 可打开管理菜单：重装、修改初始管理员用户名/密码、修改端口或卸载；"
+  log "       菜单顶部会显示${C_BOLD}安装令牌${C_RESET}（还没初始化完时才显示，可直接抄走）。"
   log "    7. 重新执行本脚本可升级部署：会重新拉取源码并同步配置，数据目录不会被触碰。"
   if ((${#todos[@]} > 0)); then
     log ""

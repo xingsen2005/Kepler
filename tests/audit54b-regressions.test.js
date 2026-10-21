@@ -822,7 +822,10 @@ test('R54b-7 · 管理员改邮箱**不**撤销会话（它不是身份、也不
   assert(authSession.getSession(token), '改邮箱后会话必须仍然有效（否则是纯打扰）');
 
   // 反向对照：改**角色**必须撤会话（证明上面那条断言有牙齿，不是恒真）
-  const r2 = await api('PUT', `/api/users/${u.id}`, { as: admin, body: { role: 'admin' } });
+  // R71：改角色只有根用户能做（管理员改角色会把「改角色 = 授予角色」变成一条提权通道），
+  // 故这条对照用根用户身份跑 —— 要验的是「改角色撤会话」，不是「谁能改角色」。
+  const root = { id: 'root-2', username: 'boss2', role: 'root' };
+  const r2 = await api('PUT', `/api/users/${u.id}`, { as: root, body: { role: 'admin' } });
   assertEqual(r2.status, 200);
   assert(r2.json.sessionsRevoked >= 1, '改角色必须撤销会话（SEC-02）');
   assertEqual(authSession.getSession(token), null, '改角色后旧会话必须失效');

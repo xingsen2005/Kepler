@@ -1085,6 +1085,8 @@ export const API = {
 `);
   fs.writeFileSync(path.join(dir, 'util.js'), `
 export const __toast = (globalThis.__r51Toast = []);
+export function isStaffRole(role) { return role === 'admin' || role === 'root'; }
+export function roleLabel(role) { return role === 'root' ? '根用户' : (role === 'admin' ? '管理员' : '普通用户'); }
 export function toast(m, o) { globalThis.__r51Toast.push([m, o]); }
 export function confirmDialog() { return Promise.resolve(true); }
 export function promptDialog() { return Promise.resolve('x'); }

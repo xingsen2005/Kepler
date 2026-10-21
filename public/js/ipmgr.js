@@ -25,7 +25,7 @@
  * 每次切页都会收到 403 噪音）。
  */
 import { API } from './api.js';
-import { toast, confirmDialog, openModal, escapeHtml, fmtTime } from './util.js';
+import { toast, confirmDialog, openModal, escapeHtml, fmtTime, isStaffRole } from './util.js';
 import { buildTransferBox } from './listdialog.js';
 import { App } from './main.js';
 // R37：IP 限速值也用 MB/s 输入（与四张列表卡片的限速对话框同一套换算与校验）
@@ -37,7 +37,7 @@ let ipCache = null;
 
 /** 渲染期角色判断（真正的强制校验在服务端；此处仅避免发起注定 403 的请求与闪现错误） */
 function isAdmin() {
-  return !!(App.state.user && App.state.user.role === 'admin');
+  return isStaffRole(App.state.user && App.state.user.role);
 }
 
 /* ============================== 页面级入口 ============================== */

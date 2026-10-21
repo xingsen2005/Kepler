@@ -15,6 +15,8 @@ const {
 } = require('./_shared');
 // R23-03：前缀递归删除的唯一实现点在 `fs-gateway.js`（本文件原先自带一份同构实现）
 const gateway = require('../fs-gateway');
+// R71：角色语义的唯一事实源（`root` 也是管理层 —— 桶的字段白名单 / 可见性判定必须放行）
+const roles = require('../roles');
 // R23-03：用量缓存增量修正 —— 唯一实现在 `./stats`（原先 fs / buckets 各有一份懒加载包装）
 const { adjustStorageCache } = require('./stats');
 // R37：限速入参合法性的唯一判据（非法值绝不能静默归一化成 0 = 不限速）
@@ -216,7 +218,7 @@ router.put('/buckets/local/:id', (req, res) => {
      * 普通用户自行调大，闸门等于自带一个"解除限制"按钮（自绕过）。
      * 这与 R25 凭据级配额的处理一致：额度由管理员设置、对所有写入者生效。
      */
-    if (roleOf(req) !== 'admin') {
+    if (!roles.isStaff(roleOf(req))) {
       for (const k of Object.keys(b)) {
         if (k !== 'remark') delete b[k];
       }
@@ -225,7 +227,7 @@ router.put('/buckets/local/:id', (req, res) => {
     // 同一文件的 /active 早已校验 target.visibleToUsers，这里漏了 →
     // 普通用户可修改**对自己不可见**的管理员专属桶的备注（迷惑管理员）
     // 与容量配额（放松或收紧配额限制）。两处判定必须一致。
-    if (roleOf(req) !== 'admin') {
+    if (!roles.isStaff(roleOf(req))) {
       const target = requireLocalBucket(req.params.id);
       if (target.visibleToUsers === false) return res.status(403).json({ error: '无权访问该存储桶' });
     }
@@ -271,7 +273,7 @@ router.put('/buckets/local/:id/enabled', requireAdmin, (req, res) => {
 router.put('/buckets/local/:id/active', (req, res) => {
   try {
     const target = requireLocalBucket(req.params.id);
-    if (roleOf(req) !== 'admin' && target.visibleToUsers === false) {
+    if (!roles.isStaff(roleOf(req)) && target.visibleToUsers === false) {
       return res.status(403).json({ error: '无权访问该存储桶' });
     }
     if (target.enabled === false) return res.status(400).json({ error: '该存储桶已停用，请先在存储桶管理中启用后再切换' });

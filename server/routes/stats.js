@@ -2,6 +2,8 @@
  * 路由：监控统计（速率 / 存储用量 / 汇总 / 操作日志） + 健康检查
  */
 const { express, configStore, statsStore } = require('./_context');
+// R71：`/health` 的运维字段按「是否管理层」分档 —— 根用户必须与管理员同级
+const roles = require('../roles');
 const secureStore = require('../secure-store');
 const updateCheck = require('../update-check');
 const { LIMITS } = require('../limits');
@@ -169,7 +171,7 @@ router.get('/health', (req, res) => {
    * 不挂 `requireAdmin`（前端全局横幅与运维探针都靠它），所以这里按角色分档下发，
    * 而不是给它单独挂管理员守卫 —— 那会让普通用户拿到 403、拿不到「服务是否可用」。
    */
-  if (req.authUser && req.authUser.role === 'admin') {
+  if (req.authUser && roles.isStaff(req.authUser.role)) {
     out.bucketCount = cfg && Array.isArray(cfg.buckets) ? cfg.buckets.length : 0;
     out.lastWriteAt = (cfg && cfg.updatedAt) || '';
   }

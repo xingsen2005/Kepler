@@ -207,6 +207,11 @@ async function serve(auth) {
 
 const ADMIN = { username: 'admin', role: 'admin' };
 const USER = { username: 'u', role: 'user' };
+/**
+ * R71：`defaultRole: 'admin'` 是**授予管理员身份**，只有根用户能做（见 `site.js` 的闸门）。
+ * 需要写这一档的用例必须用根用户身份，否则测的就不是「读写回环」而是 403。
+ */
+const ROOT_USER = { username: 'root', role: 'root' };
 
 test('R54-4 · /site/info 是公开接口：未登录与普通用户都能读到站点名称', async () => {
   configStore.saveSite({ siteName: '公开可见的名字' });
@@ -249,8 +254,9 @@ test('R54-4 · /site/config 仅管理员（含未登录）', async () => {
   }
 });
 
-test('R54-4 · 管理员读写回环：保存后立即能读回，且响应即最新视图', async () => {
-  const s = await serve(ADMIN);
+test('R54-4 · 管理层读写回环：保存后立即能读回，且响应即最新视图', async () => {
+  // R71：写 `defaultRole: 'admin'` 只有根用户被允许，故回环用根用户身份跑
+  const s = await serve(ROOT_USER);
   try {
     const put = await request(s.port, 'PUT', '/api/site/config', {
       body: { siteName: '回环站', registration: 'open', defaultRole: 'admin' },

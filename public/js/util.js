@@ -1,5 +1,24 @@
 /** 通用工具：格式化 / Toast / 弹窗 / 图标 / Canvas 图表 */
 
+/**
+ * R71：角色判据的前端**唯一**实现点。
+ *
+ * 前端这层只决定「渲不渲染入口 / 按钮」，从来不是安全边界（服务端 `requireAdmin`
+ * 与 `routes/users.js` 的 `denyIfCannotManage()` 才是）。但它必须与服务端**同口径**：
+ * 根用户继承管理员的全部能力，若这里仍按 `role === 'admin'` 比较，根用户登录后
+ * 会看到「用户管理 / 存储桶管理 / 系统设置」全部消失 —— 表现为「最高权限反而什么都没」。
+ */
+export function isStaffRole(role) {
+  return role === 'admin' || role === 'root';
+}
+
+/** 角色 → 中文标签（与服务端 `server/roles.js` 的 `roleLabel()` 同文案） */
+export function roleLabel(role) {
+  if (role === 'root') return '根用户';
+  if (role === 'admin') return '管理员';
+  return '普通用户';
+}
+
 export function escapeHtml(s) {
   return String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
 }

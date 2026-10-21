@@ -1,6 +1,6 @@
 /** 资源管理器核心 —— 目录列表 / 分页 / 多视图 / 排序 / 多选 / 右键菜单 / 拖拽 / 搜索 */
 import { API } from './api.js';
-import { escapeHtml, fmtSize, fmtTime, toast, confirmDialog, openModal, iconHtml, propertyBodyHtml, TYPE_LABEL, FILE_TYPES } from './util.js';
+import { escapeHtml, fmtSize, fmtTime, toast, confirmDialog, openModal, iconHtml, propertyBodyHtml, TYPE_LABEL, FILE_TYPES, isStaffRole } from './util.js';
 import { App } from './main.js';
 import { uploadMgr } from './upload.js';
 import { ops } from './ops.js';
@@ -941,7 +941,7 @@ function hideLoadingHint() {
 
 function handleFsError(e) {
   if (e.status === 428) {
-    const isAdmin = App.state.user && App.state.user.role === 'admin';
+    const isAdmin = isStaffRole(App.state.user && App.state.user.role);
     toast(e.message + (isAdmin ? '，正在打开密钥管理…' : '，请联系管理员配置访问密钥'), { type: 'warn' });
     if (isAdmin) import('./settings.js').then((m) => m.settings.open());
     return;

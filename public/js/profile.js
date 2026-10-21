@@ -12,7 +12,7 @@
  * 明确不支持改角色 / 权限（服务端 /users/me 同样拒绝，避免自行提权）。
  */
 import { API } from './api.js';
-import { toast, escapeHtml, openModal } from './util.js';
+import { toast, escapeHtml, openModal, roleLabel } from './util.js';
 import { App } from './main.js';
 import { registerWindowsHello, webauthnSupported, isSecureContextOK } from './webauthn.js';
 
@@ -34,7 +34,7 @@ export function openProfileDialog() {
     </div>
     <div class="form-item">
       <label>当前角色</label>
-      <input type="text" value="${me.role === 'admin' ? '管理员' : '普通用户'}" disabled>
+      <input type="text" value="${roleLabel(me.role)}" disabled>
       <div class="hint">角色由管理员分配，不能自行修改。</div>
     </div>
     <!-- R54②：邮箱（需求 2.3 补填 / 2.4 修改）。改它必须过两道证明，见下方 hint -->
@@ -280,7 +280,7 @@ export function openProfileDialog() {
       const nameEl = document.getElementById('user-name');
       if (nameEl) nameEl.textContent = body.username;
       const headEl = document.getElementById('um-head');
-      if (headEl) headEl.textContent = `${body.username}（${me.role === 'admin' ? '管理员' : '普通用户'}）`;
+      if (headEl) headEl.textContent = `${body.username}（${roleLabel(me.role)}）`;
       close();
       toast(emailChanged ? '资料已更新，邮箱已生效' : '资料已更新', { type: 'success' });
     } catch (e) {

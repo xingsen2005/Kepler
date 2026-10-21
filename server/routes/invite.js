@@ -27,6 +27,8 @@
  */
 const { express, configStore, statsStore, inviteStore } = require('./_context');
 const { requireAdmin, apiHandler } = require('./_shared');
+// R71：邀请码的「身份」是授予角色的另一条通道，必须与 `POST /users { role }` 同口径
+const roles = require('../roles');
 // 入参合法性的唯一判据（与 `invite-store` 的落盘归一化共用同一组来源）
 const {
   DEFAULT_ROLES, normalizeDefaultRole, parseInviteCountInput,
@@ -109,6 +111,18 @@ function buildPatch(b, partial) {
 }
 
 // 邀请码列表（仅管理员）
+/**
+ * R71：「发放某身份的邀请码」的越权闸门（`POST /invites`、`/invites/bulk`、`PUT /invites/:id` 共用）。
+ *
+ * 只有 `admin` 需要拦：`user` 是发给普通人的，`root` 从来不在可授予集合里
+ * （`limits.DEFAULT_ROLES` 就只有 `user` / `admin`）。
+ */
+function assertCanGrantRole(req, role) {
+  if (role !== roles.ADMIN) return;
+  if (roles.canAssignRole(req.authUser && req.authUser.role)) return;
+  throw Object.assign(new Error('仅根用户可发放「管理员」身份的邀请码'), { status: 403 });
+}
+
 router.get('/invites', requireAdmin, apiHandler(async (req, res) => {
   res.json({ ok: true, invites: inviteStore.list() });
 }));
@@ -119,6 +133,11 @@ router.get('/invites', requireAdmin, apiHandler(async (req, res) => {
  * `role` 缺省时取**站点设置里的「新用户身份」**（`site.defaultRole`）——
  * 与「公开注册」模式下注册得到的身份是同一个来源，管理员不必在
  * 「站点设置」和「邀请码设置」两处各记一遍同一个默认值。
+ *
+ * ⚠️ R71：**「管理员」身份的邀请码仅根用户可发**。邀请码等于一张「免注册口令」，
+ * 用它发管理员就是在「添加管理员」—— 需求把这件事划给了根用户。若不设这道闸门，
+ * 一个管理员只要生成一枚 admin 码、自己注册掉，就凭空多出一个与自己同级的账户，
+ * 而 `POST /users { role: 'admin' }` 上的校验形同虚设。
  *
  * ⚠️ 身份是**生成时快照**进记录里的，不是注册时现取：管理员看到列表里写着
  * 「管理员」，用这枚码注册出来就一定是管理员。若改成注册时现取，
@@ -132,9 +151,11 @@ router.post('/invites', requireAdmin, apiHandler(async (req, res) => {
 
   const patch = buildPatch(b, true); // 复用同一组判据；未给的字段取默认值
   const site = configStore.getSite();
+  const grantedRole = patch.role !== undefined ? patch.role : site.defaultRole;
+  assertCanGrantRole(req, grantedRole);
   const made = inviteStore.generate({
     count: cnt.value,
-    role: patch.role !== undefined ? patch.role : site.defaultRole,
+    role: grantedRole,
     maxUses: patch.maxUses !== undefined ? patch.maxUses : 0,
     expiresAt: patch.expiresAt !== undefined ? patch.expiresAt : null,
     note: patch.note !== undefined ? patch.note : '',
@@ -146,7 +167,7 @@ router.post('/invites', requireAdmin, apiHandler(async (req, res) => {
     // ⚠️ 日志里**只记数量与配置**，绝不记邀请码本身：审计日志是明文 JSONL，
     // 把码写进去等于把口令摊在日志里（与 backup.js 的实时码同类的泄漏面）。
     detail: `管理员「${req.authUser.username}」生成 ${made.length} 个邀请码`
-      + `（身份=${made.length ? (made[0].role === 'admin' ? '管理员' : '普通用户') : '-'}`
+      + `（身份=${made.length ? roles.roleLabel(made[0].role) : '-'}`
       + `，次数上限=${made.length ? (made[0].maxUses || '不限') : '-'}`
       + `，过期时间=${made.length && made[0].expiresAt ? made[0].expiresAt : '永久'}`
       + `，备注=${(made.length && made[0].note) || '无'}）`,
@@ -166,6 +187,7 @@ router.post('/invites/bulk', requireAdmin, apiHandler(async (req, res) => {
   const ids = parseIds(b.ids);
   if (!ids || !ids.length) throw Object.assign(new Error('请先选择要设置的邀请码'), { status: 400 });
   const patch = buildPatch(b, false);
+  if (patch.role !== undefined) assertCanGrantRole(req, patch.role);
   const r = inviteStore.bulkUpdate(ids, patch);
   statsStore.addLog({
     action: 'invite.update', level: 'info',
@@ -222,6 +244,7 @@ router.post('/invites/export', requireAdmin, apiHandler(async (req, res) => {
  */
 router.put('/invites/:id', requireAdmin, apiHandler(async (req, res) => {
   const patch = buildPatch(req.body || {}, false);
+  if (patch.role !== undefined) assertCanGrantRole(req, patch.role);
   const v = inviteStore.update(req.params.id, patch);
   if (!v) throw Object.assign(new Error('邀请码不存在或已被删除'), { status: 404 });
   statsStore.addLog({

@@ -366,6 +366,11 @@ function withFreshInviteStore(fn) {
  * ================================================================== */
 
 const ADMIN = { id: 'u-admin', username: 'root', role: 'admin', permissions: {} };
+/**
+ * R71：**授予管理员**只有根用户能做（`invite.js` 的 `assertCanGrantRole`），
+ * 故凡是「发一张 role=admin 的邀请码」的用例都得用这个身份。
+ */
+const ROOT_ACTOR = { id: 'u-root', username: 'root', role: 'root', permissions: {} };
 const PLAIN = { id: 'u-plain', username: 'bob', role: 'user', permissions: {} };
 
 test('R54c-03a · 六条邀请码接口全部要求管理员：未登录 401、普通用户 403', async () => {
@@ -387,9 +392,10 @@ test('R54c-03a · 六条邀请码接口全部要求管理员：未登录 401、�
 });
 
 test('R54c-03b · 生成 → 列表 → 批量设置 → 删除：真 HTTP 回环', async () => {
+  // R71：本用例要发 role=admin 的码（授予管理员），只有根用户能做
   const gen = await api('POST', '/api/invites', {
     body: { count: 3, role: 'admin', maxUses: 2, note: 'HTTP 批次' },
-    as: ADMIN,
+    as: ROOT_ACTOR,
   });
   assertEqual(gen.status, 200);
   assertEqual((gen.json.invites || []).length, 3);
@@ -496,6 +502,14 @@ test('R54c-04a · closed 模式：注册被拒（文案指向管理员），且*
 });
 
 test('R54c-04b · invite 模式：没填码 400、格式错 400、码无效 403、码有效则注册成功', async () => {
+  /**
+   * R71：**空库的第一个账户**会被强制建成根用户（「根用户只属于部署后的第一个账户」）。
+   * 本用例要验的是「身份取自邀请码上的 role」，故先把「第一个账户」这一特殊性消耗掉，
+   * 否则下面那次注册会被建成根用户，断言就变成在测另一条规则了。
+   */
+  if (configStore.listUsers().length === 0) {
+    await configStore.addUser({ username: 'seed-owner', password: PASSWORD, role: 'user' });
+  }
   setRegistration('invite', 'user');
   const ip = nextIp();
 

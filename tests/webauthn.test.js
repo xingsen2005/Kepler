@@ -1166,7 +1166,14 @@ test('config-store：isWebauthnEnabled 对视图与原始记录的判定差异�
     configStore.clearUserWebauthn(created.id);
     assertEqual(configStore.isWebauthnEnabled(configStore.findUserRawById(created.id)), false, '清除后应回到未启用');
   } finally {
-    configStore.removeUser(created.id);
+    /**
+     * R71：本文件的数据目录在用例开始时是空的 ⇒ 这个 `role: 'user'` 的账户其实是
+     * **空库的第一个账户**，会被强制建成根用户；而「最后一个根用户不可删除」会拦住
+     * 下面这句清理。清理不是断言对象，故按实时角色判断（否则红的是清理、不是被测逻辑）。
+     */
+    const live = configStore.getUserById(created.id);
+    const rootTotal = configStore.listUsers().filter((u) => u.role === 'root').length;
+    if (live && !(live.role === 'root' && rootTotal <= 1)) configStore.removeUser(created.id);
   }
 });
 

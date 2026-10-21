@@ -24,6 +24,8 @@ const { sessionCookie, clearCookie, webauthnContext } = require('./_shared');
 const { normalizeEmail, parseEmailInput, EMAIL_CODE_RESEND_MS } = require('../limits');
 // R54③：邀请码的入参判据（**只判格式**，核销由 `inviteStore.consume` 负责）
 const { parseInviteCodeInput } = require('../limits');
+// R71：角色标签的唯一映射点（初始化 / 注册的审计日志里要写「根用户」而不是 `root`）
+const roles = require('../roles');
 // R69：首次初始化的「安装令牌」需要落盘（0600）与恒定时比较
 const fs = require('fs');
 const path = require('path');
@@ -422,6 +424,40 @@ function setupTokenHint() {
     : '';
 }
 
+/**
+ * 启动时**主动**生成安装令牌（R72）。
+ *
+ * ## 为什么不继续等「第一次需要它」
+ *
+ * 令牌原本是懒生成的：有人打开页面（`GET /auth/me`）或直接打 `/auth/init` 时才落盘。
+ * 这让**部署脚本**处在尴尬位置 —— 它在服务刚起来时就把「部署完成」的信息打印完了，
+ * 那一刻文件还不存在，于是收尾信息里只能写「去翻启动日志」。而用户真正需要它的时刻
+ * 恰恰是「还没打开页面」：登录页要填的那一栏就是它。
+ *
+ * 现在改成「进程启动、且确实还没初始化」就生成并落盘，于是：
+ *  - 部署脚本可以直接读文件，把令牌印在收尾信息与管理菜单里；
+ *  - 用户打开页面前，令牌已经在 `data/setup-token.txt`，不再有「先有鸡还是先有蛋」。
+ *
+ * ## 边界（任何一个不满足都**不**生成）
+ *
+ *  - 非部署模式（`HOST` 回环）：本机形态本来就不需要令牌，凭空造一个只会让人多填一栏；
+ *  - 已经有账户：令牌只在「首次初始化」有意义，已初始化的实例不该再有一枚可用的令牌；
+ *  - 读用户列表失败（配置损坏等）：宁可不生成，也不要在异常状态下写一个来历不明的凭据。
+ *
+ * 幂等：文件已存在时 `ensureSetupToken()` 直接复读，不会换掉用户已经抄走的那一枚。
+ */
+function primeSetupToken() {
+  if (!setupTokenRequired()) return '';
+  let initialized = false;
+  try {
+    initialized = configStore.listUsers().length > 0;
+  } catch (e) {
+    return '';
+  }
+  if (initialized) return '';
+  return ensureSetupToken();
+}
+
 function setupTokenMatches(given) {
   const want = ensureSetupToken();
   const a = Buffer.from(String(given || ''), 'utf8');
@@ -464,7 +500,16 @@ router.post('/auth/init', async (req, res) => {
       if (b.confirmPassword !== undefined && String(b.confirmPassword) !== String(b.password || '')) {
         return res.status(400).json({ error: '两次输入的密码不一致' });
       }
-      const user = await configStore.addUser({ username: b.username, password: b.password, role: 'admin', permissions: {} });
+      /**
+       * R71：**第一个账户就是根用户**。
+       *
+       * 这里刻意把 `role` 写成 `root`（而不是继续写 `admin`）—— 存储层的
+       * `resolveNewUserRole()` 在空库时本来也会强制成 root，但两处都写明才算
+       * 「意图可读」：读这段代码的人不该靠翻 `config-store` 才知道初始化建的是谁。
+       * 若真有并发把库先填上（下面的二次检查已挡，属兜底），它会以 403 失败 ——
+       * fail-closed，而不是静默造出第二个根用户。
+       */
+      const user = await configStore.addUser({ username: b.username, password: b.password, role: roles.ROOT, permissions: {} });
       // R69：初始化完成即抹掉安装令牌文件 —— 它的全部生命周期就是「第一次初始化之前」
       if (setupTokenRequired()) {
         try { fs.unlinkSync(setupTokenFile()); } catch (e) { /* 文件不在也无所谓 */ }
@@ -473,7 +518,7 @@ router.post('/auth/init', async (req, res) => {
       }
       const token = authSession.createSession(user);
       res.setHeader('Set-Cookie', sessionCookie(token));
-      statsStore.addLog({ action: 'auth.init', detail: `系统初始化，创建管理员「${user.username}」` });
+      statsStore.addLog({ action: 'auth.init', detail: `系统初始化，创建${roles.roleLabel(user.role)}「${user.username}」` });
       res.json({ ok: true, user });
     } finally {
       initInFlight = false;
@@ -643,7 +688,7 @@ router.post('/auth/register', async (req, res) => {
 
     statsStore.addLog({
       action: 'auth.register',
-      detail: `新用户「${user.username}」注册成功（身份：${user.role === 'admin' ? '管理员' : '普通用户'}`
+      detail: `新用户「${user.username}」注册成功（身份：${roles.roleLabel(user.role)}`
         + `；方式：${granted ? '邀请码' : '公开注册'}；来源 IP：${ip}）`,
     });
     // 注册即登录：刚设的密码就在手上，再让他手打一遍只是仪式感
@@ -889,3 +934,5 @@ module.exports = router;
 module.exports.loginLockKey = loginLockKey;
 // R54②：同上，暴露重置路径的锁定键（两条路径的锁定实例互相独立）
 module.exports.resetLockKey = resetLockKey;
+// R72：启动时预生成安装令牌（`server/index.js` 在监听前调用），供部署脚本读取后打印
+module.exports.primeSetupToken = primeSetupToken;

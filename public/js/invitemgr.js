@@ -28,9 +28,11 @@
  */
 import { API } from './api.js';
 import {
-  toast, confirmDialog, openModal, escapeHtml, fmtTime, matchesQuery, previewMoreState,
+  toast, confirmDialog, openModal, escapeHtml, fmtTime, matchesQuery, previewMoreState, roleLabel,
 } from './util.js';
 import { openListDialog } from './listdialog.js';
+// R71：只有根用户能发放「管理员」身份的邀请码 —— 界面按当前登录者的角色决定是否给出这一档
+import { App } from './main.js';
 
 /**
  * 卡片里最多显示多少条。
@@ -50,8 +52,6 @@ const STATUS_META = {
   disabled: { label: '已停用', cls: 'gone' },
 };
 
-const ROLE_LABEL = { user: '普通用户', admin: '管理员' };
-
 let cache = [];
 /** 已勾选的邀请码 id（**跨刷新保留**，但每次刷新会剔除已经不存在的 id） */
 let selected = new Set();
@@ -63,10 +63,6 @@ let wired = false;
 /** 邀请码状态映射（未知状态按「有效」以外最保守的展示处理：不显示为"有效"） */
 function metaOf(st) {
   return STATUS_META[st] || { label: st || '未知', cls: 'gone' };
-}
-
-function roleLabel(r) {
-  return ROLE_LABEL[r] || r || '—';
 }
 
 /**
@@ -341,6 +337,14 @@ function showAllInvites() {
 function inviteFieldsHtml(p, v) {
   const val = v || {};
   const role = val.role === 'admin' ? 'admin' : 'user';
+  /**
+   * R71：**「管理员」这一档只对根用户渲染**。
+   *
+   * 服务端 `POST /invites` 会以 403 拦下管理员发 admin 码（那等于「添加管理员」）。
+   * 界面上仍要隐藏它：留一个必然失败的选项，用户会以为是网络或后端出错，
+   * 而不是「这件事不归我管」。
+   */
+  const canGrantAdmin = Boolean(App.state.user && App.state.user.role === 'root');
   const hasExp = Boolean(val.expiresAt);
   const uses = Number(val.maxUses) > 0 ? Number(val.maxUses) : 0;
   return `
@@ -349,9 +353,13 @@ function inviteFieldsHtml(p, v) {
         <label>注册后的身份</label>
         <select id="${p}-role" class="full">
           <option value="user"${role === 'user' ? ' selected' : ''}>普通用户</option>
-          <option value="admin"${role === 'admin' ? ' selected' : ''}>管理员</option>
+          ${canGrantAdmin
+            ? `<option value="admin"${role === 'admin' ? ' selected' : ''}>管理员</option>`
+            : ''}
         </select>
-        <div class="hint">用这枚邀请码注册出来的账户<b>直接获得</b>该身份。</div>
+        <div class="hint">用这枚邀请码注册出来的账户<b>直接获得</b>该身份。${canGrantAdmin
+          ? '「管理员」仅根用户可发放。'
+          : '「管理员」身份只有根用户可发放，如需管理员账户请联系根用户。'}</div>
       </div>
       <div class="form-item">
         <label>使用次数上限</label>

@@ -140,7 +140,7 @@ npm run lint     # 代码检查（ESLint 可选，未安装时给出安装指引
 | --- | --- |
 | `npm start` | 启动服务（HTTP + HTTPS） |
 | `npm run dev` | 开发模式，`node --watch` 监听文件变更自动重启（Node 18.11+ 内置，无需 nodemon） |
-| `npm test` | 运行 `tests/**/*.test.js` 全部测试（73 个文件 / 1333 条用例，零新增依赖） |
+| `npm test` | 运行 `tests/**/*.test.js` 全部测试（74 个文件 / 1361 条用例，零新增依赖） |
 | `npm run test:watch` | 测试监听模式，代码变更后即时重跑 |
 | `npm run lint` | ESLint 检查；未安装 eslint 时降级提示安装命令，不阻断流程 |
 
@@ -159,6 +159,8 @@ curl -fLo /tmp/kepler-deploy.sh https://raw.githubusercontent.com/xingsen2005/Ke
 
 脚本会自动安装 git / curl / Node.js 等依赖、从 `https://github.com/xingsen2005/Kepler.git` 拉取源码、配置 Nginx 反代与 HTTPS 证书、注册 systemd 服务并做健康检查。**只需提供域名**，用户名与密码在打开页面后的首次初始化流程中设置。脚本幂等，重复执行等价于升级 / 修复。
 
+部署完成时会打印**安装令牌**（部署模式下首次初始化必须填的那一串，紧跟「访问地址」）：它由服务端在启动时生成并落到 `<数据目录>/setup-token.txt`，**一次性**，初始化成功后自动失效、文件也会被删掉。装完没记下来的话，执行 `kepler` 打开管理菜单，顶部会再显示一遍。
+
 > **CentOS 8 用户注意**：CentOS Linux 8 已于 2021-12-31 EOL，官方镜像站（含 `mirrorlist.centos.org`，2024-06-30 下线）不再为 8 提供仓库。典型症状是安装 `git` 时报 `perl-libs … is filtered out by modular filtering` —— **即使是全新安装的纯净系统也会中招**：这不是「模块流状态不一致」，而是 RHEL 8 的 module failsafe 按模块的包级过滤清单把 `perl-libs` 屏蔽掉了，所以 `dnf module reset perl` 那一套在干净机器上是**空转**。**脚本会自己修**，按「代价从小到大」逐档试：① 首选 `dnf install -y --setopt='*.module_hotfixes=true' <包>`（让仓库按**包级**视图参与求解、本次事务绕过模块过滤，**不改机器上任何持久状态**）；② 这一步不行才复位模块流并按报错里期望的流重新 `enable`（它会改**全局**模块状态，所以排在后面）；③ 仍不行才放宽候选版本（`--nobest`）。**绝不用 `--skip-broken`** —— 它会让「装不上」返回 0，脚本误以为装好了。手工等价命令就是第 ① 条（那个 `*` 的引号必须留，否则会被你自己的 shell 展开成文件名）。日志里 `Invalid configuration value: failovermethod=…` 是**无害警告**（旧版 yum 的选项，dnf 不认识），不是失败原因。长期建议迁到 Rocky / AlmaLinux。
 
 安装完成会注册全局 `kepler` 命令，输入编号回车即可执行（也可直接 `kepler 4` 一步到位）：
@@ -171,6 +173,8 @@ curl -fLo /tmp/kepler-deploy.sh https://raw.githubusercontent.com/xingsen2005/Ke
 | 4 | 修改应用端口 | 同步 `.env`、服务与 Nginx 反代配置 |
 | 5 | 卸载 | 清理服务、应用、数据、证书配置与全局命令 |
 | 0 | 退出 | — |
+
+> 菜单顶部会显示当前**安装令牌**（仅「部署模式且尚未初始化」时才有），可直接抄走 —— 不必再去翻 `journalctl`。
 
 常用参数：`--domain`（必填）、`--port`、`--https-port`、`--http-port`、`--dir`、`--data-dir`、`--mode systemd|docker`、`--tls auto|acme|file|none`、`--mirror cn`（国内加速）、`--skip-node` / `--skip-deps` / `--skip-nginx` / `--skip-service`（自行接管某一步）。
 
@@ -217,7 +221,7 @@ docker run -d -p 3000:3000 -p 3443:3443 -v s3-data:/app/data s3-manager
 
 ---
 
-1. 首次打开进入初始化页，创建**管理员账号**并登录。
+1. 首次打开进入初始化页，创建**管理员账号**（该账户即**根用户**）并登录。部署模式（对外提供服务）下，这一页还要填部署完成信息里给出的**安装令牌**；没记下就执行 `kepler`，菜单顶部会显示，也可直接看服务器上的 `<数据目录>/setup-token.txt`（初始化成功后自动失效并删除）。
 2. 自动弹出「系统设置」，在**访问密钥管理**卡片中通过**图标卡片**选择服务商（非下拉菜单），再按该服务商的字段名填入访问密钥（腾讯云为 SecretId / SecretKey，阿里云为 AccessKey ID / AccessKey Secret，Google Cloud 需用互操作性 HMAC 密钥，Backblaze 为 keyID / applicationKey 等，界面随选择自动切换提示）。选择 **Cloudflare R2 / MinIO** 时，表单会额外出现「服务端点」一栏（R2 填账户 ID、MinIO 填自建访问地址），其余厂商不显示该栏。
 3. 可点「测试连接」用未保存的密钥先验证，再「保存密钥」。
 4. 在左侧「存储桶」区域点击 **+** 添加桶：填写桶名与地域，或点「从云端获取桶列表并选择」（**仅管理员**）；又拍云 / Google Cloud / R2 / MinIO / **Microsoft Azure** 的地域可留空（服务端会补上服务商默认值，界面上该栏的星号会同步隐藏）。可添加多个桶，点击列表项切换；每个桶可设置备注名与**容量配额**（0 = 不限；**仅管理员可设置**，且它是**服务端强制的写入上限** —— 超出后该桶的上传 / 复制 / 移动（含 WebDAV）一律 `403`，普通用户只能查看当前上限）。

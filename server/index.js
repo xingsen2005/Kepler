@@ -515,6 +515,19 @@ require('./atomic-write')
   .catch(() => { /* 清扫失败不影响启动 */ });
 
 const httpServer = registerServer(http.createServer(app), 'HTTP');
+/**
+ * R72：**启动即预生成安装令牌**（部署模式 + 尚未初始化时；其余情况内部直接返回）。
+ *
+ * 原先令牌是「等到第一次需要」才落盘，而部署脚本在服务刚起来时就把收尾信息打印完了，
+ * 那一刻文件还不存在 —— 于是「部署完成」的信息里没有令牌，用户只能去翻启动日志。
+ * 位置放在 listen **之前**：先有文件、再对外提供服务，部署脚本随后读它才不会读到空。
+ */
+try {
+  require('./routes/auth').primeSetupToken();
+} catch (e) {
+  // 生成失败不影响启动：`/auth/init` 仍会懒生成（见 routes/auth.js 的 ensureSetupToken）
+  console.warn('[Storage Manager] 安装令牌预生成失败（不影响启动）：', e && e.message);
+}
 httpServer.listen(HTTP_PORT, HOST, () => {
   console.log(`[Storage Manager] HTTP   : http://${HOST === '0.0.0.0' ? 'localhost' : HOST}:${HTTP_PORT}`);
 });

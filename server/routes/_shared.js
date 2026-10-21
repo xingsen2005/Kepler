@@ -5,6 +5,7 @@
  * 供各领域子路由复用。**行为与原实现完全一致**，仅搬移位置。
  */
 const crypto = require('crypto');
+const roles = require('../roles');
 const { providers, security, configStore, statsStore, encStore, s3, gitignore } = require('./_context');
 /**
  * R25：`gitignore` 必须在**模块作用域**可见 —— `cachedGitignoreMatcher()` 里用了
@@ -108,12 +109,20 @@ function credentialsFor(req) {
 /* ============================ 中间件 ============================ */
 
 /**
- * 仅管理员可访问；非管理员一律 403（前端隐藏入口只是第一层，接口层强制校验）
+ * 仅管理员（**含根用户**）可访问；其余一律 403（前端隐藏入口只是第一层，接口层强制校验）
  *  — 安全要求：所有涉及全局配置 / 密钥 / 明文密码 / 规则的接口都必须挂载本中间件。
+ *
+ * R71：判据从 `role !== 'admin'` 改为 `roles.isStaff()`。根用户拥有管理员的**全部**能力，
+ * 若这里仍按等值比较，最高权限账户会在每一个管理接口上拿到 403 —— 而且因为前端
+ * 也按角色隐藏入口，症状是「登录后什么都没有」，看不出是权限判定写窄了。
+ *
+ * ⚠️ 本中间件只回答「**能不能用这个功能**」，不回答「**能管谁**」。
+ * 「管理员只能管普通用户」那条边界在 `routes/users.js` 的 `assertCanManageUser()`
+ * 里，两者不能互相替代（前者放行整个路由，后者要看目标用户的实时角色）。
  */
 function requireAdmin(req, res, next) {
   const u = req.authUser;
-  if (!u || u.role !== 'admin') {
+  if (!u || !roles.isStaff(u.role)) {
     return res.status(403).json({ error: '仅管理员可执行该操作' });
   }
   next();

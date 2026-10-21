@@ -1,6 +1,6 @@
 /** 应用入口 —— 全局状态、工具栏、状态栏、视图调度 */
 import { API, setWriteObserver } from './api.js';
-import { toast, fmtSize, openModal, openAgreementDialog, escapeHtml, confirmDialog, showQuotaDialog, banNotice } from './util.js';
+import { toast, fmtSize, openModal, openAgreementDialog, escapeHtml, confirmDialog, showQuotaDialog, banNotice, isStaffRole, roleLabel } from './util.js';
 import { explorer } from './explorer.js';
 import { filetype } from './filetype.js';
 import { ops } from './ops.js';
@@ -1164,11 +1164,11 @@ function renderUserMenu() {
   }
   if (wrap) wrap.hidden = false;
   if (nameEl) nameEl.textContent = user.username;
-  if (headEl) headEl.textContent = `${user.username}（${user.role === 'admin' ? '管理员' : '普通用户'}）`;
+  if (headEl) headEl.textContent = `${user.username}（${roleLabel(user.role)}）`;
 
   // 「编辑资料」对所有角色可见（普通用户改自己资料的唯一入口）；
   // 「用户管理」仅管理员可见。显式双向赋值，避免上一会话的 hidden 状态残留。
-  const isAdmin = user.role === 'admin';
+  const isAdmin = isStaffRole(user.role);
   const profileItem = document.getElementById('um-profile');
   if (profileItem) profileItem.hidden = false;
   if (usersItem) usersItem.hidden = !isAdmin;
@@ -1333,7 +1333,7 @@ function loadEncState() {
 
   // `mode` 属安全配置（会暴露"用什么算法/魔数"），仅管理员需要，仅管理员可读；
   // 它不参与下载门控，取不到也不影响行为。
-  if (!(App.state.user && App.state.user.role === 'admin')) return;
+  if (!isStaffRole(App.state.user && App.state.user.role)) return;
   API.encSettings().then((s) => {
     App.state.enc = { mode: s.mode, passwordSet: !!s.passwordSet };
   }).catch(() => { /* 保持 encStatus 给出的 passwordSet */ });
@@ -1357,7 +1357,7 @@ async function loadConfig(first) {
       toast('本地加密配置校验失败（可能被篡改或损坏），请重新配置密钥', { type: 'error', duration: 8000 });
     } else if (first && !cfg.configured) {
       // 仅管理员在首次未配置时引导配置；普通用户提示联系管理员（共享密钥，无需自行绑定）
-      const isAdmin = App.state.user && App.state.user.role === 'admin';
+      const isAdmin = isStaffRole(App.state.user && App.state.user.role);
       if (isAdmin) {
         settings.open();
         toast('欢迎使用对象存储管理系统，请先完成访问密钥配置', { type: 'info', duration: 6000 });
@@ -1380,7 +1380,7 @@ function renderBucketList() {
   const cfg = App.state.config;
   const buckets = App.state.buckets || [];
   const activeId = cfg ? cfg.activeBucketId : '';
-  const isAdmin = !!(App.state.user && App.state.user.role === 'admin');
+  const isAdmin = isStaffRole(App.state.user && App.state.user.role);
   if (!buckets.length) {
     // 普通用户不再自行添加桶：可见桶由管理员开放，一个都没有时只能联系管理员
     const tip = isAdmin
@@ -1464,7 +1464,7 @@ function openBucketDialog(existing) {
   // `visibleToUsers` 一律丢弃（SEC-01）；而「从云端获取桶列表」用的是
   // POST /config/verify（仅管理员，SEC-11）—— 两件事普通用户都做不了主。
   // 与其留一堆勾了也没用 / 点了就 403 的控件，不如整项不渲染。
-  const isAdminUser = !!(App.state.user && App.state.user.role === 'admin');
+  const isAdminUser = isStaffRole(App.state.user && App.state.user.role);
   // 候选密钥：已绑定（本地已存）且未停用；未配置任何密钥时无法拉取云端列表
   const allCreds = (App.state.config && App.state.config.credentials) || [];
   const usableCreds = allCreds.filter((c) => c.enabled !== false);
@@ -1638,7 +1638,7 @@ const ACL_LABEL = { 'public-read': '公有读私有写', 'public-read-write': '�
 async function checkBucketAcl() {
   // SEC-07：该接口为管理员专属（会遍历全部桶并返回桶名/地域/备注）。
   // 普通用户直接不发请求 —— 避免"必然 403"的无用调用与信息面暴露。
-  if (!(App.state.user && App.state.user.role === 'admin')) return;
+  if (!isStaffRole(App.state.user && App.state.user.role)) return;
   try {
     const r = await API.aclCheck();
     if (r.disabled) return;
@@ -1796,7 +1796,7 @@ function bindToolbar() {
   $('op-selectall').onclick = () => explorer.selectAll();
   $('btn-bucket-add').onclick = () => {
     if (!App.state.config || !App.state.config.configured) {
-      const isAdmin = App.state.user && App.state.user.role === 'admin';
+      const isAdmin = isStaffRole(App.state.user && App.state.user.role);
       if (isAdmin) {
         toast('请先在“密钥管理”中配置访问密钥', { type: 'warn' });
         settings.open();

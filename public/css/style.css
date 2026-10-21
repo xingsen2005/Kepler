@@ -1184,6 +1184,9 @@ input.full { width: 100%; }
 /* ============================ 用户管理表格 ============================ */
 .user-table { margin-top: 4px; }
 .user-tbl .lk-badge.admin { background: var(--tint-info); color: #0369a1; }
+/* R71：根用户徽章。比「管理员」更醒目一档（它是唯一且不可授予的角色），
+   与 admin 用不同色系，避免在列表里和普通管理员混成一片。 */
+.user-tbl .lk-badge.root { background: var(--tint-bad); color: var(--danger); font-weight: 600; }
 .user-tbl .lk-badge.self { background: var(--tint-enc); color: #92400e; }
 .user-tbl td b { font-size: 13px; }
 .user-tbl .mini-btn:disabled { opacity: .45; cursor: not-allowed; }

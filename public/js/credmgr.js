@@ -1,6 +1,6 @@
 /** 密钥管理页 —— 访问密钥（共享/可见性）/ 自定义域名 / 连接验证 */
 import { API } from './api.js';
-import { toast, confirmDialog, openModal, escapeHtml, matchesQuery, previewMoreState } from './util.js';
+import { toast, confirmDialog, openModal, escapeHtml, matchesQuery, previewMoreState, isStaffRole } from './util.js';
 import { openListDialog, providerSelectOptions } from './listdialog.js';
 // R37：「限速」列的渲染与对话框（四张列表卡片共用同一实现点）
 import { openSpeedLimitDialog, speedCellHtml } from './speedlimit.js';
@@ -74,7 +74,7 @@ function wire() {
 }
 
 function isAdmin() {
-  return !!(App.state.user && App.state.user.role === 'admin');
+  return isStaffRole(App.state.user && App.state.user.role);
 }
 
 function render() {

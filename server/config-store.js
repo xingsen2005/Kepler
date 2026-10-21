@@ -25,6 +25,12 @@ const atomic = require('./atomic-write');
 const path = require('path');
 const providers = require('./providers');
 const paymentProviders = require('./payment-providers');
+/**
+ * R71：角色语义的唯一事实源（`root` / `admin` / `user`，以及「谁管谁」的判定）。
+ * 本文件是**存储层**，只关心两件事：角色**能不能落盘**（读盘归一）、
+ * 角色**能不能被写进来**（新建 / 修改 / 删除时的保护）。越权判定在路由层。
+ */
+const roles = require('./roles');
 const { assertSafeEndpoint } = require('./endpoint-guard');
 // R37：限速值的归一化判据（叶子模块，不会成环）
 // R53：SMTP 端口的归一化判据同上 —— `config-store`（读盘）与 `routes/smtp.js`（入参）共用
@@ -592,7 +598,15 @@ function normalize(raw) {
   cfg.users = cfg.users.filter((u) => u && typeof u === 'object' && typeof u.username === 'string' && u.username);
   for (const u of cfg.users) {
     if (typeof u.username !== 'string') u.username = '';
-    if (!['admin', 'user'].includes(u.role)) u.role = 'user';
+    /**
+     * R71：**必须认可 `root`**。
+     *
+     * 旧实现写的是 `!['admin','user'].includes(u.role)` ⇒ `u.role = 'user'`，而
+     * `root` 不在那个白名单里：读一次盘就把根用户**静默降级**成普通用户。
+     * 这类「读盘路径上的降级」不可逆且无痕迹（配置里还是 root，界面与鉴权都按 user），
+     * 所以归一化本身也是必须被护栏钉住的判据，而不只是格式化代码。
+     */
+    u.role = roles.normalizeStoredRole(u.role);
     if (!u.permissions || typeof u.permissions !== 'object') u.permissions = {};
     if (typeof u.passwordHash !== 'string') u.passwordHash = '';
     if (typeof u.passwordSalt !== 'string') u.passwordSalt = '';
@@ -616,6 +630,38 @@ function normalize(raw) {
      * 的代码（谁把它删掉都不会有测试变红，久而久之被当成死代码）。宁可不要。
      */
   }
+  ensureRootUser(cfg);
+  return cfg;
+}
+
+/**
+ * R71：给**已经初始化过**的实例补一个根用户（幂等）。
+ *
+ * 需求的口径是「根用户 = 部署完成后创建的第一个账户」。全新实例由 `addUser()` 在
+ * 空库时直接产出 root，走不到这里；而升级上来的实例**已经有账户了**，它们的
+ * 「第一个账户」就是最早创建的那一个 —— 也就是当年 `/auth/init` 建出来的管理员。
+ *
+ * 三条判据必须一起成立，缺一条都会造成不同的事故：
+ *  ① **一个 root 都不存在**才动 —— 否则每次读盘都可能把第二个账户也「补」成根用户，
+ *     那就成了需求禁止的「重复授予」；
+ *  ② 选 `createdAt` **最早**的那个（同刻按数组顺序，即创建顺序）—— 选错人等于把最高
+ *     权限交给一个不相干的账户；
+ *  ③ 只在内存里补（与上面 `u.role` 归一化同一形态）：本函数位于**读盘路径**，
+ *     在这里 `persist()` 会与 `load()` 的缓存/去抖机制相互递归。选择这样做是安全的：
+ *     判据是**确定性纯函数**（同样的磁盘内容必然选出同一个人），下一次任何写操作
+ *     （登录时的哈希迁移、改配置、建用户……）就会把它落盘。
+ */
+function ensureRootUser(cfg) {
+  if (!Array.isArray(cfg.users) || !cfg.users.length) return cfg;
+  if (cfg.users.some((u) => roles.isRoot(u.role))) return cfg;
+  let pick = cfg.users[0];
+  let pickAt = String(pick.createdAt || '');
+  for (const u of cfg.users) {
+    const at = String(u.createdAt || '');
+    // 空串（历史脏数据没有 createdAt）排在任何有效时间之后 —— 有时间的那个更可信
+    if (at && (!pickAt || at < pickAt)) { pick = u; pickAt = at; }
+  }
+  pick.role = roles.ROOT;
   return cfg;
 }
 
@@ -1031,7 +1077,9 @@ function listCredentials() {
  */
 function listCredentialsFor(role) {
   const { credentials, activeCredentialId } = listCredentials();
-  if (role === 'admin') return { credentials, activeCredentialId };
+  // R71：判据从 `role === 'admin'` 改为「是否管理层」—— 否则根用户会被当成普通用户，
+  // 只看到 `visibleToUsers` 的密钥（最高权限账户反而权限最小，且没有任何报错）。
+  if (roles.isStaff(role)) return { credentials, activeCredentialId };
   const visible = credentials.filter((c) => c.visibleToUsers !== false);
   let activeId = activeCredentialId;
   if (!visible.some((c) => c.id === activeId)) {
@@ -2505,8 +2553,30 @@ function assertPasswordPolicy(password) {
   }
 }
 
-function normalizeRole(role) {
-  return ['admin', 'user'].includes(role) ? role : 'user';
+/**
+ * R71：**新用户身份的裁决点**（`addUser` 的唯一调用处）。
+ *
+ * 三条规则，顺序即优先级：
+ *  ① **空库的第一个账户 ⇒ 根用户**，无论调用方请求了什么角色。这是需求里
+ *     「根用户只能且默认授予系统部署完成后创建的第一个用户」的落地形态 ——
+ *     把判据放在存储层而不是 `/auth/init` 里，是因为注册接口同样可能成为
+ *     「第一个账户」（有人把库里的人清空后走公开注册），两条路径必须同源；
+ *  ② 显式请求 `root` 而库中已有账户 ⇒ **403**（不静默降级成 user：管理员点了
+ *     「授予根用户」却得到一个普通用户，是比失败更坏的结果）；
+ *  ③ 其余非法值按 `user` 兜底（沿用旧语义：`role` 缺省 / 拼错一律最小权限）。
+ *
+ * @param {object} cfg 当前配置（调用时已确保 `cfg.users` 存在）
+ * @param {string|undefined} requested 请求的角色
+ * @returns {string} root | admin | user
+ */
+function resolveNewUserRole(cfg, requested) {
+  if (!Array.isArray(cfg.users) || cfg.users.length === 0) return roles.ROOT;
+  if (requested === roles.ROOT) {
+    throw Object.assign(
+      new Error('根用户角色不可授予：它只属于系统创建的第一个账户'), { status: 403 },
+    );
+  }
+  return roles.isAssignableRole(requested) ? requested : roles.USER;
 }
 
 function normalizePermissions(p) {
@@ -2732,7 +2802,12 @@ function userView(u) {
   return {
     id: u.id,
     username: u.username,
-    role: u.role || 'user',
+    /**
+     * R71：回给前端的 `role` 也要过一遍归一化 —— 它是**判据**而不只是展示：
+     * 前端靠它决定「用户管理」里哪些行的按钮可用（管理员不能动管理员/根用户）。
+     * 落一个 `root` 出去、回一个空串回来，界面就会把所有行都当成可管。
+     */
+    role: roles.normalizeStoredRole(u.role),
     permissions: u.permissions || {},
     // Windows Hello：仅暴露"是否启用"与注册时间，公钥/凭据 ID 一律不出服务端
     webauthnEnabled: w.enabled,
@@ -2775,6 +2850,17 @@ function adminCount(cfg) {
 }
 
 /**
+ * 根用户数量统计（用于保护**最后一个**根用户）。
+ *
+ * 与「至少保留一个管理员」同型但**理由更强**：管理员还能被别人重新授予，根用户不能 ——
+ * 一个根用户都不剩时，系统就永久失去了「管理管理员」的能力，只能改配置文件才能恢复。
+ * 正常情况下它恒为 1（角色不可授予），但历史数据 / 手工改过的配置可能不止一个。
+ */
+function rootCount(cfg) {
+  return (cfg.users || []).filter((u) => roles.isRoot(u.role)).length;
+}
+
+/**
  * R54②：邮箱唯一性的**唯一实现点**。
  *
  * 为什么必须唯一：邮箱是「重置密码」的收件地址。同一个邮箱绑在两个账户上时，
@@ -2814,7 +2900,7 @@ async function addUser({ username, password, role, permissions, speedLimit, emai
     passwordSalt: salt,
     passwordHash: hash,
     passwordParams: params, // R69：哈希用的成本参数（缺失 = 旧版默认，见 paramsOf）
-    role: normalizeRole(role),
+    role: resolveNewUserRole(cfg, role),
     permissions: normalizePermissions(permissions),
     // 新用户默认未启用 Windows Hello；启用须走"注册并验证凭据"的完整流程
     webauthn: normalizeWebauthn(null),
@@ -2855,11 +2941,30 @@ async function updateUser(id, patch) {
     user.passwordParams = cred.params;
   }
   if (patch.role !== undefined) {
-    const role = normalizeRole(patch.role);
-    if (user.role === 'admin' && role !== 'admin' && adminCount(cfg) <= 1) {
+    /**
+     * R71：角色变更的三条存储层铁律（放在这里而不是只放路由层，是因为
+     * `updateUser` 还有别的调用方，路由层的校验挡不住内部调用）。
+     *
+     *  ① **根用户的角色不可变更** —— 不可授予，也就不可撤销。允许「降级根用户」
+     *     等于给了界面一条事实上的转让/销毁通道（降完再也升不回来）；
+     *  ② 非根用户**不能升成根用户** —— 需求禁止重复授予；
+     *  ③ 「至少保留一个管理员」保持原样：它保护的是「系统仍有人能登录管理」。
+     */
+    if (roles.isRoot(user.role)) {
+      throw Object.assign(
+        new Error('根用户角色不可变更：它既不可授予，也不可撤销'), { status: 400 },
+      );
+    }
+    const next = roles.normalizeStoredRole(patch.role);
+    if (roles.isRoot(next)) {
+      throw Object.assign(
+        new Error('根用户角色不可授予：它只属于系统创建的第一个账户'), { status: 403 },
+      );
+    }
+    if (user.role === 'admin' && next !== 'admin' && adminCount(cfg) <= 1) {
       throw Object.assign(new Error('至少保留一个管理员账户'), { status: 400 });
     }
-    user.role = role;
+    user.role = next;
   }
   if (patch.permissions !== undefined) {
     user.permissions = normalizePermissions(patch.permissions);
@@ -2884,6 +2989,16 @@ function removeUser(id) {
   const idx = cfg.users.findIndex((u) => u.id === id);
   if (idx < 0) return false;
   const target = cfg.users[idx];
+  /**
+   * R71：**最后一个根用户不可删除**。
+   *
+   * 路由层已经拦掉了「删自己」，所以这条只会命中「根用户 A 删根用户 B」这种
+   * 多根场景（历史数据 / 手工配置才会出现）。那时同样要兜住：删掉最后一个，
+   * 系统就再也没有根用户，而该角色**不可重新授予** ⇒ 只能改配置文件自救。
+   */
+  if (roles.isRoot(target.role) && rootCount(cfg) <= 1) {
+    throw Object.assign(new Error('至少保留一个根用户账户'), { status: 400 });
+  }
   if (target.role === 'admin' && adminCount(cfg) <= 1) {
     throw Object.assign(new Error('至少保留一个管理员账户'), { status: 400 });
   }

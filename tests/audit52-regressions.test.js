@@ -608,6 +608,8 @@ async function loadExplorer(opts = {}) {
 export function escapeHtml(s) { return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
 export function fmtSize(n) { return n + ' B'; }
 export function fmtTime() { return 'T'; }
+export function isStaffRole(role) { return role === 'admin' || role === 'root'; }
+export function roleLabel(role) { return role === 'root' ? '根用户' : (role === 'admin' ? '管理员' : '普通用户'); }
 export function toast() {}
 export function confirmDialog() { return Promise.resolve(true); }
 export function openModal() { return { close() {}, bodyEl: {}, overlay: {} }; }
@@ -737,6 +739,8 @@ export const API = {
 `);
   fs.writeFileSync(path.join(dir, 'util.js'), `
 export const __toast = (globalThis.__r52Toast = []);
+export function isStaffRole(role) { return role === 'admin' || role === 'root'; }
+export function roleLabel(role) { return role === 'root' ? '根用户' : (role === 'admin' ? '管理员' : '普通用户'); }
 export function toast(m, o) { globalThis.__r52Toast.push([m, o]); }
 export function confirmDialog() { return Promise.resolve(true); }
 export function promptDialog() { return Promise.resolve('x'); }

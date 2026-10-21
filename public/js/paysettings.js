@@ -9,7 +9,7 @@
  * 普通用户整卡不可见且不会发起任何请求；服务端各接口也一律 requireAdmin。
  */
 import { API } from './api.js';
-import { toast, escapeHtml, confirmDialog, fmtTime } from './util.js';
+import { toast, escapeHtml, confirmDialog, fmtTime, isStaffRole } from './util.js';
 import { App } from './main.js';
 import { paymentLogo } from './payment-logos.js';
 
@@ -24,7 +24,7 @@ let siteUrl = ''; // 站点对外地址（网关回调 / 支付完成回跳的�
 
 /** 渲染期角色判断（真正的强制校验在服务端） */
 function isAdmin() {
-  return !!(App.state.user && App.state.user.role === 'admin');
+  return isStaffRole(App.state.user && App.state.user.role);
 }
 
 function $(id) {

@@ -110,11 +110,19 @@ async function runInlineScript(script, field, value, dataDir) {
   return { out: sandbox.__out, err: sandbox.__err, code: sandbox.process.exitCode };
 }
 
+/**
+ * 「初始管理员」从 R71 起落成**根用户**（空库第一个账户由存储层强制成 `root`）。
+ * 这里用同一个检索函数取账户，避免两个用例各写一份判据后只改了一处。
+ */
+function findInitialAdmin(store) {
+  return store.listUsers().find((u) => u.role === 'root' || u.role === 'admin');
+}
+
 /** 直接以「同一份数据目录」读取落盘后的管理员状态 */
 async function readAdminState(dataDir) {
   const mod = freshRequireStore(dataDir);
   const store = mod.require(CONFIG_STORE);
-  const admin = store.listUsers().find((u) => u.role === 'admin');
+  const admin = findInitialAdmin(store);
   if (!admin) return { name: null, okOldPass: null, okNewPass: null };
   const [oldPass, newPass] = await Promise.all([
     store.authenticateUser(admin.username, 'Old' + 'Pass123'),
@@ -130,6 +138,8 @@ async function readAdminState(dataDir) {
 async function seedAdmin(dataDir) {
   const mod = freshRequireStore(dataDir);
   const store = mod.require(CONFIG_STORE);
+  // ⚠️ 这是空库里的**第一个**账户 ⇒ 存储层会强制把它落成根用户（R71），
+  // 请求里的 `role: 'admin'` 被忽略。断言一律用 `findInitialAdmin()` 取它。
   await store.addUser({ username: 'admin', password: 'Old' + 'Pass123', role: 'admin' });
   await store.flush();
 }
@@ -578,7 +588,7 @@ test('deploy.sh：改管理员密码在特殊字符下真实生效（真实 node
       assert.strictEqual(r.code, 0, `改密码不应失败（${pass}）：${r.err}`);
       const mod = freshRequireStore(dataDir);
       const store = mod.require(CONFIG_STORE);
-      const admin = store.listUsers().find((u) => u.role === 'admin');
+      const admin = findInitialAdmin(store);
       const loggedIn = await store.authenticateUser(admin.username, pass);
       assert.strictEqual(loggedIn ? loggedIn.username : null, 'admin',
         `密码必须原样落盘，才能用「用户输入的原文」登录：${JSON.stringify(pass)}`);
@@ -588,6 +598,152 @@ test('deploy.sh：改管理员密码在特殊字符下真实生效（真实 node
       delete process.env.S3_DATA_DIR;
       fs.rmSync(tmp, { recursive: true, force: true });
     }
+  }
+});
+
+/* ================================================================== *
+ * R72：安装令牌必须出现在「部署完成」的信息里，也必须能在管理菜单里看到
+ * ================================================================== */
+
+/**
+ * 三条断言缺一条就留一种假绿：
+ *  ① 静态：脚本**只读**服务端落盘的那一份，绝不自己生成（两处各自生成 = 两枚令牌，
+ *     用户照打印的填必然 403，而现象像「令牌功能坏了」）；
+ *  ② 收尾信息（真跑 print_summary）：令牌原样出现在输出里，且只出现一次 ——
+ *     文件不存在时不得硬编造一串，只能给出「去哪拿」的说明；
+ *  ③ 管理菜单（真跑 manage_menu）：顶部显示，且**文件消失后不再显示**（初始化成功即失效）。
+ */
+test('R72 · 安装令牌：脚本只读服务端那一份，不得自己生成', () => {
+  const src = readDeploy();
+  assert(hasFn(src, 'setup_token_read'), '必须有 setup_token_read()：收尾信息与菜单共用一个读取点');
+  assert(hasFn(src, 'setup_token_path'), '必须有 setup_token_path()：路径只写一处，避免两处拼错');
+  const body = codeOnly(fnBody(src, 'setup_token_read'));
+  assert(/setup-token\.txt/.test(codeOnly(fnBody(src, 'setup_token_path'))),
+    '令牌文件名必须是服务端的那个（data/setup-token.txt）');
+  assert(/tr -d/.test(body) && /printf/.test(body),
+    '读取要剥掉行尾换行再输出：带换行的令牌粘进输入框必然 403');
+
+  // 反向：脚本里不得有任何自己的随机源（注释已剥掉，扫的是真正会执行的代码）
+  const code = codeOnly(src);
+  for (const gen of ['randomBytes', 'openssl rand', '/dev/urandom']) {
+    assert(code.indexOf(gen) === -1, `deploy.sh 不得自行生成令牌（发现 ${gen}）——生成权只在服务端`);
+  }
+});
+
+test('R72 · 安装令牌：收尾信息里原样打印，没有令牌时不编造', async () => {
+  const TOKEN = 'aaaabbbbccccddddeeeeffff00001111';
+  const { tmp, dataDir } = tempDataDir('kepler-setup-summary-');
+  const tokenFile = path.join(dataDir, 'setup-token.txt');
+  // 令牌文件由**服务端**生成（0600 + 行尾换行），这里照原样造一份
+  fs.writeFileSync(tokenFile, TOKEN + '\n', { mode: 0o600 });
+  const snippet = (out) => `
+set -Eeuo pipefail
+source ./deploy.sh
+trap - ERR
+DATA_DIR="$KEPLER_DATA"
+DOMAIN="example.com"
+SERVICE_READY=1
+NGINX_OK=1
+EXT_OK=1
+print_summary 2>&1
+`;
+  try {
+    const withToken = await spawnBashSnippet(snippet(), { KEPLER_DATA: dataDir });
+    if (withToken.unavailable) return;
+    assert.strictEqual(withToken.code, 0, `print_summary 不应失败：${withToken.err}`);
+    assert.strictEqual(withToken.out.split(TOKEN).length - 1, 1,
+      `令牌必须原样出现在「部署完成」的信息里，且只出现一次，实际输出：\n${withToken.out}`);
+
+    // 反向对照：文件不在了（= 已经初始化过）时，不得残留/编造任何令牌
+    fs.unlinkSync(tokenFile);
+    const withoutToken = await spawnBashSnippet(snippet(), { KEPLER_DATA: dataDir });
+    assert.strictEqual(withoutToken.code, 0, `print_summary 不应失败：${withoutToken.err}`);
+    assert.strictEqual(withoutToken.out.indexOf(TOKEN), -1, '没有令牌时不得残留上一次打印的内容');
+    assert(withoutToken.out.indexOf('安装令牌') >= 0,
+      '没有令牌时也要有一行说明（「当前没有」/「服务未就绪」），否则用户以为这项被漏掉了');
+  } finally {
+    delete process.env.S3_DATA_DIR;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('R72 · 安装令牌：管理菜单顶部显示，初始化完成（文件消失）后不再显示', async () => {
+  const TOKEN = 'feedfacefeedfacefeedfacefeedface';
+  const { tmp, dataDir } = tempDataDir('kepler-setup-menu-');
+  const tokenFile = path.join(dataDir, 'setup-token.txt');
+  fs.writeFileSync(tokenFile, TOKEN + '\n', { mode: 0o600 });
+  // `STATE_LOADED=1` 绕开「未找到部署状态」的前置；`printf 0` 让菜单读完就退出
+  const snippet = `
+set -Eeuo pipefail
+source ./deploy.sh
+trap - ERR
+DATA_DIR="$KEPLER_DATA"
+STATE_LOADED=1
+printf '0\\n' | manage_menu 2>&1
+`;
+  try {
+    const shown = await spawnBashSnippet(snippet, { KEPLER_DATA: dataDir });
+    if (shown.unavailable) return;
+    assert.strictEqual(shown.code, 0, `manage_menu 不应失败：${shown.err}`);
+    assert.strictEqual(shown.out.split(TOKEN).length - 1, 1,
+      `菜单应显示当前令牌（实际输出：\n${shown.out}）`);
+
+    fs.unlinkSync(tokenFile);
+    const stale = await spawnBashSnippet(snippet, { KEPLER_DATA: dataDir });
+    assert.strictEqual(stale.code, 0, `manage_menu 不应失败：${stale.err}`);
+    assert.strictEqual(stale.out.indexOf(TOKEN), -1,
+      '初始化成功后服务端会删掉令牌文件，菜单不得继续显示那一串已失效的凭据');
+    assert(stale.out.indexOf('安装令牌') >= 0, '没有令牌时菜单也要有一行说明（「已完成初始化」）');
+  } finally {
+    delete process.env.S3_DATA_DIR;
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test('R72 · 服务端：启动即生成安装令牌（不必等页面探活），幂等且初始化后不再生成', async () => {
+  const { tmp, dataDir } = tempDataDir('kepler-setup-prime-');
+  const code = `
+const fs = require('fs');
+const path = require('path');
+const auth = require('./server/routes/auth');
+const store = require('./server/config-store');
+const file = path.join(process.env.S3_DATA_DIR, 'setup-token.txt');
+(async () => {
+  const first = auth.primeSetupToken();
+  console.log('FIRST=' + first);
+  console.log('ON_DISK=' + (fs.existsSync(file) ? fs.readFileSync(file, 'utf8').trim() : ''));
+  const again = auth.primeSetupToken();
+  console.log('SAME=' + (first === again));
+  await store.addUser({ username: 'owner', password: 'Unit!2026abc', role: 'user' });
+  try { fs.unlinkSync(file); } catch (e) { /* 已删 */ }
+  console.log('AFTER_INIT=' + JSON.stringify(auth.primeSetupToken()));
+  console.log('RECREATED=' + fs.existsSync(file));
+})().catch((e) => { console.error(e); process.exit(1); });
+`;
+  const r = await new Promise((resolve) => {
+    const child = spawn(process.execPath, ['-e', code], {
+      cwd: ROOT,
+      env: { ...process.env, S3_DATA_DIR: dataDir, HOST: '0.0.0.0', NODE_ENV: 'production' },
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    let out = '';
+    let err = '';
+    child.stdout.on('data', (d) => { out += d; });
+    child.stderr.on('data', (d) => { err += d; });
+    child.on('close', (c) => resolve({ code: c, out, err }));
+    child.on('error', (e) => resolve({ code: -1, out: '', err: String(e) }));
+  });
+  try {
+    assert.strictEqual(r.code, 0, `探测进程应正常退出：${r.err}`);
+    const first = (/^FIRST=(.*)$/m.exec(r.out) || [])[1] || '';
+    assert(/^[0-9a-f]{32}$/.test(first), `启动时就必须生成 32 位 hex 令牌，实际：${JSON.stringify(first)}`);
+    const onDisk = (/^ON_DISK=(.*)$/m.exec(r.out) || [])[1] || '';
+    assert.strictEqual(onDisk, first, '落盘内容必须与返回的一致（部署脚本读的就是这个文件）');
+    assert(/^SAME=true$/m.test(r.out), '重复调用不得换令牌（否则用户抄走的那枚立刻失效）');
+    assert(/^AFTER_INIT=""$/m.test(r.out), '已经有账户时不再生成（初始化完成后不该再有一枚可用令牌）');
+    assert(/^RECREATED=false$/m.test(r.out), '初始化后即便文件被删也不得重建');
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
   }
 });
 

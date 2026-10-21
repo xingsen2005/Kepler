@@ -6,6 +6,8 @@
  *  — 重命名 / 移动 / 删除 / 目录树
  */
 const { express, providers, configStore, statsStore, uploadSessions, encStore, streamDownload, shareStore } = require('./_context');
+// R71：角色语义的唯一事实源（`root` 也属管理层，不得再用 `role === 'admin'` 字面量比较）
+const roles = require('../roles');
 const {
   getClient, p, translateError, listAll, listAllInfo, listAllExact, listPage, LIMITS,
   normalizeKey, badRequest, copySource,
@@ -697,7 +699,7 @@ router.post('/fs/upload/init', async (req, res) => {
  */
 function assertSessionOwner(sess, req) {
   if (!sess) return;
-  if (req.authUser && req.authUser.role === 'admin') return;
+  if (req.authUser && roles.isStaff(req.authUser.role)) return;
   const owner = String(sess.createdBy || '');
   const me = String((req.authUser && req.authUser.username) || '');
   if (owner && owner === me) return;
@@ -978,7 +980,7 @@ router.post('/fs/upload/abort', async (req, res) => {
 router.get('/fs/sessions', async (req, res) => {
   try {
     requireConfig();
-    const isAdminUser = req.authUser && req.authUser.role === 'admin';
+    const isAdminUser = req.authUser && roles.isStaff(req.authUser.role);
     const opt = isAdminUser ? undefined : { createdBy: (req.authUser && req.authUser.username) || '\u0000' };
     const list = uploadSessions.list(opt).map((s) => ({
       sessionId: s.id, key: s.key, size: s.size, chunkSize: s.chunkSize,

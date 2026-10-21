@@ -1,11 +1,11 @@
 /** 监控仪表盘 —— 存储用量 / 流量趋势 / 请求统计 / 操作日志 */
 import { API } from './api.js';
-import { fmtSize, fmtTime, escapeHtml, drawDonut, drawGroupedBars, drawStackedBars, drawHBars } from './util.js';
+import { fmtSize, fmtTime, escapeHtml, drawDonut, drawGroupedBars, drawStackedBars, drawHBars, isStaffRole } from './util.js';
 import { App } from './main.js';
 
 /** 操作日志为管理员专属（日志详情含用户名 / 客户端 IP / 对象键 / 桶名）—— SEC-07 */
 function isAdmin() {
-  return !!(App.state.user && App.state.user.role === 'admin');
+  return isStaffRole(App.state.user && App.state.user.role);
 }
 
 let logsShown = false;

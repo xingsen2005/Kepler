@@ -24,6 +24,8 @@
  */
 const { express, configStore, statsStore } = require('./_context');
 const { requireAdmin, apiHandler } = require('./_shared');
+// R71：「新用户身份=管理员」等于让每一个注册者都成为管理员，属「添加管理员」
+const roles = require('../roles');
 // 入参合法性的唯一判据（与 `config-store` 的落盘归一化共用同一组来源）
 const {
   parseSiteNameInput, REGISTRATION_MODES, DEFAULT_ROLES,
@@ -80,6 +82,13 @@ router.put('/site/config', requireAdmin, apiHandler(async (req, res) => {
     if (typeof b.defaultRole !== 'string' || !DEFAULT_ROLES.includes(b.defaultRole)) {
       throw Object.assign(
         new Error(`新用户身份须为 ${DEFAULT_ROLES.join(' / ')} 之一`), { status: 400 });
+    }
+    /**
+     * R71：把「新用户身份」设成管理员，等价于**给所有注册者发放管理员** ——
+     * 这是「添加管理员」的第三条通道（另两条是 `POST /users` 与邀请码），仅根用户可开。
+     */
+    if (b.defaultRole === 'admin' && !roles.canAssignRole(req.authUser && req.authUser.role)) {
+      throw Object.assign(new Error('仅根用户可将「新用户身份」设为管理员'), { status: 403 });
     }
     patch.defaultRole = b.defaultRole;
   }

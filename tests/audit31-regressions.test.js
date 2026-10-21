@@ -109,6 +109,9 @@ export const API = new Proxy({}, {
 `;
 
 const UTIL_STUB = `
+// R71：根用户与管理员同级 —— 桩必须提供真实实现（否则 ESM 链接期就整片变红）
+export function isStaffRole(role) { return role === 'admin' || role === 'root'; }
+export function roleLabel(role) { return role === 'root' ? '根用户' : (role === 'admin' ? '管理员' : '普通用户'); }
 export const toast = (m) => { (globalThis.__toasts = globalThis.__toasts || []).push(m); };
 export const escapeHtml = (s) => String(s == null ? '' : s);
 export const confirmDialog = async () => true;

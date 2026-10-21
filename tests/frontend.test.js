@@ -393,9 +393,11 @@ test('添加存储桶对话框：管理员专属项仅管理员渲染', () => {
   const fn = /function openBucketDialog\(existing\)\s*\{([\s\S]*?)\n\}/.exec(src);
   assert(fn, 'main.js 应存在 openBucketDialog');
 
-  // ① 单一判据（避免多处判断漂移）
-  assert(/isAdminUser\s*=\s*!!\(App\.state\.user\s*&&\s*App\.state\.user\.role === 'admin'\)/.test(fn[1]),
-    'openBucketDialog 应定义 isAdminUser 作为唯一判据');
+  // ① 单一判据（避免多处判断漂移）。R71 起「管理员专属」的口径是「管理层」
+  //    （`admin` 或 `root`），故判据统一走 `isStaffRole(...)` 而不是内联字面量 ——
+  //    内联 `role === 'admin'` 会让根用户在界面上看不到这些项。
+  assert(/isAdminUser\s*=\s*isStaffRole\(App\.state\.user\s*&&\s*App\.state\.user\.role\)/.test(fn[1]),
+    'openBucketDialog 应定义 isAdminUser 作为唯一判据（走 isStaffRole）');
 
   // ② 三处管理员专属内容都按该判据条件渲染：非管理员根本不产出这段 DOM
   //    - 访问密钥选择器：非管理员提交的 credentialId 会被服务端丢弃（SEC-01）

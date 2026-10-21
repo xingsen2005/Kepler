@@ -99,12 +99,19 @@ async function seed({ credSpeed = 0, bucketSpeed = 0, userSpeed = 0 } = {}) {
     activeCredentialId: 'c1',
     activeBucketId: 'b1',
   });
-  // 用户只能走 addUser（密码要哈希）；同名先清掉，保证用例可重复跑
+  /**
+   * 用户只能走 addUser（密码要哈希）；同名**复用**而不是删掉重建，保证用例可重复跑。
+   *
+   * R71：不能再用「先 removeUser 再 addUser」—— 本文件第一个建出来的账户就是**根用户**，
+   * 而根用户不可删除（`至少保留一个根用户账户`），夹具会在第二个用例上直接抛错。
+   * 复用同一个账户既保住幂等，也不再触碰那条保护。
+   */
   const exist = configStore.listUsers().find((u) => u.username === 'r37user');
-  if (exist) await configStore.removeUser(exist.id);
-  const u = await configStore.addUser({
-    username: 'r37user', password: 'pw-123456', role: 'user', speedLimit: userSpeed,
-  });
+  const u = exist
+    ? await configStore.updateUser(exist.id, { speedLimit: userSpeed })
+    : await configStore.addUser({
+      username: 'r37user', password: 'pw-123456', role: 'user', speedLimit: userSpeed,
+    });
   return { credId: 'c1', bucketId: 'b1', userId: u.id };
 }
 

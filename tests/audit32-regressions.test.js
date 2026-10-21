@@ -346,6 +346,9 @@ export const API = new Proxy({}, {
 
 /** `util.js` 桩：toast / confirmDialog 都记录下来，便于断言「提示了什么」 */
 const UTIL_STUB = `
+// R71：根用户与管理员同级 —— 桩必须提供真实实现（否则 ESM 链接期就整片变红）
+export function isStaffRole(role) { return role === 'admin' || role === 'root'; }
+export function roleLabel(role) { return role === 'root' ? '根用户' : (role === 'admin' ? '管理员' : '普通用户'); }
 export const toast = (m, o) => { (globalThis.__toasts = globalThis.__toasts || []).push({ m, o }); };
 export const escapeHtml = (s) => String(s == null ? '' : s);
 export const confirmDialog = async (opts) => {

@@ -1,6 +1,6 @@
 /** 文件操作 —— 新建 / 重命名 / 移动 / 删除 / 下载 / 复制链接 */
 import { API } from './api.js';
-import { toast, confirmDialog, promptDialog, openModal, escapeHtml, fmtSize, fmtTime } from './util.js';
+import { toast, confirmDialog, promptDialog, openModal, escapeHtml, fmtSize, fmtTime, isStaffRole } from './util.js';
 import { App } from './main.js';
 import { openDownload } from './enc.js';
 // R37：文件分享的「下载限速」与「链接管理」是**同一份字段**（同一条分享记录上的
@@ -10,7 +10,7 @@ import { parseMbpsInput, ceilingText, fetchCeiling, toMBps } from './speedlimit.
 
 export const ops = {
   needConfig() {
-    const isAdmin = App.state.user && App.state.user.role === 'admin';
+    const isAdmin = isStaffRole(App.state.user && App.state.user.role);
     if (isAdmin) {
       toast('请先在密钥管理中配置访问密钥与存储桶', { type: 'warn' });
       import('./settings.js').then((m) => m.settings.open());

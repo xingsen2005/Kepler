@@ -141,7 +141,7 @@ test('R69-05 · 部署模式：正确令牌可完成初始化，且令牌是一�
 
   const r = await api('POST', '/api/auth/init', { body: { username: 'owner', password: PASSWORD, setupToken: token } });
   assertEqual(r.status, 200, `带正确令牌应能初始化（实际 ${r.status} ${JSON.stringify(r.json)}）`);
-  assertEqual(configStore.listUsers().length, 1, '应当只建出一个管理员');
+  assertEqual(configStore.listUsers().length, 1, '应当只建出一个账户（R71 起空库的第一个账户是根用户）');
   assertEqual(fs.existsSync(tokenFile), false, '初始化成功后令牌文件必须删除（一次性）');
 
   // 再拿同一枚令牌重放：系统已初始化，无论如何都不该再建号
@@ -245,10 +245,16 @@ test('R69-11 · 口令策略：8 位下限、弱口令黑名单、纯重复字�
  * ================================================================== */
 
 test('R69-12 · 非空 permissions 被 400 拒绝（不给「已限制」的错觉）', async () => {
-  const admin = configStore.listUsers().find((u) => u.role === 'admin');
-  assert(admin, '前置：R69-05 已建出管理员');
+  /**
+   * R71 起 `/auth/init` 建出的**是根用户**（不是管理员），故这里按「管理层」取账户、
+   * 并原样回填它真实的角色 —— 冒充成 `admin` 会让下面的「新建普通用户」虽然仍能过，
+   * 但用例就不再代表真实身份了（真正的根用户在界面上是能建管理员的）。
+   */
+  const admin = configStore.listUsers().find((u) => u.role === 'admin' || u.role === 'root');
+  assert(admin, '前置：R69-05 已建出管理层账户');
+  const asActor = { id: admin.id, username: admin.username, role: admin.role, permissions: {} };
   const r = await api('POST', '/api/users', {
-    as: { id: admin.id, username: admin.username, role: 'admin', permissions: {} },
+    as: asActor,
     body: { username: 'permuser', password: PASSWORD, role: 'user', permissions: { canDelete: true } },
   });
   assertEqual(r.status, 400, `非空 permissions 必须 400（实际 ${r.status}）`);
@@ -257,7 +263,7 @@ test('R69-12 · 非空 permissions 被 400 拒绝（不给「已限制」的错�
 
   // 空对象是历史默认值，必须放行
   const ok = await api('POST', '/api/users', {
-    as: { id: admin.id, username: admin.username, role: 'admin', permissions: {} },
+    as: asActor,
     body: { username: 'permok', password: PASSWORD, role: 'user', permissions: {} },
   });
   assertEqual(ok.status, 200, `空 permissions 应放行（实际 ${ok.status} ${JSON.stringify(ok.json)}）`);
