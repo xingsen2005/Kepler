@@ -19,6 +19,9 @@ import * as couponmgr from './couponmgr.js';
 import { verifyWindowsHello, webauthnSupported } from './webauthn.js';
 import { providerMeta } from './provider-logos.js';
 import { openProfileDialog } from './profile.js';
+// R70：PWA（Service Worker 注册 / 「安装到桌面」入口）。刻意**不**在此处做任何 I/O ——
+// 真正的监听与注册在 init() 里由 initPwa() 一次性挂上，模块加载期无副作用。
+import * as pwa from './pwa.js';
 // R8-04：加密访问令牌是**凭据**，登出时必须随会话一起丢弃（见 forceLogout）。
 import { reset as resetEncSession } from './enc.js';
 
@@ -267,6 +270,15 @@ async function init() {
   bindViewHash();
   // R47：写操作成功后自动同步界面（消除「必须刷新才看到生效结果」）
   setWriteObserver(onServerWrite);
+
+  /**
+   * R70：PWA。挂 `beforeinstallprompt` / `appinstalled` 监听 + 注册 Service Worker。
+   *
+   * 刻意**不等**它（无 await）：里面注册 SW 是个网络动作，而下面的主链路是登录态探测 ——
+   * 让登录等一个离线缓存，是把增强能力排在核心功能前面。它内部全程 catch，
+   * 失败也不会让 init() 连锁中断。
+   */
+  pwa.initPwa();
 
   /**
    * R54：站点名称 → 浏览器标题栏。
@@ -1162,6 +1174,14 @@ function renderUserMenu() {
   if (usersItem) usersItem.hidden = !isAdmin;
   if (sep) sep.hidden = !isAdmin;
 
+  /**
+   * R70：「安装到桌面」的显隐**在这里统一刷**，与「用户管理」同款理由 ——
+   * `beforeinstallprompt` 可能在本函数跑之前就到达（比如二次访问时浏览器更快），
+   * 也可能在之后到达（`onInstallStateChange` 会再刷一次）。两处都调同一个
+   * `pwa.syncInstallItem()`，保证换账号 / 重新登录后不会残留上一会话的状态。
+   */
+  pwa.syncInstallItem();
+
   // SEC-07：操作日志（详情含用户名 / 客户端 IP / 对象键 / 桶名）仅管理员可见。
   // 在**角色权威渲染点**统一赋值，避免仅绑定一次导致换账号后残留。
   const sideLogs = document.getElementById('side-logs');
@@ -1275,6 +1295,29 @@ function bindUserMenu() {
       forceLogout('已退出登录');
     };
   }
+
+  /**
+   * R70：「安装到桌面」。
+   *
+   * 点击必须**直接**调 `pwa.promptInstall()`（不要包 `setTimeout` / `.then`）：
+   * 浏览器要求 prompt() 处在用户手势的调用栈里，一旦被推迟到微任务之后，
+   * Chrome 会静默拒绝，表现就是「点了没反应」。
+   *
+   * 用户选了「取消」不报错 —— 那是正常结果，不是失败。
+   */
+  const installItem = document.getElementById('um-install');
+  if (installItem) {
+    installItem.onclick = async () => {
+      closeMenu();
+      const result = await pwa.promptInstall();
+      if (result === 'accepted') toast('已开始安装，请稍候…');
+      // dismissed / unavailable：什么都不说。用户主动取消时再弹一句「已取消」
+      // 是在替用户解释他自己的操作，反而打断。
+    };
+  }
+
+  // 可安装状态变化（beforeinstallprompt / appinstalled / 退出独立窗口）时重刷菜单项
+  pwa.onInstallStateChange(() => pwa.syncInstallItem());
 }
 
 /** 加密设置摘要（含查看密码是否设置），设置变更事件后刷新 */

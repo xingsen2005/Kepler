@@ -80,21 +80,37 @@ app.use((req, res, next) => {
   //   却使整站 XSS 纵深防护近乎归零 —— 任何一处 innerHTML 拼接遗漏都会被
   //   直接升级为脚本执行。该处理器已改为 addEventListener（explorer.js）。
   //   同时补齐 object-src / base-uri / form-action，收窄可攻击面。
+  /**
+   * 两个验证码服务商的脚本源都必须在列：host-source **精确匹配**，少一个 www 或漏整个域名
+   * 即被拦 → 组件永不 load → 全站无法登录（R14-02）。R41：recaptcha.net 下发的只是**引导脚本**，
+   * 它再注入实现 recaptcha__*.js —— 境内取自 www.gstatic.cn、境外 www.gstatic.com（同一份内容，
+   * 同为 858138 字节），两个都要列，少一个该地区用户就永远停在"正在加载人机验证组件…"。
+   *
+   * ⚠️ 这段注释刻意放在 `res.setHeader` **之前**，而不是夹在指令字符串中间：
+   * `tests/audit40-regressions.test.js` 与 `audit-regressions.test.js` 都靠「CSP 头名 →
+   * 最后一条指令名」之间 900 字符的窗口去定位这段值班的字符串，**注释也算在窗口里**。
+   * R70 加了两条指令后余量已不多，把长注释挪到窗口外才能既保留这些「为什么」、
+   * 又不去放宽那两条判据。
+   * （本注释刻意不写那两个定位用的字面串 —— 写了会被 `indexOf` 先命中，把窗口截短。）
+   */
   res.setHeader('Content-Security-Policy',
     "default-src 'self'; "
     + "img-src 'self' data:; "
-    + "style-src 'self' 'unsafe-inline'; "   // 少量组件依赖内联样式，暂保留
-    // 两个验证码服务商的脚本源都必须在列：host-source **精确匹配**，少一个 www 或漏整个域名
-    // 即被拦 → 组件永不 load → 全站无法登录（R14-02）。R41：recaptcha.net 下发的只是**引导脚本**，
-    // 它再注入实现 recaptcha__*.js —— 境内取自 www.gstatic.cn、境外 www.gstatic.com（同一份内容，
-    // 同为 858138 字节），两个都要列，少一个该地区用户就永远停在"正在加载人机验证组件…"。
+    + "style-src 'self' 'unsafe-inline'; "
     + "script-src 'self' https://www.recaptcha.net https://www.gstatic.com https://www.gstatic.cn https://challenges.cloudflare.com; "
     + "frame-src https://www.recaptcha.net https://challenges.cloudflare.com; "
-    + "connect-src 'self'; "
-    + "object-src 'none'; "                  // 禁止 <object>/<embed>/<applet>
-    + "base-uri 'self'; "                    // 防止 <base> 劫持相对路径脚本
-    + "form-action 'self'; "                 // 防止表单外泄到第三方
+    + "connect-src 'self'; worker-src 'self'; child-src 'self'; "
+    + "object-src 'none'; base-uri 'self'; form-action 'self'; "
     + "frame-ancestors 'none'");
+  /**
+   * R70：为什么 CSP 里要显式写 `worker-src 'self'; child-src 'self'`。
+   *
+   * Service Worker 的脚本抓取走的是**独立的取指令**，不是 `script-src`。`default-src 'self'`
+   * 在多数浏览器上确实能兜住，但 SW 注册被 CSP 拦掉时**页面不会报任何错** ——
+   * 控制台只有一条 CSP violation，界面上表现为「安装按钮永远不出现」，
+   * 也就是可安装性静默消失。`child-src` 是 `worker-src` 普及前的旧名，
+   * 两者同列以覆盖较老的 WebView/内嵌浏览器。
+   */
   // 部署模式补 HSTS（与 S1 的 HTTPS 强制配套）：明文二次访问前就被浏览器内部升级
   if (security.IS_DEPLOY) {
     res.setHeader('Strict-Transport-Security', 'max-age=31536000; includeSubDomains');
@@ -257,8 +273,43 @@ app.use('/api', routes);
 // 公开分享页（/s/:id），需在静态资源与 SPA 兜底之前挂载
 app.use('/', shareRoutes);
 
-// 静态前端（协商缓存：ETag 304 复用，更新后立即生效）
 const PUBLIC_DIR = path.join(__dirname, '..', 'public');
+
+/**
+ * R70：PWA 的两条**动态**路由。都必须注册在 `express.static` **之前**。
+ *
+ * ## `/manifest.webmanifest` —— 为什么不是静态文件
+ *
+ * 需求要求「桌面快捷方式的名称以『站点名称』为准」。快捷方式的名称由系统在**安装那一刻**
+ * 读 manifest 的 `name`（退化到 `short_name`）决定，装完就固化，网页之后改 `document.title`
+ * 完全无效。静态文件只能写死一个名字 ⇒ 只能每次现场生成（见 `server/pwa.js`）。
+ *
+ * ## `/sw.js` —— 为什么不是静态文件
+ *
+ * 它是 `public/sw.js` 这份**模板**，唯一需要现场替换的是版本号占位符：
+ * 缓存名带版本 ⇒ 发版即换缓存 ⇒ `activate` 顺手删掉上一版。若原样静态下发，用户升级后
+ * 仍会拿到旧 `main.js`（SW 缓存无过期时间），表现为「服务端修好了、用户那边还是老样子」。
+ *
+ * 两个响应都刻意 `no-cache`（可存、每次回源校验）：
+ *  - manifest 改完站点名称，下一步点「安装」就得是新名字，不能等 5 分钟；
+ *  - sw.js 更严格 —— 浏览器只接受 `max-age` 不超过 86400 的 SW 脚本缓存，
+ *    写 `no-cache` 才能让「改了 SW 立刻生效」可预期。
+ */
+const pwa = require('./pwa');
+
+app.get(pwa.MANIFEST_PATH, pwa.manifestHandler);
+/**
+ * `/sw.js` 的响应头、模板读取、版本号替换全在 `server/pwa.js` 里
+ * （`serviceWorkerHandler`）—— 这里只挂载。
+ *
+ * ⚠️ 刻意不在这行内联实现：护栏 `audit70` 必须能直接调用**生产的那份实现**。
+ * 早先本文件内联了整段逻辑，而测试里为了起服务又重写了一份等价路由，
+ * 于是针对 `index.js` 的反向变异**根本打不到**测试实际跑的那个函数（fail=0 假绿）。
+ * 逻辑收进模块后，「被测的那一层」与「线上跑的那一层」是同一份代码。
+ */
+app.get('/sw.js', pwa.serviceWorkerHandler);
+
+// 静态前端（协商缓存：ETag 304 复用，更新后立即生效）
 app.use(express.static(PUBLIC_DIR, {
   etag: true,
   lastModified: true,

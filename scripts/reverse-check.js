@@ -9844,6 +9844,217 @@ const CASES = [
       testFile: 'audit69-regressions.test.js',
       minFail: 1,
     },
+
+    /* ============ 第七十轮 · PWA（R70） ============ */
+    {
+      /**
+       * 撤掉后：「快捷方式的名称以站点名称为准」这条需求**整条失效** ——
+       * manifest 永远返回一个写死的默认名，界面上完全看不出来（页面标题仍是对的，
+       * 只有装到桌面上的那个图标名字不对）。这正是本需求最容易「看着做了」的错法。
+       * 判据 `R70-01`/`R70-04` 要求 name/short_name 原样取站点名称。
+       */
+      name: 'R70-01a · manifest 忽略站点名称（快捷方式名字退回写死值）',
+      file: 'server/pwa.js',
+      anchor: "  const displayName = name || 'Kepler 对象存储管理系统';",
+      replacement: "  const displayName = 'Kepler 对象存储管理系统';",
+      testFile: 'audit70-pwa.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * 撤掉后：`short_name` 被截成 12 个字符。Chrome/Edge 建桌面快捷方式**优先取
+       * short_name**，于是需求只对了一半，而用户看到的是被截断的那个名字。
+       * 判据 `R70-01` 要求两者同值。
+       */
+      name: 'R70-01b · short_name 被截短（Chrome 建快捷方式优先取它）',
+      file: 'server/pwa.js',
+      anchor: '    short_name: displayName,',
+      replacement: "    short_name: displayName.slice(0, 12),",
+      testFile: 'audit70-pwa.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * 撤掉后：manifest 退回静态同名文件（把动态路由改成读盘）。判据 `R70-03`
+       * 断言 `public/` 下不得存在静态 manifest —— 静态文件只能写死一个名字。
+       * 这里用「注册顺序」这个等价失效点：把 manifest 路由挪到 static 之后，
+       * 静态中间件先返回 404，浏览器判定不可安装。
+       */
+      name: 'R70-03a · manifest 路由退到 express.static 之后（被静态中间件吃掉）',
+      file: 'server/index.js',
+      anchor: 'app.get(pwa.MANIFEST_PATH, pwa.manifestHandler);',
+      replacement: 'void pwa.MANIFEST_PATH; // 路由挪到 static 之后（见用例说明）',
+      testFile: 'audit70-pwa.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * 撤掉后：版本号替换退回**只替首处**。占位符一旦在模板里出现两次
+       * （历史上注释与代码各写一次），`String.replace` 会先命中注释、常量一字未动 ——
+       * 而响应里"看起来"确实少了一处占位符，不深查就发现不了。
+       * 后果是缓存标签恒为 `dev`，**所有版本共用一个缓存**，发版后用户永远拿旧前端。
+       *
+       * ⚠️ 本条是 `mutations` 多步，**两步都落在 `server/pwa.js`**（`mutations` 不支持
+       * 跨文件：每步只有 anchor / replacement，全部作用于 `file`）。第一步在
+       * `renderServiceWorker` 的**函数体内**写一个占位符字面串（模拟注释式写法，
+       * 位置在模板拼接之前），第二步把全局替换改回只替首处的 `replace`。
+       * 只做第二步是**无效变异**：当前模板里占位符只剩一处，`replace` 也能正确替换 ——
+       * 实测 fail=0（这条对照最初就因此假绿），必须两步一起才复现得出该 bug。
+       *
+       * 判据 `R70-05` 断言的是**代码行**里的 `const VERSION` 已是具体版本号，
+       * 而不是「响应里还有没有这个字符串」—— 后者在只替注释时同样成立。
+       */
+      name: 'R70-05a · 版本号替换退回只替首处（被替换的是注释，常量没动）',
+      file: 'server/pwa.js',
+      mutations: [
+        {
+          anchor: "  return String(template || '').split(SW_VERSION_PLACEHOLDER).join(String(version || '0.0.0'));",
+          // 变异：先拼一段「注释」到待替换文本前面，再用只替首处的 replace ——
+          // 于是被替换掉的是注释里的那一处，真正的 `const VERSION` 原样留下。
+          // 这正是模板里注释与代码各写一次时的真实行为。
+          replacement: "  const withNote = '// 变异：注释里也写一次 __KEPLER_VERSION__\\n' + String(template || '');\n"
+            + "  return withNote.replace('__KEPLER_VERSION__', String(version || '0.0.0'));",
+        },
+      ],
+      testFile: 'audit70-pwa.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * 撤掉后：模板里又出现第二个占位符（注释里写一次、代码里写一次）。
+       *
+       * 这正是本轮实测踩到的真实形态：旧实现用只替首处的 `String.replace`，
+       * 于是被替换的是**注释**、`const VERSION` 一字未动 —— 而响应里"看起来"
+       * 确实少了一处占位符。判据 `R70-06` 断言占位符在模板里**恰好出现 1 次
+       * 且必须落在 `const VERSION` 那一行**。
+       *
+       * ⚠️ anchor 必须锚在**代码行**上（`const VERSION = …`），不能锚在注释里：
+       * `invariants.test.js` 的 anchor 自检是**双侧剥注释后**比对的，整句都在注释里
+       * 的 anchor 会被判成「悬空」（实测第一版就这么红了）。注释的注入放在
+       * replacement 里 —— 替换文本是变异态，不受那条自检约束。
+       */
+      name: 'R70-06a · 模板里出现第二个占位符（重新打开「注释先命中」的口子）',
+      file: 'public/sw.js',
+      anchor: "const VERSION = '__KEPLER_VERSION__';",
+      replacement: "// 变异：注释里也写一次 __KEPLER_VERSION__（第二个占位符）\n"
+        + "const VERSION = '__KEPLER_VERSION__';",
+      testFile: 'audit70-pwa.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * 撤掉后：`/api` 被纳入缓存。换账号后同一 URL 可能直接命中上一个账号的数据，
+       * 且这类泄露**没有任何报错**。判据 `R70-07` 逐个路径验 BYPASS_RE。
+       */
+      name: 'R70-07a · SW 把 /api 纳入缓存（换账号可能读到上一账号的数据）',
+      file: 'public/sw.js',
+      anchor: "const BYPASS_RE = /^\\/(?:api|s|dav)(?:\\/|$)/i;",
+      replacement: "const BYPASS_RE = /^\\/(?:s|dav)(?:\\/|$)/i;",
+      testFile: 'audit70-pwa.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * 撤掉后：缓存名去掉版本号 ⇒ 发版后缓存永不失效 ⇒ 用户永远拿旧前端，
+       * 而服务端日志一切正常。判据 `R70-08` 要求 SHELL_CACHE 带 TAG。
+       */
+      name: 'R70-08a · 外壳缓存名去掉版本号（发版后用户永远拿旧前端）',
+      file: 'public/sw.js',
+      anchor: "const SHELL_CACHE = 'kepler-shell-' + TAG;",
+      replacement: "const SHELL_CACHE = 'kepler-shell';",
+      testFile: 'audit70-pwa.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * 撤掉后：`install` 用 `addAll` 一次装齐。只要有一个资源拿不到，**整个安装失败**，
+       * 而界面上的表现只是「安装按钮点了没反应」(Chrome 不发 beforeinstallprompt)。
+       * 判据 `R70-09` 明确禁止 addAll。
+       */
+      name: 'R70-09a · install 退回 addAll（一项失败即整个安装失败）',
+      file: 'public/sw.js',
+      anchor: "    await Promise.all(SHELL.map((url) => cache.add(new Request(url, { cache: 'reload' })).catch(() => {})));",
+      replacement: '    await cache.addAll(SHELL);',
+      testFile: 'audit70-pwa.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * 撤掉后：`index.html` 不再声明 manifest ⇒ 浏览器根本不知道有这份 manifest，
+       * 可安装性归零（且**不会**报任何错，只是安装图标永不出现）。
+       * 判据 `R70-10`。
+       */
+      name: 'R70-10a · index.html 去掉 manifest 声明（可安装性归零且无报错）',
+      file: 'public/index.html',
+      anchor: '  <link rel="manifest" href="/manifest.webmanifest">',
+      replacement: '  <!-- manifest 已移除 -->',
+      testFile: 'audit70-pwa.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * 撤掉后：安装菜单项默认可见。浏览器不支持 / 已装成 App / 不满足可安装性时，
+       * 用户点它就等于点了个没反应的东西 —— 比不摆更让人困惑。
+       * 判据 `R70-11` 断言它带 hidden 且显隐由 canInstall() 决定。
+       */
+      name: 'R70-11a · 安装菜单项默认可见（点了没反应）',
+      file: 'public/index.html',
+      anchor: '<div class="um-item" id="um-install" hidden>安装到桌面</div>',
+      replacement: '<div class="um-item" id="um-install">安装到桌面</div>',
+      testFile: 'audit70-pwa.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * 撤掉后：`beforeinstallprompt` 回调里直接 `prompt()`。这个事件**每页只发一次**，
+       * 在事件里用掉 = 用户之后点菜单永远调不出安装框（Chrome 会静默拒绝）。
+       * 判据 `R70-12` 明确禁止在事件回调里调 prompt()。
+       */
+      name: 'R70-12a · 在 beforeinstallprompt 里直接 prompt（一次性凭据被提前用掉）',
+      file: 'public/js/pwa.js',
+      anchor: "    deferredPrompt = e;\n    notifyInstallState();",
+      replacement: "    deferredPrompt = e;\n    e.prompt();\n    notifyInstallState();",
+      testFile: 'audit70-pwa.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * 撤掉后：SW 注册失败不再被 catch ⇒ 明文 HTTP / 隐私模式下注册被拒，
+       * 异常冒泡打断 `init()` 连锁 —— 拿核心功能（登录、上传下载）去换一个增强功能。
+       * 判据 `R70-13` 要求 registerServiceWorker 内有 catch。
+       */
+      name: 'R70-13a · SW 注册失败不再 catch（增强能力拖垮 init 主链路）',
+      file: 'public/js/pwa.js',
+      anchor: "    navigator.serviceWorker.register('/sw.js', { scope: '/' }).catch(() => {",
+      replacement: "    navigator.serviceWorker.register('/sw.js', { scope: '/' }).then(() => {",
+      testFile: 'audit70-pwa.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * 撤掉后：图标 PNG 的圆角没了（白底矩形铺满四角）。桌面上的快捷方式变成
+       * 一个死板的方块 —— 正是需求原文「需要加白底和圆角正方形」要的形状差别。
+       * 判据 `R70-14` **解码像素**核对四角 alpha=0。
+       */
+      name: 'R70-14a · 标准图标去掉圆角（四角变成不透明白底）',
+      file: 'public/icons/icon.svg',
+      anchor: '<rect width="1024" height="1024" rx="228" fill="#FFFFFF"/>',
+      replacement: '<rect width="1024" height="1024" rx="0" fill="#FFFFFF"/>',
+      testFile: 'audit70-pwa.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * 撤掉后：SVG 的白底整块删掉 ⇒ 图标变成透明底上的图形，在深色任务栏或
+       * 深色壁纸上几乎看不见（需求明确要求「加白底」）。判据 `R70-16`。
+       */
+      name: 'R70-16a · 图标 SVG 去掉白底（深色背景下图形几乎不可见）',
+      file: 'public/icons/icon.svg',
+      anchor: '<rect width="1024" height="1024" rx="228" fill="#FFFFFF"/>',
+      replacement: '<!-- 白底已移除 -->',
+      testFile: 'audit70-pwa.test.js',
+      minFail: 1,
+    },
   ];
 
 module.exports = { runCase, CASES, parseArgs };

@@ -36,7 +36,7 @@ function syntaxOk(src) {
 }
 
 test('前端模块数量符合预期（未意外增删）', () => {
-  assertEqual(MODULES.length, 33, `public/js 模块数应为 33，实际 ${MODULES.length}（新增/删除模块时请同步此基线）`);
+  assertEqual(MODULES.length, 34, `public/js 模块数应为 34，实际 ${MODULES.length}（新增/删除模块时请同步此基线）`);
   assert(MODULES.includes('webauthn.js'), '应包含 webauthn.js（Windows Hello 前端模块）');
   assert(MODULES.includes('profile.js'), '应包含 profile.js（「编辑资料」自助弹窗）');
   assert(MODULES.includes('ordermgr.js'), '应包含 ordermgr.js（订单管理页）');
@@ -52,6 +52,7 @@ test('前端模块数量符合预期（未意外增删）', () => {
   assert(MODULES.includes('filetype.js'), '应包含 filetype.js（侧栏「文件类型」筛选，R44 —— 取代与地址栏重复的文件夹导航树）');
   assert(MODULES.includes('share-list.js'), '应包含 share-list.js（分享页列表勾选，R51 —— **普通脚本**，不是 ESM）');
   assert(MODULES.includes('share-order.js'), '应包含 share-order.js（分享页订单号一键复制，R64 —— **普通脚本**，不是 ESM：分享页 CSP 不允许内联脚本）');
+  assert(MODULES.includes('pwa.js'), '应包含 pwa.js（PWA 接线：SW 注册 + 「安装到桌面」入口，R70）');
 });
 
 for (const f of MODULES) {

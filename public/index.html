@@ -5,12 +5,23 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <meta name="referrer" content="no-referrer">
   <title>Kepler 对象存储管理系统</title>
+  <!-- ============ R70：PWA（可安装 / 桌面快捷方式） ============
+       ① manifest 走**服务端动态生成**的 /manifest.webmanifest —— 不能换成静态文件：
+          桌面快捷方式的名称由系统在安装那一刻读 manifest 的 name（退化到 short_name），
+          装完就固化，之后改 document.title 完全无效。站点名称是可配的，只能现场生成。
+       ② theme-color 与 manifest 的 theme_color 同值（#0067c0，即 css 的 --accent）：
+          Android 的地址栏与任务切换器用它上色。 -->
+  <link rel="manifest" href="/manifest.webmanifest">
+  <meta name="theme-color" content="#0067c0">
   <link rel="stylesheet" href="css/style.css">
   <!-- R40：主题脚本必须是 <head> 里的**普通脚本** —— 不能写成 module（module 天然 defer，
        会先按亮色画一帧再变暗，也就是"闪白"），也不能内联（CSP 的 script-src 没有
        'unsafe-inline'，见 server/index.js 的 SEC-06）。它同步把 data-theme 写到 <html> 上。 -->
   <script src="js/theme.js"></script>
+  <!-- favicon 用 data URI（随 HTML 走、零请求）；iOS 的「添加到主屏幕」不读 manifest，
+       只认 apple-touch-icon，所以另给一张 180×180 PNG（同源的白底圆角图形）。 -->
   <link rel="icon" href="data:image/svg+xml,<svg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'><rect width='32' height='32' rx='7' fill='%230067c0'/><path d='M8 11h6l2 2h8v10a2 2 0 0 1-2 2H10a2 2 0 0 1-2-2z' fill='%23fff'/></svg>">
+  <link rel="apple-touch-icon" href="/icons/apple-touch-icon.png">
 </head>
 <body>
   <!-- ============ 文件类型图标雪碧（R44） ============
@@ -73,6 +84,15 @@
             <div id="user-menu" class="user-menu" hidden>
               <div class="um-head" id="um-head"></div>
               <div class="um-item" id="um-profile">编辑资料</div>
+              <!-- R70：「安装到桌面」。默认 hidden —— 只有浏览器真的触发了
+                   beforeinstallprompt（可安装）时才由 js/pwa.js 放出来。
+                   在已装成 App 的独立窗口里、或浏览器不支持时，这一项永远不出现：
+                   摆一个点了没反应的菜单项，比不摆更让人困惑。
+                   上下各一条分隔线（同样默认 hidden），只在可安装时跟着出现，
+                   避免「一条悬空的分隔线」这种破绽。 -->
+              <div class="um-sep" id="um-install-sep-top" hidden></div>
+              <div class="um-item" id="um-install" hidden>安装到桌面</div>
+              <div class="um-sep" id="um-install-sep" hidden></div>
               <div class="um-item" id="um-users" hidden>用户管理</div>
               <div class="um-sep" id="um-sep" hidden></div>
               <div class="um-item danger" id="um-logout">退出</div>
@@ -912,7 +932,7 @@
             <div class="dash-card wide sysset-card">
               <h3 class="sysset-h3"><span class="sysset-tag about">关于</span>关于</h3>
               <div class="about-body">
-                <p><b>Kepler 对象存储管理系统</b> Build 1.9.5</p>
+                <p><b>Kepler 对象存储管理系统</b> Build 1.9.6</p>
                 <ul class="about-list">
                   <li>开发者：邢森</li>
                   <li>项目地址：<a href="https://github.com/xingsen2005/Kepler" target="_blank" rel="noopener noreferrer">https://github.com/xingsen2005/Kepler</a></li>
