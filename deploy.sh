@@ -1324,9 +1324,9 @@ resolve_node_version() {
   if [[ -n "$NODE_VERSION" ]]; then printf '%s' "${NODE_VERSION#v}"; return 0; fi
   local v=""
   v="$(curl -fsSL --max-time 15 https://nodejs.org/dist/index.json 2>/dev/null \
-        | grep -o '"version":"v20\.[0-9.]*"' | head -n1 | sed 's/.*:"v//;s/"//' || true)"
+        | grep -o '"version":"v24\.[0-9.]*"' | head -n1 | sed 's/.*:"v//;s/"//' || true)"
   [[ -n "$v" ]] && { printf '%s' "$v"; return 0; }
-  printf '%s' "20.19.0"   # 兜底：确定存在的 LTS 版本
+  printf '%s' "24.22.1"   # 兜底：24.x LTS 线上 CVE-2026-111497（Brotli 越界写）的最低修复版
 }
 
 node_tarball_base() {
@@ -1442,7 +1442,7 @@ centos_vault_hints() {
   add_hint "      ${PM} clean all"
   add_hint "      ${PM} makecache"
   add_hint "    ③ 重新安装 Node.js"
-  add_hint "      curl -fsSL https://rpm.nodesource.com/setup_20.x | bash -"
+  add_hint "      curl -fsSL https://rpm.nodesource.com/setup_24.x | bash -"
   add_hint "      ${PM} install -y nodejs --allowerasing"
   add_hint "  ⚠️ 只是权宜之计：CentOS ${major} 已不再收到安全更新，务必尽快迁移到"
   add_hint "  Rocky Linux / AlmaLinux（1:1 兼容的重建版）或 CentOS Stream（滚动维护版）。"
@@ -1452,16 +1452,16 @@ centos_vault_hints() {
 node_manual_hints() {
   local arch="${NODE_ARCH:-x64}"
   HINTS=()
-  add_hint "本机需要 Node.js ≥ v18（项目 package.json 的 engines 要求）。任选一种装法："
+  add_hint "本机需要 Node.js ≥ v24.22.1（项目 package.json 的 engines 要求；v24.22.1 是 CVE-2026-111497（Brotli 解码器越界写，可 RCE）的最低修复版，Node 20.x 及更早已 EOL 不再有修复）。任选一种装法："
   add_hint ""
   case "$PM" in
     apt)
       add_hint "  【A】NodeSource（Debian/Ubuntu —— 与本机匹配）"
-      add_hint "    curl -fsSL https://deb.nodesource.com/setup_20.x | bash -"
+      add_hint "    curl -fsSL https://deb.nodesource.com/setup_24.x | bash -"
       add_hint "    apt-get install -y nodejs" ;;
     dnf|yum)
       add_hint "  【A】NodeSource（RHEL/CentOS/Rocky/Alma —— 与本机匹配）"
-      add_hint "    curl -fsSL https://rpm.nodesource.com/setup_20.x | bash -"
+      add_hint "    curl -fsSL https://rpm.nodesource.com/setup_24.x | bash -"
       add_hint "    ${PM} install -y nodejs --allowerasing"
       # 已 EOL 的 CentOS 上，【A】一定装不上（源没了）—— 直接把 Vault 方案摆在紧后面，
       # 而不是让用户照着【A】再失败一次。
@@ -1474,16 +1474,16 @@ node_manual_hints() {
       add_hint "  【A】发行版源：$(pm_install_cmd) nodejs npm" ;;
   esac
   add_hint "  【B】其它发行版参考"
-  add_hint "    Debian/Ubuntu: curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && apt-get install -y nodejs"
-  add_hint "    RHEL/CentOS  : curl -fsSL https://rpm.nodesource.com/setup_20.x | bash - && dnf install -y nodejs --allowerasing"
+  add_hint "    Debian/Ubuntu: curl -fsSL https://deb.nodesource.com/setup_24.x | bash - && apt-get install -y nodejs"
+  add_hint "    RHEL/CentOS  : curl -fsSL https://rpm.nodesource.com/setup_24.x | bash - && dnf install -y nodejs --allowerasing"
   add_hint "  【C】官方二进制包（任何发行版通用，装进 /usr/local）"
-  add_hint "    curl -fsSL https://nodejs.org/dist/v20.19.0/node-v20.19.0-linux-${arch}.tar.gz \\"
+  add_hint "    curl -fsSL https://nodejs.org/dist/v24.22.1/node-v24.22.1-linux-${arch}.tar.gz \\"
   add_hint "      | tar -xz -C /usr/local --strip-components=1"
   add_hint "  【D】国内服务器可用 npmmirror 镜像（替换【C】的下载地址）"
-  add_hint "    https://registry.npmmirror.com/-/binary/node/v20.19.0/node-v20.19.0-linux-${arch}.tar.gz"
+  add_hint "    https://registry.npmmirror.com/-/binary/node/v24.22.1/node-v24.22.1-linux-${arch}.tar.gz"
   add_hint "  【E】用 nvm 自行管理多版本：https://github.com/nvm-sh/nvm"
   add_hint ""
-  add_hint "装完确认：node -v（应显示 v18/v20/v22 等 ≥ v18 的版本）"
+  add_hint "装完确认：node -v（应显示 ≥ v24.22.1 的版本）"
   add_hint "然后让脚本跳过安装、只做校验："
   add_hint "    $(rerun_cmd --skip-node)"
 }
@@ -1510,10 +1510,10 @@ node_conflict_hints() {
       add_hint "    1) ${PM} install -y nodejs --allowerasing   # 先试这条：让 dnf 直接替换掉冲突的旧模块包"
       add_hint "    2) ${PM} module reset nodejs"
       add_hint "    3) ${PM} remove -y nodejs npm nodejs-full-i18n nodejs-libs nodejs-devel"
-      add_hint "    4) curl -fsSL https://rpm.nodesource.com/setup_20.x | bash - && ${PM} install -y nodejs --allowerasing" ;;
+      add_hint "    4) curl -fsSL https://rpm.nodesource.com/setup_24.x | bash - && ${PM} install -y nodejs --allowerasing" ;;
     apt)
       add_hint "    1) apt-get remove -y nodejs npm && apt-get autoremove -y"
-      add_hint "    2) curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && apt-get install -y nodejs" ;;
+      add_hint "    2) curl -fsSL https://deb.nodesource.com/setup_24.x | bash - && apt-get install -y nodejs" ;;
     *)
       add_hint "    1) 先卸掉发行版自带的 nodejs/npm，再重新安装" ;;
   esac
@@ -1546,7 +1546,7 @@ node_pm_extra_args() {
 }
 
 install_node() {
-  local required="18"
+  local required="24.22.1"
   NODE_BIN="$(command -v node || true)"
   if [[ -n "$NODE_BIN" ]]; then
     local cur; cur="$("$NODE_BIN" -v | sed 's/^v//' || true)"
@@ -1589,13 +1589,13 @@ install_node() {
   # 4.2 NodeSource 仓库（Debian / RHEL 系）
   #
   # ⚠️ 信任假设（审计 L-11）：这两条是 `curl … | bash`，**无法做哈希校验** ——
-  # setup_20.x 是官方的**浮动分支脚本**（内容随上游更新），上游也不提供稳定哈希。
+  # setup_24.x 是官方的**浮动分支脚本**（内容随上游更新），上游也不提供稳定哈希。
   # 这里选择保留（它是标准做法，且装完的 npm 包仍受仓库签名保护），但把假设写明：
   #  · 信任对象 = `deb.nodesource.com` / `rpm.nodesource.com` 的 TLS 证书链（本机 CA）；
   #  · 若环境不允许「下载即执行」，请用下面的 4.3 官方 tarball 路径（已做 SHA-256 校验），
   #    或在镜像里预装 Node.js 后用 --mode= 跳过安装。
   if [[ "$PM" == "apt" || "$PM" == "dnf" || "$PM" == "yum" ]]; then
-    local major="$NODE_VERSION"; [[ -n "$major" ]] || major="20"
+    local major="$NODE_VERSION"; [[ -n "$major" ]] || major="24"
     major="${major%%.*}"
     info "尝试 NodeSource 仓库（Node ${major}.x）…"
     if [[ "$PM" == "apt" ]]; then
@@ -3672,7 +3672,7 @@ diagnose_service() {
     add_hint "  · 确认没有残留进程后：systemctl restart ${SERVICE_NAME}"
     add_hint "  · 仍不行就检查 ${DATA_DIR} 下的锁文件残留"
   elif grep -qiE 'SyntaxError|Unexpected token|not supported|ERR_REQUIRE_ESM' <<<"$j"; then
-    add_hint "【结论】Node 版本与代码不兼容（需要 ≥ v18）。"
+    add_hint "【结论】Node 版本与代码不兼容（需要 ≥ v24.22.1）。"
     add_hint "  · ${NODE_BIN:-node} -v"
     add_hint "  · 升级后用 $(rerun_cmd --skip-node) 重跑"
   elif [[ -n "$st" && "$st" != "active" ]]; then

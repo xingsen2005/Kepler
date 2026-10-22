@@ -54,12 +54,12 @@ test('R66-01 · CI 工作流存在，且真的会执行（npm ci / lint / 逐文
   assertMatch(code, /node --test "\$f"/,
     '必须逐文件跑测试：本项目实测过「全集 glob 会卡死」，且 node 18 的 --test 不支持 glob');
 
-  // 矩阵：至少要覆盖声明的两端（engines: >=18）与当前 LTS，以及两个平台
+  // 矩阵：至少要覆盖 engines 声明的下界（>=24.22.1 ⇒ 24），以及两个平台
   for (const os of ['ubuntu-latest', 'windows-latest']) {
     assert(code.includes(os), `矩阵里必须有 ${os} —— 只跑 Linux 会漏掉换行/路径类问题`);
   }
-  for (const v of ["'18'", "'20'", "'22'"]) {
-    assert(code.includes(v), `矩阵里必须有 Node ${v}（engines 声明 >=18，就得真的验 18）`);
+  for (const v of ["'24'"]) {
+    assert(code.includes(v), `矩阵里必须有 Node ${v}（engines 声明 >=24.22.1，就得真的验 24）`);
   }
   assertEqual(/continue-on-error:\s*true/.test(code), false,
     '不得用 continue-on-error 把红灯变成绿灯 —— 一条测试红就是红');

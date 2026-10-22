@@ -2698,7 +2698,7 @@ test('依赖清单必须与锁文件同步（否则 npm ci 必然失败）', () 
     `依赖清单与锁文件不同步（部署脚本的 npm ci 会每次失败，只能靠兜底 npm install 侥幸装上）：\n  ${bad.join('\n  ')}\n`
     + '  修法：npm install --package-lock-only（纯增量同步锁文件，不改已装的依赖）');
 
-  // engines 是文档里「Node ≥ 18」那条要求的单一事实源，锁文件根条目也必须跟它一致
+  // engines 是文档里「Node ≥ 24.22.1」那条要求的单一事实源，锁文件根条目也必须跟它一致
   if (pkg.engines) {
     const same = JSON.stringify(root.engines || null) === JSON.stringify(pkg.engines);
     assert(same,

@@ -10,7 +10,7 @@
 #    本项目实测过：把全部文件交给一个 glob 会**卡死**（跨文件状态泄漏 + 单进程内存
 #    累积），本地一直用 `for f in tests/*.test.js` 逐个跑。CI 必须与本地同口径，
 #    否则「本地绿、CI 红」这种最难排查的差异会天天发生。
-#    顺带的好处：node 18 的 `--test` 不支持 glob，逐文件写法对 18/20/22 都成立。
+#    顺带的好处：逐文件写法不依赖 `--test` 的 glob 支持，Node 24 上同样成立。
 #
 # 2) **不设置 `continue-on-error`，也不忽略非零退出码。** 一条测试红就是红。
 #    唯一的例外是「本机没有 bash」的部署脚本用例：它们在 Linux 上**全部真跑**，
@@ -35,14 +35,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest]
-        node: ['18', '20', '22']
-        exclude:
-          # Windows 只跑一个版本：Windows 侧的失败几乎都是「bash / 路径 / 换行」这类
-          # 与 Node 版本无关的问题，跑三遍不会多发现任何东西，只会把 CI 时间翻三倍。
-          - os: windows-latest
-            node: '18'
-          - os: windows-latest
-            node: '20'
+        node: ['24']
     steps:
       - name: 检出代码
         uses: actions/checkout@v4

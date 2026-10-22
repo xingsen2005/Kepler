@@ -99,7 +99,7 @@ curl -fLo /tmp/kepler-deploy.sh https://raw.githubusercontent.com/xingsen2005/Ke
 
 ---
 
-- Node.js ≥ 18（推荐 20 及以上；S3 适配器依赖内置 `fetch`，热重载依赖 `--watch`）
+- Node.js ≥ 24.22.1（24.22.1 是 CVE-2026-111497（Brotli 解码器越界写，可 RCE）的最低修复版，Node 20.x 及更早已 EOL 不再有修复；S3 适配器依赖内置 `fetch`，热重载依赖 `--watch`）
 - 仅一个运行时依赖：`express`（腾讯云自 1.7.2 起并入 S3 兼容协议，`cos-nodejs-sdk-v5` 已移除）
 - 测试与 lint 不引入运行时依赖：测试使用 Node 内置 `node:test`；ESLint 为可选开发依赖
 
@@ -139,7 +139,7 @@ npm run lint     # 代码检查（ESLint 可选，未安装时给出安装指引
 | 命令 | 说明 |
 | --- | --- |
 | `npm start` | 启动服务（HTTP + HTTPS） |
-| `npm run dev` | 开发模式，`node --watch` 监听文件变更自动重启（Node 18.11+ 内置，无需 nodemon） |
+| `npm run dev` | 开发模式，`node --watch` 监听文件变更自动重启（Node 内置，无需 nodemon） |
 | `npm test` | 运行 `tests/**/*.test.js` 全部测试（76 个文件 / 1387 条用例，零新增依赖） |
 | `npm run test:watch` | 测试监听模式，代码变更后即时重跑 |
 | `npm run lint` | ESLint 检查；未安装 eslint 时降级提示安装命令，不阻断流程 |
@@ -213,7 +213,7 @@ docker build -t s3-manager .
 docker run -d -p 3000:3000 -p 3443:3443 -v s3-data:/app/data s3-manager
 ```
 
-镜像基于 `node:22-alpine`，多阶段构建；以非 root 用户 `node` 运行，`tini` 作为 PID 1 转发信号，`/app/data` 声明为数据卷（**主密钥与配置都在此目录，务必持久化**）。`.dockerignore` 已排除 `data/`，不会将本机密钥打入镜像。
+镜像基于 `node:24.22.1-alpine`，多阶段构建；以非 root 用户 `node` 运行，`tini` 作为 PID 1 转发信号，`/app/data` 声明为数据卷（**主密钥与配置都在此目录，务必持久化**）。`.dockerignore` 已排除 `data/`，不会将本机密钥打入镜像。
 
 ---
 

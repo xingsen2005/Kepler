@@ -4938,10 +4938,10 @@ const CASES = [
       anchor: '      add_hint "    1) ${PM} install -y nodejs --allowerasing   # 先试这条：让 dnf 直接替换掉冲突的旧模块包"\n'
         + '      add_hint "    2) ${PM} module reset nodejs"\n'
         + '      add_hint "    3) ${PM} remove -y nodejs npm nodejs-full-i18n nodejs-libs nodejs-devel"\n'
-        + '      add_hint "    4) curl -fsSL https://rpm.nodesource.com/setup_20.x | bash - && ${PM} install -y nodejs --allowerasing" ;;',
+        + '      add_hint "    4) curl -fsSL https://rpm.nodesource.com/setup_24.x | bash - && ${PM} install -y nodejs --allowerasing" ;;',
       replacement: '      add_hint "    1) ${PM} module reset nodejs"\n'
         + '      add_hint "    2) ${PM} remove -y nodejs npm nodejs-full-i18n nodejs-libs nodejs-devel"\n'
-        + '      add_hint "    3) curl -fsSL https://rpm.nodesource.com/setup_20.x | bash - && ${PM} install -y nodejs" ;;',
+        + '      add_hint "    3) curl -fsSL https://rpm.nodesource.com/setup_24.x | bash - && ${PM} install -y nodejs" ;;',
       testFile: 'audit40-regressions.test.js',
       minFail: 1,
     },

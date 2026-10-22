@@ -2507,7 +2507,7 @@ test('deploy.sh：已 EOL 的 CentOS 必须给出 Vault（归档源）方案，�
   assert(/\bclean all\b/.test(vault) && /\bmakecache\b/.test(vault),
     '必须给出「清理并重建缓存」两步（dnf clean all + dnf makecache）：'
     + '只换源不清缓存，旧的 mirrorlist 元数据会继续作祟');
-  assert(/setup_20\.x/.test(vault),
+  assert(/setup_24\.x/.test(vault),
     '第 ③ 步必须回到「重装 node」——三步是一套完整可敲的动作，缺了它用户不知道换完源之后干嘛');
   assert(/Rocky|Alma/.test(vault) && /CentOS Stream/.test(vault),
     '必须建议迁移到 Rocky / Alma / CentOS Stream：Vault 只是权宜之计，EOL 的机器收不到安全更新');

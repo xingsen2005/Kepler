@@ -10,14 +10,14 @@
 # ============================================================
 
 # ---------- 阶段 1：安装依赖 ----------
-FROM node:22-alpine AS deps
+FROM node:24.22.1-alpine AS deps
 WORKDIR /app
 COPY package.json package-lock.json ./
 # 只装生产依赖，且忽略生命周期脚本（本项目依赖无需编译）
 RUN npm ci --omit=dev --ignore-scripts
 
 # ---------- 阶段 2：运行 ----------
-FROM node:22-alpine AS runtime
+FROM node:24.22.1-alpine AS runtime
 WORKDIR /app
 
 ENV NODE_ENV=production \
