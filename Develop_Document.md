@@ -36,72 +36,73 @@
     - [1.6 WebDAV 口令为可恢复加密](#develop_document-section12)
     - [1.7 为何不引入 SM4 作为文件加密算法](#develop_document-section13)
     - [1.8 为何不使用对象存储自带的服务端加密](#develop_document-section14)
-  - [2. 技术限制与已知局限](#develop_document-section15)
-  - [3. 威胁模型与不设防边界](#develop_document-section16)
-  - [4. 审计后的行为变更](#develop_document-section17)
-  - [5. 安全说明](#develop_document-section18)
-  - [6. REST API 模块化组织](#develop_document-section19)
-  - [7. HTTP API](#develop_document-section20)
-    - [7.1 认证与用户](#develop_document-section21)
-    - [7.2 配置、密钥与存储桶](#develop_document-section22)
-    - [7.3 文件与上传](#develop_document-section23)
-    - [7.4 分享、加密、IP、WebDAV、统计](#develop_document-section24)
-  - [8. 支付设置](#develop_document-section25)
-    - [8.1 主要校验规则](#develop_document-section26)
-    - [8.2 开关层级](#develop_document-section27)
-    - [8.3 接口](#develop_document-section28)
-    - [8.4 支付状态机](#develop_document-section29)
-    - [8.5 各状态切换的字段变化、校验与异常处理](#develop_document-section30)
-    - [8.6 已支付凭证](#develop_document-section31)
-    - [8.7 订单退款（人工记账）](#develop_document-section32)
-    - [8.8 真实支付网关](#develop_document-section33)
-    - [8.9 支付结果确认（服务端查单）](#develop_document-section34)
-  - [9. 搜索](#develop_document-section35)
-  - [10. 性能与可靠性](#develop_document-section36)
-- [三、核心模块实现](#develop_document-section37)
-  - [1. 文件加密与元数据](#develop_document-section38)
-    - [1.1 三种方式与密文结构](#develop_document-section39)
-    - [1.2 元数据是解密的唯一凭据](#develop_document-section40)
-    - [1.3 分片路径与完整性校验](#develop_document-section41)
-    - [1.4 查看密码与访问令牌](#develop_document-section42)
-    - [1.5 孤儿元数据巡检](#develop_document-section43)
-  - [2. 统一文件网关](#develop_document-section44)
-    - [2.1 收口的理由](#develop_document-section45)
-    - [2.2 读取路径：信号量与范围请求](#develop_document-section46)
-    - [2.3 删除、复制与移动的截断契约](#develop_document-section47)
-  - [3. 分片上传与断点续传](#develop_document-section48)
-  - [4. 分享链接生命周期](#develop_document-section49)
-    - [4.1 标识与快照字段](#develop_document-section50)
-    - [4.2 状态判定顺序](#develop_document-section51)
-    - [4.3 下载配额与来源判定](#develop_document-section52)
-  - [5. 请求上下文与会话鉴权](#develop_document-section53)
-  - [6. IP 访问守卫](#develop_document-section54)
-  - [7. 速率限制与失败锁定](#develop_document-section55)
-  - [8. 列举上限与目录缓存](#develop_document-section56)
-  - [9. 统计与操作日志](#develop_document-section57)
-  - [10. WebDAV 服务](#develop_document-section58)
-  - [11. 服务端点守卫](#develop_document-section59)
-  - [12. 上传过滤匹配器](#develop_document-section60)
-  - [13. 持久化、启动与关闭](#develop_document-section61)
-  - [14. 前端模块与渲染约定](#develop_document-section62)
-- [四、测试](#develop_document-section63)
-  - [1. 测试与 CI](#develop_document-section64)
-  - [2. 测试护栏编写约定](#develop_document-section65)
-- [五、开始二次开发](#develop_document-section66)
-  - [1. 高层架构总览](#develop_document-section67)
-    - [1.1 分层视图与请求链路](#develop_document-section68)
-    - [1.2 状态存放与启动顺序](#develop_document-section69)
-  - [2. 本地启动与调试](#develop_document-section70)
-    - [2.1 启动方式与端口](#develop_document-section71)
-    - [2.2 服务端调试](#develop_document-section72)
-    - [2.3 前端调试](#develop_document-section73)
-  - [3. 最小示例 A：新增一个只读接口](#develop_document-section74)
-    - [3.1 第一步：写路由](#develop_document-section75)
-    - [3.2 第二步：挂载与依赖注入](#develop_document-section76)
-    - [3.3 第三步：补护栏并验证](#develop_document-section77)
-  - [4. 最小示例 B：新增一个前端卡片](#develop_document-section78)
-  - [5. 二次开发检查清单](#develop_document-section79)
-- [六、审计发现台账（合并存档）](#develop_document-section80)
+    - [1.9 传递长尾依赖](#develop_document-section15)
+  - [2. 技术限制与已知局限](#develop_document-section16)
+  - [3. 威胁模型与不设防边界](#develop_document-section17)
+  - [4. 审计后的行为变更](#develop_document-section18)
+  - [5. 安全说明](#develop_document-section19)
+  - [6. REST API 模块化组织](#develop_document-section20)
+  - [7. HTTP API](#develop_document-section21)
+    - [7.1 认证与用户](#develop_document-section22)
+    - [7.2 配置、密钥与存储桶](#develop_document-section23)
+    - [7.3 文件与上传](#develop_document-section24)
+    - [7.4 分享、加密、IP、WebDAV、统计](#develop_document-section25)
+  - [8. 支付设置](#develop_document-section26)
+    - [8.1 主要校验规则](#develop_document-section27)
+    - [8.2 开关层级](#develop_document-section28)
+    - [8.3 接口](#develop_document-section29)
+    - [8.4 支付状态机](#develop_document-section30)
+    - [8.5 各状态切换的字段变化、校验与异常处理](#develop_document-section31)
+    - [8.6 已支付凭证](#develop_document-section32)
+    - [8.7 订单退款（人工记账）](#develop_document-section33)
+    - [8.8 真实支付网关](#develop_document-section34)
+    - [8.9 支付结果确认（服务端查单）](#develop_document-section35)
+  - [9. 搜索](#develop_document-section36)
+  - [10. 性能与可靠性](#develop_document-section37)
+- [三、核心模块实现](#develop_document-section38)
+  - [1. 文件加密与元数据](#develop_document-section39)
+    - [1.1 三种方式与密文结构](#develop_document-section40)
+    - [1.2 元数据是解密的唯一凭据](#develop_document-section41)
+    - [1.3 分片路径与完整性校验](#develop_document-section42)
+    - [1.4 查看密码与访问令牌](#develop_document-section43)
+    - [1.5 孤儿元数据巡检](#develop_document-section44)
+  - [2. 统一文件网关](#develop_document-section45)
+    - [2.1 收口的理由](#develop_document-section46)
+    - [2.2 读取路径：信号量与范围请求](#develop_document-section47)
+    - [2.3 删除、复制与移动的截断契约](#develop_document-section48)
+  - [3. 分片上传与断点续传](#develop_document-section49)
+  - [4. 分享链接生命周期](#develop_document-section50)
+    - [4.1 标识与快照字段](#develop_document-section51)
+    - [4.2 状态判定顺序](#develop_document-section52)
+    - [4.3 下载配额与来源判定](#develop_document-section53)
+  - [5. 请求上下文与会话鉴权](#develop_document-section54)
+  - [6. IP 访问守卫](#develop_document-section55)
+  - [7. 速率限制与失败锁定](#develop_document-section56)
+  - [8. 列举上限与目录缓存](#develop_document-section57)
+  - [9. 统计与操作日志](#develop_document-section58)
+  - [10. WebDAV 服务](#develop_document-section59)
+  - [11. 服务端点守卫](#develop_document-section60)
+  - [12. 上传过滤匹配器](#develop_document-section61)
+  - [13. 持久化、启动与关闭](#develop_document-section62)
+  - [14. 前端模块与渲染约定](#develop_document-section63)
+- [四、测试](#develop_document-section64)
+  - [1. 测试与 CI](#develop_document-section65)
+  - [2. 测试护栏编写约定](#develop_document-section66)
+- [五、开始二次开发](#develop_document-section67)
+  - [1. 高层架构总览](#develop_document-section68)
+    - [1.1 分层视图与请求链路](#develop_document-section69)
+    - [1.2 状态存放与启动顺序](#develop_document-section70)
+  - [2. 本地启动与调试](#develop_document-section71)
+    - [2.1 启动方式与端口](#develop_document-section72)
+    - [2.2 服务端调试](#develop_document-section73)
+    - [2.3 前端调试](#develop_document-section74)
+  - [3. 最小示例 A：新增一个只读接口](#develop_document-section75)
+    - [3.1 第一步：写路由](#develop_document-section76)
+    - [3.2 第二步：挂载与依赖注入](#develop_document-section77)
+    - [3.3 第三步：补护栏并验证](#develop_document-section78)
+  - [4. 最小示例 B：新增一个前端卡片](#develop_document-section79)
+  - [5. 二次开发检查清单](#develop_document-section80)
+- [六、审计发现台账（合并存档）](#develop_document-section81)
 
 ---
 
@@ -632,7 +633,264 @@ s3-client.js（内置）              azure-client.js（内置）
 
 故本系统自研加密：密钥完全掌握在用户手中，云厂商侧只能看到密文。其代价是 enc.key 与 enc-meta.json 必须与 secret.key 同等备份、缺一即密文永久不可解。
 
-<h2 id="develop_document-section15">2. 技术限制与已知局限</h2>
+<h3 id="develop_document-section15">1.9 传递长尾依赖</h3>
+
+本项目在 `dependencies` 中只声明了 `express@4.22.3` 一个依赖，但 `express` 自身具有**运行时闭包 68 个、开发时闭包 92 个**——「只有一个依赖」说的是 `package.json` 里的那一行，不是 `node_modules` 的实际规模。
+
+继续减少长尾依赖的**收益已经为零**，已做满的局部修剪清单：
+
+- `urlencoded` 用 `extended: false`；
+- `query parser` 用 `simple`；
+- 不设 `trust proxy`；
+- 不用 `accepts` / `format` / `vary` / `render` / `engine` / `param`；
+- cookie 由自己手写解析，不引 `cookie-parser`；
+- gzip / tar / qrcode / SMTP / PNG 全部自写，零依赖。
+
+由于 `eager require` 结构的原因，保留 `express` 等于运行时闭包**恒为 ~68 条**。要继续降低，只有换掉 `express` 这一条路。
+
+<h4>① 运行时闭包</h4>
+
+<h5>A. Express 框架本体</h5>
+
+| 包 | 作用 |
+| --- | --- |
+| `express@4.22.3` | Web 框架核心：应用 / 路由 / 中间件调度 |
+| `merge-descriptors@1.0.3` | 将 Router 方法合并到 app 对象（`app.get` 等代理） |
+| `utils-merge@1.0.1` | 浅合并配置对象（app settings 初始化） |
+| `path-to-regexp@0.1.13` | 路径字符串 → 正则（`/user/:id` 路由匹配） |
+| `array-flatten@1.1.1` | 展平路由注册参数（`app.get('/a', mw1, mw2)`） |
+| `methods@1.1.2` | HTTP 方法名清单（`router.get/post/...` 动态生成） |
+
+<h5>B. HTTP 报文基础工具</h5>
+
+| 包 | 作用 |
+| --- | --- |
+| `http-errors@2.0.1` | 构造带 status / expose 的 HTTP 错误对象 |
+| `statuses@2.0.2` | 状态码 ↔ 消息文本映射 |
+| `vary@1.1.2` | 追加 / 合并 `Vary` 响应头（缓存正确性） |
+| `range-parser@1.2.1` | 解析 `Range: bytes=0-99` 头（断点续传） |
+| `fresh@0.5.2` | 对比 ETag / Last-Modified 判断缓存是否仍新鲜（304） |
+| `etag@1.8.1` | 生成强 / 弱 ETag |
+| `encodeurl@2.0.0` | URL 编码用于 Location / Set-Cookie 头 |
+| `escape-html@1.0.3` | 错误页 HTML 转义（防 XSS） |
+| `ms@2.0.0` | 时间字符串 ↔ 毫秒（`maxAge: '1d'`）；`send` 因版本冲突嵌套了 `ms@2.1.3` |
+| `parseurl@1.3.3` | 带缓存的 `req.url` 解析（避免重复 parse） |
+| `media-typer@0.3.0` | 解析 `type/subtype+suffix` 结构（type-is 的底层） |
+
+<h5>C. 请求体解析管线（body-parser 家族）</h5>
+
+| 包 | 作用 |
+| --- | --- |
+| `body-parser@1.20.8` | JSON / urlencoded / raw / text 四种解析器 |
+| `raw-body@2.5.3` | 读取原始请求流为 Buffer（带长度限制） |
+| `bytes@3.1.2` | `'5mb'` → 字节数（limit 配置解析） |
+| `content-type@1.0.5` | 解析 / 序列化 `Content-Type`（含参数 charset） |
+| `content-disposition@0.5.4` | `Content-Disposition` 头（附件下载文件名） |
+| `type-is@1.6.18` | 判断请求体 MIME 是否匹配（`is('json')`） |
+| `iconv-lite@0.4.24` | 非 UTF-8 编码解码（GBK 等 charset 支持） |
+| `qs@6.16.1` | 嵌套查询串 / 表单解析（`a[b][c]=1`） |
+| `unpipe@1.0.0` | 请求流未消费时安全卸载（防挂起） |
+
+<h5>D. Cookie 体系</h5>
+
+| 包 | 作用 |
+| --- | --- |
+| `cookie@0.7.2` | Cookie 解析（`parse`）与序列化（`serialize`） |
+| `cookie-signature@1.0.7` | HMAC-SHA256 签名 / 验签（`s:` 前缀签名 Cookie） |
+
+<h5>E. 内容协商（Accept 家族）</h5>
+
+| 包 | 作用 |
+| --- | --- |
+| `accepts@1.3.8` | `req.accepts()` / `acceptsLanguages` 高层协商 |
+| `negotiator@0.6.3` | Accept / Accept-Language / Accept-Encoding 协商算法 |
+| `mime-types@2.1.35` | 扩展名 ↔ MIME 类型查找 |
+| `mime-db@1.52.0` | IANA MIME 完整数据库（mime-types 的数据源） |
+| `mime@1.6.0` | 独立的扩展名推断（send 用它从文件名猜 Content-Type） |
+
+<h5>F. 静态文件服务</h5>
+
+| 包 | 作用 |
+| --- | --- |
+| `serve-static@1.16.3` | `express.static()` 中间件 |
+| `send@0.19.2` | 文件流式响应：Range、条件请求、目录索引 |
+
+<h5>G. 网络地址与信任代理</h5>
+
+| 包 | 作用 |
+| --- | --- |
+| `proxy-addr@2.0.8` | 根据 `trust proxy` 设置确定客户端真实 IP |
+| `ipaddr.js@1.9.1` | IPv4 / IPv6 解析与 CIDR 匹配（`10.0.0.0/8`） |
+| `forwarded@0.2.0` | 解析 `X-Forwarded-For` 链 |
+
+<h5>H. 请求 / 响应生命周期与可观测性</h5>
+
+| 包 | 作用 |
+| --- | --- |
+| `finalhandler@1.3.2` | 中间件链末端：404 响应与最终错误输出 |
+| `on-finished@2.4.1` | 请求 / 响应完成时回调（访问日志、流清理） |
+| `ee-first@1.1.1` | 多事件「先到先得」监听（on-finished 的实现基础） |
+| `debug@2.6.9` | 条件调试日志（`DEBUG=express:*`） |
+| `depd@2.0.0` | 废弃 API 警告（deprecate） |
+| `destroy@1.2.0` | 强制销毁流 / socket（错误后释放资源） |
+| `object-inspect@1.13.4` | 对象字符串化（http-errors / finalhandler 调试输出） |
+| `toidentifier@1.0.1` | `'Not Found'` → `'notFound'`（错误类事件名转换） |
+| `setprototypeof@1.2.0` | `Object.setPrototypeOf` 的兼容封装 |
+
+<h5>I. 继承与 Buffer 安全</h5>
+
+| 包 | 作用 |
+| --- | --- |
+| `inherits@2.0.4` | 经典原型继承（http-errors 各错误类） |
+| `safe-buffer@5.2.1` | 无抛错的 Buffer API |
+| `safer-buffer@2.1.2` | iconv-lite 使用的 Buffer 安全层 |
+
+<h5>J. ECMAScript 规范垫片（intrinsic 抽象层，15 个）</h5>
+
+> 这组不实现业务功能，而是按 ECMA-262 规范安全访问 JS 内建能力，兼容老引擎并防原型污染。
+
+| 包 | 作用 |
+| --- | --- |
+| `get-intrinsic@1.3.0` | 按规范名获取原始内建（`%Object.prototype%`） |
+| `call-bind@1.0.4` | 安全 `Function.prototype.call/bind`（拒绝原始值 this） |
+| `call-bind-apply-helpers@1.0.2` | call / apply / bind 的分实现 |
+| `call-bound@1.0.4` | `callBind(intrinsic)` 的简写（绑定好的方法） |
+| `function-bind@1.1.2` | `Function.prototype.bind` 实现 |
+| `es-define-property@1.0.1` | 规范语义的 `[[DefineOwnProperty]]` |
+| `es-object-atoms@1.1.2` | `ToObject` / `RequireObjectCoercible` 原语 |
+| `es-errors@1.3.0` | 规范错误类型构造器 |
+| `es-set-prototypeof@1.2.0` | 规范语义的 `[[SetPrototypeOf]]` |
+| `get-proto@1.0.1` | 获取 `[[Prototype]]`（含跨 realm） |
+| `dunder-proto@1.0.1` | 通过 `__proto__` 访问器读原型 |
+| `gopd@1.2.0` | `Object.getOwnPropertyDescriptor` 兜底 |
+| `has-symbols@1.1.0` | Symbol 支持检测 |
+| `hasown@2.0.4` | 规范语义的 `Object.prototype.hasOwnProperty.call` |
+| `math-intrinsics@1.1.0` | `Math.floor/max` 等的安全引用 |
+
+<h5>K. 侧信道存储（防原型污染，4 个）</h5>
+
+> qs、call-bind 等用 WeakMap / Symbol 存储「私有」状态，而不是写对象属性，防御原型污染攻击。
+
+- `side-channel@1.1.1`（统一入口）
+- `side-channel-list@1.0.1`（无 Symbol 环境的列表实现）
+- `side-channel-map@1.0.1`（Map 实现）
+- `side-channel-weakmap@1.0.2`（WeakMap 实现）
+
+<h4>② 开发时闭包</h4>
+
+<h5>A. ESLint 核心引擎</h5>
+
+| 包 | 作用 |
+| --- | --- |
+| `eslint@9.39.5` | Linter 主体：规则调度、文件遍历、报告 |
+| `eslint-scope@8.4.0` | 作用域分析（变量声明 / 引用追踪） |
+| `eslint-visitor-keys@4.2.1` | AST 节点子键表（遍历器 keys） |
+| `espree@10.4.0` | 默认解析器 |
+| `esquery@1.7.0` | AST 选择器（`esquery`，用于规则匹配节点） |
+| `esrecurse@4.3.0` | AST 递归遍历（esquery 依赖） |
+| `estraverse@5.3.0` | AST 遍历控制器 |
+| `esutils@2.0.3` | AST / 关键字工具（regex 判断等） |
+| `acorn@8.18.0` | JS 解析器内核 |
+| `acorn-jsx@5.3.2` | acorn 的 JSX 插件 |
+| `@types/estree@1.0.9` | ESTree AST 类型定义 |
+
+<h5>B. ESLint 配置系统（Flat Config 生态）</h5>
+
+| 包 | 作用 |
+| --- | --- |
+| `@eslint/config-array@0.21.2` | flat config 数组抽象（层叠合并） |
+| `@eslint/config-helpers@0.4.2` | 配置辅助函数 |
+| `@eslint/core@0.17.0` | 共享类型 / 工具 |
+| `@eslint/eslintrc@3.3.7` | 旧式 `.eslintrc` 兼容层 |
+| `@eslint/js@9.39.5` | 官方推荐规则集 |
+| `@eslint/object-schema@2.1.7` | 配置对象 schema 校验 |
+| `@eslint/plugin-kit@0.4.1` | 插件开发工具 |
+| **@eslint-community 系列工具** | |
+| `@eslint-community/eslint-utils@4.10.1` | 规则编写工具（getStaticValue 等） |
+| `@eslint-community/regexpp@4.12.2` | 正则表达式 AST 解析（no-control-regex 等规则） |
+| `globals@14.0.0` | 各环境全局变量清单（browser / node / es2024） |
+
+<h5>C. 配置文件发现与解析</h5>
+
+| 包 | 作用 |
+| --- | --- |
+| `js-yaml@4.3.2` | 解析 YAML 配置（`.eslintrc.yml`） |
+| `json-stable-stringify-without-jsonify@1.0.1` | 稳定 JSON 序列化（缓存 key） |
+| `strip-json-comments@3.1.1` | 剥离 JSON 注释 |
+| `import-fresh@3.3.1` | 绕过 require 缓存重新加载配置 |
+| `parent-module@1.0.1` | 获取调用方模块（import-fresh 依赖） |
+| `callsites@3.1.0` | 调用栈信息（parent-module 依赖） |
+| `resolve-from@4.0.0` | 从指定目录 resolve 模块（插件解析） |
+| `cross-spawn@7.0.6` | 跨平台子进程（`--init` 等） |
+| `shebang-command@2.0.0` / `shebang-regex@3.0.0` | 解析 `#!` 行（Windows 下换 shell） |
+| `path-key@3.1.1` | PATH 环境变量键名（Windows 是 `Path`） |
+
+<h5>D. 文件匹配与忽略</h5>
+
+| 包 | 作用 |
+| --- | --- |
+| `ignore@5.3.2` | `.eslintignore` 规则引擎 |
+| `minimatch@3.1.5` | glob 匹配（`**/*.js`） |
+| `brace-expansion@1.1.21` | `{a,b}` 花括号展开 |
+| `balanced-match@1.0.2` / `concat-map@0.0.1` | minimatch 的底层工具 |
+| `glob-parent@6.0.2` | 取 glob 的静态父目录（用于 watch / ignore） |
+| `is-glob@4.0.3` / `is-extglob@2.1.1` | 判断字符串是否含 glob 语法 |
+| `natural-compare@1.4.0` | 自然排序（`file2` < `file10`，结果排序确定性） |
+
+<h5>E. 缓存系统</h5>
+
+| 包 | 作用 |
+| --- | --- |
+| `file-entry-cache@8.0.0` | 按文件 mtime 缓存 lint 结果（增量加速） |
+| `flat-cache@4.0.1` | 磁盘键值缓存 |
+| `flatted@3.4.4` | 支持循环引用的 JSON 序列化 |
+| `keyv@4.5.4` | 统一 KV 存储接口 |
+| `json-buffer@3.0.1` | Buffer 的 JSON 编解码（keyv） |
+| `imurmurhash@0.1.4` | 增量哈希（缓存一致性校验） |
+| `fast-deep-equal@3.1.3` | 深比较（配置变化检测） |
+| `fast-json-stable-stringify@2.1.0` | 稳定序列化（缓存 key 生成） |
+| `fast-levenshtein@2.0.6` | 编辑距离 |
+
+<h5>F. 命令行与终端 UI</h5>
+
+| 包 | 作用 |
+| --- | --- |
+| `chalk@4.1.2` | 终端着色（错误红色等） |
+| `ansi-styles@4.3.0` | ANSI 转义码定义 |
+| `supports-color@7.2.0` | 终端颜色能力检测 |
+| `has-flag@4.0.0` | 命令行 flag 检测 |
+| `optionator@0.9.4` | CLI 参数解析（`--fix` 等） |
+| `prelude-ls@1.2.1` | 函数式工具（optionator 依赖） |
+| `type-check@0.4.0` | 类型断言（optionator 参数校验） |
+| `levn@0.4.1` | 类 JSON DSL 解析（optionator） |
+| `deep-is@0.1.4` | 深比较（levn / optionator） |
+| `word-wrap@1.2.5` | 消息折行（`--format` 输出对齐） |
+| `argparse@2.0.1` | 参数解析（js-yaml 依赖） |
+
+<h5>G. Node 通用工具杂项</h5>
+
+| 包 | 作用 |
+| --- | --- |
+| `which@2.0.2` | PATH 中查找可执行文件 |
+| `isexe@2.0.0` | 可执行权限判断（which 依赖） |
+| `lodash.merge@4.6.2` | 深合并（规则配置合并） |
+| `punycode@2.3.1` | 域名编码（uri-js 依赖） |
+| `uri-js@4.4.1` | URI 解析（ajv 的 format 校验） |
+| `@humanwhocodes/module-importer@1.0.1` | ESM / CJS 双态导入 |
+| `@humanwhocodes/retry@0.4.3` | 重试工具（网络缓存写入） |
+| `@humanfs/*`（core / node / types） | 虚拟文件系统抽象（eslint 9 的 fs 层） |
+| `yocto-queue@0.1.0` | 微型队列（p-limit 依赖） |
+
+<h5>H. 嵌套副本（16 条）——npm 版本冲突仲裁记录</h5>
+
+| 位置 | 原因 |
+| --- | --- |
+| `debug@4.4.3` ×3 + `ms@2.1.3` ×3 | 根目录 debug 锁在 2.x（Express 要求），eslint / config-array / eslintrc 需要 4.x → 各自内嵌 |
+| `ajv@6.15.0` ×2 + `json-schema-traverse@0.4.1` ×2 | eslint / eslintrc 需要 ajv@6，根或其他依赖占用 ajv@8 → 内嵌 |
+| `find-up@5`、`locate-path@6`、`p-limit@3`、`p-locate@5`、`path-exists@4` | eslint 需要 find-up@5 一族，与外部版本冲突 → 整链内嵌 |
+| `eslint-visitor-keys@3.4.3` | eslint-utils 需要 v3，根已升级 v4 → 内嵌 |
+
+<h2 id="develop_document-section16">2. 技术限制与已知局限</h2>
 
 - 本项目为个人项目，未经企业级安全审计，请勿直接用于企业生产环境。
 - WebDAV 的 **PUT 写入**为全量缓冲（整份文件进内存后才加密上传），属设计权衡，暂不优化；**读取侧支持 HTTP Range 断点续传**，二者不冲突——前者是写入路径，后者是读取路径。
@@ -656,7 +914,7 @@ s3-client.js（内置）              azure-client.js（内置）
 - 公钥与凭据 ID **不下发前端**，前端只拿到 `webauthnEnabled` 布尔值与随机挑战。
 
 
-<h2 id="develop_document-section16">3. 威胁模型与不设防边界</h2>
+<h2 id="develop_document-section17">3. 威胁模型与不设防边界</h2>
 
 **设防（设计上明确抵御）**
 
@@ -682,7 +940,7 @@ s3-client.js（内置）              azure-client.js（内置）
 
 **magic 模式的明确定位**：它是**混淆级**保护，用于对抗「有人顺手打开云盘控制台、看到一堆文件就想点开看看」这类弱动机窥探（密文文件头被魔数覆写，直接双击无法打开）。它**不**用于对抗有动机的攻击者：异或密钥流不具备语义安全——同一主密钥 + 同一盐下相同明文必产生相同密文，且只要知道任意一段明文就能反推出该段的密钥流，进而还原对象其余部分。需要真正的保密性请使用 crypto 模式。
 
-<h2 id="develop_document-section17">4. 审计后的行为变更</h2>
+<h2 id="develop_document-section18">4. 审计后的行为变更</h2>
 
 | 变更 | 影响 |
 | --- | --- |
@@ -713,7 +971,7 @@ s3-client.js（内置）              azure-client.js（内置）
 | 支付轮询补按 IP 的查单预算 | `/s/:id/pay/status` 原本只有订单级节流（3 秒一次）而无按 IP 总量上限，持票据者可造多个订单把网关查单预算放大到约 66 倍。现叠加 200/10 分钟的按 IP 预算，超限时静默返回当前状态（不打断正常 3 秒轮询） |
 | `magic` 上限下沉到加密入口 | 上限不再只在分片路径生效：直传与 WebDAV PUT 两条「整文件一次加密」入口由 `encryptBuffer` 自身按模式拒绝（超限 413）；「中途切到 magic 的续传会话」如实拒绝并要求重建任务，避免单个大分片同步阻塞数秒 |
 
-<h2 id="develop_document-section18">5. 安全说明</h2>
+<h2 id="develop_document-section19">5. 安全说明</h2>
 
 - **密钥加密存储**：配置写入 `data/config.enc`，AES-256-GCM（随机 IV + 认证标签）；主密钥为本机随机生成的 `data/secret.key`；访问密钥不回传浏览器，界面仅显示掩码。
 - **账号口令存储**：登录口令以 **scrypt** 派生后只存盐与摘要——16 字节随机盐（32 位十六进制）、32 字节输出、代价参数取 Node 默认（N=16384 / r=8 / p=1）；校验用 `timingSafeEqual` 做定长比较，避免时序侧信道。必须使用**异步** scrypt（理由见「文件加密与元数据」）：同步版本会占满单线程事件循环，几十个并发请求就能让全站（含正在进行的下载与 WebDAV）一起卡死。WebDAV 口令因协议限制只能可恢复加密，与登录口令完全隔离（见「设计背景与刻意取舍」）。
@@ -731,7 +989,7 @@ s3-client.js（内置）              azure-client.js（内置）
 - **操作审计**：上传 / 下载 / 删除 / 重命名 / 移动 / 配置变更等关键操作记录于 `data/logs.jsonl`，界面内可筛选查看。
 - **支付结果只认服务端查单**：规则见「设计背景与刻意取舍 → 支付结果仅限服务端查单返回」（权威定义，此处不重复）。已支付票据为 `订单ID.HMAC(linkId:orderId)` 的签名 Cookie（`httpOnly` + `SameSite=Lax`），签名输入同时绑定链接与订单，无法跨链接复用。
 
-<h2 id="develop_document-section19">6. REST API 模块化组织</h2>
+<h2 id="develop_document-section20">6. REST API 模块化组织</h2>
 
 `server/routes.js` 是一个轻量**聚合器**，按业务领域将路由分散到 `server/routes/` 下的子模块，各子模块互不依赖：
 
@@ -767,7 +1025,7 @@ server/routes/
 - **挂载顺序有语义**：`auth` 必须最先（匿名白名单依赖它先命中）；`/credentials/visibility` 必须注册在 `/credentials/:id` 之前，否则会被参数路由吞掉。改动顺序前先运行 `npm test`。
 - **路由表面积受测试保护**：`tests/routes-surface.test.js` 维护期望路由基线，增删路由必须同步更新，避免误删或意外遮蔽。
 
-<h2 id="develop_document-section20">7. HTTP API</h2>
+<h2 id="develop_document-section21">7. HTTP API</h2>
 
 除登录 / 初始化 / 验证码与公开分享页外，`/api/**` 均需登录会话，非安全方法须携带同源头 `X-Requested-With`。
 
@@ -821,7 +1079,7 @@ server/routes/
 
 > 这套做法的代价是**客户端必须理解业务语义**，无法靠响应体自洽。这是已知的取舍：给 `error` 加机器可读码要改 `sendError()` 与全部 `badRequest()` 调用点（约几十处），属于破坏性契约变更，当前版本不做。若你确实需要它，改造入口就在上一段引用的那两个符号。
 
-<h3 id="develop_document-section21">7.1 认证与用户</h3>
+<h3 id="develop_document-section22">7.1 认证与用户</h3>
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
@@ -907,7 +1165,7 @@ curl -s -b cookie.txt http://127.0.0.1:3000/api/auth/me
 - `401` 无会话访问受保护接口 → `{ "error": "未登录或会话已过期，请重新登录" }`
 
 
-<h3 id="develop_document-section22">7.2 配置、密钥与存储桶</h3>
+<h3 id="develop_document-section23">7.2 配置、密钥与存储桶</h3>
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
@@ -972,7 +1230,7 @@ curl -s -b cookie.txt -X PUT http://127.0.0.1:3000/api/config \
 - `400` 服务商不支持 → `{ "error": "当前版本暂不支持该服务商，请选择其他服务商" }`
 - `403` 非管理员 → `{ "error": "仅管理员可执行该操作" }`（前端隐藏入口只是第一层，接口层一律强制校验）
 
-<h3 id="develop_document-section23">7.3 文件与上传</h3>
+<h3 id="develop_document-section24">7.3 文件与上传</h3>
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
@@ -1092,7 +1350,7 @@ curl -s -b cookie.txt -X POST http://127.0.0.1:3000/api/fs/upload/init \
 
 - `chunk` 会校验分片大小 ≤ 会话的 `chunkSize`，超限返回 **400**（R10-08）：分片偏移已由 `chunkSize` 确定，超大的分片既无法正确合并，也会让 magic 的同步 XOR 独占事件循环数秒。
 
-<h3 id="develop_document-section24">7.4 分享、加密、IP、WebDAV、统计</h3>
+<h3 id="develop_document-section25">7.4 分享、加密、IP、WebDAV、统计</h3>
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
@@ -1285,11 +1543,11 @@ curl -s -b cookie.txt -X POST http://127.0.0.1:3000/api/payment/orders/po_1d3f5a
 - `400` 未支付成功 → `{ "error": "该订单未支付成功，无需退款" }`
 - `400` 尚未支付 → `{ "error": "该订单尚未完成支付，无法退款" }`
 
-<h2 id="develop_document-section25">8. 支付设置</h2>
+<h2 id="develop_document-section26">8. 支付设置</h2>
 
 系统设置页内的「支付设置」卡片用于登记各支付平台的 API 凭证与站点地址。凭证部分只做**必填与格式校验**（不代持资金、不做联机验证）；下单与查单由 `server/payment-gateway.js` 直连各平台官方接口完成。
 
-<h3 id="develop_document-section26">8.1 主要校验规则</h3>
+<h3 id="develop_document-section27">8.1 主要校验规则</h3>
 
 | 平台 | 字段 | 规则 |
 | --- | --- | --- |
@@ -1307,7 +1565,7 @@ curl -s -b cookie.txt -X POST http://127.0.0.1:3000/api/payment/orders/po_1d3f5a
 | PayPal | Client ID / Client Secret | 20 ~ 128 位，可含 `-` `_` |
 | PayPal | 运行环境 `mode` | `sandbox` / `live` |
 
-<h3 id="develop_document-section27">8.2 开关层级</h3>
+<h3 id="develop_document-section28">8.2 开关层级</h3>
 
 | 层级 | 字段 | 说明 |
 | --- | --- | --- |
@@ -1317,7 +1575,7 @@ curl -s -b cookie.txt -X POST http://127.0.0.1:3000/api/payment/orders/po_1d3f5a
 
 三态区分（界面与接口均体现）：`enabled`（开关打开）→ `configured`（凭证填完）→ `available`（= 两者皆真，下载者才可选它付款）。渠道开启但凭证未填完时状态为**待补全**，不参与可收款渠道列表。
 
-<h3 id="develop_document-section28">8.3 接口</h3>
+<h3 id="develop_document-section29">8.3 接口</h3>
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
@@ -1334,7 +1592,7 @@ curl -s -b cookie.txt -X POST http://127.0.0.1:3000/api/payment/orders/po_1d3f5a
 
 > 十条接口全部挂载 `requireAdmin`；该卡片列入 `ADMIN_ONLY_CARDS`，普通用户整卡不可见且不发请求。凭证随系统配置一同以 AES-256-GCM 加密保存于 `data/config.enc`。
 
-<h3 id="develop_document-section29">8.4 支付状态机</h3>
+<h3 id="develop_document-section30">8.4 支付状态机</h3>
 
 ```
 （访问链接）→ 未支付 ──选渠道发起──→ 支付中 ──成功──→ 已支付 ──管理员标记退款──→ 已退款（凭证失效）
@@ -1351,7 +1609,7 @@ curl -s -b cookie.txt -X POST http://127.0.0.1:3000/api/payment/orders/po_1d3f5a
 
 > 下载放行是**白名单判定**（`payerState(...) === 'paid'` 才放行），而不是"只要不是未支付就放行"的黑名单 —— 后者在新增状态时会被默认放行，退款后仍能下载等于下载者可免费获取文件。
 
-<h3 id="develop_document-section30">8.5 各状态切换的字段变化、校验与异常处理</h3>
+<h3 id="develop_document-section31">8.5 各状态切换的字段变化、校验与异常处理</h3>
 
 | 切换 | 字段变化 | 校验规则 | 异常场景 |
 | --- | --- | --- | --- |
@@ -1368,13 +1626,13 @@ curl -s -b cookie.txt -X POST http://127.0.0.1:3000/api/payment/orders/po_1d3f5a
 
 > **币种语义**：`currency` 恒为 `CNY`——它是 `payment-rules.js` 中的常量，写入分享链接时由 `normalisePaid` 强制归一，接口不接受其他取值。PayPal 本身支持多币种，但本系统不开放：各币种的最小单位并不相同（JPY 无小数位、KWD 为三位小数），「以分为整数」这一金额语义只对人民币成立，放开币种等于引入一整类舍入错误。
 
-<h3 id="develop_document-section31">8.6 已支付凭证</h3>
+<h3 id="develop_document-section32">8.6 已支付凭证</h3>
 
 支付成功后下发 Cookie 票据 `订单ID.HMAC(linkId:orderId)`，`httpOnly` + `SameSite=Lax`。签名输入同时绑定链接与订单，因此票据**无法跨链接复用**、也无法伪造；下载端只认 `status === 'paid'` 的订单。
 
 标记为已退款后，票据依然能被识别（`payerState` 返回 `refunded` 而非 `none`）——这让下载者看到「这笔已退款，请重新支付」而不是「请付费下载」，但**不产生任何放行效果**；退款订单同样纳入「永不裁剪」集合，否则日后无从证明这笔钱退过。
 
-<h3 id="develop_document-section32">8.7 订单退款（人工记账）</h3>
+<h3 id="develop_document-section33">8.7 订单退款（人工记账）</h3>
 
 **本系统不代持资金**——下载者付的钱从未经过这台服务器，退款是在支付宝 / 微信支付 / PayPal 的商户后台手动完成的。因此退款功能**不发起、也不可能有**任何网关退款调用，它只做三件事：
 
@@ -1392,7 +1650,7 @@ curl -s -b cookie.txt -X POST http://127.0.0.1:3000/api/payment/orders/po_1d3f5a
 
 > **为什么不做真退款**：真退款需要商户私钥去调用网关的退款接口，并要求处理异步退款通知、部分退款、退款失败重试与手续费退还。本系统的定位是「托管下载 + 记账」，引入这些等于引入一条全新的资金流链路和相应的一致性责任；相比之下，人工在商户后台退款 + 在此处打标记，语义更诚实：系统不会假装自己经手了钱。
 
-<h3 id="develop_document-section33">8.8 真实支付网关</h3>
+<h3 id="develop_document-section34">8.8 真实支付网关</h3>
 
 `server/payment-gateway.js` 直连三家平台的官方接口，**零新增依赖**（RSA-SHA256 签名、AES-256-GCM 解密、HTTP 调用全部基于 Node 内置模块）：
 
@@ -1404,7 +1662,7 @@ curl -s -b cookie.txt -X POST http://127.0.0.1:3000/api/payment/orders/po_1d3f5a
 
 微信 Native 的二维码由 `server/qrcode.js` 自行生成（字节模式、纠错等级 M、版本 1–10、按 ISO/IEC 18004 计算纠错码字与掩码惩罚分，输出内联 SVG），不引入二维码库；`tests/qrcode.test.js` 按标准逐项校验。
 
-<h3 id="develop_document-section34">8.9 支付结果确认（服务端查单）</h3>
+<h3 id="develop_document-section35">8.9 支付结果确认（服务端查单）</h3>
 
 规则同「设计背景与刻意取舍 → [支付结果仅限服务端查单返回](#develop_document-section10)」（**权威定义，此处不重复**）。支付侧的两个具体落点：
 
@@ -1413,7 +1671,7 @@ curl -s -b cookie.txt -X POST http://127.0.0.1:3000/api/payment/orders/po_1d3f5a
 
 **新增一家支付平台的步骤**：① 在 `server/payment-providers.js` 定义 `fields`（含 `official` 官方字段名、`pattern` / `validator` / `secret` 标记、`maxLength`）；② 需要联机校验时用 `registerValidator(platformId, fn)` 登记，路由与前端无需改动；③ 在 `server/payment-gateway.js` 实现 `createCharge` / `queryCharge`——**查单必须 fail-closed**（异常即视为未支付，不放行）；④ 前端 `paysettings.js` 的表单由服务端下发的同一份字段定义渲染，通常无需改动，只需在 `payment-logos.js` 追加 LOGO。
 
-<h2 id="develop_document-section35">9. 搜索</h2>
+<h2 id="develop_document-section36">9. 搜索</h2>
 
 搜索的**正确性**已经完整（逐页扫描 + 游标续扫、不重不漏、客户端断开即停止翻页），本节只讨论**性能**：还有哪些社区建议没有采纳，以及为什么。
 
@@ -1439,7 +1697,7 @@ curl -s -b cookie.txt -X POST http://127.0.0.1:3000/api/payment/orders/po_1d3f5a
 - **站外写入不可感知**：别人绕过本系统（直接在控制台操作、或经其他工具写桶）时，本进程收不到任何信号，只能等 TTL 到期。这与「缓存多久」无关，是分布式系统的固有代价 —— 影响范围只是「最多陈旧一个 TTL」。
 - **首轮必须真扫一遍**：候选集只能让**后续**搜索免费；第一次搜索（或 TTL 过期后）仍要按页翻完整个前缀。若单桶对象数到 10 万量级，首扫延迟会变得显眼 —— 此时正确的做法是**后台扫描作业**（定时物化候选集），而不是继续加长 TTL。
 
-<h2 id="develop_document-section36">10. 性能与可靠性</h2>
+<h2 id="develop_document-section37">10. 性能与可靠性</h2>
 
 - **异步 I/O**：日志内存缓冲（50 条或 2 秒）批量落盘；配置、加密元数据、分享链接、上传会话、统计均异步 / 串行写入，避免阻塞事件循环。
 - **缓存与并发**：解密配置 60 秒 TTL 缓存；多桶统计并发上限 3，腾讯云优先调用官方 `?stats`、失败回退对象列举（S3 厂商直接走列举估算），容量结果缓存 15 分钟。
@@ -1448,12 +1706,12 @@ curl -s -b cookie.txt -X POST http://127.0.0.1:3000/api/payment/orders/po_1d3f5a
 
 ---
 
-<h1 id="develop_document-section37">三、核心模块实现</h1>
+<h1 id="develop_document-section38">三、核心模块实现</h1>
 
-<h2 id="develop_document-section38">1. 文件加密与元数据</h2>
+<h2 id="develop_document-section39">1. 文件加密与元数据</h2>
 
 
-<h3 id="develop_document-section39">1.1 三种方式与密文结构</h3>
+<h3 id="develop_document-section40">1.1 三种方式与密文结构</h3>
 
 `server/enc-store.js` 提供三种模式，密文结构互不相同：
 
@@ -1469,7 +1727,7 @@ curl -s -b cookie.txt -X POST http://127.0.0.1:3000/api/payment/orders/po_1d3f5a
 
 > 魔数模式属于混淆级保护，非强加密，建议仅用于防止 IDC 服务商审核。若涉及隐私或敏感数据请务必选择 crypto 模式。
 
-<h3 id="develop_document-section40">1.2 元数据是解密的唯一凭据</h3>
+<h3 id="develop_document-section41">1.2 元数据是解密的唯一凭据</h3>
 
 解密参数（IV / TAG / 盐 / 原始文件头 / 原始大小）保存在 `data/enc-meta.json`，按 `<bucket>|<key>` 索引。该文件是 crypto 与 magic 两种模式解密的**唯一**凭据来源，因此围绕它有一组硬性约束：
 
@@ -1477,7 +1735,7 @@ curl -s -b cookie.txt -X POST http://127.0.0.1:3000/api/payment/orders/po_1d3f5a
 - 密文一旦安全落云，立即把解密凭据同步落盘，将「云端已有密文、本地尚无元数据」的窗口压到零；上传完成等关键节点与进程退出钩子各兜一次。
 - 重命名 / 移动 / 复制时同步迁移元数据；只有**云端确认删除成功**的对象才清理其元数据。按前缀无条件清空的接口已从代码中移除：它与「列举被截断」组合时会只删掉前 N 个对象却清空整个前缀的元数据，残留密文永久不可解。
 
-<h3 id="develop_document-section41">1.3 分片路径与完整性校验</h3>
+<h3 id="develop_document-section42">1.3 分片路径与完整性校验</h3>
 
 分片加密状态随上传会话持久化，magic 模式的盐与原始文件头在首次加密时即固定，进程重启后续传仍保持一致。
 
@@ -1488,7 +1746,7 @@ magic 属混淆级保护，本身没有认证标签：密文一旦被篡改或�
 - crypto 模式为**每段独立**的 GCM 认证：段内任何字节被篡改，都会在该段 `decipher.final()` 处报错；密文被**截断**时，末尾的分段状态机走不完，`flush` 直接判为「数据不完整」——也就是说「尾部少一段 / 少几个字节」是可以检出的。
 - 但**逐段 GCM 只认证单段**：AAD 为空，段序号与对象身份都没有被绑定进认证。因此把两个**等长**段的 `IV ‖ 密文 ‖ TAG` 整块互换、或把同一密钥下另一个对象的段拼进来，每段自身依然能通过认证——解出的是顺序错误或来源错误的明文，且无从察觉。这是**已知局限**：补 AAD 需要版本号与迁移路径（老密文没有 AAD，直接改会让历史对象全部解不开），因此暂未引入。
 
-<h3 id="develop_document-section42">1.4 查看密码与访问令牌</h3>
+<h3 id="develop_document-section43">1.4 查看密码与访问令牌</h3>
 
 查看密码是可选的访问控制层，与加密密钥相互独立（以 scrypt 哈希存储，忘记可重置）。校验通过后签发 30 分钟有效的 HMAC 令牌：**管理端 `/api/**` 只从 `x-enc-token` 请求头读取**（不进入 URL、浏览器历史、Referer 与访问日志），**分享页 `/s/…` 另发一枚 `HttpOnly`、`path=/s/` 的 Cookie** 供解锁后复用（该 Cookie 不进入 `/api/**`）。
 
@@ -1496,24 +1754,24 @@ R22-04：本库「解密下发」共三个出口 —— 管理端 `/api/fs/downl
 
 口令校验入口一律使用异步 scrypt：该类入口攻击者可达，同步版本会占满单线程事件循环，数十个并发请求即可让全站失去响应。
 
-<h3 id="develop_document-section43">1.5 孤儿元数据巡检</h3>
+<h3 id="develop_document-section44">1.5 孤儿元数据巡检</h3>
 
 对象被本系统之外的工具删除，或云端操作成功而本地元数据写入失败，都会留下指向已不存在对象的元数据。孤儿记录本身只造成无谓膨胀，但元数据丢失意味着密文永久不可解，二者方向相反、不可简单取舍。因此提供巡检接口：列出某桶下「本地有元数据、云端已无对应对象」的候选，**交由调用方决定是否清理**，巡检过程本身不删除任何记录。
 
-<h2 id="develop_document-section44">2. 统一文件网关</h2>
+<h2 id="develop_document-section45">2. 统一文件网关</h2>
 
-<h3 id="develop_document-section45">2.1 收口的理由</h3>
+<h3 id="develop_document-section46">2.1 收口的理由</h3>
 
 `server/fs-gateway.js` 是全部对象读写删操作的唯一入口，管理端路由与 WebDAV 共用。收口之前 WebDAV 直连 SDK，会产生四类问题：写入未加密、读取直接下发密文（用户编辑回写即永久损坏）、删除 / 复制 / 移动不联动元数据、全链路无审计日志。
 
 网关行为随加密模式自动切换：不加密时走直通路径，行为与未启用加密完全一致；加密时写操作自动加密后上传，读操作挂载解密流透明还原，删除与复制移动同步联动元数据并记录审计。
 
-<h3 id="develop_document-section46">2.2 读取路径：信号量与范围请求</h3>
+<h3 id="develop_document-section47">2.2 读取路径：信号量与范围请求</h3>
 
 - 加密读取受信号量限流（并发上限 3），避免多路大文件同时解密造成内存线性增长。释放器必须幂等且带下界保护：可销毁流在带错误销毁时会先 `error` 后 `close`，若两个回调各递减一次，计数将漂移为负，此后并发上限永久失效。
 - 加密对象的范围请求需完整下载解密后在内存中切片；明文超过上限即退化为全量流式解密（忽略 Range），避免单请求占用与明文等量的内存。非加密对象的 Range 由对象存储原生处理。
 
-<h3 id="develop_document-section47">2.3 删除、复制与移动的截断契约</h3>
+<h3 id="develop_document-section48">2.3 删除、复制与移动的截断契约</h3>
 
 前缀删除（目录删除）必须遵守同一套契约，且全项目只允许一份实现：
 
@@ -1524,7 +1782,7 @@ R22-04：本库「解密下发」共三个出口 —— 管理端 `/api/fs/downl
 
 复制同样存在大小阈值：服务端单次复制有上限，超出必须先探测对象大小再决定是否分块复制，否则会出现「同一操作在管理界面成功、在 WebDAV 必然失败」的行为分裂。`CopySource` 的格式由客户端工厂统一生成（S3 厂商为 `/bucket/key`，腾讯云为外链形式），不再本地硬编码。
 
-<h2 id="develop_document-section48">3. 分片上传与断点续传</h2>
+<h2 id="develop_document-section49">3. 分片上传与断点续传</h2>
 
 - 会话持久化在 `data/upload-sessions.json`，记录 uploadId、已上传分片 ETag 与**分片加密参数**；加密参数同样受敏感数据保护。
 - 恢复上传按「Key + Size + 创建者 + 目标桶」匹配。仅按 Key + Size 匹配会命中其他用户或其他桶的会话：前者泄露他人会话标识与分片进度（存在性侧信道），后者会让续传落到错误的桶上。
@@ -1532,9 +1790,9 @@ R22-04：本库「解密下发」共三个出口 —— 管理端 `/api/fs/downl
 - 落盘采用去抖合并，但**去抖窗口内进程被强制终止会丢失分片加密参数**——已上传的分片将无法解密，表现为「上传成功但文件无法打开」，重新上传还会产生新的计费分片。因此优雅停机必须强制落盘；退出钩子的兜底必须使用同步写，异步写在 `exit` 处理器返回后永远不会被调度。
 - 会话列表按创建者过滤，管理员可见全部。
 
-<h2 id="develop_document-section49">4. 分享链接生命周期</h2>
+<h2 id="develop_document-section50">4. 分享链接生命周期</h2>
 
-<h3 id="develop_document-section50">4.1 标识与快照字段</h3>
+<h3 id="develop_document-section51">4.1 标识与快照字段</h3>
 
 链接 ID 为 16 字节 base64url（22 字符，128 位熵）——它会暴露在公开 URL 中，故不能过短；历史 8 / 12 字符 ID 仍可正常访问。链接在创建时快照目标对象、所属桶、展示用文件名与大小；分享者的收费意图同样原样保留在链接上。
 
@@ -1542,13 +1800,13 @@ R22-04：本库「解密下发」共三个出口 —— 管理端 `/api/fs/downl
 
 **管理页的列**：除文件与状态外，还展示**分享者**（`createdBy`）与**存储桶**（`bucket`），两者同样取自创建时的快照 —— 管理员看到一条陌生链接时，先要知道它是谁建的、指向哪个桶，才能决定是联系创建者还是直接处理。早于「按创建者隔离」那次改造创建的链接没有 `createdBy`，界面显示占位符而不是把空白当成某个用户。
 
-<h3 id="develop_document-section51">4.2 状态判定顺序</h3>
+<h3 id="develop_document-section52">4.2 状态判定顺序</h3>
 
 状态序为 `已删除 > 已过期 > 次数用尽 > 有效`。「对象已不存在」排在最前：它是最根本的事实，否则管理页仍显示「有效」，管理员会去调整有效期或次数，改完照样无法下载。前端判定独立成模块并与服务端同序，避免出现「管理页显示有效、访客打开却提示文件已删除」。
 
 对象缺失有两个判定来源：系统内删除对象时，按**已确认删除的 key 集合**批量标记（不接受前缀，理由同元数据清理）；系统外删除则依靠分享页的惰性探测补齐，且只有云端明确返回「不存在」才予标记，其余一律按「仍存在」处理——误标会让一条正常的链接被永久判死。
 
-<h3 id="develop_document-section52">4.3 下载配额与来源判定</h3>
+<h3 id="develop_document-section53">4.3 下载配额与来源判定</h3>
 
 **放行判定顺序**（唯一权威定义；改动此处请同步「设计背景与刻意取舍 → 支付结果仅限服务端查单返回」）：
 
@@ -1564,7 +1822,7 @@ R22-04：本库「解密下发」共三个出口 —— 管理端 `/api/fs/downl
 - 来源判定分层：持有有效票据 → 放行（票据为 `SameSite=Lax`，跨站子资源请求不会携带，天然阻断预取）；浏览器显式声明跨站 → 拒绝；缺失来源头 → 回退校验 `Referer`，有 `Referer` 但不同源即拒绝，无 `Referer` 视为直连客户端，放行但记录审计。
 - 密码通过后签发的令牌与**当前密码哈希**绑定，而非仅与链接 ID 绑定：修改或清除密码后旧令牌立即失效。否则「修改分享密码」这一动作无法撤回已获授权的访问者。
 
-<h2 id="develop_document-section53">5. 请求上下文与会话鉴权</h2>
+<h2 id="develop_document-section54">5. 请求上下文与会话鉴权</h2>
 
 - 「当前桶」是会话级状态；全局默认桶的语义降级为**系统默认桶**，仅在无会话场景（WebDAV、分享链接、启动自检）与首次登录时作为回退。
 - 上下文基于 `AsyncLocalStorage`，在鉴权中间件里建立一次，后续任意深度的异步调用都可取到，路由层无需逐个传参——避免为几十个调用点补参数时的漏改。切换当前桶可直接更新上下文，无需重新登录。
@@ -1572,7 +1830,7 @@ R22-04：本库「解密下发」共三个出口 —— 管理端 `/api/fs/downl
 - 会话 Cookie 的 `Max-Age` 由服务端剩余有效期推导；勾选「记住登录状态」时有效期由 24 小时延长至 30 天。浏览器本地只保存用户名——真正免于重复登录的是会话有效期，而非本地存储的凭据。
 - 未捕获异常不因已打印而继续服务：本服务持有「加密元数据」与「配置」两类一旦写坏即不可逆的状态，继续接受请求会让故障在用户数据上放大，因此记录后触发优雅关闭。
 
-<h2 id="develop_document-section54">6. IP 访问守卫</h2>
+<h2 id="develop_document-section55">6. IP 访问守卫</h2>
 
 - 规则模型：目标（单 IP 或 CIDR）、作用范围（空 = 全局，否则为桶集合）、方法（空 = 全部方法）、启用状态与命中计数。历史单桶字段在加载时迁移为数组。
 - 判定优先级：**回环放行 → 桶级规则（仅作用于目标桶的请求）→ 全局规则 → 按桶屏蔽海外 IP**，任一级别命中即屏蔽；桶级与全局规则互不覆盖，各自独立生效。
@@ -1582,7 +1840,7 @@ R22-04：本库「解密下发」共三个出口 —— 管理端 `/api/fs/downl
 - 中间件必须挂在鉴权之前（否则被屏蔽的请求会先执行一遍业务逻辑），因此需自行解析一次会话 token。WebDAV 服务复用同一套判定——它监听独立端口，此前完全不受约束，等于为屏蔽规则开了一道旁门。
 - 命中提示页会回显客户端 IP；该值在启用 `TRUST_PROXY` 后来自请求方可控的请求头，必须转义。
 
-<h2 id="develop_document-section55">7. 速率限制与失败锁定</h2>
+<h2 id="develop_document-section56">7. 速率限制与失败锁定</h2>
 
 - 限流采用滑动计数窗口，按 IP（可拼接业务键）统计，超限返回 429 并给出重试等待秒数。
 - 失败锁定在「同一窗口内连续失败达阈值」后触发，冻结时长随失败次数指数增长（有上限）。计数必须按窗口衰减：终身累计会让隔数日手误一次的正常用户在第 N 次被锁在门外。**但锁定期内不得重置**——否则等到窗口滑过再失败一次即可清零，等于为锁定留了后门。
@@ -1590,7 +1848,7 @@ R22-04：本库「解密下发」共三个出口 —— 管理端 `/api/fs/downl
 - 跟踪表设有键数硬上限，达上限时优先淘汰未锁定的条目；该上限只承担内存安全职责，不作为安全边界——各入口自身的限流器才是边界。
 - 预置实例覆盖登录、加密查看密码、分享密码、系统初始化、口令校验类管理动作、WebDAV 认证、分享下载与支付异步通知。其中支付通知端点匿名可达，且会携带真实商户凭据向网关查单：缺少限流时，任何人扫到回调地址即可反复触发查单、刷光查单配额。
 
-<h2 id="develop_document-section56">8. 列举上限与目录缓存</h2>
+<h2 id="develop_document-section57">8. 列举上限与目录缓存</h2>
 
 - 所有列举上限集中在 `server/limits.js`：搜索与用量估算 5000、文件夹属性计数 20000、删除与清空 5000、WebDAV `Depth: infinity` 5000，另设 50000 的硬性天花板。此前这些数字散落在四个文件中，取值从 2 万到 20 万不等且互不知情。全部可用环境变量覆盖，便于受控压测。
 - 目录缓存定位为「加速重复刷新」，**绝不作为真值来源**：TTL 仅 3 秒（`LIST_CACHE_TTL_MS=0` 可整体关闭），且任何写操作立即失效整个桶的缓存。
@@ -1605,14 +1863,14 @@ R22-04：本库「解密下发」共三个出口 —— 管理端 `/api/fs/downl
 - 容量上单条目上限 1 万键（`SEARCH_CANDIDATES_MAX_ITEMS`）：**越限即整条丢弃**并记一条 `warn` 日志，该子树退回「逐页列举 + 秒级页缓存」的既有行为。丢弃之后**不允许从当前页重新积累** —— 那样物化出来的是一段「中间窗口」而非从头开始的连续前缀，续扫时会静默漏掉窗口之前的对象。大桶不适合物化候选集，正确的做法是上后台扫描作业。
 - 对象存储的列举游标是**独占**语义（返回**大于** `Marker` 的键），故候选集内的二分切片必须用严格大于：用「大于等于」会让续扫把刚处理过的对象再发一次。
 
-<h2 id="develop_document-section57">9. 统计与操作日志</h2>
+<h2 id="develop_document-section58">9. 统计与操作日志</h2>
 
 - 统计按天聚合（保留最近 30 天），另有按桶累计的上传 / 下载字节数与请求数；实时速率为内存采样，不持久化。
 - 操作日志写入 `data/logs.jsonl`，上限 5000 条：内存缓冲合并写入，避免每次请求同步追加阻塞事件循环；字段经清洗去除控制字符并截断长度，避免污染 JSONL 结构。
 - 轮转由定时器在空闲时执行：先刷出缓冲再轮转（否则两者几乎必然相撞、轮转长期得不到执行），且只在确实超出上限时做异步流式重写，不再无条件全量重写整个文件。
 - 统计文件的损坏降级语义与敏感数据不同：统计并非核心数据，不因它拒绝启动，但**读降级为空表、写永久锁定**，磁盘原件备份为 `.corrupt-<时间戳>` 等待人工恢复。
 
-<h2 id="develop_document-section58">10. WebDAV 服务</h2>
+<h2 id="develop_document-section59">10. WebDAV 服务</h2>
 
 - 独立 HTTPS 端口（**复用应用自备的那份证书**：`TLS_CERT_FILE` / `TLS_KEY_FILE`），Basic 认证；未启用、无有效账户、**或没有可用证书**时都不监听（R49：WebDAV 强制 HTTPS，不会降级为明文；缺证书时界面会直接显示原因）。
 - **对外地址必须由服务端推导，不能把监听地址当对外地址**：界面「服务器地址」按确定性从高到低取 ①`WEBDAV_PUBLIC_URL`（部署脚本写入的对外基地址）②请求域名（**仅当 `TRUST_PROXY=1` 且请求里确有 `X-Forwarded-Proto` / `-For`**，否则等于把地址交给请求方决定）③直连回退（面板主机名 + WebDAV 端口，只服务启动日志）。旧实现只拼「监听地址 + 端口」，而部署时 `.env` 写的是 `HOST=0.0.0.0`，于是界面**恒显示 `https://localhost:8443/dav/`** —— 那是**服务器自己**的回环地址，用户复制到资源管理器 / Finder 必然连不上，且界面上看不出任何异常（地址有、状态还是绿色「服务运行中」）。另有一条容易漏的：**Nginx 的 `$host` 已剥掉端口**，站点跑在非 443 端口时反代传来的 Host 仍是不带端口的域名，照它拼出来的地址会指向 443；故部署脚本注入 `X-Forwarded-Port $server_port`，应用侧优先取 Host 自带端口、其次该头。
@@ -1629,7 +1887,7 @@ R22-04：本库「解密下发」共三个出口 —— 管理端 `/api/fs/downl
 - **Range 响应两端必须自洽**：读取侧支持断点续传，因此带 `Range` 的 `GET` 必须回 **206 + 区间长度 + `Content-Range`**，`HEAD` 也须给出同一套事实。此前 `GET` 把 `Range` 交给云端（只拿回区间字节）却宣告**全量** `Content-Length`，客户端按宣告长度继续等剩余字节，最终报「传输被提前关闭」——大文件表现为下载损坏 / 播放失败（VLC、PDF 阅读器、Office、多线程下载器的续传都走这条路径）。越界范围回 `416`（并带 `Content-Range: bytes */total`），不得折叠成 500，否则客户端会当成服务端故障而无限重试。
 - 列举上限同样取自集中定义，不再在本模块硬编码。**截断必须显式告出**：`Depth: 1` 的 `PROPFIND` 取满上限时返回 `X-WebDAV-Truncated` / `X-WebDAV-Truncated-Reason` 响应头并写一条 `warn` 审计日志（含具体路径与条数）。刻意**不**往 207 体里塞伪 `<D:response>`——那会被资源管理器当成真实条目渲染成幽灵文件，比不提示更糟。
 
-<h2 id="develop_document-section59">11. 服务端点守卫</h2>
+<h2 id="develop_document-section60">11. 服务端点守卫</h2>
 
 自定义 `endpoint` 决定服务端把凭据发往何处，因此校验策略默认从严：
 
@@ -1638,7 +1896,7 @@ R22-04：本库「解密下发」共三个出口 —— 管理端 `/api/fs/downl
 - 云平台实例元数据地址永远拒绝，不受上述开关影响；
 - **不对域名做 DNS 解析后再判定**：解析会引入新的解析面与 TOCTOU 问题，且内网对象存储常以内部域名暴露。只判定 IP 字面量与元数据主机名，是在不破坏既有内网部署前提下的务实边界。
 
-<h2 id="develop_document-section60">12. 上传过滤匹配器</h2>
+<h2 id="develop_document-section61">12. 上传过滤匹配器</h2>
 
 `.gitignore` 语法解析遵循 git 官方规范：注释、`!` 取反、尾随 `/`（仅匹配目录）、`**` 前导 / 中间 / 尾随、`* ? [..]` 通配、反斜杠转义；含 `/` 的规则锚定在 `.gitignore` 所在目录，否则可匹配任意层级；同一路径按规则顺序「最后命中者生效」。
 
@@ -1646,7 +1904,7 @@ R22-04：本库「解密下发」共三个出口 —— 管理端 `/api/fs/downl
 
 解析设有结构性上限，超出时**截断并在匹配器上标记**，由调用方决定是否告警——静默丢弃会让「本该被忽略的文件却被上传」难以排查。
 
-<h2 id="develop_document-section61">13. 持久化、启动与关闭</h2>
+<h2 id="develop_document-section62">13. 持久化、启动与关闭</h2>
 
 - 全部持久化文件采用「临时文件 + rename」的原子写入。直接写目标文件会先清空再写入，进程在两步之间退出即留下 0 字节文件。临时文件名必须包含随机量：仅用毫秒时间戳会在同一毫秒内重名，后一次写入以 `w` 模式打开同一临时文件并先行截断，两次写入将共用一份数据。
 - 启动时清扫孤儿临时文件，三重条件缺一不可：文件名匹配本模块规则、文件名中的 pid 已不存活、修改时间早于阈值。Windows 上 `process.kill(pid, 0)` 对系统服务返回 `EPERM`，需再核对一次进程列表，避免将系统服务误判为孤儿。PID 复用会导致漏删，清扫属尽力而为，宁可漏删不可误删。
@@ -1655,7 +1913,7 @@ R22-04：本库「解密下发」共三个出口 —— 管理端 `/api/fs/downl
 - 单实例锁基于独占创建的锁文件，锁内记录 pid；持有者进程已不存在时自动接管。其目的在于避免两个进程各自持有配置缓存并交替整体覆盖 `config.enc`。
 - 优雅关闭顺序：停止接收新请求 → 刷出日志缓冲 → 等待敏感数据异步写完成 → 配置落盘 → 停止 WebDAV → 退出，并设置兜底超时。
 
-<h2 id="develop_document-section62">14. 前端模块与渲染约定</h2>
+<h2 id="develop_document-section63">14. 前端模块与渲染约定</h2>
 
 - 前端为原生 ES Module，无构建步骤；模块按职责划分，管理端能力按角色物理分离（动机见「设计背景与刻意取舍」）。
 - **唯一的非 ESM 例外是 `pay-poll.js`**：它服务于服务端渲染的分享页，需要从 `<script data-link-id>` 属性上取参数，而 `document.currentScript` 在 `type="module"` 脚本里恒为 `null`，因此写成普通脚本。它曾经是页面里的内联 `<script>`——CSP 移除 `script-src 'unsafe-inline'` 后那段脚本被浏览器静默拒绝执行，「支付成功后自动放行」的承诺随之失效；抽成同源静态文件即落回 `script-src 'self'` 之内。**分享页与主站共用同一套 CSP**，因此分享页模板里同样不允许出现内联脚本或内联事件处理器。
@@ -1667,10 +1925,10 @@ R22-04：本库「解密下发」共三个出口 —— 管理端 `/api/fs/downl
 
 ---
 
-<h1 id="develop_document-section63">四、测试</h1>
+<h1 id="develop_document-section64">四、测试</h1>
 
 
-<h2 id="develop_document-section64">1. 测试与 CI</h2>
+<h2 id="develop_document-section65">1. 测试与 CI</h2>
 
 项目使用 Node 内置的 `node:test` runner，不引入任何测试依赖：
 
@@ -1725,7 +1983,7 @@ R22-04：本库「解密下发」共三个出口 —— 管理端 `/api/fs/downl
 >
 > 现在两侧都已闭合：① 树里的条目已删除、本段改为如实描述；② `tests/docs-sync.test.js` 新增「目录结构代码块里列出的仓库文件必须真实存在」断言（`data/` 运行期子树与显式豁免项除外），此后**任何**在树里登记一个不存在文件的改动都会立刻变红。CI 本身仍是待办（见「六、审计发现台账」R23 行）。
 
-<h2 id="develop_document-section65">2. 测试护栏编写约定</h2>
+<h2 id="develop_document-section66">2. 测试护栏编写约定</h2>
 
 - **护栏优先写成行为断言**：早期有两条只检查「源码里能否 grep 到某个词」，退回旧实现后照样全部通过（形同虚设），已改写为行为断言。**确需读源码时（如「全库仅一处调用 `markPaid`」这类结构性承诺），断言的扫描范围必须与承诺范围一致**——只扫一个文件的话，在别的文件里调用一次就能同时骗过文档与护栏；这类断言应遍历全部源码文件，并在失败信息里列出命中位置。
 
@@ -1739,15 +1997,15 @@ R22-04：本库「解密下发」共三个出口 —— 管理端 `/api/fs/downl
 - **测「连接断开后停止工作」这类时序行为，用挂起的假依赖而不是 sleep**：让假 `getBucket` 把回调存起来，测试端先 `destroy()`、再手动放行首页，之后是否发起第 2 次调用就完全由被测代码的判断决定，与机器快慢无关（放行后仍需一个宽限期让事件循环推进，但那是等待而非断言）。
 - 所有审计回归护栏均经**反向对照**验证检出能力：退回旧实现必须 FAIL。变异脚本要**先断言锚点命中**（静默变异失败会伪装成「护栏没抓住」），并做到崩溃安全（登记 + `exit`/`SIGINT`/`SIGTERM`/`uncaughtException` 强制还原 + `data/` 快照）。
 
-<h1 id="develop_document-section66">五、开始二次开发</h1>
+<h1 id="develop_document-section67">五、开始二次开发</h1>
 
 本章面向**第一次接触本仓库的开发者**：读完 `1. 高层架构总览` 就知道代码分几层，照着 `2. 本地启动与调试` 能在几分钟内把服务跑起来并看到界面，`3` / `4` 是两个可照抄的最小改动示例，`5` 是提交前必须过一遍的自检清单。
 
 > 本章只讲「路怎么走」，不重复前四章的结论。凡本章与前文冲突，**以前文为准**并请顺手修正本章。
 
-<h2 id="develop_document-section67">1. 高层架构总览</h2>
+<h2 id="develop_document-section68">1. 高层架构总览</h2>
 
-<h3 id="develop_document-section68">1.1 分层视图与请求链路</h3>
+<h3 id="develop_document-section69">1.1 分层视图与请求链路</h3>
 
 整个系统是**一个单体 Node 进程**：没有消息队列、没有数据库、没有前端构建产物（前端是浏览器直接加载的原生 ESM）。状态全部落在 `data/` 的 JSON 文件里。分层只有四层，且**依赖方向严格自上而下**——领域层模块不知道 HTTP 的存在，因此可以脱离 express 单独测试。
 
@@ -1809,7 +2067,7 @@ R22-04：本库「解密下发」共三个出口 —— 管理端 `/api/fs/downl
 5. `listCache` 命中就直接返回（同目录重复刷新不访云端）；未命中才调云端 `getBucket`，并用 `encStore.encryptedSetFor()` 标出哪些对象是密文；
 6. 组装 `{ prefix, contents, prefixes, isTruncated, nextMarker }` 返回，前端按 `isTruncated` 决定是否显示「加载更多」。
 
-<h3 id="develop_document-section69">1.2 状态存放与启动顺序</h3>
+<h3 id="develop_document-section70">1.2 状态存放与启动顺序</h3>
 
 **状态全在 `data/`**，没有数据库。因此「备份」= 复制 `data/` 目录；「迁移」= 复制目录 + 保证目标机器上有同样的 `data/*.key`。写测试时优先用 `S3_DATA_DIR` 指向临时目录做隔离（多数存储模块支持；`config-store` 不支持，涉及它的用例要另想办法）。
 
@@ -1824,9 +2082,9 @@ R22-04：本库「解密下发」共三个出口 —— 管理端 `/api/fs/downl
 7. 按已保存配置启动 WebDAV；
 8. 注册 `uncaughtException`：记录后优雅退出（认为进程已进入未定义状态，继续服务会把故障放大到用户数据上）。调试时可用 `NO_RESTART_ON_UNCAUGHT=1` 关闭该行为。
 
-<h2 id="develop_document-section70">2. 本地启动与调试</h2>
+<h2 id="develop_document-section71">2. 本地启动与调试</h2>
 
-<h3 id="develop_document-section71">2.1 启动方式与端口</h3>
+<h3 id="develop_document-section72">2.1 启动方式与端口</h3>
 
 ```bash
 npm install            # 只有 1 个运行时依赖（express；R49 起 cos-nodejs-sdk-v5 已移除）
@@ -1857,7 +2115,7 @@ npm run lint           # node scripts/lint.js（ESLint 包装器：未装 eslint
 
 > 调试时**不要直接对着真实 `data/` 反复折腾**：起第二个实例会被单实例锁拒绝，而误改配置可能导致加密数据损坏。优先 `S3_DATA_DIR` 指向一个临时目录。
 
-<h3 id="develop_document-section72">2.2 服务端调试</h3>
+<h3 id="develop_document-section73">2.2 服务端调试</h3>
 
 - **断点**：`node --inspect-brk server/index.js`，再用 Chrome 打开 `chrome://inspect`（或 VS Code 的 attach 配置）。前端代码直接在浏览器 DevTools 里断点即可。
 - **看日志**：操作审计落在 `data/logs.jsonl`（滚动保留，不追求长期明细），管理员可 `GET /api/stats/logs` 拉取；启动期与异常直接打在控制台。
@@ -1866,7 +2124,7 @@ npm run lint           # node scripts/lint.js（ESLint 包装器：未装 eslint
 - **测改动**：`npm test` 跑全量；用例条数的量级见「四、测试 → 1. 测试与 CI」（此处**故意不写数字**，避免第二处计数再次漂移）。只想跑其中一个文件用 `node --test tests/<file>.test.js`。**`npm test` 的 glob 必须带引号**，否则某些 shell 会先展开路径。
 - **本机跑不起来的两条**：`RE-03` 与 `R7-07` 依赖 `spawnSync`，在部分 Windows 环境恒返回 `status=null`（EBUSY），属**环境性失败而非回归**；判定方法是看这两条之外的用例是否全绿。
 
-<h3 id="develop_document-section73">2.3 前端调试</h3>
+<h3 id="develop_document-section74">2.3 前端调试</h3>
 
 前端是原生 ESM、无构建步骤：**改完 `public/js/*.js` 刷新页面即可**（浏览器对 ESM 有缓存，必要时硬刷新）。
 
@@ -1875,11 +2133,11 @@ npm run lint           # node scripts/lint.js（ESLint 包装器：未装 eslint
 - 异步列表渲染一律走「请求序号」机制，避免旧响应覆盖新结果；渲染函数要幂等（同一份数据渲染两次结果一致）。
 - 冒烟可用无头 Chrome：`chrome --headless=new --dump-dom http://127.0.0.1:3000`（Windows 下用绝对路径调用 `chrome.exe`）。
 
-<h2 id="develop_document-section74">3. 最小示例 A：新增一个只读接口</h2>
+<h2 id="develop_document-section75">3. 最小示例 A：新增一个只读接口</h2>
 
 **需求**：加一个 `GET /api/demo/ping`，返回当前登录用户名与服务器时间，仅管理员可访问。这个例子覆盖了新增后端能力要动的**全部三个地方**：路由文件、`routes.js` 挂载、路由表面积护栏。
 
-<h3 id="develop_document-section75">3.1 第一步：写路由</h3>
+<h3 id="develop_document-section76">3.1 第一步：写路由</h3>
 
 新建 `server/routes/demo.js`。约定：从 `_context.js` 取依赖（唯一 DI 点）、从 `_shared.js` 取中间件，文件末尾导出一个 `express.Router`：
 
@@ -1905,7 +2163,7 @@ router.get('/demo/ping', requireAdmin, (req, res) => {
 module.exports = router;
 ```
 
-<h3 id="develop_document-section76">3.2 第二步：挂载与依赖注入</h3>
+<h3 id="develop_document-section77">3.2 第二步：挂载与依赖注入</h3>
 
 在 `server/routes.js` 里加一行。**挂载顺序有语义**（`auth` 必须最先；`/credentials/visibility` 必须早于 `/credentials/:id`，否则会被参数路由吞掉），新模块一般追加在末尾即可：
 
@@ -1916,7 +2174,7 @@ router.use(require('./routes/demo'));   // 新增
 
 需要用到其它 server 模块时，**先加到 `server/routes/_context.js`** 再从 `_context` 解构，不要在自己的文件里直接 `require('../config-store')`——否则测试无法对单一模块做依赖替换。
 
-<h3 id="develop_document-section77">3.3 第三步：补护栏并验证</h3>
+<h3 id="develop_document-section78">3.3 第三步：补护栏并验证</h3>
 
 `tests/routes-surface.test.js` 维护着路由表面积基线：**新增路由不登记，测试会红**。这一步是刻意的设计——它保证「删了一个路由」这种事不会被静默放过。
 
@@ -1940,7 +2198,7 @@ curl -s -b cookie.txt http://127.0.0.1:3000/api/demo/ping
 
 最后把新接口补进 `7. HTTP API` 的表格（否则文档与代码分叉，`docs-sync` 不会发现这一点）。
 
-<h2 id="develop_document-section78">4. 最小示例 B：新增一个前端卡片</h2>
+<h2 id="develop_document-section79">4. 最小示例 B：新增一个前端卡片</h2>
 
 **需求**：加一个「示例卡片」主视图，进入时拉取上面那个 `/api/demo/ping` 并显示结果。三个改动点：
 
@@ -1977,7 +2235,7 @@ curl -s -b cookie.txt http://127.0.0.1:3000/api/demo/ping
 
 前端改动执行 `npm test` 也会覆盖一部分：`tests/frontend.test.js` 会校验所有前端模块的 ESM 语法、`import` 路径是否存在、主视图列表与 DOM 是否一致。改动后应将 `1. 目录结构` 里的模块清单补上（`docs-sync` 会进行检查）。
 
-<h2 id="develop_document-section79">5. 二次开发检查清单</h2>
+<h2 id="develop_document-section80">5. 二次开发检查清单</h2>
 
 - [1] **落盘使用 `atomic-write`**？直接 `writeFile` 会先截断，进程中断就留下 0 字节文件。
 - [2] **权限判定用的是实时用户记录**（`findUserRawById()`）而不是会话快照？降权 / 删户 / 改密后是否主动销毁了对方会话？
@@ -1993,7 +2251,7 @@ curl -s -b cookie.txt http://127.0.0.1:3000/api/demo/ping
 
 ---
 
-<h1 id="develop_document-section80">六、审计发现台账（合并存档）</h1>
+<h1 id="develop_document-section81">六、审计发现台账（合并存档）</h1>
 
 > 本节把原先散落在仓库根目录的多份审计文档（`AUDIT_FINDINGS.md`、`ANALYSIS-ROUND7.md`～`ANALYSIS-ROUND13.md`、`fix-record.md`）**缩减、合并**成下述两张表，并作为其唯一正本。这些单文件已删除。审计编号的「含义与闭合依据」登记在此，由 `tests/docs-sync.test.js` 护栏保证不遗漏（引用 ⊆ 登记、登记 ⊆ 引用，双向闭合）。
 
