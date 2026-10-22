@@ -5,7 +5,7 @@
 > 本文件是**事后重建**的，不是随每次发版逐条维护的发布记录。项目虽托管在 GitHub（`origin` 可用、有提交历史），但提交历史**未按发布切分** —— 提交信息多为「bug fix」这类无信息量占位，也没有留存任何发布记录文档，因此：
 >
 > - **不给出任何发布日期**。版本标题写「日期未归档」，而不是填一个看起来合理的日期；
-> - 版本号的唯一事实源是 `package.json` 的 `version` 字段（当前 `1.9.9`）；
+> - 版本号的唯一事实源是 `package.json` 的 `version` 字段（当前 `1.9.10`）；
 > - `1.2.5` 之前各版本的**逐版本变更与发布日期均未归档**，本文件不追溯、不虚构；
 > - 可核实素材只有两处，都在 `Develop_Document.md`：**「六、审计发现台账（合并存档）」**（编号台账 `SEC-*` / `FUN-*` / `PERF-*` / `LOW-*` / `S*` / `P*`、历轮汇总）与**「审计后的行为变更」**小节。
 >
@@ -49,6 +49,54 @@
 - **修法**：`server/config-store.js` 新增 **`smtpSendConfig()`** —— 发信路径**唯一**的取配置入口（明文口令 + `configured` 判据一次给全），`server/email-code.js` 与 `server/routes/smtp.js` 一律改走它；「能不能发信」的判据抽成 `smtpConfigured()` 纯函数，供**对外视图**与**发信端**共用（判据分叉会表现成「路由放行并回『验证码已发送』，而发信端抛 503」）。
 - **护栏**：`tests/audit53-regressions.test.js` 新增第 ⑨ **取用层** 4 条 —— 落盘一份口令后真连一个**要求认证**的假 SMTP（沿用 `TLS-PSK` 免证书），断言它收到的 `AUTH PLAIN` 载荷就是那份口令、且验证码真的进了 DATA 正文；再走一次匿名 `POST /api/auth/forgot`，把「路由 → `email-code.js` → `smtp.js`」整条链路串起来（测试文件 32 → **36 条**，反向对照台账 +4 条 `R53-10a`~`R53-10d`）。
 - 本修复属**同一发布包内**的缺陷修复，**版本号不变**。
+
+## [1.9.10] - 日期未归档
+
+对一份外部《Kepler 漏洞评估报告》（9 条，`F-01`~`F-09`）**逐条复核**（R74）。结论是**只有 1 条需要动代码**，其余 4 条判为幻觉（已登记进 `Audit_illusion_report.md` 的 `03`~`06`）、2 条属报告自己已承认的设计约束、1 条按用户要求忽略。
+
+### 安全修复 · 导出码 KDF 改为异步（`F-04`，唯一实体漏洞）
+
+- `server/backup.js` 的 `deriveKey()` 原用 `crypto.scryptSync`，`N=131072 / r=8 / p=1` 实测把主线程整段占住 ≈ 530ms（同参数异步版墙钟 ≈ 495ms —— 差别不在快慢，而在「这 500ms 里别人能不能跑」）。期间 WebDAV、下载与全部 API 都在排队。
+- 改为 Promise 包装的 `crypto.scrypt`；`seal()` / `open()` 随之变 `async`，`server/routes/backup.js` 的两处调用点补 `await`。
+- `open()` 的「新参数 → 旧参数」两级回退改成 `for` 循环，并**刻意把 `decodeCode()` 留在 `try` 之外**：否则「码是对的、里面不是备份」会被当成「这级参数不对」而继续下一级，最终报成「密码错误」——这两种失败对应完全不同的可执行动作（重输密码 vs 重新复制一份导出码）。
+- `Develop_Document.md` 的台账 `SEC-05` 原先写「全库无 `scryptSync`」，**与代码相反**（该句自 R38 引入 `backup.js` 起就为假，且 `tests/` 里没有任何机器在验证它）。现改写为准确表述并指向新增护栏。
+
+### 依赖 CVE 清零（`F-01` / `F-02`）
+
+- `npm audit fix` 后：`express` 4.22.2 → **4.22.3**、`proxy-addr` 2.0.7 → **2.0.8**（`GHSA-jqcg-44mw-7w3h`，CVSS 9.1）、`qs` → **6.16.1**、`body-parser` → **1.20.8**；`npm audit --omit=dev` 报 **0 vulnerabilities**。
+- 报告对 `qs` 两条 moderate 的「真实可达」判断**不成立**：`GHSA-x5fp-wj9c-mxmx` 需 `comma: true`，而 express 的 `parseExtendedQueryString` 与 body-parser 的 `urlencoded` 都不传该选项（项目唯一的 `urlencoded` 还是 `extended: false`，走 `querystring`）；`GHSA-4mjr-xmp4-gh2g` 落在 `qs.stringify()`，全库无此调用。依赖债本身真实，错的是可达性论证 —— 已记入幻觉报告 `06`。
+
+### 判为幻觉的四条（→ `Audit_illusion_report.md`）
+
+- `03`「WebDAV `PUT` 无上限保护、单请求缓冲量未设顶」：**与代码相反**。`fs-gateway.js` 有 `MAX_WRITE_BUFFER = 128MB`（超限即 `destroy()` + 413）与 `MAX_WRITE_STREAMS = 2` 并发信号量，且 `await acquireWriteStream()` 排在缓冲**之前**。
+- `04`「旧版实例的检查更新指向已 404 的旧仓库」：`git log -S` 零命中 —— `update-check.js` 自首次出现起 `OWNER_REPO` 就是 `xingsen2005/Kepler`，**从来没有哪个版本指向过旧仓库**。
+- `05`「响应体只有 `{ error }`、错误码不全局统一」：`errorBody()` 产出的是超集（`code` / `quota`），前端 `api.js` 已在消费；真实缺口只是「错误码集合未写成契约」。
+- `06`：见上节。
+
+`F-03`（主密钥无轮换）与 `F-05`（审计日志无抗抵赖）**事实成立但属已披露的设计约束**，ADR-0005 明文写着「轮换本身没有实现」；`F-06`（`magic` 为混淆级）按用户要求忽略。
+
+### 护栏
+
+- 新增 `tests/audit74-regressions.test.js` **4 条**：`R74-01` 用 `setTimeout(0)` 与 `seal()` 赛跑来判「KDF 是否让出主线程」（**语义**判据，不用墙钟阈值，换机器不会假红）；`R74-02` 硬编历史上的 `N=16384` 封一份旧码，验两级回退没退化成一级；`R74-03` 结构损坏不得报成「密码错误」；`R74-04` 路由必须 `await` `seal`/`open`。
+- `tests/invariants.test.js` 新增「`SEC-05`：全库不得出现同步 scrypt」**1 条**：改用 `espree` **AST** 判定（覆盖 `MemberExpression.property` 与解构别名），并内含违规样例自检。此前一版写法用 `stripComments()` + 文本匹配，在 `share-routes.js` 上**状态漂移**（正则字面量与模板串混排导致 130 行注释未被抹白），既会假红也会假绿 —— 判据必须落在实际执行的那一层。
+- `R74-04` 最初写成带 lookbehind 的正则，**被目标文件第 18 行的文档注释 `backup.open()` 判红**（真实调用在 L91 / L117，都带 `await`）⇒ 同样改为 AST，并补四条扫描器自检（裸调用必被抓、带 `await` 不得假红、注释不算调用）。
+- 反向变异实测：把 `deriveKey()` 塞回 `scryptSync`（**语法自洽**的完整函数体替换——首版变异留下孤立 `});`，那是文件级语法错，不是判据变红）→ 红的是 `R74-01`；删掉路由的 `await`（`seal` / `open` 各一次）→ 红的是 `R74-04`。
+
+### 依赖面收敛（R75）
+
+对外部《依赖清单》的复核结论：**数字全对**。运行时闭包 **68** 条、开发时闭包 **92** 条、嵌套副本 **17** 条，与 `npm ls` 和 `package-lock.json` 的 `dev` 标记逐条吻合；`npm ci --omit=dev` 的生产面、`eslint` 缺失时 `lint` 降级这两条描述也与实现一致。
+
+但**条数不是风险面**，真正的风险是「代码直接 `require` 了一个没写进 `package.json` 的包」—— 它能跑纯粹是因为 npm 把它平铺到了 `node_modules/` 根部，一旦上游换依赖关系就变成 `MODULE_NOT_FOUND`，而且往往只在某些机器上。实测扫出 **1 处真问题**：R74 新写的护栏用了 `espree`（当时只是 `eslint` 的传递依赖）。另有 1 处误报值得记：`audit49` 的**断言文案字符串**里写着 `require('selfsigned')`（它断言的是这个包不该存在），正则会把这条错误地判成未声明依赖 ⇒ 判据必须走 AST。
+
+- `espree` 显式进 `devDependencies`（版本与上游实际用的 `^10.4.0` 对齐，不装第二份）；闭包条数不变（68 / 160）。
+- `express` 由 `^4.19.2` **钉成精确版本 `4.22.3`**：`npm ci` 本来就按 lockfile，钉精确值是为了让**开发机上的一次 `npm install`** 不再悄悄把小版本抬走。代价是 `npm audit fix` 不能再自动生效，CVE 响应要显式改这一行 —— 这是刻意的，依赖面变动应当出现在提交里。
+- `app.set('query parser', 'simple')`：全库 `req.query.*` 的取值全是扁平标量，没有任何一处依赖 `a[b]=1`。改后 `qs` 从「靠论证说明不可达」变成**构造上不可达**（请求根本走不到那份代码），顺带天然免疫 `?__proto__[x]=1` 一类原型污染。这是本轮唯一能在**不改对象键、不改密文格式**的前提下缩小实际可达攻击面的动作。
+- CI 新增 `npm audit --omit=dev --audit-level=high`：此前**没有任何机器在看运行时依赖的 CVE** —— `F-01` / `F-02` 那两条能挂那么久，根因就是「写了护栏但没人跑」的同型问题。
+- 新增两条护栏（`invariants.test.js`）：`R75-01` 运行时依赖白名单 + 闭包预算（从 lockfile 直接算，不 spawn npm）；`R75-02` 用 `espree` AST 扫 `server/` `scripts/` `tests/` 里所有 `require('<字面量>')`，根包必须已声明。三条反向变异实测：塞进一个运行时依赖 → 红 `R75-01`；`server/` 里 `require('qs')` → 红 `R75-02`；把预算调成 10 → 红 `R75-01`。
+
+⚠️ 本轮另修一处**工作区事故**：`Develop_Document.md` 在编辑过程中被截断（丢了 6.4 / 6.5 两整节，`routes-surface` 的「路由必须能在文档里搜到」当场变红才发现）。已从 `git show HEAD:` 恢复全文并重放本轮 5 处正当修改，最终 diff 收敛为 6 增 3 删。**教训**：长文档用「按行号 splice」改，行号一旦漂移就会静默切掉尾部；后续一律按**内容锚点**定位。
+
+- 全量 **1387 条**通过（含 `skipped 1`）；版本 `1.9.9` → `1.9.10`（五个落点全量同步）；测试文件 **75 → 76**。
 
 ## [1.9.9] - 日期未归档
 

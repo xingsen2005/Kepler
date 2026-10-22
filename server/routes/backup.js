@@ -88,7 +88,7 @@ router.post('/backup/export', requireAdmin, apiHandler(async (req, res) => {
   const b = req.body || {};
   await assertAccountPassword(req, b.password);
   const plain = backup.buildCode();
-  const code = backup.seal(plain, b.backupPassword);
+  const code = await backup.seal(plain, b.backupPassword);
   res.json({
     code,
     fingerprint: backup.fingerprint(code),
@@ -114,7 +114,7 @@ router.post('/backup/import', requireAdmin, apiHandler(async (req, res) => {
       + '请在一台全新部署、尚未配置任何项目的实例上导入',
     ), { status: 409 });
   }
-  const data = backup.open(b.code, b.backupPassword);
+  const data = await backup.open(b.code, b.backupPassword);
   const summary = backup.apply(data);
   res.json({ ok: true, summary });
 }));

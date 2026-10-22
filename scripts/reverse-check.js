@@ -1478,7 +1478,8 @@ const CASES = [
        */
       name: 'D1-12 · 锁文件与 package.json 脱同步（npm ci 必然 EUSAGE，只能靠兜底碰运气）',
       file: 'package-lock.json',
-      anchor: '      "devDependencies": {\n        "eslint": "^9.0.0"\n      }',
+      // R75：新增 espree 后锚点同步（声明了三个字段就必须一起清掉，否则"脱同步"不成立）
+      anchor: '      "devDependencies": {\n        "eslint": "^9.0.0",\n        "espree": "^10.4.0"\n      }',
       replacement: '      "devDependencies": {}',
       testFile: 'invariants.test.js',
       minFail: 1,
@@ -6511,8 +6512,9 @@ const CASES = [
       // （依赖回来了，下一个想用它的人立刻找得到）。
       name: 'R49-16a · cos-nodejs-sdk-v5 重新出现在 package.json 依赖里',
       file: 'package.json',
-      anchor: '  "dependencies": {\n    "express": "^4.19.2"\n  },',
-      replacement: '  "dependencies": {\n    "express": "^4.19.2",\n    "cos-nodejs-sdk-v5": "^2.14.0"\n  },',
+      // R75：express 由 `^4.19.2` 钉成精确版本后锚点同步（语义不变：往依赖里塞回 cos SDK）
+      anchor: '  "dependencies": {\n    "express": "4.22.3"\n  },',
+      replacement: '  "dependencies": {\n    "express": "4.22.3",\n    "cos-nodejs-sdk-v5": "^2.14.0"\n  },',
       testFile: 'audit49-regressions.test.js',
       minFail: 1,
     },

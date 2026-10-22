@@ -412,11 +412,34 @@ function badCode(msg) {
 
 /* ============================ 导出码（加密） ============================ */
 
+/**
+ * 由备份密码派生导出码的 AES 密钥。
+ *
+ * ⚠️ **SEC-05：必须走异步 scrypt，禁止改回 `crypto.scryptSync`。**
+ *
+ * 同步版会把主线程整段占住（`N=131072 / r=8 / p=1` 实测 ≈ 530ms），而 `encryptBuffer` /
+ * 下载 / WebDAV 全在同一个事件循环里 —— 一次导出校验就是一次全站停顿。本机同参数
+ * 实测：同步 530ms、异步 495ms，墙钟几乎一致，差别只在「这 500ms 里别人能不能跑」。
+ *
+ * 这条纪律曾被漏掉过一次：R38 引入本模块时写的是 `scryptSync`，而
+ * `Develop_Document.md` 的台账 `SEC-05` 那一行写的是「全库无 `scryptSync`」——
+ * 判据与实际相反，且 `tests/` 里没有任何东西守着它。R74 补上两道：
+ * `tests/invariants.test.js`「SEC-05：全库不得出现同步 scrypt」（`espree` AST 全库扫描，
+ * 含违规样例自检）钉静态面，`tests/audit74-regressions.test.js` 的 R74-01 钉行为面
+ * （`setTimeout(0)` 必须能插进 `seal()` 完成之前）。
+ *
+ * @param {string} password
+ * @param {Buffer} salt
+ * @param {{N:number,r:number,p:number,keylen:number}} [params]
+ * @returns {Promise<Buffer>}
+ */
 function deriveKey(password, salt, params) {
   const p = params || SCRYPT;
-  return crypto.scryptSync(String(password), salt, p.keylen, {
-    N: p.N, r: p.r, p: p.p,
-    maxmem: SCRYPT_MAXMEM,
+  return new Promise((resolve, reject) => {
+    crypto.scrypt(String(password), salt, p.keylen, {
+      N: p.N, r: p.r, p: p.p,
+      maxmem: SCRYPT_MAXMEM,
+    }, (err, key) => (err ? reject(err) : resolve(key)));
   });
 }
 
@@ -438,20 +461,28 @@ function normalizePassword(pw) {
  * AES-256-GCM 而非 CBC：导入时**必须先认证后使用** —— 否则一段被篡改（甚至只是复制时
  * 少了一个字符）的密文会解出半截配置，而半截配置的导入是**破坏性**的
  * （见 `apply()` 的覆盖语义）。认证失败 → 抛「密码错误或备份码已损坏」，绝不落盘。
+ *
+ * R74：本函数是 async —— `deriveKey()` 已改为异步 scrypt（SEC-05，见该函数的说明）。
+ * 调用方必须 `await`，否则拿到的是 Promise 而不是码串。
  */
-function seal(code, backupPassword) {
+async function seal(code, backupPassword) {
   const pw = normalizePassword(backupPassword);
   const plain = Buffer.from(String(code || ''), 'utf8');
   const salt = crypto.randomBytes(SALT_BYTES);
   const iv = crypto.randomBytes(IV_BYTES);
-  const cipher = crypto.createCipheriv('aes-256-gcm', deriveKey(pw, salt), iv);
+  const cipher = crypto.createCipheriv('aes-256-gcm', await deriveKey(pw, salt), iv);
   const ct = Buffer.concat([cipher.update(plain), cipher.final()]);
   const tag = cipher.getAuthTag();
   return [SEAL_HEAD, b64u(salt), b64u(iv), b64u(tag), b64u(ct)].join('.');
 }
 
-/** 解开导出码；密码错 / 被篡改一律抛错（GCM 认证失败），不返回半截结果 */
-function open(sealedCode, backupPassword) {
+/**
+ * 解开导出码；密码错 / 被篡改一律抛错（GCM 认证失败），不返回半截结果。
+ *
+ * R74：async（同 `seal()`）。“抬头 / 段完整性”两类校验仍**同步**先做完 ——
+ * 输入畸形就不必再花 500ms 去算 KDF。
+ */
+async function open(sealedCode, backupPassword) {
   const parts = String(sealedCode || '').trim().split('.');
   if (parts.length !== 5 || parts[0] !== SEAL_HEAD) {
     throw badCode('导出码抬头不正确（请确认粘贴的是「导出」得到的那串码）');
@@ -464,26 +495,32 @@ function open(sealedCode, backupPassword) {
   if (salt.length !== SALT_BYTES || iv.length !== IV_BYTES || !ct.length) {
     throw badCode('导出码内容不完整（可能复制时缺了一段）');
   }
-  let plain;
   /**
    * R69：`SEAL_HEAD` 没有随 KDF 参数一起升版（光看抬头分不出新旧），因此按
    * **新参数 → 旧参数**的顺序各试一次。GCM 认证失败是"密码错"与"参数不匹配"的
    * 共同表现，只有两种都失败才算真的错 —— 否则升级会让所有历史导出码一夜失效。
+   *
+   * ⚠️ 两级都失败时**必须抛同一个错误**：两把 KDF 参数各错一次的耗时不同，若让
+   * 调用方看出「这次走了第二级」，就等于用一个时间差泄漏了「码是按新参数还是旧参数封的」。
    */
-  try {
-    const dec = crypto.createDecipheriv('aes-256-gcm', deriveKey(pw, salt), iv);
-    dec.setAuthTag(tag);
-    plain = Buffer.concat([dec.update(ct), dec.final()]);
-  } catch (e) {
+  for (const params of [SCRYPT, SCRYPT_LEGACY]) {
+    let plain;
     try {
-      const dec = crypto.createDecipheriv('aes-256-gcm', deriveKey(pw, salt, SCRYPT_LEGACY), iv);
+      const dec = crypto.createDecipheriv('aes-256-gcm', await deriveKey(pw, salt, params), iv);
       dec.setAuthTag(tag);
       plain = Buffer.concat([dec.update(ct), dec.final()]);
-    } catch (e2) {
-      throw Object.assign(new Error('备份密码错误，或导出码已被篡改'), { status: 400, backupCodeInvalid: true });
+    } catch (e) {
+      // GCM 认证失败 = 密码错或参数不匹配，换下一级参数再试
+      continue;
     }
+    /**
+     * ⚠️ `decodeCode()` 刻意放在 try **之外**：它抛的是「内容能解开但结构不对」
+     * （不是认证失败）。留在 try 里就会被当成"这级参数不对"，于是用户看到的
+     * 是一句「密码错误」—— 而他真正的处境是"码解开了，但里面不是备份"。
+     */
+    return decodeCode(plain.toString('utf8'));
   }
-  return decodeCode(plain.toString('utf8'));
+  throw Object.assign(new Error('备份密码错误，或导出码已被篡改'), { status: 400, backupCodeInvalid: true });
 }
 
 /* ============================ 导入（覆盖） ============================ */

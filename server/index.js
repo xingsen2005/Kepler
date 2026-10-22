@@ -32,6 +32,21 @@ const { loadTlsCert, hintText } = require('./tls-cert');
 
 const app = express();
 
+/**
+ * R75：查询串解析器固定为 `simple`（`querystring`），**刻意不用默认的 `extended`（`qs`）**。
+ *
+ * 全库 `req.query.*` 的取值全是扁平标量（`prefix` / `limit` / `page` / `action` …），
+ * 没有任何一处依赖 `a[b]=1` 这类嵌套语法。而 `extended` 会把每个请求都送进 `qs`，
+ * 于是 `qs` 历年那几条咨询（`arrayLimit` 绕过、`isBuffer` DoS）就成了「要靠论证说明不可达」
+ * 的问题；换成 `simple` 之后它们变成**构造上不可达** —— 请求根本走不到那份代码。
+ * `simple` 同时天然免疫 `?__proto__[x]=1` 这一类原型污染，因为 `querystring.parse`
+ * 返回的是 null 原型对象。
+ *
+ * 语义差异只有一处：`?a[]=1` 在 `simple` 下得到键名 `"a[]"` 的字面量，不再是数组。
+ * 本项目没有任何前端或第三方集成这样传参（护栏见 `tests/invariants.test.js`）。
+ */
+app.set('query parser', 'simple');
+
 const HOST = process.env.HOST || '127.0.0.1';
 const HTTP_PORT = Number(process.env.PORT) || 3000;
 const HTTPS_PORT = Number(process.env.HTTPS_PORT) || 3443;

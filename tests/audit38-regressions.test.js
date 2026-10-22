@@ -299,19 +299,19 @@ test('R38-02g · 实时码可自洽解码，且声明的分区与实际内容一
 /* R38-02 · 导出码（账户口令 + 独立备份密码）                              */
 /* ==================================================================== */
 
-test('R38-02h · 导出码往返一致，且必须用备份密码才能打开', () => {
+test('R38-02h · 导出码往返一致，且必须用备份密码才能打开', async () => {
   const code = backup.buildCode();
-  const sealed = backup.seal(code, 'backup-pass-123');
+  const sealed = await backup.seal(code, 'backup-pass-123');
   assertEqual(sealed.startsWith(backup.SEAL_HEAD + '.'), true, 'R38-02：导出码有独立的抬头，便于人眼区分');
   assert(sealed !== code, 'R38-02：导出码必须与实时码不同（前者是密文）');
-  const out = backup.open(sealed, 'backup-pass-123');
+  const out = await backup.open(sealed, 'backup-pass-123');
   assertEqual(JSON.stringify(out), JSON.stringify(backup.decodeCode(code)),
     'R38-02：导出码解出来的内容必须与实时码完全一致');
 });
 
-test('R38-02i · 备份密码错误 / 导出码被篡改都必须报错，绝不返回半截配置', () => {
-  const sealed = backup.seal(backup.buildCode(), 'backup-pass-123');
-  assert.throws(() => backup.open(sealed, 'backup-pass-124'), /密码错误|篡改/,
+test('R38-02i · 备份密码错误 / 导出码被篡改都必须报错，绝不返回半截配置', async () => {
+  const sealed = await backup.seal(backup.buildCode(), 'backup-pass-123');
+  await assert.rejects(() => backup.open(sealed, 'backup-pass-124'), /密码错误|篡改/,
     'R38-02：密码错必须报错（GCM 认证失败），绝不能解出半截配置 —— 半截配置的导入是破坏性的');
 
   // 篡改密文段中间一个字符
@@ -320,18 +320,18 @@ test('R38-02i · 备份密码错误 / 导出码被篡改都必须报错，绝不
   const tail = parts[4].slice(6);
   const flip = parts[4][5] === 'A' ? 'B' : 'A';
   const tampered = [parts[0], parts[1], parts[2], parts[3], head + flip + tail].join('.');
-  assert.throws(() => backup.open(tampered, 'backup-pass-123'), /密码错误|篡改/,
+  await assert.rejects(() => backup.open(tampered, 'backup-pass-123'), /密码错误|篡改/,
     'R38-02：被改过一个字符的导出码必须认证失败（这就是选 AES-GCM 而不是 CBC 的原因）');
 
   // 抬头不对：实时码不能被当成导出码导入
-  assert.throws(() => backup.open(backup.buildCode(), 'backup-pass-123'), /抬头/,
+  await assert.rejects(() => backup.open(backup.buildCode(), 'backup-pass-123'), /抬头/,
     'R38-02：把实时码当导出码导入必须被拒 —— 实时码没有完整性保护，谁都能改一个字节再让服务端吃进去');
 });
 
-test('R38-02j · 备份密码有长度约束（太短直接拒，不静默接受）', () => {
-  assert.throws(() => backup.seal(backup.buildCode(), '1234567'), new RegExp(String(backup.PASSWORD_MIN)),
+test('R38-02j · 备份密码有长度约束（太短直接拒，不静默接受）', async () => {
+  await assert.rejects(() => backup.seal(backup.buildCode(), '1234567'), new RegExp(String(backup.PASSWORD_MIN)),
     'R38-02：备份密码短于下限必须报错，绝不静默接受一个弱口令来保护全部密钥');
-  assert.throws(() => backup.seal(backup.buildCode(), 'x'.repeat(backup.PASSWORD_MAX + 1)), /最长/,
+  await assert.rejects(() => backup.seal(backup.buildCode(), 'x'.repeat(backup.PASSWORD_MAX + 1)), /最长/,
     'R38-02：超长也必须拒绝（与 WebDAV 账户口令同一上限，避免同一套界面两种口径）');
 });
 
@@ -528,7 +528,7 @@ test('R38-02r · 导出必须校验账户口令：口令错 → 403 且不产生
     });
     assertEqual(good.status, 200, 'R38-02：账户口令正确时应返回导出码');
     assertEqual(String(good.json.code).startsWith(backup.SEAL_HEAD + '.'), true, 'R38-02：返回的是加密导出码');
-    const opened = backup.open(good.json.code, 'backup-pass-123');
+    const opened = await backup.open(good.json.code, 'backup-pass-123');
     assert(Object.keys(opened).length > 0, 'R38-02：导出码必须能用备份密码解开（闭环验证）');
   } finally { await s.close(); }
 });
@@ -538,7 +538,7 @@ test('R38-02s · 导入在「已有配置」的实例上必须 409，且不能�
   const s = await serveBackup({ id: me.id, username: 'admin1', role: 'admin' });
   try {
     const snapshot = backup.buildCode();
-    const sealed = backup.seal(snapshot, 'backup-pass-123');
+    const sealed = await backup.seal(snapshot, 'backup-pass-123');
     const before = backup.buildCode();
     const r = await request(s.port, 'POST', '/backup/import', { body: { code: sealed, backupPassword: 'backup-pass-123' } });
     assertEqual(r.status, 409, 'R38-02：已配置实例必须拒绝导入（覆盖不可撤销）');

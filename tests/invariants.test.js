@@ -2259,6 +2259,92 @@ test('上游状态码不占本地 401/403 语义', () => {
     `命中 ${hits.length} 处（401 必须被映射掉，否则前端会当成会话过期并强制登出）：\n  ${hits.join('\n  ')}`);
 });
 
+/**
+ * 类别：同步 KDF 阻塞事件循环（SEC-05）
+ *
+ * 台账 `SEC-05` 的「验证依据」栏从 R21 起就写着「全库无 `scryptSync`」—— 而那句话
+ * **从来没有机器在验证**。R38 引入 `server/backup.js` 时写了一个 `scryptSync`，
+ * 台账于是变成了一句假话，却一直全绿：**判据落在了没有代码的那一层**。
+ *
+ * 为什么不给 `backup.js` 开例外：「全库无」是一句可以被验证的话；一旦开了例外，
+ * 那句话就永远无法恢复成真，例外清单还会成为下一处新增的藏身地。而异步版成本很低
+ * （`deriveKey()` 已改，见 R74），没有理由保留同步调用。
+ *
+ * ## 为什么用 AST 而不是 `stripComments` + 文本匹配
+ *
+ * 本项目绝大多数静态判据都走「剥注释 + 文本匹配」，那是因为它们的靶子（`mkdirSync`、
+ * 裸 `deleteMultipleObject`）在**调用形态**上足够唯一。这一条不同：`scryptSync`
+ * 会作为**标识符**出现在注释、字符串、甚至别人的函数名里，而复用现有 `stripComments`
+ * 实测**在 `server/share-routes.js` 上会状态漂移** —— 该文件里有 `'` / `` ` `` 混排的
+ * 模板字符串与正则字面量，剥注释后第 841 行起仍有 130 行注释没被抹白。那种情况下
+ * 文本匹配既可能假红（把注释判成违规）也可能假绿（把代码当注释吞掉）。
+ *
+ * 既然 `espree` 已是 devDependency（eslint 的解析器），直接用 AST 判定
+ * 「**有没有一个节点真的在引用这个标识符**」既准确又不依赖脆弱的文本启发式。
+ * 这正是本项目反复强调的「判据必须落在**实际被执行的那一层**」。
+ */
+function scryptSyncViolations(src, rel) {
+  const espree = require('espree');
+  let ast;
+  try {
+    ast = espree.parse(src, { ecmaVersion: 2023, sourceType: 'script', loc: true });
+  } catch (e) {
+    // 解析失败必须报出来，绝不能当成"没有违规" —— 否则一个新语法就能让本条永久失明
+    return [`${rel}:0  解析失败，SEC-05 判据无法求值：${e.message}`];
+  }
+  const out = [];
+  const visit = (node) => {
+    if (!node || typeof node.type !== 'string') return;
+    let hit = null;
+    // ① `crypto.scryptSync(...)` —— 成员访问
+    if (node.type === 'MemberExpression' && !node.computed
+      && node.property && node.property.name === 'scryptSync') {
+      hit = node.loc.start.line;
+    }
+    // ② 解构 / 别名：`const { scryptSync } = crypto`
+    if (node.type === 'Identifier' && node.name === 'scryptSync') {
+      hit = node.loc.start.line;
+    }
+    if (hit) out.push(`${rel}:${hit}  scryptSync`);
+    for (const key of Object.keys(node)) {
+      if (key === 'loc' || key === 'range' || key === 'parent') continue;
+      const v = node[key];
+      if (Array.isArray(v)) v.forEach(visit);
+      else if (v && typeof v.type === 'string') visit(v);
+    }
+  };
+  visit(ast);
+  /**
+   * 同一行可能被成员访问与标识符两个节点各命中一次（`crypto.scryptSync` 的属性名
+   * 本身就是一个 Identifier）。按行去重，避免一条违规报两次。
+   */
+  return [...new Set(out)];
+}
+
+test('SEC-05：全库不得出现同步 scrypt（主线程被占住即全站停顿）', () => {
+  const hits = [];
+  for (const f of serverFiles) hits.push(...scryptSyncViolations(f.src, f.rel));
+  assertEqual(hits.length, 0,
+    `命中 ${hits.length} 处 —— SEC-05 要求口令 / 密钥派生一律走异步 scrypt：\n  ${hits.join('\n  ')}\n`
+    + '  同步版会把主线程整段占住（N=131072 / r=8 / p=1 本机实测 ≈ 530ms），期间 WebDAV、'
+    + '下载与全部 API 请求排队。修法：`crypto.scrypt(pw, salt, keylen, opts, cb)` 包一层 Promise'
+    + '（参考 `config-store.js` 的 `scryptHex()` 与 `backup.js` 的 `deriveKey()`）');
+
+  /**
+   * 下界自检：扫描器若因为某种语法而整片失明，"0 处命中"同样成立。
+   * 用一段**确定的违规样例**打通同一条判定链路。
+   */
+  const fake = [
+    "const s = 'scryptSync 只是字符串，不算违规';",
+    '// 这一行注释里提到 scryptSync 也不算违规',
+    'const k = crypto.scryptSync(pw, salt, 32);',
+    'const { scryptSync: alias } = crypto;',
+  ].join('\n');
+  assertEqual(scryptSyncViolations(fake, 'sample.js').length, 2,
+    '扫描器自检失败：样例里应恰好抓到 2 处（第 3 行成员访问 + 第 4 行解构别名），'
+    + '字符串与注释里的字样都不算 —— 抓到 0 说明 AST 解析链路已失效，本条的绿不可信');
+});
+
 test('HEAD 与 GET 同源：head 必须注册在同名 get 之前', () => {
   const hits = [];
   for (const f of serverFiles) hits.push(...headOrderViolations(f.src, f.rel));
@@ -2623,4 +2709,147 @@ test('依赖清单必须与锁文件同步（否则 npm ci 必然失败）', () 
     assert(root.license === pkg.license,
       `锁文件根条目的 license（${root.license}）与 package.json（${pkg.license}）不一致`);
   }
+});
+
+/* ==================================================================== *
+ * R75 · 依赖面护栏：长尾只能"显式变长"，不能悄悄变长
+ * ==================================================================== */
+
+/**
+ * 运行时依赖白名单。
+ *
+ * 这不是"讨厌依赖"，而是把「新增一个运行时依赖」从一次随手 `npm i` 变成一次**显式决议**：
+ * 改这个常量就必须在 PR 里说清为什么、以及它带来的闭包有多大。
+ *
+ * 现状：`express` 一个，它的运行时闭包 68 条（另见下一条用例的预算）。
+ */
+const RUNTIME_DEP_BUDGET = {
+  allowed: ['express'],
+  /** 运行时闭包（含嵌套副本）上限。涨到超过它，必须连同本注释一起改，说明新增了谁的子树 */
+  closureMax: 70,
+};
+
+test('R75-01 · 运行时依赖只能是白名单内的那几个（长尾不得悄悄变长）', () => {
+  const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
+  const lock = JSON.parse(fs.readFileSync(path.join(ROOT, 'package-lock.json'), 'utf8'));
+  const packages = lock.packages || {};
+
+  const actual = Object.keys(pkg.dependencies || {}).sort();
+  const allowed = [...RUNTIME_DEP_BUDGET.allowed].sort();
+
+  assertEqual(actual.join(','), allowed.join(','),
+    `运行时依赖清单变了：实际 [${actual.join(', ')}]，白名单 [${allowed.join(', ')}]。`
+    + '新增运行时依赖会连带一整棵子树（`npm ci --omit=dev` 装的就是它），'
+    + '确需新增时请同步改 RUNTIME_DEP_BUDGET 并在提交信息里写明理由与闭包增量');
+
+  // 另外两类容易被忘掉的字段：它们同样会让 `npm ci` 装上东西，但不在 dependencies 里
+  for (const field of ['peerDependencies', 'optionalDependencies', 'bundledDependencies', 'bundleDependencies']) {
+    const v = pkg[field];
+    const empty = v === undefined || (Array.isArray(v) && v.length === 0)
+      || (typeof v === 'object' && Object.keys(v).length === 0);
+    assert(empty, `package.json 出现了 ${field}（${JSON.stringify(v)}）—— 它会绕过运行时依赖白名单把包装进来`);
+  }
+
+  /**
+   * 闭包预算：从 lockfile 直接算，不 spawn npm（快、且不依赖本机是否装过 dev 依赖）。
+   * `dev: true` 的条目只服务 lint / 测试，不进生产镜像（Dockerfile 是 `npm ci --omit=dev`）。
+   */
+  let prod = 0;
+  let dev = 0;
+  for (const [k, v] of Object.entries(packages)) {
+    if (!k.startsWith('node_modules/')) continue;
+    if (v && v.dev) dev++; else prod++;
+  }
+
+  // 下界自检：算出 0 条说明 lockfile 结构变了（例如退回 v1），此时"没超预算"毫无意义
+  assert(prod > 0,
+    '扫描范围自检：从 package-lock.json 里一条生产依赖都没数出来 —— 锁文件格式可能已变，本判据需同步调整');
+  assert(prod <= RUNTIME_DEP_BUDGET.closureMax,
+    `运行时闭包 ${prod} 条，超过预算 ${RUNTIME_DEP_BUDGET.closureMax} 条（dev-only ${dev} 条不计）。`
+    + '这类增长通常来自间接依赖换版本，请先看 \`npm ls --omit=dev --all\` 里谁把新子树带进来了');
+});
+
+test('R75-02 · 代码不得直接 require 未声明的包（否则就是在赌传递依赖）', () => {
+  /**
+   * 为什么要有这条：直接 `require()` 一个**没写进 package.json** 的包，当下能跑，
+   * 纯粹是因为 npm 把它平铺到了 `node_modules/` 根部。一旦上游换版本、改依赖关系、
+   * 或 npm 换一种提升策略，它就会变成 `MODULE_NOT_FOUND` —— 而且往往**只在某些机器上**。
+   *
+   * 本项目真实踩过两次：R74 新写的护栏用了 `espree`（当时只是 eslint 的传递依赖），
+   * 以及历史上 `selfsigned` 被移除后仍留在测试里。两条都是"本机能跑、换台机器就炸"。
+   *
+   * ⚠️ 判据必须走 AST：用正则扫源码会被**注释**与**字符串**骗到 ——
+   * `tests/audit49-regressions.test.js` 的断言文案里就写着 `require('selfsigned')`
+   * （它断言的是"这个包不该存在"），正则会把这条错误地判成未声明依赖。
+   */
+  const espree = require('espree');
+  const pkg = JSON.parse(fs.readFileSync(path.join(ROOT, 'package.json'), 'utf8'));
+  const declared = new Set([
+    ...Object.keys(pkg.dependencies || {}),
+    ...Object.keys(pkg.devDependencies || {}),
+  ]);
+  const builtins = new Set(require('module').builtinModules);
+
+  const rootOf = (id) => {
+    if (id.startsWith('@')) return id.split('/').slice(0, 2).join('/');
+    return id.split('/')[0];
+  };
+
+  /** 找出 AST 里所有 `require('<字面量>')` 的实参 */
+  const requiresIn = (src) => {
+    const ast = espree.parse(src, { ecmaVersion: 2023, sourceType: 'script' });
+    const out = [];
+    const visit = (node) => {
+      if (!node || typeof node.type !== 'string') return;
+      if (node.type === 'CallExpression'
+        && node.callee && node.callee.type === 'Identifier' && node.callee.name === 'require'
+        && node.arguments.length === 1 && node.arguments[0].type === 'Literal'
+        && typeof node.arguments[0].value === 'string') {
+        out.push({ id: node.arguments[0].value, line: node.loc ? node.loc.start.line : 0 });
+      }
+      for (const key of Object.keys(node)) {
+        if (key === 'loc') continue;
+        const v = node[key];
+        if (Array.isArray(v)) v.forEach(visit);
+        else if (v && typeof v.type === 'string') visit(v);
+      }
+    };
+    visit(ast);
+    return out;
+  };
+
+  const offenders = [];
+  let scannedFiles = 0;
+  let scannedRequires = 0;
+  const walk = (dir) => {
+    for (const e of fs.readdirSync(path.join(ROOT, dir), { withFileTypes: true })) {
+      const rel = `${dir}/${e.name}`;
+      if (e.isDirectory()) {
+        if (e.name === 'node_modules' || e.name.startsWith('.')) continue;
+        walk(rel);
+        continue;
+      }
+      if (!e.name.endsWith('.js')) continue;
+      scannedFiles++;
+      const src = fs.readFileSync(path.join(ROOT, rel), 'utf8');
+      for (const r of requiresIn(src)) {
+        scannedRequires++;
+        if (r.id.startsWith('.') || r.id.startsWith('/')) continue;
+        if (r.id.startsWith('node:')) continue;
+        const root = rootOf(r.id);
+        if (builtins.has(root)) continue;
+        if (declared.has(root)) continue;
+        offenders.push(`${rel}:${r.line} → ${r.id}（根包 ${root} 未在 package.json 声明）`);
+      }
+    }
+  };
+  for (const dir of ['server', 'scripts', 'tests']) walk(dir);
+
+  // 下界自检：三个目录加起来只有几十个 require 的话，上面那条 walk 大概率已经失效
+  assert(scannedFiles > 50 && scannedRequires > 200,
+    `扫描范围自检：扫了 ${scannedFiles} 个文件、${scannedRequires} 处 require —— 明显偏少，本判据可能已失效`);
+
+  assertEqual(offenders.length, 0,
+    `以下代码直接 require 了未声明的包（当下能跑只是因为它被平铺在 node_modules 根部）：\n  ${offenders.join('\n  ')}\n`
+    + '  修法：把该包写进 dependencies（运行时用）或 devDependencies（测试/工具用），版本与上游实际用的对齐，避免装出两份');
 });

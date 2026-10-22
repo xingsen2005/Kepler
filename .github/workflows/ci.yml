@@ -56,6 +56,9 @@ jobs:
       - name: 安装依赖（严格按 lockfile）
         run: npm ci
 
+      - name: 依赖漏洞（只看运行时闭包，高危才拦）
+        run: npm audit --omit=dev --audit-level=high --registry=https://registry.npmjs.org
+
       - name: 静态检查（eslint 未安装时自动跳过，返回 0）
         run: npm run lint
 
