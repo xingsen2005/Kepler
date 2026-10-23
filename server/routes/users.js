@@ -17,7 +17,15 @@
  * 管理员之间可以互相删除的越权漏洞正是由此而来。
  */
 const { express, configStore, statsStore, authSession, emailCode } = require('./_context');
-const { requireAdmin, sendError } = require('./_shared');
+/**
+ * R71：**「谁能管谁」的唯一接口层判定点** —— R78 起实现搬到 `_shared.js`。
+ *
+ * 搬家的原因：代用户关闭 Windows Hello 与「重置密码」是同一档运维能力，
+ * 必须共用同一条判据；而它此前只住在 users.js 里，`routes/webauthn.js` 那条
+ * `POST /users/:id/webauthn/disable` 因此一直只挂 `requireAdmin`（管理员可以
+ * 静默拆掉根用户的二因素）。判据只能有一份实现，谁需要谁引。
+ */
+const { requireAdmin, sendError, denyIfCannotManage } = require('./_shared');
 /**
  * R71：角色语义的唯一事实源。本文件**不得**再出现 `role === 'admin'` 这类字面量比较 ——
  * 越权判据一旦散在多个 if 里，漏掉任何一处（例如新加的「强制登出」）都不会报错，
@@ -46,38 +54,6 @@ function loadTargetUser(req, res) {
     return null;
   }
   return target;
-}
-
-/**
- * R71：**「谁能管谁」的唯一接口层判定点**（编辑 / 删除 / 封禁 / 解封 / 强制登出共用）。
- *
- * 为什么必须收成一个函数：这五条路由原本各自只挂 `requireAdmin`，也就是「是管理员
- * 就能管任何人」。要修的漏洞恰恰在**这一层缺了一句判定**，而修法是给五处都补上 ——
- * 散着写就必然出现「改了删除、漏了封禁」（封禁等于软删除，同样是越权）。
- *
- * 被拒绝时的**预期行为**（护栏逐条钉住，见 `tests/root-role.test.js`）：
- *  1. 响应 `403` + `{ error: '管理员只能管理普通用户：目标账户是管理员，该操作仅根用户可执行' }`；
- *  2. **目标账户一个字节都不改**（不删除、不改角色、不写封禁、不吊销会话）——
- *     判定必须在任何写操作**之前**，事后回滚不算数；
- *  3. 侧栏看不到其他人的变化：管理员仍能在 `GET /users` 里看到该账户，说明它没被删；
- *  4. 留一条 `users.denied`（level=warn）审计日志：谁、对谁、想做什么。
- *     拒绝也要留痕 —— 否则「有人反复尝试删除根用户」这件事在日志里完全不可见。
- *
- * @returns {boolean} `true` = 已回写 403，调用方必须立即 return
- */
-function denyIfCannotManage(req, res, target, action) {
-  const actor = req.authUser || {};
-  if (roles.canManageUser(actor.role, target.role)) return false;
-  statsStore.addLog({
-    action: 'users.denied',
-    level: 'warn',
-    detail: `${roles.roleLabel(actor.role)}「${actor.username || '(未知)'}」尝试${action}`
-      + `${roles.roleLabel(target.role)}「${target.username}」被拒绝（管理员只能管理普通用户）`,
-  });
-  res.status(403).json({
-    error: `管理员只能管理普通用户：目标账户是${roles.roleLabel(target.role)}，该操作仅根用户可执行`,
-  });
-  return true;
 }
 
 /**

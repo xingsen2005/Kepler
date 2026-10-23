@@ -938,12 +938,68 @@ function buildFinalMeta(sess) {
     if (!sess.enc.parts[n]) throw bad(`第 ${n} 分片缺少加密元数据（可能以明文上传），请取消任务后重新上传`);
   }
   const segments = parts
-    .map(([n, v]) => ({ n: Number(n), iv: v.iv, tag: v.tag, ctLen: v.ctLen }))
+    .map(([n, v]) => {
+      /**
+       * R77：**新元数据不得再产出「缺 iv/tag」的形态**。
+       *
+       * 缺 iv/tag 的历史条目之所以还能被解密，是因为 R24-03 留了免检豁免；一旦
+       * 新写入也能落出这种条目，豁免就会被源源不断地续命（典型来源是**旧版本
+       * 创建、升级后才续传**的上传会话：`sess.enc.parts[n]` 里没有 iv/tag，
+       * 这里原本会把 undefined 原样写进 JSON，序列化后字段直接消失）。
+       * 与其等到下载时才发现不可校验，不如在合并前就拒绝并让用户重传。
+       */
+      if (!v || !v.iv || !v.tag) {
+        throw bad(`第 ${n} 分片的加密元数据缺少 IV/TAG（可能来自旧版本的上传会话），请取消任务后重新上传`);
+      }
+      return { n: Number(n), iv: v.iv, tag: v.tag, ctLen: v.ctLen };
+    })
     .sort((a, b) => a.n - b.n);
   return stampKeyId({ mode: 'crypto', origSize: sess.size, createdAt: iso(), crypto: { segments } });
 }
 
 /* ============================ 解密流 ============================ */
+
+/**
+ * R77：是否允许按旧行为解密**缺少 IV/TAG** 的历史加密元数据（默认**关**）。
+ *
+ * 默认关是安全默认：这类元数据无法校验分段顺序，重排 / 拼接只能靠 GCM 逐段
+ * 认证（每段各自自洽，挡不住整体换序）。逃生门留给「手上确实有老文件、且必须
+ * 先取回」的运维场景 —— 取回后重新上传即会生成完整的 iv/tag，随后应撤掉开关。
+ *
+ * **在调用时读取**而不是模块加载期固化：运维改完 env 重启即生效，测试也能在
+ * 同一个进程内分别验证「默认拒绝」与「显式放行」两条路径。
+ */
+function legacyUnverifiedAllowed() {
+  return String(process.env.ALLOW_LEGACY_UNVERIFIED_CRYPTO || '') === '1';
+}
+
+let legacyWarned = false;
+/** 放行历史元数据时**每次进程只告警一次**：解密是高频路径，逐次刷屏会把日志淹掉 */
+function warnLegacyUnverifiedOnce() {
+  if (legacyWarned) return;
+  legacyWarned = true;
+  console.warn('[enc-store] 警告：ALLOW_LEGACY_UNVERIFIED_CRYPTO=1 —— 正在解密缺少 IV/TAG 的'
+    + '历史密文，分段重排 / 拼接无法检出；请尽快取回并重新上传，然后撤掉该开关。');
+}
+
+/**
+ * 构造一条**必然失败**的解密流（元数据不合格时用）。
+ *
+ * ⚠️ 不要退回 `new Transform()` + `process.nextTick(destroy)` 的写法：
+ * 那是一个**直通**流，只要调用方在同一 tick 里 `end(密文)`（测试与
+ * `PassThrough` 类调用方都会这样），'end' 会先于 nextTick 触发，
+ * 于是密文被原样当作「明文」交给下游，错误反而丢了 —— 实测本轮护栏
+ * 一上手就抓到了这个形态（`out.length === 0` 断言直接变红）。
+ *
+ * 现在两条路径都失败：有数据 → `transform` 立刻回错；空输入 →
+ * nextTick 兜底 destroy（否则空流会静默"成功"）。
+ */
+function failStream(message) {
+  const err = new Error(message);
+  const t = new Transform({ transform(chunk, enc, cb) { cb(err); } });
+  process.nextTick(() => { if (!t.destroyed) t.destroy(err); });
+  return t;
+}
 
 /**
  * 构造解密 Transform：输入云端密文字节流，输出原始明文流。
@@ -1050,7 +1106,34 @@ function decryptTransform(meta) {
 
   // crypto 模式：分段状态机 [魔数10B] (IV12B 密文 TAG16B)×N
   const segs = (meta.crypto && meta.crypto.segments) || [];
-  if (!segs.length) { const t = new Transform(); process.nextTick(() => t.destroy(new Error('缺少加密分段元数据'))); return t; }
+  if (!segs.length) return failStream('缺少加密分段元数据');
+  /**
+   * R77（外部审计 F-E1）：**缺 IV/TAG 的历史元数据必须 fail-closed**。
+   *
+   * R24-03 的逐段比对给「历史元数据缺 iv/tag」留了跳过比对的豁免（向后兼容），
+   * 但这条豁免既没有回填迁移来关闭，也没有任何护栏覆盖 —— 于是凡在 iv/tag 落进
+   * 元数据之前加密、至今仍在云端的对象，这项保护一天也没生效过：能写云端对象者
+   * 把等长分段重排、或把另一个密文对象的分段拼接进来，**每段的 GCM 仍然各自
+   * 自洽通过**，静默产出被重排的明文，下载方收不到任何错误。这与本函数
+   * 「任何篡改都会报错，不会输出损坏明文」的承诺直接矛盾。
+   *
+   * 判据落在**构造期**（一个字节都还没下发）而不是逐段推进时：否则「先给半截
+   * 明文、再报错」正是 R27-11 花一整轮消除掉的失败形态。
+   *
+   * 逃生门见 `legacyUnverifiedAllowed()`：默认关，放行时每次进程告警一次。
+   */
+  const legacyAt = segs.findIndex((s) => !s || !s.iv || !s.tag);
+  if (legacyAt >= 0) {
+    if (!legacyUnverifiedAllowed()) {
+      return failStream(
+        `该对象的加密元数据缺少 IV/TAG（第 ${legacyAt + 1} 段），来自 v1.2.4 之前的版本：`
+        + '无法校验分段的顺序与完整性（重排 / 拼接将无法检出），因此拒绝解密。'
+        + '请先用旧版本取回并重新上传（重新加密会生成完整元数据）；'
+        + '确需临时按旧行为解密，可在服务端设置 ALLOW_LEGACY_UNVERIFIED_CRYPTO=1 后重启。'
+      );
+    }
+    warnLegacyUnverifiedOnce();
+  }
   let si = 0, phase = 'magic', remaining = CRYPTO_MAGIC.length;
   let pending = Buffer.alloc(0);
   let decipher = null, ctLeft = 0;
@@ -1120,7 +1203,8 @@ function decryptTransform(meta) {
              *
              * 按位置比对 IV 与 TAG 同时钉住「顺序」与「内容」：重排会让第 i 段读到邻段
              * 的 IV，拼接会让它读到别的对象的 IV —— 两者都在此立即失败。
-             * （历史元数据若缺少 iv/tag 则跳过比对，保持向后兼容。）
+             * （R77：缺 iv/tag 的历史元数据已在构造期被拒绝，根本走不到这里；
+             *  只有显式设了 ALLOW_LEGACY_UNVERIFIED_CRYPTO=1 时才回到「跳过比对」。）
              */
             const wantIv = segs[si] && segs[si].iv ? String(segs[si].iv).toLowerCase() : '';
             if (wantIv && wantIv !== t.toString('hex')) {

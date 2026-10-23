@@ -661,6 +661,44 @@ function errorBody(err) {
   return out;
 }
 
+/**
+ * R71：**「谁能管谁」的唯一接口层判定点**（编辑 / 删除 / 封禁 / 解封 / 强制登出 /
+ * 代关 Windows Hello 共用）。
+ *
+ * 为什么必须收成一个函数：这几条路由原本各自只挂 `requireAdmin`，也就是「是管理员
+ * 就能管任何人」。要修的漏洞恰恰在**这一层缺了一句判定**，而修法是给每一处都补上 ——
+ * 散着写就必然出现「改了删除、漏了封禁」（封禁等于软删除，同样是越权）。
+ *
+ * R78：它从 `routes/users.js` 搬到本文件。原因很具体 —— 代用户关闭 Windows Hello
+ * 是**同级的运维救济能力**（与重置密码同一档），必须共用同一条判据；留在 users.js
+ * 里就只能被 users.js 自己调用，于是 `webauthn.js` 那条路由一直漏着（管理员可以
+ * 静默拆掉根用户的二因素）。判据只能有一份实现，谁需要谁引。
+ *
+ * 被拒绝时的**预期行为**（护栏逐条钉住，见 `tests/root-role.test.js`）：
+ *  1. 响应 `403` + `{ error: '管理员只能管理普通用户：目标账户是管理员，该操作仅根用户可执行' }`；
+ *  2. **目标账户一个字节都不改**（不删除、不改角色、不写封禁、不吊销会话）——
+ *     判定必须在任何写操作**之前**，事后回滚不算数；
+ *  3. 侧栏看不到其他人的变化：管理员仍能在 `GET /users` 里看到该账户，说明它没被删；
+ *  4. 留一条 `users.denied`（level=warn）审计日志：谁、对谁、想做什么。
+ *     拒绝也要留痕 —— 否则「有人反复尝试删除根用户」这件事在日志里完全不可见。
+ *
+ * @returns {boolean} `true` = 已回写 403，调用方必须立即 return
+ */
+function denyIfCannotManage(req, res, target, action) {
+  const actor = req.authUser || {};
+  if (roles.canManageUser(actor.role, target.role)) return false;
+  statsStore.addLog({
+    action: 'users.denied',
+    level: 'warn',
+    detail: `${roles.roleLabel(actor.role)}「${actor.username || '(未知)'}」尝试${action}`
+      + `${roles.roleLabel(target.role)}「${target.username}」被拒绝（管理员只能管理普通用户）`,
+  });
+  res.status(403).json({
+    error: `管理员只能管理普通用户：目标账户是${roles.roleLabel(target.role)}，该操作仅根用户可执行`,
+  });
+  return true;
+}
+
 Object.assign(module.exports, {
   typeOf, baseName, parentOf,
   roleOf, bucketsFor, credentialsFor,
@@ -674,6 +712,8 @@ Object.assign(module.exports, {
   FRAGMENT_CACHE_MAX, DEFAULT_FRAGMENT_TTL_MS, sweepFragmentCache,
   checkBasenameExcluded, assertNotExcluded,
   sendError, errorBody,
+  // R71 / R78：「能管谁」的唯一判定点（users / webauthn 两条路由族共用）
+  denyIfCannotManage,
   // R25：按 API Key 的配额（闸门 + 明细）
   QUOTA_EXCEEDED_CODE, assertCredentialQuota, credentialUsage, recordUsageDelta,
   // R28-02：按单个存储桶的配额（闸门 + 明细）

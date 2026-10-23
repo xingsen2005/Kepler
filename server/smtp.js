@@ -547,7 +547,19 @@ class SmtpSession {
   }
 }
 
-/** 入参收敛：缺字段补默认值，所有文本统一转字符串（不信任调用方类型） */
+/**
+ * 入参收敛：缺字段补默认值，所有文本统一转字符串（不信任调用方类型）
+ *
+ * R78：**所有会进信头的字段一律过 `oneLine()`** —— `from` / `fromName` / `to` /
+ * `subject` 都会被原样拼进 `From:` / `To:` / `Subject:` 行，而 SMTP 的信头以
+ * `\r\n` 分行：一个带换行的收件地址（`a@b.c\r\nBcc: victim@x.y`）就是一次
+ * **信头注入** —— 收件人之外多出一整行 `Bcc`，或者把正文提前顶到信头区。
+ * 旧实现只对 `subject` 做了处理（经 `encodedWord()` 间接 `oneLine`），
+ * `from` / `to` / `fromName` 是裸拼的；上游若有一条调用方没做邮箱格式校验，
+ * 这里就是最后一道防线。放在**收敛点**而不是拼装点，是因为拼装点有 `From`
+ * 与 `To` 两处、将来还会有 `Cc`，逐处补必然漏一处。
+ * `text` 是正文，**绝不能**处理（那是合法的多行内容）。
+ */
 function normalizeOptions(opts) {
   const o = opts || {};
   const n = Number(o.timeoutMs);
@@ -557,10 +569,10 @@ function normalizeOptions(opts) {
     secure: o.secure !== false,
     user: String(o.user || '').trim(),
     password: typeof o.password === 'string' ? o.password : '',
-    from: String(o.from || '').trim(),
-    fromName: String(o.fromName || '').trim(),
-    to: String(o.to || '').trim(),
-    subject: String(o.subject || '').trim() || 'Kepler 发信测试',
+    from: oneLine(String(o.from || '').trim()),
+    fromName: oneLine(String(o.fromName || '').trim()),
+    to: oneLine(String(o.to || '').trim()),
+    subject: oneLine(String(o.subject || '').trim()) || 'Kepler 发信测试',
     text: typeof o.text === 'string' ? o.text : '',
     timeoutMs: Number.isFinite(n) && n > 0 ? Math.floor(n) : DEFAULT_TIMEOUT_MS,
   };
@@ -698,4 +710,7 @@ async function verify(opts) {
 
 module.exports = {
   sendMail, verify, DEFAULT_TIMEOUT_MS, CODE, buildMessage, dotStuff, encodedWord,
+  // R78：信头字段的收敛点 —— 单独导出是为了让「CRLF 不得进信头」这条判据
+  // 能在不真连 SMTP 服务器的前提下被钉住（见 tests/audit78-regressions.test.js）
+  normalizeOptions,
 };

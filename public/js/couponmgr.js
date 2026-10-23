@@ -279,7 +279,10 @@ function openDialog() {
     filter: (all, state) => all.filter((c) => {
       if (state.filters.status && c.status !== state.filters.status) return false;
       const text = [c.code, c.note, fmtScope(c)].join(' ');
-      return matchesQuery(text, state.query);
+      // R78：参数顺序必须是 `(query, texts)` —— 写反成 `(text, state.query)` 之后，
+      // 实际比较的是「用户输入是否包含用户输入」（`x.indexOf(x) === 0`），
+      // 于是搜索框对结果**毫无影响**：不输入时全显示，输入了还是全显示。
+      return matchesQuery(state.query, text);
     }),
     rowHtml: (list) => tableHtml(list),
     bindRows: (root, list) => bindRows(root, list),

@@ -2331,6 +2331,16 @@ function addWebdavAccount(b) {
   if (cfg.webdav.accounts.some((a) => a.appName === appName)) {
     throw Object.assign(new Error('同名应用账户已存在，请使用编辑功能修改'), { status: 409 });
   }
+  /* R78：**username 也必须唯一** —— 它才是 WebDAV 认证时的查找键。
+   *
+   * 旧实现只查 `appName`（展示名），于是可以建出两个 `appName` 不同、`username`
+   * 完全相同的账户：认证侧 `accounts.find(a => a.username === u)` 永远取到**第一个**，
+   * 第二个账户的密码从头到尾没用过，而管理界面显示"创建成功、已启用"。用户拿到凭据
+   * 连不上，排查时看到的每个字段都对 —— 这是最难查的一类问题。
+   * 只查 appName、不查真正的主键，等于把这条约束留给了用户去记。 */
+  if (cfg.webdav.accounts.some((a) => a.username === username)) {
+    throw Object.assign(new Error('该登录用户名已被其它 WebDAV 账户占用，请换一个'), { status: 409 });
+  }
   const now = new Date().toISOString();
   const acc = { id: newId(), appName, username, passwordSealed: sealPassword(password), createdAt: now, updatedAt: now };
   cfg.webdav.accounts.push(acc);
@@ -2348,6 +2358,10 @@ function updateWebdavAccount(id, b) {
     const { appName, username } = normalizeAccountInput(merged);
     if (cfg.webdav.accounts.some((a) => a.id !== id && a.appName === appName)) {
       throw Object.assign(new Error('同名应用账户已存在'), { status: 409 });
+    }
+    // R78：username 是认证查找键，改成一个已被占用的值同样会让本账户永远登不上（见 addWebdavAccount）
+    if (cfg.webdav.accounts.some((a) => a.id !== id && a.username === username)) {
+      throw Object.assign(new Error('该登录用户名已被其它 WebDAV 账户占用，请换一个'), { status: 409 });
     }
     acc.appName = appName;
     acc.username = username;

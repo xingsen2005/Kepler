@@ -784,16 +784,36 @@ async function moveObject(bucket, srcKey, dstKey, auditAction, auditPrefix) {
 async function rollbackCopies(s3, cfg, keys) {
   let removed = 0;
   const errors = [];
+  /** R78：被**云端确认删除**的键（不是「尝试删过」的键） */
+  const removedKeys = [];
   for (let i = 0; i < keys.length; i += 1000) {
     const batch = keys.slice(i, i + 1000);
     try {
       // R10-03：回滚也是批量删除 —— 判据必须同样走白名单，否则日志会谎报「已回滚 N/N」
       const res = await deleteMultipleConfirmed(s3, cfg, batch);
       removed += res.okKeys.length;
+      for (const k of res.okKeys) removedKeys.push(k);
       for (const x of res.errors) errors.push(x);
     } catch (e) { /* 尽力而为：一个批次失败也要继续删剩下的 */ }
   }
-  return { removed, errors };
+  /**
+   * R78：**副本删掉了，它的加密元数据也必须跟着走**。
+   *
+   * `copyObject()` 走 `reconcileAfterWrite()`，成功时会给目标键写一份加密元数据
+   * （密文副本没有它就是永久不可解）。回滚把目标对象删了却把这份元数据留在原处，
+   * 得到一条**指向已删对象的孤儿记录**，后果不是"占几行 JSON"这么轻：
+   * 用户之后往同一个 key 上传**明文**文件时，`encStore.getMeta()` 仍返回这条旧元数据
+   * ⇒ 下载侧按密文处理、`decryptTransform()` 去解一段明文 ⇒ 文件损坏（R77 之后
+   * 是直接报错拒绝下发，但用户看到的是"我刚传的文件打不开"）。`moveObject()` 里
+   * 早就按「云端确认删除之后才动元数据」这个顺序手工清了一次，另外四处（目录 MOVE /
+   * 目录 COPY / 文件复制 / WebDAV 目录 COPY）都没有 —— 因为收口点在这里。
+   *
+   * 注意顺序：**只清 `okKeys`（云端明确确认已删）**。删除失败的副本仍在云端，
+   * 清掉它的元数据才是真正的数据丢失（密文永久不可解）；那一档留给
+   * `findOrphanMeta()` 巡检与人工核对。
+   */
+  if (removedKeys.length) encStore.removeMetaBatch(cfg.bucket, removedKeys);
+  return { removed, errors, removedKeys };
 }
 
 /**

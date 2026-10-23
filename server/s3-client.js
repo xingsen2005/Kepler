@@ -20,7 +20,7 @@
  */
 const crypto = require('crypto');
 const { URL } = require('url');
-const { Readable, pipeline } = require('stream');
+const { Readable, Transform, pipeline } = require('stream');
 
 /**
  * R21-12：出站请求**禁止自动跟随重定向**（`fetch` 默认是 `follow`）。
@@ -517,7 +517,9 @@ class S3Client {
       return fetch(target, init)
         .then((res) => {
           rejectRedirect(res);
-          return { res, body: undefined, timeoutTimer: timer };
+          // R78：把 `abort` 一并交出去 —— 流式下载要能在「数据停滞」时主动掐断上游，
+          // 而计时器本身不该再表达「整个 body 的传输总时长」（见 getObject 流式分支）。
+          return { res, body: undefined, timeoutTimer: timer, abort: () => { try { controller.abort(); } catch (e) { /* 已结束 */ } } };
         })
         .catch((e) => {
           clearTimeout(timer);
@@ -751,7 +753,7 @@ class S3Client {
     return this._do(cb, async () => {
       const { bucket } = this._ctx(params);
       // rawBody: 必须原样拿到 Response —— 流式模式要 pipe res.body，缓冲模式要 arrayBuffer()
-      const { res, timeoutTimer } = await this._request({
+      const { res, timeoutTimer, abort } = await this._request({
         method: 'GET', bucket, key: params.Key || '',
         headers: params.Range ? { range: params.Range } : undefined,
         timeoutMs: params.__timeoutMs, rawBody: true,
@@ -775,17 +777,55 @@ class S3Client {
       // 非腾讯云厂商的下载全线失效，且加密读信号量被永久泄漏（R14-01）。
       const out = params.Output;
       if (out && typeof out.pipe === 'function') {
-        // 流式模式：把响应体导进调用方给的流。超时改由流生命周期兜底 ——
-        // body 读完/出错时清理定时器，避免长下载过程中被请求级 timer 误 abort。
+        /* 流式模式：把响应体导进调用方给的流。
+         *
+         * R78：**请求级计时器到此为止，后面按「空闲」判死，而不是按「总时长」。**
+         *
+         * 旧实现把 `timeoutTimer` 留给 body 的生命周期兜底（`end`/`close`/`error` 时才清），
+         * 而它在 `fetch()` 发出时就已启动、默认 `S3_TIMEOUT_MS`（120 秒）—— 于是
+         * 「整个 body 的传输总时长 > 120 秒」必然被 `controller.abort()` 掐断：
+         * 一个 2GB 对象在 10MB/s 的链路上要 200 秒，下载到 120 秒处硬中断，
+         * 前端看到的是「网络错误」而不是任何超时提示，且**可稳定复现**（大文件必挂）。
+         * 超时的本意是「别永远挂着」，不是「大文件不许下」。
+         *
+         * 改法：握手完成即清掉请求级计时器，改挂一个**空闲看门狗** —— 每收到一块
+         * 数据就重置，连续 `timeoutMs` 一个字节都没有才掐断。这既保住了「指针不动就
+         * 放弃」，又不会因为传输得久就误杀。
+         */
+        clearTimeout(timeoutTimer);
+        const idleMs = Number(params.__timeoutMs) || this.timeout;
         const stream = Readable.fromWeb(res.body);
-        const clear = () => clearTimeout(timeoutTimer);
-        stream.once('end', clear);
-        stream.once('close', clear);
-        stream.once('error', clear);
+        let idleTimer = null;
+        const stopIdle = () => { if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; } };
+        const armIdle = () => {
+          stopIdle();
+          idleTimer = setTimeout(() => {
+            idleTimer = null;
+            const err = new Error(`上游数据传输停滞超过 ${Math.round(idleMs / 1000)} 秒，已中断`);
+            err.code = 'IdleTimeout';
+            err.statusCode = 504; // 网关超时：与「密钥被拒绝(401)」严格区分，避免前端误判登出
+            try { abort(); } catch (e) { /* 已结束 */ }
+            idle.destroy(err);
+          }, idleMs);
+          if (idleTimer.unref) idleTimer.unref(); // 不把进程钉在事件循环里
+        };
+        /**
+         * ⚠️ 空闲计时的「每块重置」必须做在一个**透传 Transform** 里，不能用
+         * `stream.on('data', …)`：给可读流挂 `data` 监听会**立刻把它切进 flowing 模式**，
+         * 而此刻 `pipeline` 还没接上 —— 头几个分块会被丢掉（下载出来的文件短一截，
+         * 且没有任何报错）。挂在 transform 上则天然与数据流同步：每块经过就重置一次。
+         */
+        const idle = new Transform({
+          transform(chunk, enc, cb) { armIdle(); cb(null, chunk); },
+        });
+        idle.once('end', stopIdle);
+        idle.once('close', stopIdle);
+        idle.once('error', stopIdle);
+        armIdle(); // 覆盖「响应头到了、body 一个字节都不来」这一档
         // 用 pipeline 而非 stream.pipe(out)：任一端出错都要让另一端收到并销毁。
         // 只 pipe 的话，上游错误不会传到 out，上层会永久挂起（这正是本条缺陷的放大环节）。
-        pipeline(stream, out, (pipeErr) => {
-          clear();
+        pipeline(stream, idle, out, (pipeErr) => {
+          stopIdle();
           if (pipeErr) out.destroy(pipeErr);
         });
         return { Body: out, headers: headerObject(res.headers), statusCode: res.status };

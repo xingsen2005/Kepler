@@ -403,7 +403,25 @@ function orderNoScript() {
 function encGateNeeded(l) {
   if (!l) return false;
   if (!encStore.passwordSet()) return false; // 未设访问密码 → 加密只是静态保护，不拦下载
-  return !!encStore.getMeta(l.bucket, l.key); // 只有密文对象才需要解密权限
+  /**
+   * R78：判据从「`l.key` 这**一个**对象」改为「**整份快照**里的任一对象」。
+   *
+   * R21-01 当时的写法是 `getMeta(l.bucket, l.key)`，它成立有一个隐含前提：
+   * 「`l.key` 就是用户这一次要拿到的那个对象」。多条目 / 文件夹分享打破了这个前提 ——
+   * 建链时 `key` 传的是空串，`share-store.js` 落库时取 `key || snap[0].key`，
+   * 于是 `l.key` 恒等于**快照第一项**：文件夹分享的第一项是目录 key（目录永远没有
+   * 加密元数据），多文件分享的第一项只要不是密文同样返回 null。两个分支都让
+   * `getMeta` 落空 ⇒ 列表页 / HEAD / 下载三处门禁一起失效，而下载链路本身是
+   * **逐文件**判定加密的（命中 meta 即 `decryptTransform()` 下发明文），
+   * 于是「已设加密访问密码」的密文被原样解密送给匿名访客。
+   *
+   * 改法：不再猜「是哪一个对象」，直接问「这条分享里**有没有**密文」——
+   * 对快照里的每一项跑同一个 `getMeta`（就是 `/fs/download` / `/fs/head` 用的那一个，
+   * 全库仍然只有一份判据）。判定因此变宽：快照里混了一个密文文件时，明文成员也要
+   * 先过密码 —— 这是**有意的**，这道门禁是整条分享的准入控制，不是逐文件属性。
+   */
+  const items = shareStore.view(l, { items: true }).items || [];
+  return items.some((i) => !!encStore.getMeta(l.bucket, i.key));
 }
 
 /** 分享侧加密令牌：优先请求头（脚本 / curl），其次本页作用域的 Cookie */

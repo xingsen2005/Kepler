@@ -52,6 +52,19 @@ function guardExportRate(req) {
 }
 
 /**
+ * R78：导入限流 —— 与导出**分开计数**（各自的语义与预算不同，理由见
+ * `security.backupImportLimiter` 的说明）。缺了它，`POST /backup/import` 就是一条
+ * 「不计数、不减速」的口令 + 导出码在线试错通道，而每次尝试都要服务端跑一遍 scrypt。
+ */
+function guardImportRate(req) {
+  const ip = security.clientIp(req) || 'unknown';
+  const r = security.backupImportLimiter(ip);
+  if (!r.ok) {
+    throw Object.assign(new Error(`操作过于频繁，请 ${r.retryAfter} 秒后重试`), { status: 429 });
+  }
+}
+
+/**
  * 页面状态。
  *
  * `canImport` 每次现算（不缓存）：它是**唯一准入判据**，缓存一分钟就可能让用户在
@@ -105,6 +118,11 @@ router.post('/backup/export', requireAdmin, apiHandler(async (req, res) => {
  */
 router.post('/backup/import', requireAdmin, apiHandler(async (req, res) => {
   const b = req.body || {};
+  // R78：限流排在**最前面** —— 它约束的是「这个端点被调用的次数」，与实例当前
+  // 能不能导入无关；若放在 `canImport()` 之后，攻击者仍能以无限速率试探
+  // （每次都要读一遍全部配置来算 `isEmptyData`）。两者都在**解密之前**：
+  // 未授权的尝试一次 scrypt 都不该跑。
+  guardImportRate(req);
   if (!backup.canImport()) {
     // ⚠️ 刻意**不**在错误对象上挂结构化标志（如 `backupImportClosed: true`）：
     // `apiHandler` 只下发 `{ error: err.message }`，挂在错误上的自定义字段**到不了客户端**

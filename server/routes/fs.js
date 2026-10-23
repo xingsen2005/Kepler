@@ -1736,6 +1736,16 @@ router.post('/fs/copy', apiHandler(async (req, res) => {
      * 用「复制失败毁掉目标侧既有数据」换来的纪律，此处一字不改地沿用。
      */
     const protectedKeys = new Set();
+    /**
+     * R78：**按下标**记录「这一项覆盖掉的既有字节数」。
+     *
+     * 复制是净增占用，但「覆盖写入」的净增是 `新大小 − 旧大小` —— 旧对象被替换后
+     * 不再占用空间。按 root 下标记账（而不是记一个总数）是为了让「逐项失败 / 用户选
+     * 跳过」的那些项**不参与**扣减：拿总数去减会把失败项的旧大小也算进去，
+     * 于是用量被少记。探测失败按 0 计 —— 方向是**多记**，宁可让配额判得严一点，
+     * 也不放行超额写入。
+     */
+    const overByRoot = new Map();
     const work = [];
     for (const p of runnable) {
       try {
@@ -1751,11 +1761,24 @@ router.post('/fs/copy', apiHandler(async (req, res) => {
           if (p.occupied) {
             // 只有「撞上了且用户选了覆盖」的这一项才做这次列举，见函数头说明
             const pre = await listAllExact(client, cfg, p.newKey, { cap: LIMITS.STAT, noStat: true }, '复制');
-            for (const it of pre) protectedKeys.add(it.key);
+            let over = 0;
+            for (const it of pre) {
+              protectedKeys.add(it.key);
+              over += Number(it.size) || 0; // R78：净增 = 新 − 旧（见 overByRoot 的说明）
+            }
+            overByRoot.set(p.i, over);
           }
         } else {
-          tasks.push({ from: p.key, to: p.newKey, size: 0 });
-          if (p.occupied) protectedKeys.add(p.newKey);
+          /* R78：这里原本恒传 `size: 0`，于是阶段 4 的 `addBytes` 对**单文件复制**
+           * 的贡献是 0 —— 配额闸门实际是在「新增 0 字节」的前提下判定的，形同虚设。
+           * 复制是纯净增，必须按真实大小断言，因此补一次 HEAD（复用 `copyOne` 里
+           * 同一个 `headSize`，失败返回 0，与那里的保守口径一致）。 */
+          const sz = await headSize(client, cfg, p.key);
+          tasks.push({ from: p.key, to: p.newKey, size: sz });
+          if (p.occupied) {
+            protectedKeys.add(p.newKey);
+            overByRoot.set(p.i, await headSize(client, cfg, p.newKey));
+          }
         }
         work.push({ i: p.i, key: p.key, newKey: p.newKey, isFolder: p.isFolder, tasks });
       } catch (e) {
@@ -1859,6 +1882,26 @@ router.post('/fs/copy', apiHandler(async (req, res) => {
     }
 
     const out = rootResult.map((r, i) => r || { path: keys[i], ok: false, error: '未处理' });
+    /**
+     * R78：复制成功必须**记账**，否则配额闸门在 15 分钟统计缓存窗口内形同虚设。
+     *
+     * 「待定增量」（`bucketPendingDelta`）机制存在的意义就是关掉缓存窗口；而这条
+     * **纯净增**的写路径此前只过闸门、从不喂增量 —— 复制 N 字节后
+     * `pendingUsageDelta` 不增加，下一次断言看到的还是写入前的数字。于是「给某 API Key
+     * 设 1GB 配额 → 15 分钟内反复复制同一个 100MB 文件」每次都放行，实际写入可以
+     * 远超配额，正是项目文档反复批评的「配了额度却拦不住」。
+     *
+     * 口径与上传 / 删除一致（`/fs/upload` 传 `stored`、`/fs/delete` 传 `-freedBytes`）：
+     * 传**实际净增字节**。净增只统计真正执行过的项（用户选了「跳过」的、以及逐项失败
+     * 的都不算），覆盖写入再减去被替换掉的旧大小。
+     */
+    let addedBytes = 0;
+    for (const w of work) {
+      const r = out[w.i];
+      if (!r || !r.ok || r.skipped) continue;
+      addedBytes += w.tasks.reduce((m, t) => m + (Number(t.size) || 0), 0) - (overByRoot.get(w.i) || 0);
+    }
+    adjustStorageCache(Math.max(0, addedBytes), cfg);
     res.json({ ok: out.every((r) => r.ok), results: out });
     statsStore.addLog({
       action: 'fs.copy',

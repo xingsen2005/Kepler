@@ -693,6 +693,22 @@ const webdavRevealLimiter = createLimiter({ name: 'webdav-reveal', windowMs: 10 
  */
 const backupExportLimiter = createLimiter({ name: 'backup-export', windowMs: 10 * 60 * 1000, max: 10 });
 
+/**
+ * R78：「备份配置」**导入**时校验口令与导出码的限流器 —— 按 **IP**，10 分钟 ≤ 10 次。
+ *
+ * 与 `backupExportLimiter` 是**同一把锁的两面**，必须各给一条预算（理由与它一样：
+ * 语义不同的查证动作不该互相吃额度）。这条此前完全缺失：
+ * `POST /api/backup/import` 只挂 `requireAdmin`，没有任何 limiter。
+ *
+ * 可达性说明（为什么不按「高危」算）：`backup.canImport()` 只在**全新实例**上放行，
+ * 因此「偷到一个管理员会话 → 在线爆破导出码 → 把攻击者的配置灌进来」这条升级路径
+ * 需要一个「刚部署、还没配置任何东西」的窗口，现实中很难凑齐。但只要它成立，
+ * 后果就是整份配置（含所有云厂商密钥）易主，而 `backup.open()` 每次都要跑一遍
+ * scrypt —— 不限流的代价是「可以用别人的 CPU 免费试无限次」。取 10 次：
+ * 正常的导入是「点一次、错了看一眼、再点一次」，10 次/10 分钟绰绰有余。
+ */
+const backupImportLimiter = createLimiter({ name: 'backup-import', windowMs: 10 * 60 * 1000, max: 10 });
+
 const shareViewLimiter = createLimiter({ name: 'share-view', windowMs: 10 * 60 * 1000, max: 300 });
 
 /**
@@ -785,6 +801,7 @@ module.exports = {
   payCheckLimiter, payStatusLimiter, shareViewLimiter,
   orderRestoreLimiter, // R64：「恢复购买」按订单号取回（与 shareLimiter 分开计数）
   backupExportLimiter, // R38：备份导出校验账户口令的限流（与 passwordLimiter 刻意分开）
+  backupImportLimiter, // R78：备份导入（口令 + 导出码）的限流，与导出各给一条预算
   // R54②：注册 / 忘记密码 / 重置密码 / 邮箱验证码
   registerLimiter, registerConflictLimiter, REGISTER_CONFLICT_KEY, forgotLimiter, resetLimiter, resetLock, emailCodeLimiter,
 };

@@ -10306,6 +10306,142 @@ const CASES = [
       testFile: 'settings-ux.test.js',
       minFail: 1,
     },
+    /**
+     * R77（外部审计 F-E1）：缺 IV/TAG 的历史加密元数据必须 fail-closed。
+     *
+     * 三条各挡一个面，缺一条就会留下一个「撤掉修复仍然全绿」的缺口：
+     *  ① 解密期判据 —— 撤掉后老条目重新走「跳过比对」；
+     *  ② 写入期判据 —— 撤掉后旧版本会话续传又能落出免检条目（豁免被续命）；
+     *  ③ 「失败发生在下发之前」的形态 —— 把失败流退回「直通 + nextTick destroy」，
+     *     调用方一旦立刻 `end(密文)`，'end' 会先于 nextTick，密文被当明文吐出去。
+     *
+     * 判据文件：`tests/audit77-regressions.test.js`（断言后果，不断言源码形状）。
+     */
+    {
+      name: 'R77-01a · 撤掉历史元数据免检判据（缺 IV/TAG 的对象重新静默解密）',
+      file: 'server/enc-store.js',
+      anchor: "  const legacyAt = segs.findIndex((s) => !s || !s.iv || !s.tag);\n  if (legacyAt >= 0) {\n    if (!legacyUnverifiedAllowed()) {",
+      replacement: "  const legacyAt = -1;\n  if (legacyAt >= 0) {\n    if (!legacyUnverifiedAllowed()) {",
+      testFile: 'audit77-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R77-02a · 撤掉写入侧 IV/TAG 校验（旧会话续传又能落出免检条目）',
+      file: 'server/enc-store.js',
+      anchor: "      if (!v || !v.iv || !v.tag) {\n        throw bad(`第 ${n} 分片的加密元数据缺少 IV/TAG（可能来自旧版本的上传会话），请取消任务后重新上传`);",
+      replacement: "      if (false) {\n        throw bad(`第 ${n} 分片的加密元数据缺少 IV/TAG（可能来自旧版本的上传会话），请取消任务后重新上传`);",
+      testFile: 'audit77-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R77-03a · 失败流退回「直通 + nextTick destroy」（密文被当成明文先吐出去）',
+      file: 'server/enc-store.js',
+      /**
+       * 必须把**整个函数体**退回旧形态，只改 `cb(err)` → `cb()` 是不够的：
+       * 自定义 transform 会让 `end()` 的处理推迟到下一轮，`nextTick(destroy)`
+       * 反而先到 —— 于是测试仍然全绿（实测 fail=0）。旧形态的要害是
+       * **默认直通 Transform**：它会在同一个 tick 里把密文原样推给下游并 `end`，
+       * 抢在 destroy 之前。
+       */
+      anchor: "  const err = new Error(message);\n  const t = new Transform({ transform(chunk, enc, cb) { cb(err); } });",
+      replacement: "  const err = new Error(message);\n  const t = new Transform();",
+      testFile: 'audit77-regressions.test.js',
+      minFail: 1,
+    },
+    /* ---------------- R78：外部《模块安全审计报告》 ----------------
+     *
+     * 每条都配了「撤销后必须变红」的判据。特别注意 01a 与 11a：
+     * 前者是 R21-01 的**回归形态**（判据对象选错了），后者是「判据写好了却没接上」——
+     * 两种都不是"少了一个 if"，只断言源码里有那行字是抓不住的。
+     */
+    {
+      name: 'R78-01a · 加密门禁退回「只看 l.key 一个对象」（多条目/文件夹分享整体绕过）',
+      file: 'server/share-routes.js',
+      anchor: "  const items = shareStore.view(l, { items: true }).items || [];\n  return items.some((i) => !!encStore.getMeta(l.bucket, i.key));",
+      replacement: "  return !!encStore.getMeta(l.bucket, l.key);",
+      testFile: 'audit78-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R78-02a · 复制成功后不再记账（15 分钟缓存窗口内可无限超额）',
+      file: 'server/routes/fs.js',
+      anchor: "    adjustStorageCache(Math.max(0, addedBytes), cfg);",
+      replacement: "    void addedBytes; // R78 反向变异：只过闸门、不记账",
+      testFile: 'audit78-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R78-03a · 单文件复制退回 size:0（配额闸门在"新增 0 字节"下判定）',
+      file: 'server/routes/fs.js',
+      anchor: "          const sz = await headSize(client, cfg, p.key);",
+      replacement: "          const sz = 0;",
+      testFile: 'audit78-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R78-04a · 优惠券筛选参数顺序退回反转（搜索框变成恒真判据）',
+      file: 'public/js/couponmgr.js',
+      anchor: "      return matchesQuery(state.query, text);",
+      replacement: "      return matchesQuery(text, state.query);",
+      testFile: 'audit78-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R78-05a · parseIpInfo 不再折算 IPv4-mapped（v4 规则对 mapped 流量永不命中）',
+      file: 'server/ip-guard.js',
+      anchor: "    const mapped = mappedV4Int(bytes);\n    if (mapped !== null) return { v6: false, ip: mapped };",
+      replacement: "    const mapped = null;\n    if (false) return { v6: false, ip: 0 };",
+      testFile: 'audit78-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R78-06a · 命中计数落盘失败重新抛错（定时器里 = uncaughtException = 崩溃循环）',
+      file: 'server/ip-guard.js',
+      anchor: "        '—— 计数保留在内存中并会持续重试，进程不会因此退出。');\n    }\n    return false;",
+      replacement: "        '—— 计数保留在内存中并会持续重试，进程不会因此退出。');\n    }\n    throw e;",
+      testFile: 'audit78-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R78-07a · 流式下载退回「请求级定时器管整个 body」（大文件必然中途中断）',
+      file: 'server/s3-client.js',
+      anchor: "        clearTimeout(timeoutTimer);\n        const idleMs = Number(params.__timeoutMs) || this.timeout;",
+      replacement: "        const idleMs = Number(params.__timeoutMs) || this.timeout;",
+      testFile: 'audit78-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R78-08a · 回滚副本不再清加密元数据（留下指向已删对象的孤儿记录）',
+      file: 'server/fs-gateway.js',
+      anchor: "  if (removedKeys.length) encStore.removeMetaBatch(cfg.bucket, removedKeys);",
+      replacement: "  if (false) encStore.removeMetaBatch(cfg.bucket, removedKeys);",
+      testFile: 'audit78-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R78-09a · WebDAV 账户不再校验 username 唯一（第二个账户创建成功却永远登不上）',
+      file: 'server/config-store.js',
+      anchor: "  if (cfg.webdav.accounts.some((a) => a.username === username)) {",
+      replacement: "  if (false) {",
+      testFile: 'audit78-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R78-10a · SMTP 收件地址不再折行（CRLF 信头注入）',
+      file: 'server/smtp.js',
+      anchor: "    to: oneLine(String(o.to || '').trim()),",
+      replacement: "    to: String(o.to || '').trim(),",
+      testFile: 'audit78-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R78-11a · webauthn 代关路由拆掉「能管谁」判定（管理员可静默拆根用户的二因素）',
+      file: 'server/routes/webauthn.js',
+      anchor: "    if (denyIfCannotManage(req, res, target, '关闭 Windows Hello 验证')) return;",
+      replacement: "    if (false) return; // R78 反向变异：只挂 requireAdmin",
+      testFile: 'audit78-regressions.test.js',
+      minFail: 1,
+    },
   ];
 
 module.exports = { runCase, CASES, parseArgs };

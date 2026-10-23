@@ -16,7 +16,7 @@
  *  - 注册与关闭均要求当前密码，避免仅凭会话即可篡改二次验证配置
  */
 const { express, security, configStore, statsStore, webauthn } = require('./_context');
-const { webauthnContext, sendError, requireAdmin } = require('./_shared');
+const { webauthnContext, sendError, requireAdmin, denyIfCannotManage } = require('./_shared');
 
 const router = express.Router();
 
@@ -164,6 +164,19 @@ router.post('/users/:id/webauthn/disable', requireAdmin, (req, res) => {
   try {
     const target = configStore.getUserById(req.params.id);
     if (!target) return res.status(404).json({ error: '用户不存在' });
+    /**
+     * R78：**「能管谁」判定必须排在写操作之前** —— 与 R71 给删除 / 编辑 / 封禁 /
+     * 解封 / 强制登出补的是同一条边界，本条当时被漏掉了。
+     *
+     * 漏洞形态：只挂 `requireAdmin` 等于「是管理员就能管任何人」。管理员对根用户
+     * 调一次这个接口，根用户的 Windows Hello 就被静默拆除 —— 二因素降级为单因素，
+     * 而受害者（根用户）在自己的设置页里只会看到「未启用」，没有任何人被通知。
+     * 它比「删除用户」更隐蔽：删了至少有痕迹，拆掉二因素什么都不变。
+     *
+     * 判据共用 `denyIfCannotManage()`（`routes/_shared.js` 的唯一实现点），
+     * 被拒绝时回 403 + 写一条 `users.denied`。
+     */
+    if (denyIfCannotManage(req, res, target, '关闭 Windows Hello 验证')) return;
     const user = configStore.clearUserWebauthn(target.id);
     webauthn.clearChallengesForUser(target.id);
     statsStore.addLog({

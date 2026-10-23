@@ -149,9 +149,26 @@ function canonicalIpLiteral(ip) {
   if (!/^[0-9a-fA-F:.]+$/.test(s)) return null;
   const b = ipv6ToBytes(s);
   if (!b) return null;
-  const mapped = b.subarray(0, 10).every((x) => x === 0) && b[10] === 0xff && b[11] === 0xff;
-  if (mapped) return `${b[12]}.${b[13]}.${b[14]}.${b[15]}`;
+  const mapped = mappedV4Int(b);
+  if (mapped !== null) return `${(mapped >>> 24) & 255}.${(mapped >>> 16) & 255}.${(mapped >>> 8) & 255}.${mapped & 255}`;
   return ipv6ToString(b);
+}
+
+/**
+ * IPv4-mapped IPv6（`::ffff:a.b.c.d`）的 16 字节形态 → IPv4 整数；不是该形态返回 `null`。
+ *
+ * R78：**「地址怎么展示」与「地址怎么判定」必须同一条折算规则。**
+ * 双栈监听下 Node 报出的客户端地址常常是 `::ffff:1.2.3.4`。`normalizeIp()`（展示 /
+ * 日志 / 规则输入框）一直会把它折成 `1.2.3.4`，但 `parseIpInfo()`（判定）却把它当
+ * 纯 IPv6 处理，而 `cidrMatch()` 要求版本一致 —— 于是管理员照着界面上看到的
+ * `1.2.3.4` 加一条屏蔽规则，那条规则**永远命不中**真实流量（规则生效了，看着却没用）。
+ * 抽成一处之后，两边不可能再各走各的。
+ */
+function mappedV4Int(bytes) {
+  if (!bytes || bytes.length !== 16) return null;
+  for (let i = 0; i < 10; i++) if (bytes[i] !== 0) return null;
+  if (bytes[10] !== 0xff || bytes[11] !== 0xff) return null;
+  return (((bytes[12] << 24) | (bytes[13] << 16) | (bytes[14] << 8) | bytes[15]) >>> 0);
 }
 
 /** 规范化目标：IPv4（1.2.3.4 / 10.0.0.0/8）或 IPv6（2001:db8::1 / 2001:db8::/32）。非法返回 null */
@@ -167,6 +184,21 @@ function parseTarget(target) {
     if (prefixPart !== null && prefixPart === '') return null; // R27-09：`/` 不得退化成 `/0`
     const prefix = prefixPart === null ? 128 : Number(prefixPart);
     if (!Number.isInteger(prefix) || prefix < 0 || prefix > 128) return null;
+    /**
+     * R78：IPv4-mapped 规则（`::ffff:1.2.3.4`）同样折算成 IPv4。
+     *
+     * `parseIpInfo()` 现在把 mapped 地址按 v4 判定，若规则仍按 v6 存，两边又回到
+     * 「版本不一致 ⇒ 永不命中」。`/96` 正好是 mapped 前缀本身的宽度，因此
+     * `::ffff:1.2.3.4/120` ≡ `1.2.3.4/24`；`/96` 以下覆盖的范围超出 IPv4 空间，
+     * 保持 v6 语义（那种写法本来就表达一个 IPv6 网段，不折算）。
+     */
+    const mapped = mappedV4Int(bytes);
+    if (mapped !== null && prefix >= 96) {
+      return {
+        v6: false, ip: mapped, prefix: prefix - 96,
+        text: prefixPart === null ? ipPart : `${ipPart}/${prefix}`,
+      };
+    }
     return { v6: true, bytes, prefix, text: prefixPart === null ? ipPart : `${ipPart}/${prefix}` };
   }
   const ip = ipv4ToInt(ipPart);
@@ -210,7 +242,14 @@ function parseIpInfo(ip) {
   const s = String(ip || '').trim();
   if (s.includes(':')) {
     const bytes = ipv6ToBytes(s);
-    return bytes ? { v6: true, bytes } : null;
+    if (!bytes) return null;
+    /**
+     * R78：IPv4-mapped 地址按 **IPv4** 判定，与 `normalizeIp()` 的折算口径一致。
+     * 否则「界面上写着 1.2.3.4、照着加的规则却命不中」—— 见 `mappedV4Int()` 的说明。
+     */
+    const mapped = mappedV4Int(bytes);
+    if (mapped !== null) return { v6: false, ip: mapped };
+    return { v6: true, bytes };
   }
   const v = ipv4ToInt(s);
   return v === null ? null : { v6: false, ip: v };
@@ -366,6 +405,14 @@ function isPrivateIPv6(ip) {
 /* ------------------------- 规则存储 ------------------------- */
 
 let guard = null; // { rules: [], updatedAt }
+/**
+ * R78：规则文件「读到就坏了」的显式状态。
+ *
+ * `load()` 对损坏文件的处理是**降级为空规则集继续跑**（不阻断服务）—— 这条取舍
+ * 保留不变，但结果必须**可见**：空规则集与「本来就没配规则」在界面上长得一模一样，
+ * 管理员不会知道自己的屏蔽规则已经整体失效了。`view()` 把它带出去。
+ */
+let loadDegraded = false;
 
 /**
  * 单条规则的归一化 —— **唯一实现点**（读盘 / 导入共用）。
@@ -414,6 +461,7 @@ function load() {
   try {
     j = secureStore.readJson(GUARD_FILE, null);
   } catch (e) {
+    loadDegraded = true; // R78：降级要可见，见变量声明处
     console.error('[ip-guard] IP 屏蔽规则文件损坏，已降级为空规则并锁定写入：', e.message);
   }
   guard = (j && typeof j === 'object')
@@ -951,9 +999,56 @@ let overseasHits = 0;
 function markOverseasHit() { overseasHits++; dirty = true; }
 
 // 命中计数节流落盘（3 秒）
-setInterval(() => {
-  if (dirty) { dirty = false; persist(); }
-}, 3000).unref();
+/**
+ * R78：**定时器里绝不能让异常逃出去**。
+ *
+ * `persist()` → `secureStore.writeJson()` 在「规则文件损坏」时是**抛错**的
+ * （SEC-09 起存储层会锁定该文件的写入，见 `load()` 的 catch）。而 `setInterval`
+ * 的回调抛错 = `uncaughtException`，本项目对未捕获异常的处理是 `exit(1)`：
+ * 于是「磁盘上那份 ipguard.json 坏了」这一件事，会让服务每 3 秒崩一次、
+ * 无限重启（`ipguard.json` 每次读到都还是坏的）。同一件事在 `load()` 里
+ * 只降级成空规则集，到了这里却变成整站不可用 —— 两处的容错口径不一致才是缺陷本身。
+ *
+ * 修法：捕获并**保留 `dirty`**（计数不丢，下个周期继续尝试），失败只在
+ * **首次**告警一次（避免每 3 秒刷一行日志），恢复时再告警一次。
+ * 规则文件损坏后的 fail-open（空规则集）是 `load()` 里**有意的取舍**
+ * （不阻断服务），这里不改它 —— 只保证它不会升级成崩溃循环，并把这个状态
+ * 通过 `view().rulesPersistDegraded` 显式暴露出来，避免"看起来一切正常"。
+ */
+let persistDegraded = false;
+let persistWarned = false;
+/**
+ * 把「脏」的命中计数落盘一次。**永不抛错**（返回是否写成功）。
+ *
+ * 单独成函数而不是塞进 `setInterval` 的回调里：`persist()` 失败在定时器上下文里
+ * 是 `uncaughtException`（进程退出），而在普通调用里只是一个可上报的返回值 ——
+ * 抽出来之后这条语义才有地方被测试钉住（见 `tests/audit78-regressions.test.js`）。
+ *
+ * @returns {boolean} `true` = 无事可做或写成功
+ */
+function flushHits() {
+  if (!dirty) return true;
+  try {
+    persist();
+    dirty = false;
+    if (persistDegraded) {
+      persistDegraded = false;
+      persistWarned = false;
+      console.warn('[ip-guard] 规则文件恢复可写，命中计数已恢复正常落盘');
+    }
+    return true;
+  } catch (e) {
+    persistDegraded = true;
+    // 只在「从正常变为异常」的那一刻告警：这条路径每 3 秒走一次，逐次日志会淹掉审计
+    if (!persistWarned) {
+      persistWarned = true;
+      console.error('[ip-guard] 命中计数无法落盘（规则文件只读或损坏）：', (e && e.message) || e,
+        '—— 计数保留在内存中并会持续重试，进程不会因此退出。');
+    }
+    return false;
+  }
+}
+setInterval(flushHits, 3000).unref();
 
 /**
  * 判定一次请求是否放行，并记账（命中次数 / 海外命中）。
@@ -1026,6 +1121,14 @@ function view() {
     chinaRangeCount: loadChinaList().length,
     overseasHits,
     updatedAt: g.updatedAt,
+    /* R78：规则存储的**降级状态**必须能被界面看见。
+     *  · `rulesLoadDegraded`：磁盘上的规则文件读不出来 → 当前生效的是**空规则集**
+     *    （屏蔽整体失效，但服务继续跑，见 `load()`）；
+     *  · `rulesPersistDegraded`：命中计数写不回磁盘（文件只读或损坏），
+     *    内存计数仍在、但重启后会丢。
+     * 两者都是 `false` 才是正常态；只报"规则 0 条"会让管理员以为是自己没配。 */
+    rulesLoadDegraded: loadDegraded,
+    rulesPersistDegraded: persistDegraded,
     ipv6: {
       supported: true,
       // 提示前端：国内白名单仅覆盖 IPv4；某桶开启海外屏蔽时公网 IPv6 访问会被视为海外
@@ -1047,6 +1150,7 @@ module.exports = {
   isChinaIP, isPrivateIP, isPrivateIPv6, parseTarget, parseIpInfo,
   ipv4ToInt, ipv6ToBytes, ipv6ToString, canonicalIpLiteral, cidrContains, cidrContainsV6, cidrMatch,
   buildIntervals, normalizeRanges,     // FUN-08：可在测试中直接验证归一化性质
+  flushHits, // R78：命中计数的落盘动作（定时器只是它的调用者），供测试直接驱动
   ALLOWED_METHODS,
 };
 

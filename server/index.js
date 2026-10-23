@@ -372,6 +372,23 @@ function registerServer(srv, label) {
     } else {
       console.error(`[Storage Manager] ${label} 启动失败(${e.code || e.message})`);
     }
+    /**
+     * R78：**监听失败必须让进程死掉**，不能只打一行日志继续活着。
+     *
+     * 旧实现打完日志就返回，进程继续运行但**一个端口都没在听**。这在两种常见部署下
+     * 都是最坏的形态：
+     *  · systemd / pm2 / docker：进程状态是「running」，重启策略永远不会触发，
+     *    而端口上没有任何服务 —— 表现为「网站挂了，但运维看到进程好好的」；
+     *  · 反向代理：503 一律，日志里只有一行几乎会被滚掉的中文提示。
+     * 端口占用是**启动期**的致命错误（本函数只登记 HTTP / HTTPS 两个主服务，
+     * 没有它就没有任何对外能力），正确出口是立刻以非零码退出，交给进程管理器
+     * 重试或让部署脚本的失败分支接手（`deploy.sh` 正是按退出码判定的）。
+     * `shuttingDown` 期间不退出：那说明是停机过程中端口被主动释放，不是故障。
+     */
+    if (!shuttingDown) {
+      console.error('[Storage Manager] 无可用监听端口，进程即将退出（退出码 1）。');
+      process.exit(1);
+    }
   });
   return srv;
 }
