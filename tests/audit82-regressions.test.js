@@ -179,6 +179,19 @@ function newOrder(l, platform, patch) {
 
 const cookieOf = (l, order) => 'sp_' + l.id + '_pay=' + encodeURIComponent(paymentOrders.orderToken(order));
 
+/**
+ * R83 之后，下单成功不再用 302 把人送去网关，而是回一张同源中转页
+ * （Chrome/Safari 会把 `form-action` 施加到表单 POST 的重定向目标上，跨域 3xx 被拦）。
+ * 这里统一断言「中转页形态」，避免每条用例各写一遍。
+ */
+function assertJumpPage(r, url) {
+  assertEqual(r.status, 200, `下单成功应回同源中转页（200），实际 ${r.status}：${r.raw.slice(0, 160)}`);
+  assert(!r.headers.location, `不得再用 3xx 送人去网关，实际带了 location：${r.headers.location}`);
+  assert(/正在跳转到/.test(r.raw), '中转页要有「正在跳转到…」的明确提示');
+  assert(r.raw.indexOf('href="' + url + '"') >= 0, `中转页必须给出可点击的收银台链接（${url}）`);
+  assert(/http-equiv="refresh"[^>]*url=/.test(r.raw), '中转页要有 meta refresh 自动跳转');
+}
+
 /* ================================================================== *
  * ① 换渠道即新单
  * ================================================================== */
@@ -191,7 +204,7 @@ test('R82-01 · 换渠道必须另建新单、并按新渠道下单；被放弃�
     const before = captured.length;
 
     const r = await postForm(srv.port, '/s/' + l.id + '/pay', { platform: 'wechat' }, { cookie: cookieOf(l, old) });
-    assertEqual(r.status, 302, `下单成功应 302 跳收银台，实际 ${r.status}：${r.raw.slice(0, 160)}`);
+    assertJumpPage(r, 'https://example.invalid/pay');
 
     const hit = captured.slice(before);
     assertEqual(hit.length, 1, `应发起一次下单，实际 ${hit.length}`);
@@ -220,7 +233,7 @@ test('R82-02 · 换渠道时「每人一次」的优惠券不得变成死结（�
 
     // 第一次：按支付宝下单，券被核销
     const r1 = await postForm(srv.port, '/s/' + l.id + '/pay', { platform: 'alipay', coupon: coupon.code });
-    assertEqual(r1.status, 302, `第一次下单应 302，实际 ${r1.status}：${r1.raw.slice(0, 160)}`);
+    assertJumpPage(r1, 'https://example.invalid/pay');
     const first = paymentOrders.get(captured[captured.length - 1].orderId);
     assertEqual(first.amountFen, 50, `用券后应付 50 分，实际 ${first.amountFen}`);
     assertEqual(first.couponId, coupon.id, '订单要快照券 id');
@@ -229,10 +242,14 @@ test('R82-02 · 换渠道时「每人一次」的优惠券不得变成死结（�
     const r2 = await postForm(srv.port, '/s/' + l.id + '/pay', {
       platform: 'wechat', coupon: coupon.code,
     }, { cookie: cookieOf(l, first) });
-    assertEqual(r2.status, 302,
-      `换渠道后必须能继续付款，实际 ${r2.status}：${r2.raw.slice(0, 200)}`
-      + '（旧单不退券 ⇒ 同一张「每人一次」的券被判 already_used ⇒ 页面卡在优惠券不可用）');
-    assert(!/优惠券不可用|coupon/.test(r2.raw), '不得把用户挡在「优惠券不可用」上');
+    assertJumpPage(r2, 'https://example.invalid/pay');
+    // ↑ 旧单不退券 ⇒ 同一张「每人一次」的券被判 already_used ⇒ 这次 POST 会回付费页而不是中转页
+    /**
+     * ⚠️ 负向断言不能写成 `/coupon/` —— `renderPage()` 的 `<style>` 里恒有
+     * `.coupon-box` / `.coupon-form` 这类类名，任何页面都会命中，那是一条**恒假绿**的护栏。
+     * 这里只查**用户能看见的那句文案**（`coupon-store` 的错误码表）。
+     */
+    assert(!/您已使用过该优惠券|优惠券不可用/.test(r2.raw), '不得把用户挡在「优惠券不可用」上');
 
     const second = paymentOrders.get(captured[captured.length - 1].orderId);
     assertEqual(second.platform, 'wechat', '新单必须是新渠道');
@@ -252,12 +269,12 @@ test('R82-03 · 同一渠道再点一次必须复用同一笔订单（网关侧 
     const l = await makePaidLink();
     const before = captured.length;
     const r1 = await postForm(srv.port, '/s/' + l.id + '/pay', { platform: 'alipay' });
-    assertEqual(r1.status, 302, `第一次应 302，实际 ${r1.status}`);
+    assertJumpPage(r1, 'https://example.invalid/pay');
     const firstId = captured[captured.length - 1].orderId;
     const first = paymentOrders.get(firstId);
 
     const r2 = await postForm(srv.port, '/s/' + l.id + '/pay', { platform: 'alipay' }, { cookie: cookieOf(l, first) });
-    assertEqual(r2.status, 302, `第二次应 302，实际 ${r2.status}`);
+    assertJumpPage(r2, 'https://example.invalid/pay');
 
     const hit = captured.slice(before);
     assertEqual(hit.length, 2, '两次点击都应走到下单（网关侧按 out_trade_no 幂等）');

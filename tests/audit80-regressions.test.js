@@ -484,8 +484,17 @@ test('R80-11 · 凭证齐全时，点「立即支付」仍必须真的跳到支�
       fields: { platform: 'alipay' },
       headers: { Accept: 'text/html' },
     });
-    assertEqual(r.status, 302, `正常路径必须 302 跳收银台，实际 ${r.status}`);
-    const loc = String(r.headers.location);
+    /**
+     * R83 起，「跳到收银台」不再由这次表单 POST 的 302 完成 —— Chrome / Safari 会把
+     * CSP 的 `form-action 'self'` 施加到「表单提交后的重定向目标」上，跨域 302 被拦掉，
+     * 页面一动不动而订单已建好。现在回一张同源中转页，由页面自身发起导航。
+     * 本条的正向意图不变：**签名过的收银台地址必须真的被交到浏览器手上**。
+     */
+    assertEqual(r.status, 200, `正常路径必须回同源中转页，实际 ${r.status}`);
+    assert(!r.headers.location, `不得再用跨域 3xx 送人去网关，实际 ${r.headers.location}`);
+    const jumped = r.raw.match(/http-equiv="refresh" content="0;url=([^"]+)"/);
+    assert(jumped, '中转页必须带 meta refresh 自动跳转');
+    const loc = jumped[1].replace(/&amp;/g, '&');
     assert(/^https:\/\/openapi\.alipay\.com\/gateway\.do\?/.test(loc),
       `必须跳到支付宝网关，实际：${loc.slice(0, 120)}`);
     const u = new URL(loc);

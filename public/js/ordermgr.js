@@ -3,6 +3,8 @@ import { API } from './api.js';
 import { toast, confirmDialog, openModal, escapeHtml, fmtTime } from './util.js';
 
 let ordersCache = [];
+/** R84（M-3）：服务端「订单账本读不出来」标记 —— 只在 `refresh()` 里更新 */
+let degradedCache = false;
 let wired = false;
 
 function wire() {
@@ -86,10 +88,34 @@ export function refresh() {
   if (!box) return;
   API.paymentOrders().then((r) => {
     ordersCache = r.orders || [];
+    // R84（M-3）：`degraded` = 服务端读不出 payments.json。这一位必须带到界面上，
+    // 否则「订单页一片空白」会被读成「从来没卖出去过」。
+    degradedCache = r.degraded === true;
     render();
   }).catch((e) => {
     box.innerHTML = `<div class="lk-empty">加载失败：${escapeHtml(e.message)}</div>`;
   });
+}
+
+/**
+ * R84（M-3）：订单账本读不出来时的横幅（纯函数，便于直接断言文案）。
+ *
+ * `payments.json` 解析失败时，服务端**故意不写盘**（不覆盖现场，FUN-01），代价是
+ * 这段时间的订单与票据全部只存在于内存里、重启即失。管理端必须看见这件事，
+ * 而不是对着一张空表猜「是不是没人买」。
+ *
+ * @param {boolean} flag `/payment/orders` 返回的 `degraded`
+ * @returns {string} 空串表示正常
+ */
+export function degradedBanner(flag) {
+  if (!flag) return '';
+  return `<div role="alert" style="margin:0 0 10px;padding:10px 12px;border-left:4px solid #b91c1c;`
+    + `background:#fef2f2;color:#7f1d1d;border-radius:6px;font-size:13px;line-height:1.65">`
+    + '<b>订单账本读取失败：本页数据不完整，且新的付费已被暂停。</b><br>'
+    + '站点数据目录下的 <code>payments.json</code> 无法解析，系统为避免覆盖现场已锁定写入 —— '
+    + '这期间的订单与支付凭证不会落盘，<b>重启即失</b>。请人工检查/修复该文件后重启服务；'
+    + '在修复之前，付费链接会明确提示「订单存储暂不可用，已暂停收款」。'
+    + '</div>';
 }
 
 /**
@@ -222,12 +248,17 @@ function render() {
   // 「上面统计说收了多少、下面流水加起来对不上」这种两套口径的经典症状。
   renderRevenue(ordersCache);
 
+  // R84（M-3）：账本坏了时横幅必须**在表格之前**、且在空表情况下也要出现 ——
+  // 「读不出来」与「一笔都没有」在界面上是两件事。
+  const ban = degradedBanner(degradedCache);
+
   if (!ordersCache.length) {
-    box.innerHTML = `<div class="lk-empty">还没有付费订单。为分享链接开启「需付费下载」后，下载者支付成功即会在此留下一笔记录。</div>`;
+    box.innerHTML = ban
+      + `<div class="lk-empty">还没有付费订单。为分享链接开启「需付费下载」后，下载者支付成功即会在此留下一笔记录。</div>`;
     return;
   }
 
-  box.innerHTML = `<table class="lk-table">
+  box.innerHTML = ban + `<table class="lk-table">
     <thead><tr>
       <th>文件</th><th>文件链接</th><th>订单号</th>
       <th title="优惠前的链接标价">原价</th><th title="优惠后应支付的金额">应付</th>
@@ -361,6 +392,7 @@ async function removeFailedOrders() {
 /** 供 main.js 在登出 / 换账号时清空残留 */
 export function reset() {
   ordersCache = [];
+  degradedCache = false; // R84：告警也不能跨账号残留
   const box = document.getElementById('ordermgr-table');
   if (box) box.innerHTML = '';
   const head = document.getElementById('ordermgr-count');

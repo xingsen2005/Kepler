@@ -10773,32 +10773,42 @@ const CASES = [
        */
       name: 'R82-01a · 复用不看渠道（用户选微信却拿到支付宝收银台）',
       file: 'server/share-routes.js',
-      anchor: '  const sameChannel = !!(pendingOrder && pendingOrder.platform === platform);',
+      // R84（L-2）给判据加了 `&& !couponChanged`，本条随之**重锚**：
+      // 形态仍是「只要求有在途单」—— 把渠道与券的比较一起去掉正是最彻底的退化。
+      anchor: '  const sameChannel = !!(pendingOrder && pendingOrder.platform === platform && !couponChanged);',
       replacement: '  const sameChannel = !!pendingOrder; // R82 反向变异：不看渠道就复用',
       testFile: 'audit82-regressions.test.js',
-      minFail: 1,
+      minFail: 2,
     },
     {
       /**
        * 被放弃的在途订单不收尾 ⇒ 管理页永远显示「支付中」，
        * 而用户这次已经换渠道成功了 —— 后台与用户手上各说一套。
+       *
+       * R84：收尾原因改为「换渠道 / 换券」二选一的三元表达式，anchor 随之改为整条语句。
        */
       name: 'R82-01b · 换渠道时不收尾原在途订单（后台永远停在「支付中」）',
       file: 'server/share-routes.js',
-      anchor: "      paymentOrders.markFailed(pendingOrder.id, '已更换支付方式，原在途订单作废');",
-      replacement: '      void pendingOrder; // R82 反向变异：不收尾原在途订单',
+      anchor: "      paymentOrders.markFailed(pendingOrder.id, byCoupon\n        ? `已更换优惠券（${pendingCode || '无券'} → ${submittedCode || '无券'}），原在途订单作废`\n        : '已更换支付方式，原在途订单作废');",
+      replacement: '      void byCoupon; // R82 反向变异：不收尾原在途订单',
       testFile: 'audit82-regressions.test.js',
-      minFail: 1,
+      minFail: 2,
     },
     {
       /**
        * 换渠道时不退券 ⇒ 同一张「每人一次」的券在新单上被判 already_used，
        * 用户换个支付方式就卡在「优惠券不可用」，钱反而付不出去。
+       *
+       * ⚠️ R84（L-2）之后退券有**两个**点：① 旧单占着同一张券时「先退再验」的那一处；
+       * ② 收尾旧单的那一处。本条钉的是 ① —— 因为它才是「同券换渠道」这个死结的
+       * 唯一解药（② 发生在校验之后，救不了 already_used）。② 由 `R84-08b` 覆盖。
+       * 也正因为拆成了两处，旧的单行 anchor 会同时命中（6 空格是 8 空格的真后缀），
+       * 故改为**跨行** anchor：`indexOf + replace` 只替首处，命中两处就是假绿。
        */
       name: 'R82-02a · 换渠道时不退券（「每人一次」的券变成死结）',
       file: 'server/share-routes.js',
-      anchor: '      releaseCouponForOrder(pendingOrder);',
-      replacement: '      void 0; // R82 反向变异：不退券',
+      anchor: '        releaseCouponForOrder(pendingOrder);\n        r = valid();',
+      replacement: '        // R82 反向变异：旧单占着同一张券时也不退券\n        r = valid();',
       testFile: 'audit82-regressions.test.js',
       minFail: 1,
     },
@@ -10808,7 +10818,7 @@ const CASES = [
        */
       name: 'R82-03a · 同渠道也不复用（每次点击都新建订单）',
       file: 'server/share-routes.js',
-      anchor: '  const sameChannel = !!(pendingOrder && pendingOrder.platform === platform);',
+      anchor: '  const sameChannel = !!(pendingOrder && pendingOrder.platform === platform && !couponChanged);',
       replacement: '  const sameChannel = false; // R82 反向变异：永不复用',
       testFile: 'audit82-regressions.test.js',
       minFail: 1,
@@ -10866,6 +10876,242 @@ const CASES = [
       anchor: '  const swept = paymentOrders.sweepStalePending();',
       replacement: '  const swept = { swept: 0, skipped: true }; // R82 反向变异：不执行清理',
       testFile: 'audit82-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * R83 的正中心：成功路径退回「表单 POST 直接 302 到外部网关」。
+       *
+       * 这条变异在 **curl / Firefox** 下完全正常（订单建好、302 也回了），
+       * 只有 Chrome / Safari 会按 CSP 的 `form-action` 把整次导航拦掉 ——
+       * 于是「撤掉修复必须变红」在这里同时验证了「判据确实盯的是响应形态」。
+       * 预期红 2 条：R83-01（状态码）+ R83-04（源码里没有 jumpPage）。
+       */
+      name: 'R83-01a · 成功路径改回「表单 POST 直接 302 到外部网关」（Chrome/Safari 会拦掉跳转）',
+      file: 'server/share-routes.js',
+      anchor: '  if (payUrl) return jumpPage(res, l, order, payUrl);',
+      replacement: '  if (payUrl) return res.redirect(302, charge.url); // R83 反向变异：跨域 3xx',
+      testFile: 'audit83-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * 去掉协议白名单 ⇒ 网关回来的 `javascript:` / `data:` 会被原样渲染进
+       * `<a href>` 与 meta refresh，点一下就是在**本站源**里执行脚本。
+       */
+      name: 'R83-02a · 收银台地址不做协议白名单（javascript: / data: 被渲染成可点链接）',
+      file: 'server/share-routes.js',
+      anchor: "  if (!/^https?:\\/\\//i.test(s)) return '';",
+      replacement: "  if (!s) return ''; // R83 反向变异：不做协议白名单",
+      testFile: 'audit83-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * 链接不做属性转义 ⇒ 地址里带 `"><script>` 就能从 href 里逃出来。
+       * ⚠️ 注意 meta refresh 那一侧仍走 `esc()`，所以这条变异**只能**靠 href 被抓住 ——
+       * 也说明「同一个值在两个属性里各转义一次」不是冗余，是两条独立的注入面。
+       */
+      name: 'R83-03a · 收银台链接不转义（地址里的引号能逃出 href）',
+      file: 'server/share-routes.js',
+      anchor: '      <a class="btn primary" href="${esc(url)}" rel="noopener noreferrer"',
+      replacement: '      <a class="btn primary" href="${url}" rel="noopener noreferrer"',
+      testFile: 'audit83-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * 结构判据的退化形态：把 `safePayUrl()` 摘掉但仍然渲染中转页。
+       * 此时 R83-01（形态）依旧绿，只有 R83-04（源码里的白名单调用点）会红 ——
+       * 这正是「结构断言必须单独存在」的理由：形态对了，消毒可能没做。
+       */
+      name: 'R83-04a · charge.url 绕过 safePayUrl 直接进中转页（形态对、消毒缺）',
+      file: 'server/share-routes.js',
+      anchor: "  const payUrl = charge.kind === 'redirect' ? safePayUrl(charge.url) : '';",
+      replacement: "  const payUrl = charge.kind === 'redirect' ? charge.url : ''; // R83 反向变异：绕过白名单",
+      testFile: 'audit83-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * 图省事的「修法」：把网关域名加进 `form-action`。
+       * 网关地址是用户手填、可换支付平台的，枚举不出来；而且这等于为了一个 bug
+       * 把这条指令的防护面拆掉。
+       */
+      name: "R83-05a · 靠放宽 CSP 修 bug（把支付网关域名塞进 form-action）",
+      file: 'server/index.js',
+      anchor: `    + "object-src 'none'; base-uri 'self'; form-action 'self'; "`,
+      replacement: `    + "object-src 'none'; base-uri 'self'; form-action 'self' https://openapi.alipay.com; "`,
+      testFile: 'audit83-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * 连带损伤：把所有成功渠道都当「跳转型」处理，二维码分支被绕过。
+       * 微信 Native 本来就该留在本站扫码，被 meta refresh 送走等于用户永远扫不到码。
+       */
+      name: 'R83-06a · 丢掉二维码分支（微信 Native 也被当中转页处理）',
+      file: 'server/share-routes.js',
+      anchor: "  if (charge.kind === 'qrcode' && (charge.svg || charge.codeUrl)) return qrPayPage(res, l, order, charge);",
+      replacement: "  if (charge.kind === 'qrcode' && (charge.svg || charge.codeUrl)) void 0; // R83 反向变异：丢掉二维码分支",
+      testFile: 'audit83-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * M-1 的退化形态：查单响应照旧解析，只是**不再验签**。
+       * 此时「正常付款」看起来完全没问题（R84-02 的第一段仍然绿），
+       * 只有「伪造成功」那一段会翻 —— 这正是这条缺陷危险的地方：功能测试全绿。
+       */
+      name: 'R84-01a · 支付宝查单不验签（伪造 TRADE_SUCCESS 即可白拿）',
+      file: 'server/payment-gateway.js',
+      anchor: '  if (!alipayVerifySync(raw, json, cfg)) {',
+      replacement: '  if (false) { // R84 反向变异：跳过同步响应验签',
+      testFile: 'audit84-regressions.test.js',
+      minFail: 2,
+    },
+    {
+      /**
+       * 「按报告字面复用 `alipayVerify`」的等价形态：验签前把响应重新序列化。
+       * 语义相同的 JSON 校验能过，而**原文变了** ⇒ 真实付款全部失败。这条变异
+       * 同时说明「老实按报告抄」会引入比缺陷更严重的问题（付不了钱）。
+       */
+      name: 'R84-02a · 同步响应对「重新序列化后的 JSON」验签（原文切片丢了）',
+      file: 'server/payment-gateway.js',
+      anchor: "  const content = alipayRawNode(raw, 'alipay_trade_query_response');",
+      replacement: "  const content = JSON.stringify(json && json.alipay_trade_query_response); // R84 反向变异：重新序列化",
+      testFile: 'audit84-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * 退回 R83 之前的写法：只有微信在途订单靠轮询推进。
+       * 支付宝/PayPal 的用户付完直接关页面后**永远停在「支付中」**。
+       */
+      name: "R84-03a · 轮询推进退回「只查微信」（支付宝/PayPal 在途单永远不自愈）",
+      file: 'server/share-routes.js',
+      anchor: "  if (order.status === 'pending') {",
+      replacement: "  if (order.status === 'pending' && order.platform === 'wechat') { // R84 反向变异：只推进微信",
+      testFile: 'audit84-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * M-3 的退化形态：账本读不出来也照收钱。功能上「一切正常」（订单在内存里建得
+       * 好好的），代价是重启后钱收了、单没了、票据一起失效。
+       */
+      name: 'R84-04a · 订单账本不可用仍照常收款（fail-open）',
+      file: 'server/share-routes.js',
+      anchor: '  if (paymentOrders.isDegraded()) {',
+      replacement: '  if (false) { // R84 反向变异：账本坏了也照收',
+      testFile: 'audit84-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * 只修了一半：入口加了守卫，但 `isDegraded()` 自己恒假 ⇒ 守卫永远不触发。
+       * 这是「判据没落在实际被执行的那一层」的经典形态。
+       */
+      name: 'R84-05a · isDegraded() 恒假（守卫写了但永远不触发）',
+      file: 'server/payment-orders.js',
+      anchor: '  return loadFailed;',
+      replacement: '  return false; // R84 反向变异：永远装作没坏',
+      testFile: 'audit84-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * L-1 的退化形态：回到 `Number(v)` 直接兜底 —— `Number('') === 0`，
+       * 于是「读不到金额」被渲染成「实付 0.00」，把管理员引向错误的问题。
+       */
+      name: "R84-07a · fenFromYuan 放过空串（读不到金额变成「实付 0.00」）",
+      file: 'server/payment-gateway.js',
+      anchor: "  if (s === '') return NaN;",
+      replacement: '  if (false) return NaN; // R84 反向变异：空串仍走 Number() = 0',
+      testFile: 'audit84-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * L-2 的退化形态：复用判据回到「同渠道就行」，不看本次提交的券。
+       * 页面显示 ¥5、实际按 ¥10 扣款 —— 功能测试（同渠道幂等）依旧全绿。
+       */
+      name: 'R84-08a · 复用在途订单时忽略新提交的券（页面价与实扣价分叉）',
+      file: 'server/share-routes.js',
+      anchor: '  const sameChannel = !!(pendingOrder && pendingOrder.platform === platform && !couponChanged);',
+      replacement: '  const sameChannel = !!(pendingOrder && pendingOrder.platform === platform); // R84 反向变异：不看券',
+      testFile: 'audit84-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * 换券时收尾旧单却**不退旧券** ⇒ 那张券被白吃一次：用户放弃了一笔用 A 券的订单，
+       * A 券却永久算「已用」。它不报错、不影响新单，只是悄悄少了一张券的额度。
+       */
+      name: 'R84-08b · 换券时收尾旧单却把旧券留着（券被白吃一次）',
+      file: 'server/share-routes.js',
+      anchor: '      releaseCouponForOrder(pendingOrder);\n      statsStore.addLog({',
+      replacement: '      // R84 反向变异：收尾旧单时不退旧券\n      statsStore.addLog({',
+      testFile: 'audit84-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * L-3 的退化形态：不做重复提交合并 ⇒ 双击建两笔，第一笔成孤儿 pending。
+       */
+      name: 'R84-09a · 去掉重复提交合并（双击建双单，前者成孤儿）',
+      file: 'server/share-routes.js',
+      anchor: '    : findTwinPending(l, ip, { platform, couponCode: submittedCode, originalFen: ps.amountFen });',
+      replacement: '    : null; // R84 反向变异：不做重复提交合并',
+      testFile: 'audit84-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * L-4 的退化形态：只要验签过就处理，不看事件类型 ——
+       * 任何 PayPal 事件都能白嫖一次带商户密钥的查单。
+       */
+      name: 'R84-10a · PayPal 回调不判事件类型（任何事件都能触发查单）',
+      file: 'server/payment-gateway.js',
+      anchor: '  if (!PAYPAL_EVENT_TYPES.has(type)) {',
+      replacement: '  if (false) { // R84 反向变异：不判事件类型',
+      testFile: 'audit84-regressions.test.js',
+      minFail: 2,
+    },
+    {
+      /**
+       * 顺序错了：本地判据放在出站验签**之后** ⇒ 匿名可达的端点仍然每次都被
+       * 推去花两次出站请求（取 token + 验签），「本地能判掉的别上网判」这条丢了。
+       */
+      name: 'R84-11a · 事件类型判定挪到出站验签之后（先花配额再丢弃）',
+      file: 'server/share-routes.js',
+      anchor: '    if (!ev.accept) return { ok: false, reason: ev.reason };',
+      replacement: '    if (!ev.accept) { /* R84 反向变异：不丢弃，继续去验签 */ }',
+      testFile: 'audit84-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * 服务端报了这个字段、前端却不画 ⇒ 「账本坏了」在管理端仍然不可见，
+       * 页面只剩一张空表，看起来像「从来没卖出去过」。
+       */
+      name: 'R84-12a · 订单页不渲染账本损坏横幅（字段报了没人看）',
+      file: 'public/js/ordermgr.js',
+      anchor: '  const ban = degradedBanner(degradedCache);',
+      replacement: "  const ban = ''; // R84 反向变异：不渲染横幅",
+      testFile: 'audit84-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * 口径分叉的另一半：接口不再上报 degraded。前端那条判据会变成恒假的绿 ——
+       * 所以这两条必须各有一个变异，否则「谁在守这个字段」说不清。
+       */
+      name: 'R84-13a · 订单列表接口不上报 degraded（管理端无从得知账本坏了）',
+      file: 'server/routes/payment.js',
+      anchor: '    res.json({ orders: rows, degraded: paymentOrders.isDegraded() });',
+      replacement: '    res.json({ orders: rows }); // R84 反向变异：不上报 degraded',
+      testFile: 'audit84-regressions.test.js',
       minFail: 1,
     },
   ];

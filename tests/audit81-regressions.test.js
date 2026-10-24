@@ -111,8 +111,27 @@ async function gatewayStub(handler) {
 
 const alipayCfg = (port) => ({
   appId: '2021000000000000', privateKey: PKCS8_PEM, signType: 'RSA2',
+  /**
+   * R84（M-1）：查单响应现在**要验签**（`alipayVerifySync`），因此桩必须带上
+   * 支付宝公钥、并给出真签名 —— 否则「正常报文」用例会撞上 fail-closed。
+   */
+  alipayPublicKey: SPKI_PEM,
   gateway: `http://127.0.0.1:${port}/gateway.do`,
 });
+
+/**
+ * R84（M-1）：按**原始报文里的字节**签发支付宝同步响应。
+ *
+ * 同步响应签的是 `alipay_trade_query_response` 这个 JSON 对象在报文中的**原文切片**，
+ * 不是重新序列化的结果。这里两者恰好相同（同一段 `JSON.stringify` 直接用两次），
+ * 因此验签能过；`audit84` 里另有反例证明「重新序列化」会失败。
+ */
+function signedAlipayResponse(node) {
+  const inner = JSON.stringify(node);
+  const sign = crypto.createSign('RSA-SHA256').update(inner, 'utf8')
+    .sign(KEY_PAIR.privateKey, 'base64');
+  return `{"alipay_trade_query_response":${inner},"sign":${JSON.stringify(sign)},"sign_type":"RSA2"}`;
+}
 
 test('R81-01 · 网关回了响应头却迟迟不吐响应体：查单必须在超时后失败，不得被"读体"拖住', async () => {
   /**
@@ -167,10 +186,8 @@ test('R81-02 · 正常响应仍必须解析出结果（这次改造不得把成�
   const srv = await gatewayStub((req, res) => {
     req.resume();
     res.writeHead(200, { 'Content-Type': 'application/json;charset=utf-8' });
-    res.end(JSON.stringify({
-      alipay_trade_query_response: {
-        code: '10000', trade_status: 'TRADE_SUCCESS', total_amount: '5.00', trade_no: 'T-R81-02',
-      },
+    res.end(signedAlipayResponse({
+      code: '10000', trade_status: 'TRADE_SUCCESS', total_amount: '5.00', trade_no: 'T-R81-02',
     }));
   });
   try {

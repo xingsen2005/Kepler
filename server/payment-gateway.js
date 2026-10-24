@@ -258,9 +258,20 @@ async function alipayCreate(cfg, { order, subject, returnUrl, notifyUrl }) {
  */
 const AMOUNT_TOLERANCE_FEN = 1;
 
-/** 元 → 分；非法输入返回 NaN（不要用 0 兜底：0 会被当成"实付 0 元"而误判不符） */
+/**
+ * 元 → 分；非法输入返回 NaN（不要用 0 兜底：0 会被当成"实付 0 元"而误判不符）
+ *
+ * ⚠️ 空值必须显式挡在 `Number()` **之前**：`Number('')` / `Number('  ')` 都是 **0**、
+ * `Number(null)` 也是 0，只有 `Number('abc')` 才给 NaN。旧实现只做了后者，
+ * 于是「网关响应里读不到金额」会被当成**实付 0 元**，文案写成
+ * 「支付金额与订单金额不一致（实付 0.00，应付 5.00）」—— 方向仍是 fail-closed
+ * （不会误放行），但把管理员引向「是不是真少收了钱」，而真相是「响应里根本没有金额」。
+ */
 function fenFromYuan(v) {
-  const n = Number(String(v == null ? '' : v).trim());
+  if (v === null || v === undefined) return NaN;
+  const s = String(v).trim();
+  if (s === '') return NaN;
+  const n = Number(s);
   if (!Number.isFinite(n)) return NaN;
   return Math.round(n * 100);
 }
@@ -282,6 +293,76 @@ function checkPaidAmount(order, actualFen, actualLabel) {
   return { ok: true };
 }
 
+/**
+ * 从支付宝**同步响应原文**里取出 `<key>` 节点的原始子串（大括号配对）。
+ *
+ * 为什么对着原文切、而不是 `JSON.parse` 后 `JSON.stringify(node)`：
+ * 支付宝的同步响应签名是对 `alipay_trade_query_response` 这段 JSON 的**原始字节**
+ * 做的。重新序列化会变 —— 数字被重新格式化（`5.00` → `5`）、`\uXXXX` 被解码成字符、
+ * 键序可能不同 —— 任意一个字节不同，签名就恒定对不上。
+ * 所以这里按「跳过字符串字面量 + 配对大括号」从原文里切，保证逐字节一致。
+ */
+function alipayRawNode(raw, key) {
+  const s = String(raw == null ? '' : raw);
+  const marker = `"${key}":`;
+  const at = s.indexOf(marker);
+  if (at < 0) return '';
+  let i = at + marker.length;
+  while (i < s.length && /\s/.test(s[i])) i += 1;
+  if (s[i] !== '{') return '';
+  const start = i;
+  let depth = 0;
+  let inStr = false;
+  let escape = false;
+  for (; i < s.length; i += 1) {
+    const ch = s[i];
+    if (inStr) {
+      if (escape) escape = false;
+      else if (ch === '\\') escape = true;
+      else if (ch === '"') inStr = false;
+      continue;
+    }
+    if (ch === '"') { inStr = true; continue; }
+    if (ch === '{') depth += 1;
+    else if (ch === '}') {
+      depth -= 1;
+      if (depth === 0) return s.slice(start, i + 1);
+    }
+  }
+  return '';
+}
+
+/**
+ * 校验支付宝**同步响应**（查单等）的签名 —— R21-04 的闭合点。
+ *
+ * ⚠️ 绝不能复用 `alipayVerify()`：那个是给**异步通知**用的，待签串是
+ * 「参数按 key 升序、`k=v` 用 `&` 连接」；同步响应签的是**原始 JSON 子串**。
+ * 两种口径完全不同，拿通知那套来验响应会**恒定失败**（把所有真实支付判成失败）。
+ *
+ * 为什么必须验：查单是「支付结果判定的唯一入口」，而**支付宝网关地址是管理员手填**的。
+ * 地址一旦填错/被诱导成恶意站点（能通过「https + 非内网」这层校验），对方返回一条
+ * 金额相符的 `TRADE_SUCCESS` 就能让订单变 `paid` —— 用户一分钱没付。金额对账（I-5）
+ * 拦得住「金额不同」，拦不住「金额相同的伪造成功」。微信/PayPal 的主机名是代码内的
+ * 常量，不受这一条影响。
+ *
+ * @returns {boolean} 验不过一律 false（调用方按 `state:'error'` 处理，fail-closed）
+ */
+function alipayVerifySync(raw, json, cfg) {
+  const sign = String((json && json.sign) || '').trim();
+  const key = normalizePublicKey(cfg && cfg.alipayPublicKey);
+  if (!sign || !key) return false;
+  const content = alipayRawNode(raw, 'alipay_trade_query_response');
+  if (!content) return false;
+  const st = String((cfg && cfg.signType) || (json && json.sign_type) || 'RSA2').toUpperCase();
+  if (st === 'SM2') return false; // 国密需 SM2 实现，本地不具备 —— 明确拒绝而非放行
+  const algo = st === 'RSA' ? 'RSA-SHA1' : 'RSA-SHA256';
+  try {
+    return crypto.createVerify(algo).update(content, 'utf8').verify(key, sign, 'base64');
+  } catch (e) {
+    return false;
+  }
+}
+
 async function alipayQuery(cfg, order) {
   const params = {
     app_id: cfg.appId,
@@ -294,10 +375,25 @@ async function alipayQuery(cfg, order) {
     biz_content: JSON.stringify({ out_trade_no: order.id }),
   };
   const url = alipayBuildUrl(cfg.gateway || ALIPAY_GATEWAY, params, cfg.privateKey, cfg.signType);
-  const r = await fetchWithTimeout(url, undefined, 'json');
-  const json = r.body;
+  // M-1：取**原文**（text），验签必须对着原始字节；解析失败按「无法识别」处理
+  const r = await fetchWithTimeout(url, undefined, 'text');
+  const raw = String(r.body == null ? '' : r.body);
+  let json = null;
+  try { json = raw ? JSON.parse(raw) : null; } catch (e) { json = null; }
   const node = json && json.alipay_trade_query_response;
   if (!node) return { paid: false, state: 'error', tradeNo: '', failReason: '支付宝返回内容无法识别' };
+  /**
+   * 验签在**读任何业务字段之前**。顺序很重要：先看 `trade_status` 再看签名，
+   * 就等于先相信了不可信的输入（"检查前先使用"）。
+   */
+  if (!alipayVerifySync(raw, json, cfg)) {
+    return {
+      paid: false, state: 'error', tradeNo: '',
+      failReason: '支付宝响应签名校验失败：无法确认这条响应来自支付宝。'
+        + '请检查「支付设置 → 支付宝」里的**支付宝公钥**是否为开放平台上该应用的支付宝公钥'
+        + '（不是应用公钥、也不是应用私钥），以及网关地址是否为 https://openapi.alipay.com/gateway.do',
+    };
+  }
   if (node.code !== '10000') {
     // 交易不存在（还未在支付宝侧创建）也算未支付，不该报成错误
     if (node.sub_code === 'ACQ.TRADE_NOT_EXIST') return { paid: false, state: 'pending', tradeNo: '', failReason: '' };
@@ -528,6 +624,60 @@ async function paypalQuery(cfg, order) {
 }
 
 /**
+ * R84（L-4）：PayPal 回调的事件类型白名单。
+ *
+ * 旧实现把 `verification_status === 'SUCCESS'` 当成唯一判据 —— 签名确实是真的，
+ * 但「签名是真的」只回答「这条通知来自 PayPal」，不回答「这条通知与我要处理的事有关」。
+ * 任何类型的 PayPal 事件（订阅、争议、发票……）都能触发一次**带真实商户密钥的查单**，
+ * 消耗查单配额并污染日志。
+ *
+ * 白名单只收与「这笔订单可能已收款」直接相关的三个：订单获批（等我们去 capture）、
+ * capture 完成、旧版 sale 完成。其余记日志后丢弃。
+ */
+const PAYPAL_EVENT_TYPES = new Set([
+  'CHECKOUT.ORDER.APPROVED',
+  'PAYMENT.CAPTURE.COMPLETED',
+  'PAYMENT.SALE.COMPLETED',
+]);
+
+/**
+ * 回调时间戳容许的偏移。超过只当「可疑重放」**记 warn**，不拦 —— 因为 PayPal 会在
+ * 我们的端点短暂不可用时重试投递（间隔可达数分钟），把重试当伪造拦掉等于自废重试。
+ * 真正的判定源始终是服务端主动查单，陈旧通知最多让我们多查一次（幂等）。
+ */
+const PAYPAL_TRANSMISSION_SKEW_MS = 5 * 60 * 1000;
+
+/**
+ * R84（L-4）：判定这条 PayPal 回调「该不该处理」。
+ *
+ * @param {object} event   回调体（`webhook_event`）
+ * @param {object} headers 请求头（小写键）
+ * @returns {{accept: boolean, stale: boolean, reason: string}}
+ *   `accept=false` ⇒ 调用方应直接丢弃（不消耗查单配额）；
+ *   `accept=true, stale=true` ⇒ 照常处理，但记一条 warn。
+ */
+function paypalEventCheck(event, headers) {
+  const e = event && typeof event === 'object' ? event : {};
+  const type = String(e.event_type || '').trim();
+  if (!PAYPAL_EVENT_TYPES.has(type)) {
+    return { accept: false, stale: false, reason: `不处理的事件类型 ${type || '(空)'}` };
+  }
+  const h = headers || {};
+  const at = Date.parse(String(h['paypal-transmission-time'] || '').trim());
+  if (!Number.isFinite(at)) {
+    return { accept: true, stale: true, reason: '回调时间戳无法解析' };
+  }
+  const skew = Date.now() - at;
+  if (Math.abs(skew) > PAYPAL_TRANSMISSION_SKEW_MS) {
+    return {
+      accept: true, stale: true,
+      reason: `回调时间戳偏离当前 ${Math.round(Math.abs(skew) / 1000)} 秒`,
+    };
+  }
+  return { accept: true, stale: false, reason: '' };
+}
+
+/**
  * R69：PayPal 回调验签 —— 官方验签 API（`/v1/notifications/verify-webhook-signature`）。
  *
  * 本地无法离线验签（签名用 PayPal 的证书链与私钥），只能回源问一次。代价是每个回调
@@ -715,7 +865,13 @@ module.exports = {
   TIMEOUT_MS, CHARGE_TIMEOUT_MS, ALIPAY_GATEWAY, WECHAT_HOST,
   paypalHost, normalizePrivateKey, normalizePublicKey,
   alipaySignPayload, alipayBuildUrl, alipayTimestamp, alipayVerify,
+  // R84：同步响应验签（M-1）—— 导出以便直接驱动「原文切片」与「验签口径」这两处纯函数
+  alipayRawNode, alipayVerifySync, fenFromYuan,
+  // R84（L-1）：金额对账的文案分叉（「查不到金额」vs「金额不符」）要能被直接断言
+  checkPaidAmount,
   wechatSignPayload, wechatAuthorization, wechatDecryptResource,
   paypalVerifyWebhook,
+  // R84（L-4）：事件类型白名单 + 时间新鲜度判定 —— 导出以便直接驱动这三条分支
+  paypalEventCheck, PAYPAL_EVENT_TYPES, PAYPAL_TRANSMISSION_SKEW_MS,
   createCharge, queryCharge,
 };

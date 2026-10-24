@@ -181,6 +181,26 @@ function persist() {
   writer.schedule();
 }
 
+/**
+ * R84（M-3）：订单存储是否处于「读不出来」的降级态。
+ *
+ * `loadFailed` 原本只护住一件事 —— **不把内存空表写出去**（FUN-01，防覆盖可抢救的数据）。
+ * 但它没有向上游传递「订单系统此刻不可用」：下单、收款、签票据、放行下载全都在这份
+ * **空表**上正常运行，进程重启后订单与票据一起消失，管理页也只剩空表。
+ * 结果就是「买家付过钱 → 重启 → 查无此单」。
+ *
+ * 所以把它变成可问的状态：`POST /s/:id/pay` 命中即**拒绝收款**（fail-closed，
+ * 与加密模块 F-E1 同构），管理端订单页渲染告警横幅（与 `ip-guard` 的
+ * `rulesLoadDegraded` 同款「读到了但坏了必须可见」）。
+ *
+ * ⚠️ 必须先 `load()` 再返回：`loadFailed` 的初值是 `false`，只有真的读过一次才有意义。
+ * 判据读**调用之后**的状态 —— 这个坑 R82 的 `sweepStalePending()` 已经踩过一次。
+ */
+function isDegraded() {
+  load();
+  return loadFailed;
+}
+
 /** 取消去抖并立即落盘（优雅停机走 `index.js`，测试用它驱动落盘断言） */
 function flush() { writer.flush(); }
 
@@ -828,6 +848,7 @@ module.exports = {
   removeFailed, // R32-01：管理端「删除失效订单」（仅 failed；paid/refunded/在途 pending 不动）
   sweepStalePending, // R82：把历史遗留的 pending 一次性标为失败（只跑一次，标记在 payments.json 顶层）
   flush, // R14-09：去抖落盘的强制刷写（优雅停机 / 测试）
+  isDegraded, // R84（M-3）：订单存储读不出来时为 true —— 上游据此拒绝收款 / 显示告警
   markPaid, markFailed, markRefunded, markDownloaded, setTradeNo,
   orderToken, verifyToken, payerState, view,
   bucketOf, // R48：来源桶（快照优先、回退到现存链接）—— 收入统计按桶归集的唯一实现点

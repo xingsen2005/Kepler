@@ -283,6 +283,47 @@ function releaseCouponForOrder(order) {
   return couponStore.releaseByOrder(order.id);
 }
 
+/** R84（L-3）：判定「同一笔单的重复提交」的时间窗口 */
+const TWIN_WINDOW_MS = 5000;
+
+/**
+ * R84（L-3）：并发 / 重复提交的**建单去重**。
+ *
+ * 为什么「有票据才复用」不够：同一浏览器双击「立即支付」时两个请求是**同时**发出的，
+ * 第二个请求发出时第一个的响应（含 `sp_<linkId>_pay` 票据）还没回来 ⇒
+ * `payerStateFor()` 对两者都返回 `none`，于是各建一笔 pending 单；后写的 Cookie 覆盖
+ * 前者，前一笔成孤儿，要等 2 小时后才被裁。有券时第二笔还会撞上 `already_used`，
+ * 让「只是双击了一下」的用户看到「您已使用过该优惠券」。
+ *
+ * 判据只能用「服务端已知、且与会话无关」的事实，因此要求**五项全等**：同链接、
+ * 同出口 IP、同渠道、同券码、同原价快照，且创建时间在 `TWIN_WINDOW_MS` 内。
+ * 五项里任何一项不同都不是「同一次点击」，宁可各建一笔（宁多勿错）。
+ *
+ * 撞上就复用那一笔：网关侧 `out_trade_no` 就是 `order.id`，同一单重复下单是幂等的。
+ *
+ * ⚠️ 残留风险（已评估、按现状接受）：同一出口 IP（校园 / 办公 NAT）上两个**不同的人**
+ * 在 5 秒内对同一链接、选同一渠道、用同一张券下单，会被合并成一笔，后者也会拿到这笔
+ * 订单的票据。要真正分开需要给订单加「浏览器维度」的标识，而匿名访客只有 IP+UA 可用
+ * —— `couponStore.identityFrom()` 用的正是这两项，同样会被 NAT 折叠。相比之下，
+ * 「每次双击都多出一笔孤儿单」是确定发生的损耗，故取前者。
+ */
+function findTwinPending(l, ip, { platform, couponCode, originalFen }) {
+  const now = Date.now();
+  for (const o of paymentOrders.listForLink(l.id)) {
+    if (o.status !== 'pending') continue;
+    if (String(o.platform || '') !== platform) continue;
+    if (String(o.couponCode || '') !== couponCode) continue;
+    if (Number(o.originalFen) !== Number(originalFen)) continue;
+    if (String(o.payerIp || '') !== String(ip || '')) continue;
+    const at = Date.parse(o.createdAt || '');
+    if (!Number.isFinite(at)) continue;
+    const age = now - at;
+    if (age < 0 || age > TWIN_WINDOW_MS) continue;
+    return o;
+  }
+  return null;
+}
+
 /** 访问者对该链接的支付状态 */
 function payerStateFor(l, req) {
   return paymentOrders.payerState(l.id, getCookie(req, payCookieName(l.id)));
@@ -479,7 +520,7 @@ function fmtDate(iso) {
 
 /* ------------------------------ 页面模板 ------------------------------ */
 
-function renderPage(res, status, { title, head, body, wide, below, noNotice }) {
+function renderPage(res, status, { title, head, body, wide, below, noNotice, refresh }) {
   /**
    * R13-07：状态码白名单。全部调用方都传本地字面量（含 401 = 分享密码错误页，属本地语义），
    * 白名单把这份「本地性」变成机器可查的凭据 —— 上游状态若意外渗入（例如把云端错误码
@@ -519,6 +560,7 @@ function renderPage(res, status, { title, head, body, wide, below, noNotice }) {
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <meta name="referrer" content="no-referrer">
 <meta name="robots" content="noindex">
+${refresh ? `<meta http-equiv="refresh" content="0;url=${esc(refresh)}">` : ''}
 <title>${esc(title)} - 文件分享</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
@@ -1022,6 +1064,67 @@ function statusQueryAgeSec(orderId) {
  *
  * @param {string} [checked] 刚从 `/pay/check` 回来时携带的结果码（见 payCheckNotice）
  */
+/**
+ * 只接受 http/https 的收银台地址（R83）。
+ *
+ * 这个字符串来自支付网关的响应，最后要落进 `<a href>` 与 `<meta http-equiv="refresh">`
+ * 的属性里 —— 一旦是 `javascript:` / `data:`，点一下就成了**在本站源里执行脚本**
+ * （meta refresh 同样接受 `data:`）。所以判据必须在**渲染之前**，不能靠 `esc()`：
+ * 转义只防「逃出属性」，管不了「协议本身就可执行」。
+ * 控制字符一并拒绝（`\r\n` 会把属性拆开、NUL 会截断），**拒绝而不是清洗**。
+ */
+function safePayUrl(u) {
+  const s = String(u || '').trim();
+  if (!/^https?:\/\//i.test(s)) return '';
+  if (/[\u0000-\u001f\u007f]/.test(s)) return '';
+  return s;
+}
+
+/**
+ * 「正在跳转到支付平台」中转页（R83）—— **绝不要**把表单 POST 直接 302 到外部网关。
+ *
+ * 根因（用户实测反馈：「订单已经创建成功、后台显示支付中，但页面没跳走」）：
+ * Chrome 与 Safari 会把 CSP 的 `form-action` 也施加到**表单 POST 之后的重定向目标**上
+ * （Firefox 只查初始 action）。本项目 CSP 是 `form-action 'self'`，而收银台地址必然是
+ * 外域 ⇒ 浏览器拦下这次跳转，控制台报
+ * `Refused to send form data to '' because it violates ... "form-action 'self'"`，
+ * **页面一动不动**，而服务端早已把订单建好（后台可见「支付中」）。
+ * 这类「同一个站点 Firefox 能付、Chrome 付费全卡住」的现象极易被误判成网络/代理问题。
+ *
+ * 两条修法，这里刻意选后者：
+ *  ① 把网关域名加进 `form-action` —— 网关地址是用户手填的（可换支付平台），无法枚举；
+ *    而且那等于为一个 bug 把这条指令的防护面拆掉。
+ *  ② **不让表单 POST 跨域**：POST 只回同源页面，由**页面自身**发起导航
+ *    （meta refresh + 可点链接）。页面发起的导航不受 `form-action` 约束。
+ *
+ * 零脚本实现：CSP 不允许内联脚本，而 meta refresh 与 `<a>` 都不需要脚本，
+ * 顺带覆盖了禁用 JS / 受限内嵌窗口这些环境。
+ */
+function jumpPage(res, l, order, url) {
+  const p = paymentProviders.platform(order.platform);
+  const name = p ? p.name : order.platform;
+  renderPage(res, 200, {
+    title: '正在跳转到支付平台',
+    refresh: url,
+    head: `<div class="center-head">
+      <div class="icon-big" style="background:#e8f1fb;color:#0067c0;font-size:20px">↗</div>
+      <h1>正在跳转到${esc(name)}…</h1>
+      <p class="sub">订单已创建，正在前往支付页面。若浏览器没有自动跳转，请点击下面的按钮。</p>
+      </div>`,
+    body: `
+      <div class="meta">
+        ${orderMetaRows(order)}
+      </div>
+      <a class="btn primary" href="${esc(url)}" rel="noopener noreferrer"
+        style="display:block;text-align:center;text-decoration:none">前往${esc(name)}支付</a>
+      <div class="pay-note">本页只是中转：订单已经创建，金额与订单号都已确定。
+        跳转后请勿关闭支付页面；支付完成后回到本站即可继续下载。</div>
+      ${orderNoBox(order.orderNo || order.id)}
+      ${orderNoScript()}`,
+    below: paidBelowHtml(l, res),
+  });
+}
+
 function payingPage(res, l, order, checked) {
   const p = paymentProviders.platform(order.platform);
   const notice = payCheckNotice(checked, order);
@@ -1752,6 +1855,29 @@ router.post('/s/:id/pay', asyncHandler(async (req, res) => {
     return payPage(res, l, ps, available, msg, '', couponStateFor(l, req));
   }
 
+  /**
+   * R84（M-3）：订单存储读不出来时**必须停止收款**（fail-closed）。
+   *
+   * `payments.json` 损坏 / 不可读时，`payment-orders.load()` 会降级成内存空表并锁死写入
+   * （这是对的，防覆盖可抢救的数据），但此前**没有任何上游知道这件事**：下单、收款、
+   * 签票据、放行下载全都在这份空表上照常跑完，进程一重启订单与票据一起消失 ——
+   * 「买家付过钱 → 重启 → 查无此单」。钱已经进了商户账户，系统里却没有这笔记录。
+   *
+   * 放在这里（已算好 `available`、还没动任何状态）而不是更靠前：它要用 `payPage()`
+   * 在**付费页**上给出可读原因，而不是抛一个 500 或回一张空白页。
+   * 与加密模块 F-E1（缺 IV/TAG 的历史元数据 fail-closed）是同一个范式。
+   */
+  if (paymentOrders.isDegraded()) {
+    statsStore.addLog({
+      action: 'share.pay', level: 'error',
+      detail: `已拒绝发起支付：订单存储不可用（链接 ${l.id}，IP：${ip}）—— payments.json 读取失败，为避免「收了钱却查不到订单」暂停收款`,
+    });
+    return payPage(res, l, ps, available,
+      '订单存储暂不可用，已暂停收款：现在下单会出现「钱付了、系统里查不到订单」。'
+      + '请管理员检查站点数据目录下的 payments.json（文件损坏时系统不会自动覆盖它，可人工修复后重启服务）。',
+      '', couponStateFor(l, req));
+  }
+
   // R14-05：动单之前先问「这个人现在是什么支付态」—— 与 `GET /s/:id`（:571）和
   // `/s/:id/dl`（:1052）同源。此前唯独发起支付不查，属「同一状态多个入口」的漏网：
   //   ① 已付用户再点一次付费 → 新 pending 的票据**覆盖**已付票据，支付态由 paid 退回
@@ -1772,6 +1898,9 @@ router.post('/s/:id/pay', asyncHandler(async (req, res) => {
   /**
    * R62：券只作用于**新建订单**。复用在途订单时不能改价 —— 那笔订单已经按原金额
    * 在网关侧下过单（商户单号就是 order.id），改价会让「订单金额」与「网关收款额」分叉。
+   *
+   * R84（L-2）：**「不能改价」不等于「可以忽略新提交的券」**。旧实现在复用分支里
+   * 压根不读券码，于是「页面显示 ¥5、实际扣 ¥10」—— 见下方 `couponChanged` 的处理。
    */
   let applied = null;
   /**
@@ -1793,38 +1922,96 @@ router.post('/s/:id/pay', asyncHandler(async (req, res) => {
    * 释放后新单会按表单/Cookie 里的券码重新校验并重新核销，账面净额不变。
    */
   const pendingOrder = payer.state === 'pending' && payer.order ? payer.order : null;
-  const sameChannel = !!(pendingOrder && pendingOrder.platform === platform);
-  if (sameChannel) {
+  /**
+   * R84（L-2）：**换券即新单**，与 R82「换渠道即新单」同构。
+   *
+   * 旧实现只要「同渠道 + 有在途单」就复用，**根本不读本次提交的券**（券只在新建
+   * 分支里校验）⇒ 用户先建一笔原价 ¥10 的 pending 单 → 回付费页领一张 5 元券、
+   * 页面显示 ¥5 → 提交后按 ¥10 复用旧单。**页面价与真实扣款分叉，且没有任何提示**。
+   *
+   * 判据只比「券码」而不是比金额：金额本来就是由券算出来的，券码相同则金额必然
+   * 相同，比金额更直接（也顺带覆盖「券码换了但优惠额恰好一样」）。
+   *
+   * 三步原子与换渠道完全同构：收尾旧单 → 退券 → 按本次的券建新单。
+   */
+  const submittedCode = String((req.body && req.body.coupon) || '').trim()
+    || getCookie(req, couponCookieName(l.id));
+  const pendingCode = pendingOrder ? String(pendingOrder.couponCode || '') : '';
+  const couponChanged = !!pendingOrder && submittedCode !== pendingCode;
+  const sameChannel = !!(pendingOrder && pendingOrder.platform === platform && !couponChanged);
+  /**
+   * R84（L-3）：**重复提交合并**（见 `findTwinPending()`）。
+   *
+   * 只在「没有可用 Cookie 票据」的前提下查——有票据时 `pendingOrder` 已经是唯一真相，
+   * 再查一次只会让两条判据打架。
+   */
+  const twin = pendingOrder ? null
+    : findTwinPending(l, ip, { platform, couponCode: submittedCode, originalFen: ps.amountFen });
+  if (twin) {
+    /**
+     * 复用那笔刚建的单。**票据照样签给本次请求**：两个请求的响应谁先落地不确定，
+     * 若只有第一个响应签了票据、而浏览器恰好丢弃了它，用户就会「付了钱但手上没有
+     * 凭证」—— 这正是 R79~R83 一直在消灭的观感。
+     */
+    order = twin;
+    res.cookie(payCookieName(l.id), paymentOrders.orderToken(twin), shareCookieOptions(l.id));
+    statsStore.addLog({
+      action: 'share.pay', level: 'warn',
+      detail: `分享链接 ${l.id} 疑似重复提交（${TWIN_WINDOW_MS / 1000} 秒内同 IP / 同渠道 / 同券 / 同价）：`
+        + `复用未成交订单 ${twin.id}，不再新建（IP：${ip}）`,
+    });
+  } else if (sameChannel) {
     // 复用在途订单。网关侧商户单号就是 order.id（payment-gateway 用 out_trade_no: order.id），
     // 因此重复下单是幂等的，不会在网关侧产生第二笔。
     order = pendingOrder;
   } else {
-    if (pendingOrder) {
-      paymentOrders.markFailed(pendingOrder.id, '已更换支付方式，原在途订单作废');
-      releaseCouponForOrder(pendingOrder);
-      statsStore.addLog({
-        action: 'share.pay', level: 'warn',
-        detail: `分享链接 ${l.id} 更换支付渠道（${pendingOrder.platform} → ${platform}）：`
-          + `原在途订单 ${pendingOrder.id} 已作废，本次另建新单（IP：${ip}）`,
-      });
-    }
     /**
      * R62：券在**下单这一刻**再校验一次，而不是直接信任页面上的结果 ——
      * 页面可能停留很久（券在此期间被别人用完 / 过期），Cookie 也可能被伪造。
      * 表单里的 hidden `coupon` 优先于 Cookie：它来自本页渲染时的那张券，更接近用户意图。
+     *
+     * R84：校验**提前到收尾旧单之前**。券不合法就直接回页面 —— 不能因为「手滑填错
+     * 一张券」把用户那笔本来还能付的在途订单白扔掉。
+     *
+     * ⚠️ 但有一个例外必须照顾：**旧单占着本次要用的同一张券**。券是在下单时核销的，
+     * 只要旧单还在，这张券就是「已用过」—— 于是「换渠道时继续用同一张券」会当场被判
+     * `already_used`（R82 踩过一次，代价是用户连钱都付不出去）。这类情况先退券再验，
+     * 且**只重试一次**：退完还验不过，说明券本身就不可用（过期/用尽），不是旧单的锅。
      */
-    const code = String((req.body && req.body.coupon) || '').trim()
-      || getCookie(req, couponCookieName(l.id));
-    if (code) {
+    if (submittedCode) {
       const who = visitorIdentity(req);
-      const r = couponStore.validateForUse({
-        code, link: l, identity: who.identity, userId: who.userId,
+      const valid = () => couponStore.validateForUse({
+        code: submittedCode, link: l, identity: who.identity, userId: who.userId,
       });
+      let r = valid();
+      if (!r.ok && pendingOrder && pendingCode === submittedCode) {
+        releaseCouponForOrder(pendingOrder);
+        r = valid();
+      }
       if (!r.ok) {
         res.clearCookie(couponCookieName(l.id), { path: '/' });
-        return payPage(res, l, ps, available, '', '', { code, ok: false, message: r.message });
+        return payPage(res, l, ps, available, '', '', { code: submittedCode, ok: false, message: r.message });
       }
       applied = r;
+    }
+    if (pendingOrder) {
+      /**
+       * 收尾原因按「到底换了什么」分开记 —— 这是事后查对账时唯一线索：
+       * 用户说「我明明用了券」，得能一眼看出旧单是被换渠道废的，还是被换券废的。
+       */
+      const byCoupon = couponChanged && pendingOrder.platform === platform;
+      paymentOrders.markFailed(pendingOrder.id, byCoupon
+        ? `已更换优惠券（${pendingCode || '无券'} → ${submittedCode || '无券'}），原在途订单作废`
+        : '已更换支付方式，原在途订单作废');
+      releaseCouponForOrder(pendingOrder);
+      statsStore.addLog({
+        action: 'share.pay', level: 'warn',
+        detail: byCoupon
+          ? `分享链接 ${l.id} 更换优惠券（${pendingCode || '无券'} → ${submittedCode || '无券'}）：`
+            + `原在途订单 ${pendingOrder.id} 已作废并退券，本次另建新单（IP：${ip}）`
+          : `分享链接 ${l.id} 更换支付渠道（${pendingOrder.platform} → ${platform}）：`
+            + `原在途订单 ${pendingOrder.id} 已作废，本次另建新单（IP：${ip}）`,
+      });
     }
     const amountFen = applied ? applied.payableFen : ps.amountFen;
     // 文件名 / 对象键 / 存储桶一并快照进订单：链接删除后订单管理页仍要能回答
@@ -1920,23 +2107,32 @@ router.post('/s/:id/pay', asyncHandler(async (req, res) => {
   if (charge.tradeNo) paymentOrders.setTradeNo(order.id, charge.tradeNo);
 
   if (charge.kind === 'qrcode' && (charge.svg || charge.codeUrl)) return qrPayPage(res, l, order, charge);
-  if (charge.kind === 'redirect' && charge.url) return res.redirect(302, charge.url);
+  /**
+   * R83：收银台跳转**不能**由这次表单 POST 的 3xx 完成 —— 见 `jumpPage()` 的说明。
+   * 同时做协议白名单：`charge.url` 来自网关，`javascript:` / `data:` 一旦进了
+   * `<a href>` / meta refresh 就是在自己站点上执行脚本。
+   * 只算一次（`safePayUrl` 有 trim + 正则两趟），结果两处复用。
+   */
+  const payUrl = charge.kind === 'redirect' ? safePayUrl(charge.url) : '';
+  if (payUrl) return jumpPage(res, l, order, payUrl);
   /**
    * R80：`createCharge` 说「成功了」，却没给出任何**能付款的入口**时，绝不能落到 `payingPage`。
    *
    * 那一页写着「订单已创建，请在支付宝完成支付后返回本页」—— 可用户既没有被送去支付平台，
    * 也没有二维码，「我已完成支付」按钮点下去自然永远是「支付中」。这正是
    * 「点了立即支付没有任何反应」的另一条隐蔽路径：**订单建了，收银台没给**。
-   * 网关实现一旦回归（kind 拼错 / url 为空），这里必须当场说清楚而不是静默降级。
+   * 网关实现一旦回归（kind 拼错 / url 为空 / url 不是 http(s)），这里必须当场说清楚
+   * 而不是静默降级。
    */
+  const badUrl = charge.kind === 'redirect' && charge.url ? '（地址协议不是 http/https，已拒绝跳转）' : '';
   paymentOrders.markFailed(order.id, '支付渠道未返回可用的收银台地址');
   releaseCouponForOrder(order);
   statsStore.addLog({
     action: 'share.pay', level: 'error',
-    detail: `分享链接 ${l.id} 订单 ${order.id} 下单异常：渠道 ${chargePlatform} 返回 kind=${charge.kind || '空'}，无收银台地址`,
+    detail: `分享链接 ${l.id} 订单 ${order.id} 下单异常：渠道 ${chargePlatform} 返回 kind=${charge.kind || '空'}，无可用收银台地址${badUrl}`,
   });
   return payPage(res, l, ps, available,
-    `创建支付订单失败：支付渠道（${chargePlatform}）没有返回可用的收银台地址，请检查该渠道的网关地址配置后重试`,
+    `创建支付订单失败：支付渠道（${chargePlatform}）没有返回可用的收银台地址${badUrl}，请检查该渠道的网关地址配置后重试`,
     '', couponStateFor(l, req));
 }));
 
@@ -2088,7 +2284,20 @@ router.get('/s/:id/pay/status', asyncHandler(async (req, res) => {
     return res.json({ state: order.status, paid: order.status === 'paid', probe: true, platform: order.platform });
   }
 
-  if (order.status === 'pending' && order.platform === 'wechat') {
+  /**
+   * R84（M-2）：**任何**在途订单都要靠这里推进，不再只限微信。
+   *
+   * 旧条件是 `order.platform === 'wechat'`，理由是「微信 Native 没有回跳，只能靠轮询」。
+   * 但「有回跳」不等于「用户会回来」：在支付宝 / PayPal 收银台付完款**直接关掉标签页**
+   * 是极常见的动作。之后凭仍有效的 7 天票据 Cookie 重新打开分享页，页面停在「支付中…」，
+   * 而这个轮询一次网关请求都不发 ⇒ **永远查不到结果**，只能等用户自己发现去点
+   * 「我已完成支付」。这正是 R79~R83 一直在消灭的「付了钱却像没付」，只是残留在
+   * 三分之二的渠道上。
+   *
+   * 放宽后网关压力不变量级：订单级 3 秒节流与按 IP 的 200 次/10 分钟预算都在下面，
+   * 且它们本来就按「这次真的会出网」才扣（R10-09）。
+   */
+  if (order.status === 'pending') {
     // R8-20：节流逻辑与 /pay/check、/pay/return 收敛到同一处（原先三处各写一份，
     // 结果只有这里带了节流）。节流命中时静默返回当前状态，页面下一轮再问。
     //
@@ -2181,6 +2390,19 @@ async function verifyNotified(platform, req) {
     return { ok: true };
   }
   if (platform === 'paypal') {
+    /**
+     * R84（L-4）：先判「这条通知值不值得处理」，再花两次出站去验签。
+     * 顺序有意如此 —— 验签本身是**匿名可触发的两次出站调用**，能用本地判据挡掉的
+     * 就不该放到网络上去挡。
+     */
+    const ev = paymentGateway.paypalEventCheck(b, req.headers);
+    if (!ev.accept) return { ok: false, reason: ev.reason };
+    if (ev.stale) {
+      statsStore.addLog({
+        action: 'share.pay', level: 'warn',
+        detail: `PayPal 回调时间异常（${ev.reason}），仍按触发信号查单`,
+      });
+    }
     try {
       const ok = await paymentGateway.paypalVerifyWebhook(cfg, req.headers, b);
       return ok ? { ok: true } : { ok: false, reason: 'PayPal 验签未通过' };

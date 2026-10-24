@@ -74,7 +74,17 @@ router.get('/payment/orders', requireAdmin, (req, res) => {
         platformName: (p && p.name) || o.platform,
       });
     });
-    res.json({ orders: rows });
+    /**
+     * R84（M-3）：把「订单账本读不出来」这件事**上报到管理端**。
+     *
+     * `payments.json` 解析失败时 `load()` 只做两件事：返回内存空表、锁定写入（不覆盖
+     * 现场，FUN-01）。它从没告诉上游「订单系统不可用」—— 于是管理页看到的是一片
+     * 空，像是「从来没卖出去过」，而买家手里的票据重启后就全失效了。
+     *
+     * 这个字段不是给前端做买卖判定的，纯粹是"让坏了这件事可见"：与
+     * `ip-guard` 的 `rulesLoadDegraded` 同款做法。
+     */
+    res.json({ orders: rows, degraded: paymentOrders.isDegraded() });
   } catch (e) {
     res.status(500).json({ error: e.message });
   }
