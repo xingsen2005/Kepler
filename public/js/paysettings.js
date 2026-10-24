@@ -182,8 +182,15 @@ function fieldControl(f, value, configured) {
   const ph = escapeHtml(f.placeholder || '');
 
   if (f.input === 'select') {
+    /**
+     * R82：`disabled` 的选项照旧列出来但**不可选**（支付宝的 SM2 就是这样）。
+     *
+     * 为什么不直接从列表里删掉：删掉之后用户只会看到「签名算法：RSA2 / RSA」，
+     * 不知道自己手上的 SM2 为什么"不见了"。列出来 + 置灰 + 原因写在标签里，
+     * 才能一次说清。服务端 `validate()` 读的是同一个 `disabled` 标记，两边同源。
+     */
     const opts = (f.options || [])
-      .map((o) => `<option value="${escapeHtml(o.value)}"${o.value === value ? ' selected' : ''}>${escapeHtml(o.label)}</option>`)
+      .map((o) => `<option value="${escapeHtml(o.value)}"${o.value === value && !o.disabled ? ' selected' : ''}${o.disabled ? ' disabled' : ''}>${escapeHtml(o.label)}</option>`)
       .join('');
     return `<select id="pay-f-${escapeHtml(f.key)}" data-key="${escapeHtml(f.key)}" class="pay-input">${opts}</select>`;
   }

@@ -414,6 +414,62 @@ function get(id) {
 }
 
 /**
+ * R82：把**历史遗留的在途订单**一次性标为失败（用户明确要求）。
+ *
+ * 为什么需要它：1.9.17 之前，`createCharge` 的出站超时只覆盖响应头（见
+ * `payment-gateway.fetchWithTimeout` 的注释），网关「回了头却不吐体」时请求会挂到
+ * undici 的 300 秒兜底；而订单在 `await createCharge()` **之前**就已落库为 pending
+ * ⇒ 库里因此积下了一批**永远停在「支付中」**的订单。1.9.17 修掉了成因，但这些
+ * 存量记录不会自己消失：管理页会一直显示「支付中」，`payerState()` 还会把同一个
+ * 浏览器当成「有在途订单」。所以升级时要清一次。
+ *
+ * ## 三个刻意的设计
+ *
+ * ① **只跑一次**：结果写进 `payments.json` 顶层的 `staleSwept` 标记。用固定标签
+ *    `'R82'` 而不是版本号 —— 写成版本号的话，以后每次升版本都会被判成「还没扫过」，
+ *    于是每次升级都把当时**真正在途**的订单误杀一批。这个标记**永远不要改**。
+ * ② **读不到就不扫**：`loadFailed` 时直接返回。此时内存里是 `{orders: []}`，
+ *    扫一遍等于什么都没做却把标记写下去 —— 等磁盘文件修好，这批订单就再也不会被清了。
+ * ③ **可恢复**：`markFailed` 不是终态。若有人恰好在升级这一刻正在付款，网关侧的
+ *    异步通知仍会走到 `finalizeOrder()` → 主动查单 → `markPaid()`（`finalizeOrder`
+ *    只对 `paid`/`refunded` 提前返回）。钱不会因为这次清理而丢。
+ *
+ * 与 `removeFailed()` 的区别：那个是**删除**失败订单（管理员手动点），这里只**改状态**，
+ * 记录留着，方便管理员对着网关后台逐笔核对。
+ *
+ * @param {string} [reason] 写进 `failReason` 的原因
+ * @returns {{swept: number, skipped: boolean, already?: boolean}}
+ */
+const STALE_SWEEP_MARK = 'R82';
+function sweepStalePending(reason) {
+  /**
+   * ⚠️ `loadFailed` 必须在 `load()` **之后**再看。
+   *
+   * 旧写法把它放在前面：首次调用时 `loadFailed` 还是初始的 `false`（这个标志只在
+   * `load()` 内部失败时才置位），于是 `load()` 抛错 → 返回空表 → 函数继续往下走 →
+   * 「0 笔可清 + 写标记」—— 标记虽然因为 `persist()` 里的 `loadFailed` 守卫没落盘，
+   * 但返回值会说 `skipped: false`，调用方（启动日志）就会以为清理成功执行过。
+   * 判据要读**调用之后**的状态，不是调用之前的。
+   */
+  const db = load();
+  if (loadFailed) return { swept: 0, skipped: true };
+  if (db.staleSwept === STALE_SWEEP_MARK) return { swept: 0, skipped: true, already: true };
+  const why = String(reason || '历史在途订单：本版修复了「网关不返回完整响应体时请求会挂 5 分钟」的缺陷，'
+    + '升级时统一收尾；此类订单从未完成支付，如需核对请在支付平台后台按商户订单号查询');
+  let n = 0;
+  for (const o of db.orders) {
+    if (o.status !== 'pending') continue;
+    o.status = 'failed';
+    o.failReason = why;
+    o.updatedAt = new Date().toISOString();
+    n += 1;
+  }
+  db.staleSwept = STALE_SWEEP_MARK;
+  persist();
+  return { swept: n, skipped: false };
+}
+
+/**
  * 按**网关侧**订单号查找（异步通知定位订单用）。
  * 微信 / PayPal 的通知里带的是网关订单号，不是我们的订单 id。
  */
@@ -770,6 +826,7 @@ module.exports = {
   findByOrderNo, listForUser, claimForLink,
   pruneGlobal, // R8-25：导出以供测试直接驱动跨链接裁剪
   removeFailed, // R32-01：管理端「删除失效订单」（仅 failed；paid/refunded/在途 pending 不动）
+  sweepStalePending, // R82：把历史遗留的 pending 一次性标为失败（只跑一次，标记在 payments.json 顶层）
   flush, // R14-09：去抖落盘的强制刷写（优雅停机 / 测试）
   markPaid, markFailed, markRefunded, markDownloaded, setTradeNo,
   orderToken, verifyToken, payerState, view,

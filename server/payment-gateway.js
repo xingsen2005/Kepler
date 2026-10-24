@@ -34,6 +34,16 @@ const qrcode = require('./qrcode');
 const pemKey = require('./pem-key');
 
 const TIMEOUT_MS = 10000;
+/**
+ * R81：「用户正盯着屏幕等」的那一次下单，**整体**只给 9 秒。
+ *
+ * 单次出站 10 秒（`TIMEOUT_MS`）是给「查单」这种后台动作定的 —— 没人盯着。
+ * 但下单不同：PayPal 的下单是**两次**串行出站（取 token + 建单），各自 10 秒就是
+ * 20 秒，而付费页的提交看门狗只等 12 秒（`public/js/pay-poll.js` 的
+ * `SUBMIT_TIMEOUT_MS`）⇒ 必然出现「服务端还在等网关、前端已经宣布没收到响应」。
+ * 9 秒 < 12 秒，服务端总能先给出结论（成功跳转 / 明确失败原因）。
+ */
+const CHARGE_TIMEOUT_MS = 9000;
 const ALIPAY_GATEWAY = 'https://openapi.alipay.com/gateway.do';
 const WECHAT_HOST = 'https://api.mch.weixin.qq.com';
 
@@ -284,8 +294,8 @@ async function alipayQuery(cfg, order) {
     biz_content: JSON.stringify({ out_trade_no: order.id }),
   };
   const url = alipayBuildUrl(cfg.gateway || ALIPAY_GATEWAY, params, cfg.privateKey, cfg.signType);
-  const res = await fetchWithTimeout(url);
-  const json = await res.json();
+  const r = await fetchWithTimeout(url, undefined, 'json');
+  const json = r.body;
   const node = json && json.alipay_trade_query_response;
   if (!node) return { paid: false, state: 'error', tradeNo: '', failReason: '支付宝返回内容无法识别' };
   if (node.code !== '10000') {
@@ -322,7 +332,7 @@ function wechatAuthorization(method, canonicalUrl, body, cfg, { timestamp, nonce
     + `signature="${signature}",timestamp="${timestamp}",serial_no="${cfg.certSerialNo}"`;
 }
 
-async function wechatRequest(method, path, cfg, body) {
+async function wechatRequest(method, path, cfg, body, deadline) {
   const timestamp = String(Math.floor(Date.now() / 1000));
   const nonce = crypto.randomBytes(16).toString('hex');
   const raw = body === undefined || body === null ? '' : JSON.stringify(body);
@@ -336,22 +346,22 @@ async function wechatRequest(method, path, cfg, body) {
     'User-Agent': 's3-manager',
   };
   if (cfg.subMchId) headers['Wechatpay-Serial'] = cfg.certSerialNo;
-  const res = await fetchWithTimeout(WECHAT_HOST + path, {
+  const r = await fetchWithTimeout(WECHAT_HOST + path, {
     method,
     headers,
     body: method === 'GET' ? undefined : raw,
-  });
-  const text = await res.text();
+  }, 'text', deadline);
+  const text = r.body == null ? '' : String(r.body);
   let json = null;
   try { json = text ? JSON.parse(text) : null; } catch (e) { /* 非 JSON */ }
-  if (!res.ok) {
-    const msg = (json && (json.message || json.detail)) || text || `HTTP ${res.status}`;
+  if (!r.ok) {
+    const msg = (json && (json.message || json.detail)) || text || `HTTP ${r.status}`;
     throw new Error(String(msg).slice(0, 300));
   }
   return json || {};
 }
 
-async function wechatCreate(cfg, { order, subject, notifyUrl }) {
+async function wechatCreate(cfg, { order, subject, notifyUrl }, deadline) {
   const payload = {
     appid: cfg.appId,
     mchid: cfg.mchId,
@@ -361,7 +371,7 @@ async function wechatCreate(cfg, { order, subject, notifyUrl }) {
     amount: { total: Number(order.amountFen), currency: 'CNY' },
   };
   if (cfg.subMchId) { payload.sub_mchid = cfg.subMchId; if (cfg.subAppId) payload.sub_appid = cfg.subAppId; }
-  const r = await wechatRequest('POST', '/v3/pay/transactions/native', cfg, payload);
+  const r = await wechatRequest('POST', '/v3/pay/transactions/native', cfg, payload, deadline);
   const codeUrl = r.code_url;
   if (!codeUrl) throw new Error('微信支付未返回 code_url');
   return { kind: 'qrcode', url: '', codeUrl, svg: qrcode.toSvg(codeUrl, { scale: 6, margin: 3 }), tradeNo: '' };
@@ -417,22 +427,24 @@ function paypalBasic(cfg) {
   return 'Basic ' + Buffer.from(`${cfg.clientId}:${cfg.clientSecret}`).toString('base64');
 }
 
-async function paypalToken(cfg) {
-  const res = await fetchWithTimeout(`${paypalHost(cfg.mode)}/v1/oauth2/token`, {
+async function paypalToken(cfg, deadline) {
+  const r = await fetchWithTimeout(`${paypalHost(cfg.mode)}/v1/oauth2/token`, {
     method: 'POST',
     headers: {
       Authorization: paypalBasic(cfg),
       'Content-Type': 'application/x-www-form-urlencoded',
     },
     body: 'grant_type=client_credentials',
-  });
-  const json = await res.json().catch(() => null);
-  if (!res.ok || !json || !json.access_token) throw new Error('PayPal 获取访问令牌失败');
+  }, 'json', deadline);
+  const json = r.body;
+  if (!r.ok || !json || !json.access_token) throw new Error('PayPal 获取访问令牌失败');
   return json.access_token;
 }
 
-async function paypalCreate(cfg, { order, subject, returnUrl, cancelUrl }) {
-  const token = await paypalToken(cfg);
+async function paypalCreate(cfg, { order, subject, returnUrl, cancelUrl }, deadline) {
+  // 两次串行出站共用同一个截止时刻：只给「取 token」10 秒、再给「建单」10 秒，
+  // 前端 12 秒的看门狗必然先响（见 CHARGE_TIMEOUT_MS 的注释）
+  const token = await paypalToken(cfg, deadline);
   const body = {
     intent: 'CAPTURE',
     purchase_units: [{
@@ -442,13 +454,13 @@ async function paypalCreate(cfg, { order, subject, returnUrl, cancelUrl }) {
     }],
     application_context: { return_url: returnUrl, cancel_url: cancelUrl, user_action: 'PAY_NOW' },
   };
-  const res = await fetchWithTimeout(`${paypalHost(cfg.mode)}/v2/checkout/orders`, {
+  const r = await fetchWithTimeout(`${paypalHost(cfg.mode)}/v2/checkout/orders`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
-  });
-  const json = await res.json().catch(() => null);
-  if (!res.ok || !json || !json.id) throw new Error((json && (json.message || json.name)) || 'PayPal 创建订单失败');
+  }, 'json', deadline);
+  const json = r.body;
+  if (!r.ok || !json || !json.id) throw new Error((json && (json.message || json.name)) || 'PayPal 创建订单失败');
   const approve = (json.links || []).find((l) => l.rel === 'approve');
   if (!approve || !approve.href) throw new Error('PayPal 未返回审批链接');
   return { kind: 'redirect', url: approve.href, tradeNo: json.id };
@@ -479,12 +491,12 @@ async function paypalQuery(cfg, order) {
   const id = order.tradeNo;
   if (!id) return { paid: false, state: 'pending', tradeNo: '', failReason: '' };
   const token = await paypalToken(cfg);
-  const res = await fetchWithTimeout(`${paypalHost(cfg.mode)}/v2/checkout/orders/${encodeURIComponent(id)}`, {
+  const r = await fetchWithTimeout(`${paypalHost(cfg.mode)}/v2/checkout/orders/${encodeURIComponent(id)}`, {
     method: 'GET',
     headers: { Authorization: `Bearer ${token}` },
-  });
-  const json = await res.json().catch(() => null);
-  if (!res.ok || !json) return { paid: false, state: 'error', tradeNo: id, failReason: 'PayPal 查询订单失败' };
+  }, 'json');
+  const json = r.body;
+  if (!r.ok || !json) return { paid: false, state: 'error', tradeNo: id, failReason: 'PayPal 查询订单失败' };
   const status = json.status;
   if (status === 'COMPLETED') {
     // I-5：对账（PayPal 金额是「元」字符串）
@@ -499,8 +511,8 @@ async function paypalQuery(cfg, order) {
       method: 'POST',
       headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
       body: '{}',
-    });
-    const capJson = await cap.json().catch(() => null);
+    }, 'json');
+    const capJson = cap.body;
     if (cap.ok && capJson && capJson.status === 'COMPLETED') {
       const amt = checkPaidAmount(order, fenFromYuan(paypalCaptureAmount(capJson)), paypalCaptureAmount(capJson));
       if (!amt.ok) return { paid: false, state: 'error', tradeNo: id, failReason: amt.reason };
@@ -536,7 +548,7 @@ async function paypalVerifyWebhook(cfg, headers, event) {
     if (!String(h[k] || '').trim()) throw new Error(`回调缺少签名头 ${k}`);
   }
   const token = await paypalToken(cfg);
-  const res = await fetchWithTimeout(`${paypalHost(cfg.mode)}/v1/notifications/verify-webhook-signature`, {
+  const r = await fetchWithTimeout(`${paypalHost(cfg.mode)}/v1/notifications/verify-webhook-signature`, {
     method: 'POST',
     headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
     body: JSON.stringify({
@@ -548,36 +560,110 @@ async function paypalVerifyWebhook(cfg, headers, event) {
       webhook_id: webhookId,
       webhook_event: event,
     }),
-  });
-  const json = await res.json().catch(() => null);
-  if (!res.ok || !json) throw new Error('PayPal 验签接口请求失败');
+  }, 'json');
+  const json = r.body;
+  if (!r.ok || !json) throw new Error('PayPal 验签接口请求失败');
   return json.verification_status === 'SUCCESS';
 }
 
 /* ============================ 统一入口 ============================ */
 
-async function fetchWithTimeout(url, init) {
+/** 从 URL 里取主机名，只用于错误文案（不含路径/查询串，绝不回显任何密钥） */
+function hostOf(url) {
+  try { return new URL(String(url)).host; } catch (e) { return '支付网关'; }
+}
+
+/**
+ * 出站请求：**超时必须是整体的**（连接 + 响应头 + 响应体）。
+ *
+ * ⚠️ 这里踩过一次「前端说没收到响应、后端订单停在『支付中』」的坑，成因见下。
+ *
+ * 旧实现把 `AbortController` 的计时器放在 `finally` 里 `clearTimeout`，看上去很规矩，
+ * 但 `fetch()` 的 promise 是**一拿到响应头就 resolve** 的 —— `finally` 随即执行，
+ * 计时器当场被清掉。于是剩下那句 `await res.text()` / `await res.json()`
+ * **完全不受这个 signal 约束**，只受 undici 默认 `bodyTimeout`（**300 秒**）兜底。
+ * 网关接受 TLS 连接、回了响应头、却一直不吐响应体时（出口代理吞包、中间设备半开
+ * 连接、对方进程 hang 住），`createCharge` 会挂到 5 分钟。而订单在
+ * `await createCharge()` **之前**就已同步落库为 pending（见 `share-routes.js` 的下单
+ * 顺序）⇒ 后端显示「支付中」，前端 12 秒就看门狗收工，两边说法永远对不上。
+ *
+ * 现在把「读体」搬进同一段 `try`，计时器直到响应体读完才清，signal 全程有效。
+ * 同时按「卡在响应头」与「卡在响应体」给两种文案 —— 现场排查时这一句就能定位。
+ *
+ * @param {string} url
+ * @param {object} [init]     传给 `fetch` 的其它选项
+ * @param {'json'|'text'|'none'} [as] 读体方式，默认 `'json'`；`'none'` 表示不关心内容
+ * @param {{t:number}|null} [deadline] 上级给的**绝对**截止时刻（`Date.now() + 预算`），
+ *        用于把「取 token + 建单」这类多次串行出站压进一个总预算里
+ * @returns {Promise<{ok:boolean, status:number, body:any}>} `body` 为解析后的 JSON / 原始文本 / `null`
+ */
+async function fetchWithTimeout(url, init, as, deadline) {
+  const mode = as || 'json';
+  const host = hostOf(url);
+  const room = deadline ? deadline.t - Date.now() : TIMEOUT_MS;
+  const budget = Math.min(TIMEOUT_MS, room);
+  if (budget <= 0) {
+    throw new Error(`下单总耗时已超过 ${Math.round(CHARGE_TIMEOUT_MS / 1000)} 秒，未再向 ${host} 发起请求`);
+  }
+
   const ctrl = new AbortController();
-  const timer = setTimeout(() => ctrl.abort(), TIMEOUT_MS);
+  let phase = 'head'; // head = 还没拿到响应头；body = 已拿到头、正在读体
+  const timer = setTimeout(() => ctrl.abort(), budget);
+  const timedOut = () => new Error(phase === 'head'
+    ? `网关连接超时：${budget}ms 内没有收到 ${host} 的响应头`
+    : `网关读取超时：已连上 ${host} 并收到响应头，但 ${budget}ms 内没有读完响应体`);
+
   try {
-    /**
-     * R21-12：出站**不跟随重定向**（`fetch` 默认是 `follow`）。
-     *
-     * 三个网关的 API 主机都是固定常量（支付宝网关 / 微信 APIv3 / PayPal），正常响应
-     * 不会重定向；一旦出现 3xx，说明链路被中间人终结、或主机/配置被人改写 ——
-     * 跟随它等于把「携带商户凭据的请求」发向我们从未批准过的主机。3xx 一律当错误，
-     * 由 `createCharge` / `queryCharge` 按「下单失败 / 未确认」处理（fail-closed：
-     * 绝不会因为一个重定向而把订单判成已支付）。
-     */
-    const res = await fetch(url, Object.assign({}, init, { signal: ctrl.signal, redirect: 'manual' }));
+    let res;
+    try {
+      /**
+       * R21-12：出站**不跟随重定向**（`fetch` 默认是 `follow`）。
+       *
+       * 三个网关的 API 主机都是固定常量（支付宝网关 / 微信 APIv3 / PayPal），正常响应
+       * 不会重定向；一旦出现 3xx，说明链路被中间人终结、或主机/配置被人改写 ——
+       * 跟随它等于把「携带商户凭据的请求」发向我们从未批准过的主机。3xx 一律当错误，
+       * 由 `createCharge` / `queryCharge` 按「下单失败 / 未确认」处理（fail-closed：
+       * 绝不会因为一个重定向而把订单判成已支付）。
+       */
+      res = await fetch(url, Object.assign({}, init, { signal: ctrl.signal, redirect: 'manual' }));
+    } catch (e) {
+      if (ctrl.signal.aborted) throw timedOut();
+      throw e;
+    }
+    phase = 'body';
     if (res.status >= 300 && res.status < 400) {
+      // 不跟随，但也要把连接放掉：留着未读的 body 会让 socket 一直挂着
+      await cancelBody(res);
       throw new Error(`网关返回重定向（HTTP ${res.status}），已拒绝跟随（防 SSRF）`);
     }
-    return res;
+
+    let body = null;
+    try {
+      if (mode === 'text') {
+        body = await res.text();
+      } else if (mode === 'json') {
+        const text = await res.text();
+        try { body = text ? JSON.parse(text) : null; } catch (e) { body = null; } // 非 JSON 交给调用方按"无法识别"处理
+      } else {
+        await cancelBody(res);
+      }
+    } catch (e) {
+      if (ctrl.signal.aborted) throw timedOut();
+      throw e;
+    }
+    return { ok: res.ok, status: res.status, body };
   } finally {
     clearTimeout(timer);
   }
 }
+
+/** 丢弃响应体（尽力而为：连接已关闭时会抛，忽略即可） */
+async function cancelBody(res) {
+  if (res && res.body && typeof res.body.cancel === 'function') {
+    try { await res.body.cancel(); } catch (e) { /* 已经结束 */ }
+  }
+}
+
 
 /**
  * 下单
@@ -589,8 +675,20 @@ async function fetchWithTimeout(url, init) {
 async function createCharge(platform, cfg, opts) {
   const run = { alipay: alipayCreate, wechat: wechatCreate, paypal: paypalCreate }[platform];
   if (!run) return { ok: false, error: `未知的支付平台：${platform}` };
+  /**
+   * R81：整条下单链路共用**一个**截止时刻（而不是每个出站请求各 10 秒）。
+   *
+   * 支付宝分支不出网（纯本地签名 + 拼 URL），这个预算对它没有任何影响；
+   * 微信是 1 次出站，PayPal 是「取 token + 建单」2 次串行 —— 各给 10 秒就是 20 秒，
+   * 必然长过前端 12 秒的提交看门狗，于是出现「前端说没收到响应、后端其实还在等」。
+   * 压到 9 秒后，服务端**一定**先给出结论，前端那句看门狗只在真·没收到任何响应时响。
+   *
+   * 查单（`queryCharge`）不设总预算：它在 3 秒一次的轮询里跑，没人盯着，
+   * 单次 10 秒的 timeout 就够（也不该因为一次慢查单而放弃确认）。
+   */
+  const deadline = { t: Date.now() + CHARGE_TIMEOUT_MS };
   try {
-    const r = await run(cfg, opts);
+    const r = await run(cfg, opts, deadline);
     return Object.assign({ ok: true }, r);
   } catch (e) {
     // 网关错误信息可能含内部细节，统一截断；私钥等敏感值不会进入这里
@@ -614,7 +712,7 @@ async function queryCharge(platform, cfg, order) {
 }
 
 module.exports = {
-  TIMEOUT_MS, ALIPAY_GATEWAY, WECHAT_HOST,
+  TIMEOUT_MS, CHARGE_TIMEOUT_MS, ALIPAY_GATEWAY, WECHAT_HOST,
   paypalHost, normalizePrivateKey, normalizePublicKey,
   alipaySignPayload, alipayBuildUrl, alipayTimestamp, alipayVerify,
   wechatSignPayload, wechatAuthorization, wechatDecryptResource,

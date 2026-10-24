@@ -560,6 +560,39 @@ try {
   // 生成失败不影响启动：`/auth/init` 仍会懒生成（见 routes/auth.js 的 ensureSetupToken）
   console.warn('[Storage Manager] 安装令牌预生成失败（不影响启动）：', e && e.message);
 }
+/**
+ * R82：**启动时清理历史遗留的「支付中」订单**（只跑一次，标记落在 `payments.json` 顶层）。
+ *
+ * 1.9.17 修掉了「网关回了响应头却不吐响应体时请求挂到 300 秒」的缺陷，但此前积下的
+ * pending 订单不会自己消失：管理页一直显示「支付中」，`payerState()` 还会把同一个
+ * 浏览器当成「有在途订单」而阻止它重新发起支付。用户要求把这些历史订单统一标为失败。
+ *
+ * 三个约束（详见 `payment-orders.sweepStalePending()` 的注释）：
+ *  · **只跑一次** —— 标记写成固定标签 `'R82'`，不是版本号（否则每次升级都误杀一批真在途的）；
+ *  · **读不到就不扫** —— `loadFailed` 时直接返回，绝不把「空表 + 已扫过」落盘；
+ *  · **可恢复** —— 只改状态不删记录；若恰好有人在付款，网关通知仍会把它推回 paid。
+ *
+ * 放在 `listen` **之前**：先清干净再对外提供服务，第一个访客看到的就不是脏状态。
+ * 失败不影响启动（最坏结果是这页继续显示「支付中」，不影响收付款）。
+ */
+try {
+  const swept = paymentOrders.sweepStalePending();
+  if (swept.swept > 0) {
+    console.log(`[Storage Manager] 已把 ${swept.swept} 笔历史在途订单标记为支付失败（一次性清理，仅本版执行）`);
+    try {
+      statsStore.addLog({
+        action: 'share.pay', level: 'warn',
+        detail: `启动清理：${swept.swept} 笔历史在途订单（支付中）已统一标记为失败 —— `
+          + '本版修复了「网关不返回完整响应体时下单请求会挂 5 分钟」的缺陷，此类订单从未完成支付',
+      });
+    } catch (e) { /* 日志失败不影响启动 */ }
+  } else if (swept.already) {
+    console.log('[Storage Manager] 历史在途订单已清理过（R82 一次性迁移），本次跳过');
+  }
+} catch (e) {
+  console.warn('[Storage Manager] 历史在途订单清理失败（不影响启动）：', e && e.message);
+}
+
 httpServer.listen(HTTP_PORT, HOST, () => {
   console.log(`[Storage Manager] HTTP   : http://${HOST === '0.0.0.0' ? 'localhost' : HOST}:${HTTP_PORT}`);
 });

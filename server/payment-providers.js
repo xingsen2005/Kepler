@@ -145,9 +145,22 @@ const PLATFORMS = {
         options: [
           { value: 'RSA2', label: 'RSA2（SHA256，推荐）' },
           { value: 'RSA', label: 'RSA（SHA1，旧版）' },
-          { value: 'SM2', label: 'SM2（国密，本系统暂不支持）' },
+          /**
+           * R82：SM2 从「能保存、下单被拒」改成**保存时即拒绝**（用户明确要求）。
+           *
+           * 保留这个选项而不是删掉，是为了让用户在**选择的那一刻**就看到原因，
+           * 而不是保存成功之后某次点「立即支付」才撞墙。`disabled: true` 同时被
+           * 服务端 `validate()` 与前端 `paysettings.js` 的 `<option disabled>` 读取。
+           */
+          {
+            value: 'SM2',
+            label: 'SM2（国密，本系统不支持）',
+            disabled: true,
+            disabledReason: '本系统只有 RSA 签名实现：选 SM2 无法产出可用的签名，因此不允许保存。'
+              + '请改选 RSA2（推荐）或 RSA。',
+          },
         ],
-        hint: '需与开放平台上该应用配置的加签方式一致。⚠️ 本系统只有 RSA 签名实现：选 SM2 会在点击「立即支付」时被明确拒绝（提示改回 RSA2），因为国密签名需要 SM2 实现，本地不具备。',
+        hint: '需与开放平台上该应用配置的加签方式一致。⚠️ 本系统只有 RSA 签名实现，**SM2（国密）在保存时即被拒绝**，请选 RSA2（推荐）或 RSA。',
       },
       {
         key: 'gateway', official: 'gateway', label: '网关地址', input: 'text', required: false,
@@ -364,6 +377,23 @@ function validate(platformId, values) {
         message: `${f.label}只能是：${f.options.map((o) => o.value).join(' / ')}`,
       });
       continue;
+    }
+    /**
+     * R82：声明了 `disabled` 的枚举值**不接受保存**。
+     *
+     * 与「值不在枚举内」分开处理，是因为两者该说的话不同：不在枚举内是「你填错了」，
+     * disabled 是「这个值我们看到、但不支持」—— 后者必须给出**可照做的出路**，
+     * 否则用户只会反复试同一个选项。
+     *
+     * 判据落在**保存**这一刻（`validate()` 是 `PUT /api/payment/config/:platform`
+     * 的唯一入口），而不是下单那一刻：能存进去的配置就必须能付款。
+     */
+    if (f.options) {
+      const hit = f.options.find((o) => o.value === v);
+      if (hit && hit.disabled) {
+        errors.push({ field: f.key, message: hit.disabledReason || `${f.label}不接受取值：${v}` });
+        continue;
+      }
     }
     // 正则
     if (f.pattern && !new RegExp(f.pattern).test(v)) {

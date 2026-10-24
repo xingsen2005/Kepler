@@ -436,13 +436,19 @@ test('R80-09 · 提交瞬间必须让"点到了"可见，并在 12 秒无响应�
 
   // ② 走完 12 秒计时器（页面还没跳走 ⇒ 这次提交没拿到响应）
   const t = box.timers[box.timers.length - 1];
-  assertEqual(t.ms, 12000, '兜底计时器应为 12 秒（微信/PayPal 下单最长 10 秒）');
+  assertEqual(t.ms, 12000, '兜底计时器应为 12 秒（服务端下单总预算 9 秒，留 3 秒余量）');
   t.fn();
   assertEqual(box.btn.disabled, false, '超时后按钮必须恢复可点（否则用户彻底无法重试）');
-  assert(/没有收到服务器的响应/.test(box.note.textContent),
-    `超时必须如实说明"没拿到响应"，实际：${box.note.textContent}`);
-  assert(/插件|内嵌窗口/.test(box.note.textContent),
-    '提示要列出最可能的成因（拦截 / 受限内嵌窗口），否则用户只能猜');
+  /**
+   * R81：超时**不得**直接下结论。旧文案是「没有收到服务器的响应：订单可能没有
+   * 创建成功」—— 而更常见的实情是「订单已经建成、卡住的是跳去支付平台这一段」。
+   * 现在必须先向服务端确认（`/pay/status?probe=1`）再说话；
+   * 逐状态的具体文案由 `audit81-regressions.test.js` 的 R81-05 覆盖。
+   */
+  assert(/正在向服务端确认|无法向服务端确认/.test(box.note.textContent),
+    `超时后必须先声明"正在确认"，实际：${box.note.textContent}`);
+  assert(!/订单可能没有创建成功/.test(box.note.textContent),
+    'R81：未经确认不得断言"订单没建成"（页面上没有任何证据能得出这个结论）');
 
   // ③ 第二次点击必须被吞掉（不能产生第二笔订单）
   let prevented = false;

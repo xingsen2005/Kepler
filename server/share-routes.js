@@ -1774,11 +1774,40 @@ router.post('/s/:id/pay', asyncHandler(async (req, res) => {
    * 在网关侧下过单（商户单号就是 order.id），改价会让「订单金额」与「网关收款额」分叉。
    */
   let applied = null;
-  if (payer.state === 'pending' && payer.order) {
+  /**
+   * R82：**换渠道即新单**（用户明确要求）。
+   *
+   * 旧实现只要「该浏览器在本链接上有一笔在途订单」就复用它，**不看渠道** ——
+   * 于是「用户在付费页选了支付宝，却因为上一次点过微信而拿到微信二维码」，
+   * 而页面上的按钮明明写着支付宝。R21-06 为此写过一条「回调地址必须与原渠道同源」
+   * 的护栏：它守住了 `notifyUrl` 的正确性，但把**用户的选择**牺牲掉了。
+   *
+   * 现在复用的前提多一条 `order.platform === platform`：
+   *  · 同渠道再来一次 ⇒ 复用（幂等：网关侧 `out_trade_no` 就是 order.id，不会产生第二笔）；
+   *  · 换了渠道 ⇒ 另建新单，并**把被放弃的那笔收尾**（标失败 + 退券）。
+   *
+   * ⚠️ 退券不是可选项：`validateForUse()` 对 `perUserOnce` 的券会读
+   * `c.identities` 判「是否用过」，而核销是按下单时 `couponStore.consume()` 记进去的。
+   * 不先 `releaseByOrder()`，同一张「每人一次」的券在新单上会被判 `already_used`——
+   * 用户换个支付方式就直接卡在「优惠券不可用」，钱反而付不出去。
+   * 释放后新单会按表单/Cookie 里的券码重新校验并重新核销，账面净额不变。
+   */
+  const pendingOrder = payer.state === 'pending' && payer.order ? payer.order : null;
+  const sameChannel = !!(pendingOrder && pendingOrder.platform === platform);
+  if (sameChannel) {
     // 复用在途订单。网关侧商户单号就是 order.id（payment-gateway 用 out_trade_no: order.id），
     // 因此重复下单是幂等的，不会在网关侧产生第二笔。
-    order = payer.order;
+    order = pendingOrder;
   } else {
+    if (pendingOrder) {
+      paymentOrders.markFailed(pendingOrder.id, '已更换支付方式，原在途订单作废');
+      releaseCouponForOrder(pendingOrder);
+      statsStore.addLog({
+        action: 'share.pay', level: 'warn',
+        detail: `分享链接 ${l.id} 更换支付渠道（${pendingOrder.platform} → ${platform}）：`
+          + `原在途订单 ${pendingOrder.id} 已作废，本次另建新单（IP：${ip}）`,
+      });
+    }
     /**
      * R62：券在**下单这一刻**再校验一次，而不是直接信任页面上的结果 ——
      * 页面可能停留很久（券在此期间被别人用完 / 过期），Cookie 也可能被伪造。
@@ -1835,8 +1864,16 @@ router.post('/s/:id/pay', asyncHandler(async (req, res) => {
     });
   }
 
-  // 在途订单沿用其**原始**支付渠道：换渠道属于新单（走上面的 else 分支），
-  // 否则商户单号对应的网关与本次请求的渠道会对不上。
+  // 下单渠道**只有一个来源**：`order.platform`（本次订单自己的渠道）。
+  //
+  // R82 之后 `order.platform` 恒等于请求体里的 `platform`（复用的前提已加上
+  // `pendingOrder.platform === platform`，新建时直接就是 `platform`）。保留这个变量
+  // 而不是直接用 `platform`，是因为**回调地址必须与实际下单渠道同源**这一条
+  // （R21-06）值得用一行独立的中间变量钉住：哪天有人再动复用条件，`notifyUrl`
+  // 也不会跟着客户端提交的值漂走。
+  //
+  // 下面这道 `available` 复检在 R82 之后**理论上不可达**（上面已经校验过 `platform`），
+  // 仍然留着作为兜底：它守的是「配置在这几秒内被改动」这个竞态，而不是正常路径。
   const chargePlatform = order.platform;
   if (!available.includes(chargePlatform)) {
     return payPage(res, l, ps, available, '原支付方式已停用，请重新发起支付', '', couponStateFor(l, req));
@@ -2030,12 +2067,26 @@ router.post('/s/:id/pay/check', asyncHandler(async (req, res) => {
  *
  * 微信 Native 没有回跳，只能靠这里推进：每次被轮询时主动向网关查单。
  * 为避免被刷成网关压力，同一订单最快 3 秒查一次网关（页面轮询间隔同为 3 秒）。
+ *
+ * R81：`?probe=1` = **只读探针**，只回答「这个浏览器在这个链接上有没有订单」，
+ * 绝不触发网关查单。用途见 `public/js/pay-poll.js` 的提交看门狗 ——
+ * 用户点了「立即支付」却还在原页时，前端要能**问清楚**「订单到底建了没有」，
+ * 而不是凭 12 秒没动静就断言「订单可能没有创建成功」（那句话常常是错的：
+ * 订单其实建好了，卡住的是「从服务端跳去支付平台」这一段）。
  */
 router.get('/s/:id/pay/status', asyncHandler(async (req, res) => {
   const l = shareStore.get(req.params.id);
   if (!l) return res.status(404).json({ error: '链接不存在' });
   const order = paymentOrders.verifyToken(l.id, getCookie(req, payCookieName(l.id)));
   if (!order || order.linkId !== l.id) return res.json({ state: 'none', paid: false });
+  /**
+   * 探针分支必须在网关查单之前返回：它的语义是「本地账本怎么记的」。
+   * 一旦让它也去查单，页面在卡住期间的这次探测反而会额外打一次网关，
+   * 而且查到「已支付」时也无法在这里落库（会与轮询争同一笔订单的写入）。
+   */
+  if (String(req.query.probe || '') === '1') {
+    return res.json({ state: order.status, paid: order.status === 'paid', probe: true, platform: order.platform });
+  }
 
   if (order.status === 'pending' && order.platform === 'wechat') {
     // R8-20：节流逻辑与 /pay/check、/pay/return 收敛到同一处（原先三处各写一份，

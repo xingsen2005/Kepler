@@ -2332,11 +2332,25 @@ const CASES = [
       minFail: 1,
     },
     {
-      name: 'R21-06 · notifyUrl 退回「请求体渠道」（下单走 A、回调地址写 B）',
+      /**
+       * R21-06（R82 重述）：**回调地址必须与实际下单渠道同源**。
+       *
+       * 条目 id 保留，但变异的**落点换了**，原因写在这里以免日后误解：
+       * 原始形态是「`notifyUrl` 用请求体的 `platform`，下单用 `order.platform`」——
+       * 两者能分叉的前提正是「复用在途订单时不看渠道」，而 R82 把这个前提去掉了
+       * （复用多一个 `pendingOrder.platform === platform` 的条件）⇒ `chargePlatform`
+       * 恒等于 `platform`，「写 A 还是写 B」产出同一个回调地址，**变异不可观测**。
+       *
+       * 但**不变量本身仍然有效且可证伪**：回调地址必须由「这一单实际走的渠道」决定。
+       * 于是把变异落点挪到「用一条**别的**渠道去拼回调地址」上（这里取 `available[0]`，
+       * 即"顺手拿了第一条可用渠道"这种很常见的退化写法）—— 它产生的正是原始缺陷的
+       * **后果**（下单走 A、回调写 B），R82-01 会当场变红。
+       */
+      name: 'R21-06 · notifyUrl 不再与实际下单渠道同源（改用「第一条可用渠道」拼回调地址）',
       file: 'server/share-routes.js',
       anchor: '    notifyUrl: `${base}/pay/notify/${encodeURIComponent(chargePlatform)}`,',
-      replacement: '    notifyUrl: `${base}/pay/notify/${encodeURIComponent(platform)}`,',
-      testFile: 'audit21-regressions.test.js',
+      replacement: '    notifyUrl: `${base}/pay/notify/${encodeURIComponent(available[0])}`,',
+      testFile: 'audit82-regressions.test.js',
       minFail: 1,
     },
     {
@@ -2382,8 +2396,10 @@ const CASES = [
     {
       name: 'R21-12 · 支付网关恢复默认 follow（带商户凭据的请求被打到 Location 指向处）',
       file: 'server/payment-gateway.js',
-      anchor: "    const res = await fetch(url, Object.assign({}, init, { signal: ctrl.signal, redirect: 'manual' }));",
-      replacement: '    const res = await fetch(url, Object.assign({}, init, { signal: ctrl.signal }));',
+      // R81：`fetchWithTimeout` 里 `res` 改成先声明后赋值（超时要把读体也包进同一段 try），
+      // 锚点随之去掉 `const `。判据本身（必须显式 `redirect: 'manual'`）没变。
+      anchor: "      res = await fetch(url, Object.assign({}, init, { signal: ctrl.signal, redirect: 'manual' }));",
+      replacement: "      res = await fetch(url, Object.assign({}, init, { signal: ctrl.signal }));",
       testFile: 'audit21-regressions.test.js',
       minFail: 1,
     },
@@ -10650,6 +10666,206 @@ const CASES = [
       anchor: '  if (stateBox()) {',
       replacement: '  if (true) { // R80 反向变异：无条件轮询',
       testFile: 'audit80-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * R81 的正中心：把 `clearTimeout` 挪回「拿到响应头」的那一刻。
+       *
+       * 这就是旧实现 —— `fetch()` 一 resolve 就清计时器，剩下的 `res.text()`
+       * 不再受 signal 约束，只能等 undici 默认的 300 秒 `bodyTimeout`。
+       * 桩会在 14 秒把响应体补完，于是旧实现会**判成已支付**（R81-01 当场变红），
+       * 而正确实现 10 秒就放弃 —— 两种结局可区分，且用例不会真的挂 5 分钟。
+       */
+      name: 'R81-01a · 出站超时只管到响应头（读响应体不再受 signal 约束）',
+      file: 'server/payment-gateway.js',
+      anchor: "    phase = 'body';",
+      replacement: "    clearTimeout(timer); // R81 反向变异：拿到头就停表（旧 bug）\n    phase = 'body';",
+      testFile: 'audit81-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * 阶段标记不再切到「读体」⇒ 卡在响应体时也只报「没收到响应头」。
+       * 这两句文案是现场唯一能区分「连不上」与「对方 hang 住」的东西。
+       */
+      name: 'R81-05a · 超时不再区分「连不上」与「响应体读不完」（阶段标记恒为 head）',
+      file: 'server/payment-gateway.js',
+      anchor: "    phase = 'body';",
+      replacement: "    phase = 'head'; // R81 反向变异：永不进入读体阶段",
+      testFile: 'audit81-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * PayPal 取 token 不共用 deadline ⇒「取 token 10 秒 + 建单 10 秒」= 20 秒，
+       * 必然长过前端 12 秒的提交看门狗 —— 又回到「前端说没收到、后台还在等」。
+       */
+      name: 'R81-04a · PayPal 取 token 不共用下单总预算（两次串行出站各 10 秒）',
+      file: 'server/payment-gateway.js',
+      anchor: '  const token = await paypalToken(cfg, deadline);',
+      replacement: '  const token = await paypalToken(cfg); // R81 反向变异：token 不共用预算',
+      testFile: 'audit81-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * `createCharge` 不把 deadline 传给渠道实现 ⇒ 总预算形同虚设（9 秒只是一个没被读的常量）。
+       */
+      name: 'R81-04b · createCharge 算了 deadline 却不往下传（总预算形同虚设）',
+      file: 'server/payment-gateway.js',
+      anchor: '    const r = await run(cfg, opts, deadline);',
+      replacement: '    const r = await run(cfg, opts); // R81 反向变异：deadline 没传下去',
+      testFile: 'audit81-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * 探针回答「支付中」时不再给结论 ⇒ 落到「无法确认」那一条。
+       * 用户看到的就是「不知道」，而服务端明明已经知道订单建好了。
+       */
+      name: 'R81-06a · 探针说「支付中」时不给结论（退回"不知道"）',
+      file: 'public/js/pay-poll.js',
+      anchor: "      if (state === 'pending') {",
+      replacement: "      if (state === 'never-pending') { // R81 反向变异：不处理 pending",
+      testFile: 'audit81-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * 探针回答「查不到订单」时不再区分 ⇒ 与「已建单」混成同一条文案，
+       * 正是「订单可能没有创建成功」那句错误断言的老毛病。
+       */
+      name: 'R81-07a · 探针说「查不到订单」时不区分（两种处境混成一条文案）',
+      file: 'public/js/pay-poll.js',
+      anchor: "      if (state === 'none') {",
+      replacement: "      if (state === 'never-none') { // R81 反向变异：不处理 none",
+      testFile: 'audit81-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * 探针说「已支付」时不再刷新 ⇒ 用户明明付完了，页面还停在「请重试」。
+       */
+      name: 'R81-08a · 探针说「已支付」时不刷新页面（用户以为没付成功）',
+      file: 'public/js/pay-poll.js',
+      anchor: "      if (state === 'paid') {",
+      replacement: "      if (state === 'never-paid') { // R81 反向变异：不处理 paid",
+      testFile: 'audit81-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * 探针不再是只读的：它会走到下面的主动查单分支，卡住期间反而给网关加压，
+       * 而且「问一句」与「推一次状态」这两件事被合成一件。
+       */
+      name: 'R81-09a · ?probe=1 不再是只读（会触发网关查单）',
+      file: 'server/share-routes.js',
+      anchor: "  if (String(req.query.probe || '') === '1') {",
+      replacement: '  if (false) { // R81 反向变异：探针不生效，落到主动查单',
+      testFile: 'audit81-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * R82 的正中心：复用条件退回「只看有没有在途订单」。
+       * 用户选了微信、却拿到支付宝收银台 —— 这正是用户要求修掉的现象。
+       */
+      name: 'R82-01a · 复用不看渠道（用户选微信却拿到支付宝收银台）',
+      file: 'server/share-routes.js',
+      anchor: '  const sameChannel = !!(pendingOrder && pendingOrder.platform === platform);',
+      replacement: '  const sameChannel = !!pendingOrder; // R82 反向变异：不看渠道就复用',
+      testFile: 'audit82-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * 被放弃的在途订单不收尾 ⇒ 管理页永远显示「支付中」，
+       * 而用户这次已经换渠道成功了 —— 后台与用户手上各说一套。
+       */
+      name: 'R82-01b · 换渠道时不收尾原在途订单（后台永远停在「支付中」）',
+      file: 'server/share-routes.js',
+      anchor: "      paymentOrders.markFailed(pendingOrder.id, '已更换支付方式，原在途订单作废');",
+      replacement: '      void pendingOrder; // R82 反向变异：不收尾原在途订单',
+      testFile: 'audit82-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * 换渠道时不退券 ⇒ 同一张「每人一次」的券在新单上被判 already_used，
+       * 用户换个支付方式就卡在「优惠券不可用」，钱反而付不出去。
+       */
+      name: 'R82-02a · 换渠道时不退券（「每人一次」的券变成死结）',
+      file: 'server/share-routes.js',
+      anchor: '      releaseCouponForOrder(pendingOrder);',
+      replacement: '      void 0; // R82 反向变异：不退券',
+      testFile: 'audit82-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * 同渠道也不再复用 ⇒ 每点一次就多一笔商户单号，用户可能付两次。
+       */
+      name: 'R82-03a · 同渠道也不复用（每次点击都新建订单）',
+      file: 'server/share-routes.js',
+      anchor: '  const sameChannel = !!(pendingOrder && pendingOrder.platform === platform);',
+      replacement: '  const sameChannel = false; // R82 反向变异：永不复用',
+      testFile: 'audit82-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * 保存侧不再拦 disabled 枚举值 ⇒ SM2 又能存进去，错误被推回「点立即支付」那一刻。
+       */
+      name: 'R82-04a · 保存时不再拦 disabled 枚举值（SM2 又能存进配置）',
+      file: 'server/payment-providers.js',
+      anchor: '      if (hit && hit.disabled) {',
+      replacement: '      if (false) { // R82 反向变异：不拦 disabled 值',
+      testFile: 'audit82-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * 前端不再渲染 disabled ⇒ 用户仍能选中一个「保存必失败」的值。
+       */
+      name: 'R82-05a · 前端不渲染 disabled（SM2 仍可选，提交后才失败）',
+      file: 'public/js/paysettings.js',
+      anchor: "${o.disabled ? ' disabled' : ''}",
+      replacement: "${''}",
+      testFile: 'audit82-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * 一次性标记失效 ⇒ 每次重启都重扫一遍，把当时**真正在途**的订单误杀一批。
+       */
+      name: 'R82-06a · 清理不再"只跑一次"（每次重启都误杀真在途订单）',
+      file: 'server/payment-orders.js',
+      anchor: '  if (db.staleSwept === STALE_SWEEP_MARK) return { swept: 0, skipped: true, already: true };',
+      replacement: '  if (false) return { swept: 0, skipped: true, already: true }; // R82 反向变异：可重复扫',
+      testFile: 'audit82-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * 判据读「调用之前」的状态 ⇒ 文件损坏时返回 skipped:false，「清了 0 笔」被当成清理成功。
+       */
+      name: 'R82-07a · loadFailed 判据读到 load() 之前（文件损坏时误报"清理成功"）',
+      file: 'server/payment-orders.js',
+      anchor: '  const db = load();\n  if (loadFailed) return { swept: 0, skipped: true };',
+      replacement: '  if (loadFailed) return { swept: 0, skipped: true };\n  const db = load(); // R82 反向变异：先判后加载',
+      testFile: 'audit82-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * 启动路径不再调用清理 ⇒ 升级后没人执行迁移，管理页继续一片「支付中」。
+       */
+      name: 'R82-08a · 服务启动不再执行清理（升级后没人跑迁移）',
+      file: 'server/index.js',
+      anchor: '  const swept = paymentOrders.sweepStalePending();',
+      replacement: '  const swept = { swept: 0, skipped: true }; // R82 反向变异：不执行清理',
+      testFile: 'audit82-regressions.test.js',
       minFail: 1,
     },
   ];

@@ -234,10 +234,10 @@ test('R21-05 · 用户不存在 / 未启用 Hello 必须返回同一状态码与
 });
 
 /* ==================================================================== */
-/* R21-06 · notifyUrl 必须与实际下单渠道同源                                */
+/* R21-06 · notifyUrl 必须与实际下单渠道同源（R82 起：换渠道另建新单）        */
 /* ==================================================================== */
 
-test('R21-06 · 复用在途订单时，回调地址必须指向**订单原渠道**而非请求体渠道', async () => {
+test('R21-06 · 回调地址必须指向**实际下单渠道**；R82 起「换渠道」改为另建新单', async () => {
   const paymentRules = require(path.join(ROOT, 'server', 'payment-rules.js'));
   const paymentOrders = require(path.join(ROOT, 'server', 'payment-orders.js'));
   const paymentProviders = require(path.join(ROOT, 'server', 'payment-providers.js'));
@@ -247,12 +247,10 @@ test('R21-06 · 复用在途订单时，回调地址必须指向**订单原渠�
   paymentRules.resolvePaidState = () => ({ required: true, effective: true, amountFen: 100, currency: 'CNY', reason: '' });
   paymentProviders.isConfigured = () => true;
 
-  const pendingOrder = { id: 'o-pending-1', linkId: '', platform: 'alipay', amountFen: 100, currency: 'CNY', status: 'pending' };
-  paymentOrders.payerState = () => ({ state: 'pending', order: pendingOrder });
-
   const captured = [];
+  const origCharge = paymentGateway.createCharge;
   paymentGateway.createCharge = async (platform, cfg, opts) => {
-    captured.push({ platform, notifyUrl: opts.notifyUrl });
+    captured.push({ platform, notifyUrl: opts.notifyUrl, orderId: opts.order.id });
     return { ok: true, kind: 'redirect', url: 'https://example.invalid/pay' };
   };
 
@@ -264,17 +262,47 @@ test('R21-06 · 复用在途订单时，回调地址必须指向**订单原渠�
     expiresHours: 0, maxDownloads: 0, password: null,
     paid: { required: true, amountFen: 100, currency: 'CNY' }, createdBy: 'tester',
   });
-  pendingOrder.linkId = link.id;
+  /**
+   * 用**真实**的在途订单 + 真实票据 Cookie，而不是给 `payerState` 打桩。
+   *
+   * 判据要落在「换渠道之后库里到底有几个订单」上 —— 打桩的话 `markFailed` 找不到订单、
+   * `orderToken` 也签不出来，只能看到"下了一次单"，看不到"旧单有没有被收尾"。
+   */
+  const old = paymentOrders.create({
+    linkId: link.id, platform: 'alipay', amountFen: 100, currency: 'CNY',
+    fileName: 'a.txt', fileKey: 'a.txt', bucket: 'tb', payerIp: '127.0.0.1',
+  });
+  const cookieOf = (id) => 'sp_' + link.id + '_pay='
+    + encodeURIComponent(paymentOrders.orderToken(paymentOrders.get(id)));
 
   const srv = await serve('/', shareRoutes);
   try {
-    // 客户端提交的是**另一条**渠道（wechat）—— 两条都能通过 available 校验
-    const r = await request(srv.port, 'POST', '/s/' + link.id + '/pay', { body: { platform: 'wechat' } });
-    assertEqual(captured.length, 1, `应发起一次下单，实际 ${captured.length}（响应 ${r.status}）`);
-    assertEqual(captured[0].platform, 'alipay', 'R21-06：复用在途订单必须沿用原渠道下单');
-    assert(/\/pay\/notify\/alipay$/.test(captured[0].notifyUrl),
-      `R21-06：回调地址必须与原渠道同源（旧实现用请求体的 wechat），实际 ${captured[0].notifyUrl}`);
+    /* ① 换了渠道（原单 alipay，本次提交 wechat）⇒ 必须另建新单，并按 wechat 下单 */
+    await request(srv.port, 'POST', '/s/' + link.id + '/pay', {
+      body: { platform: 'wechat' }, headers: { cookie: cookieOf(old.id) },
+    });
+    assertEqual(captured.length, 1, `应发起一次下单，实际 ${captured.length}`);
+    assertEqual(captured[0].platform, 'wechat', 'R82：换渠道必须按**用户这次选的**渠道下单');
+    assert(/\/pay\/notify\/wechat$/.test(captured[0].notifyUrl),
+      `R21-06：回调地址必须与实际下单渠道同源，实际 ${captured[0].notifyUrl}`);
+    assert(captured[0].orderId !== old.id,
+      'R82：换渠道必须另建新单（旧实现复用原单 ⇒ 用户选支付宝却拿到微信二维码）');
+    const oldAfter = paymentOrders.get(old.id);
+    assertEqual(oldAfter.status, 'failed', '被放弃的在途订单必须收尾为失败（否则永远显示"支付中"）');
+    assert(/更换支付方式/.test(oldAfter.failReason),
+      `失败原因要说明是被替换的，实际：${oldAfter.failReason}`);
+
+    /* ② 同一渠道再来一次 ⇒ 复用刚才那笔新单，不得产生第二笔 */
+    const newId = captured[0].orderId;
+    await request(srv.port, 'POST', '/s/' + link.id + '/pay', {
+      body: { platform: 'wechat' }, headers: { cookie: cookieOf(newId) },
+    });
+    assertEqual(captured.length, 2, `同渠道重试应再下一次单，实际 ${captured.length}`);
+    assertEqual(captured[1].orderId, newId,
+      '同渠道必须复用在途订单：网关侧 out_trade_no 就是 order.id，重复下单是幂等的');
+    assert(/\/pay\/notify\/wechat$/.test(captured[1].notifyUrl), '复用分支的回调地址同样必须同源');
   } finally {
+    paymentGateway.createCharge = origCharge;
     await srv.close();
   }
 });

@@ -183,7 +183,25 @@ test('枚举字段只接受注册表内列出的值', () => {
 
   // 合法枚举值应通过
   assert(pp.validate('paypal', Object.assign({}, VALID.paypal, { mode: 'live' })).ok, 'mode=live 应通过');
-  assert(pp.validate('alipay', Object.assign({}, VALID.alipay, { signType: 'SM2' })).ok, 'signType=SM2 应通过');
+  /**
+   * R82：`signType=SM2` 由「保存能过、下单被拒」改为**保存时即被拒绝**（用户要求）。
+   *
+   * 旧契约是刻意的分工（保存层放行、下单层拒绝），但它把错误推到了用户点
+   * 「立即支付」的那一刻 —— 而那时用户已经填完一整页凭证、保存也显示成功了。
+   * 现在两层的判据同源：`options` 里 `disabled: true` 就是唯一标记，
+   * `validate()` 与前端 `<option disabled>` 都读它。
+   */
+  const sm2 = pp.validate('alipay', Object.assign({}, VALID.alipay, { signType: 'SM2' }));
+  assert(!sm2.ok, 'R82：signType=SM2 必须在保存时被拒绝');
+  const sm2Err = sm2.errors.find((e) => e.field === 'signType');
+  assert(sm2Err, `错误必须定位到 signType 字段，实际：${JSON.stringify(sm2.errors)}`);
+  assert(/不支持|无法/.test(sm2Err.message), `提示要说明"不支持这个值"，实际："${sm2Err.message}"`);
+  assert(/RSA2/.test(sm2Err.message), `提示必须给出可照做的出路（改 RSA2），实际："${sm2Err.message}"`);
+
+  // 反面：RSA2 / RSA 仍必须能保存（别把整条签名算法一起挡掉）
+  for (const st of ['RSA2', 'RSA']) {
+    assert(pp.validate('alipay', Object.assign({}, VALID.alipay, { signType: st })).ok, `signType=${st} 应通过`);
+  }
 });
 
 test('选填字段留空不影响通过，填写了就要合规', () => {
