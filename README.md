@@ -1,31 +1,8 @@
 # Kepler 对象存储管理系统
 
-**目录**
-
-- [一、功能特性](#readme-section1)
-- [二、支持的服务商](#readme-section2)
-- [三、快速开始](#readme-section3)
-  - [1. 环境要求](#readme-section4)
-  - [2. 安装与启动](#readme-section5)
-  - [3. 可用脚本](#readme-section6)
-  - [4. Docker 部署](#readme-section7)
-  - [5. 首次配置](#readme-section8)
-- [四、使用指南](#readme-section9)
-  - [1. 常用操作](#readme-section10)
-  - [2. 断点续传](#readme-section11)
-  - [3. 文件加密](#readme-section12)
-  - [4. 分享与审计](#readme-section13)
-  - [5. 用户管理与 Windows Hello](#readme-section14)
-  - [6. 安全告知](#readme-section15)
-  - [7. 付费下载](#readme-section16)
-  - [8. 订单管理](#readme-section17)
-  - [9. 负载均衡（API Key 空间配额）](#readme-section18)
-- [五、开源协议](#readme-section19)
-
-
 > 一款**多云对象存储**的本地管理工具：本地 Node.js 服务负责密钥保管、云端请求代理、加密与统计，浏览器端为原生 ES Module 前端（无构建步骤）。支持在同一界面中管理多家对象存储服务商的访问密钥与存储桶，所有密钥均以 AES-256-GCM 加密存储在本机。
 
-**此为项目介绍与快速开始教程，开发文档因篇幅原因已分离，需二次开发请阅读 [Develop_Document.md](./Develop_Document.md)**
+**此为项目介绍与快速开始教程，开发文档因篇幅原因已分离，本文档仅简单讲述如何使用，任何理解项目本身、二次开发等需求请阅读 [Develop_Document.md](./Develop_Document.md)。**
 
 **一键部署**：把下面两行整段复制到终端执行：
 
@@ -37,7 +14,7 @@ curl -fLo /tmp/kepler-deploy.sh https://raw.githubusercontent.com/xingsen2005/Ke
 
 ---
 
-<h1 id="readme-section1">一、功能特性</h1>
+<h1>一、功能特性</h1>
 
 ---
 
@@ -64,7 +41,7 @@ curl -fLo /tmp/kepler-deploy.sh https://raw.githubusercontent.com/xingsen2005/Ke
 
 ---
 
-<h1 id="readme-section2">二、支持的服务商</h1>
+<h1>二、支持的服务商</h1>
 
 ---
 
@@ -84,28 +61,24 @@ curl -fLo /tmp/kepler-deploy.sh https://raw.githubusercontent.com/xingsen2005/Ke
 | Backblaze | B2 | S3 兼容（SigV4） | `us-west-004` | ✅ 已支持 |
 
 > 各厂商的 Endpoint 按地域自动推导（如 `https://oss-cn-beijing.aliyuncs.com`）；少数厂商的端点不由地域决定：**Microsoft Azure** 的端点由**存储账户名**决定（系统自动拼出 `https://<存储账户名>.blob.core.windows.net`，因此密钥里只需填账户名与账户密钥，无需重复填端点 —— 仅在使用主权云（Azure 中国）或本地模拟器时才需要显式覆盖），Cloudflare R2 需要额外填**账户 ID**（系统据此拼出 `https://<账户 ID>.r2.cloudflarestorage.com`），MinIO 需要填**自建访问地址**（含端口）。历史版本（无服务商字段）的配置在加载时自动归为腾讯云，无需手动迁移。
->
-> ⚠️ **自建 / 内网端点的安全策略**：MinIO 这类自建部署常用内网地址或回环地址，而本系统默认**拒绝**把服务端点指向回环、内网 / 链路本地 / 保留 IP 字面量（防盲 SSRF），也要求非回环端点必须走 `https://`。确需在内网使用，请在服务端显式设置 `ALLOW_PRIVATE_ENDPOINT=1`（内网 IP 字面量）与 / 或 `ALLOW_LOOPBACK_ENDPOINT=1`（本机回环）后重启；这两项只应在本机受控环境下开启。
->
-> ⚠️ **腾讯云自 1.7.2 起走 S3 兼容协议**（原先的 COS 原生 SDK 已移除）。对象存储的 S3 协议里**没有**「读桶容量」这个接口，因此腾讯云的桶容量与其他厂商一样改为**分页列举对象累计估算**（最多扫 5001 个对象，超出即标注为估算值 —— 此为下界）。若桶内对象超过 5001 个，用量面板的数字会偏保守。
 
 ---
 
-<h1 id="readme-section3">三、快速开始</h1>
+<h1>三、手动部署</h1>
 
 ---
 
-<h2 id="readme-section4">1. 环境要求</h2>
+<h2>1. 环境要求</h2>
 
 ---
 
 - Node.js ≥ 24.22.1（24.22.1 是 CVE-2026-111497（Brotli 解码器越界写，可 RCE）的最低修复版，Node 20.x 及更早已 EOL 不再有修复；S3 适配器依赖内置 `fetch`，热重载依赖 `--watch`）
-- 仅一个运行时依赖：`express`（腾讯云自 1.7.2 起并入 S3 兼容协议，`cos-nodejs-sdk-v5` 已移除）
+- 仅一个运行时依赖：`express`
 - 测试与 lint 不引入运行时依赖：测试使用 Node 内置 `node:test`；ESLint 为可选开发依赖
 
 ---
 
-<h2 id="readme-section5">2. 安装与启动</h2>
+<h2>2. 安装与启动</h2>
 
 ---
 
@@ -116,8 +89,6 @@ npm run dev      # 开发模式（node --watch 内置热重载，改动自动重
 npm test         # 运行测试套件（零依赖，Node 内置 test runner）
 npm run lint     # 代码检查（ESLint 可选，未安装时给出安装指引）
 ```
-
-> ⚠️ **跑测试前仍建议先备份 `data/`**：全部 store 都遵守 `S3_DATA_DIR` 隔离开关，且 `tests/helpers.js` 在**顶层无条件兜底**（凡是没有自己设 env 的测试进程，一律落进进程级临时目录）—— 这是第 13 轮改成的「默认安全」。此前是"靠每个用例自觉设 env + 用完还原"，而还原之后同文件里任何一次 `require`（含经 `s3.js` / 路由 / WebDAV 传递加载）拿到的都是绑定生产 `data/` 的实例；第 12、13 两轮都实测到 `npm test` 改写生产文件（`config.enc` 装着全部云厂商密钥与账户，`stats.json` 装着桶统计）。只要将来还有模块绕过这个开关，一次 `npm test` 仍会改写它们 —— 备份成本远低于恢复成本。
 
 启动后控制台输出：
 
@@ -132,7 +103,7 @@ npm run lint     # 代码检查（ESLint 可选，未安装时给出安装指引
 
 ---
 
-<h2 id="readme-section6">3. 可用脚本</h2>
+<h2>3. 可用脚本</h2>
 
 ---
 
@@ -140,84 +111,13 @@ npm run lint     # 代码检查（ESLint 可选，未安装时给出安装指引
 | --- | --- |
 | `npm start` | 启动服务（HTTP + HTTPS） |
 | `npm run dev` | 开发模式，`node --watch` 监听文件变更自动重启（Node 内置，无需 nodemon） |
-| `npm test` | 运行 `tests/**/*.test.js` 全部测试（85 个文件 / 1465 条用例，零新增依赖） |
+| `npm test` | 运行 `tests/**/*.test.js` 全部测试（86 个文件 / 1478 条用例，零新增依赖） |
 | `npm run test:watch` | 测试监听模式，代码变更后即时重跑 |
 | `npm run lint` | ESLint 检查；未安装 eslint 时降级提示安装命令，不阻断流程 |
 
 ---
 
-<h2 id="readme-section7">4. 一键部署脚本与 Docker 部署</h2>
-
----
-
-在全新 Linux 服务器（Debian/Ubuntu、RHEL/CentOS/Rocky/Alma、Alpine、openSUSE）上跑一条命令即可完成部署：
-
-```bash
-curl -fLo /tmp/kepler-deploy.sh https://raw.githubusercontent.com/xingsen2005/Kepler/main/deploy.sh \
-  && sudo bash /tmp/kepler-deploy.sh --domain s3.example.com
-```
-
-脚本会自动安装 git / curl / Node.js 等依赖、从 `https://github.com/xingsen2005/Kepler.git` 拉取源码、配置 Nginx 反代与 HTTPS 证书、注册 systemd 服务并做健康检查。**只需提供域名**，用户名与密码在打开页面后的首次初始化流程中设置。脚本幂等，重复执行等价于升级 / 修复。
-
-部署完成时会打印**安装令牌**（部署模式下首次初始化必须填的那一串，紧跟「访问地址」）：它由服务端在启动时生成并落到 `<数据目录>/setup-token.txt`，**一次性**，初始化成功后自动失效、文件也会被删掉。装完没记下来的话，执行 `kepler` 打开管理菜单，顶部会再显示一遍。
-
-> **CentOS 8 用户注意**：CentOS Linux 8 已于 2021-12-31 EOL，官方镜像站（含 `mirrorlist.centos.org`，2024-06-30 下线）不再为 8 提供仓库。典型症状是安装 `git` 时报 `perl-libs … is filtered out by modular filtering` —— **即使是全新安装的纯净系统也会中招**：这不是「模块流状态不一致」，而是 RHEL 8 的 module failsafe 按模块的包级过滤清单把 `perl-libs` 屏蔽掉了，所以 `dnf module reset perl` 那一套在干净机器上是**空转**。**脚本会自己修**，按「代价从小到大」逐档试：① 首选 `dnf install -y --setopt='*.module_hotfixes=true' <包>`（让仓库按**包级**视图参与求解、本次事务绕过模块过滤，**不改机器上任何持久状态**）；② 这一步不行才复位模块流并按报错里期望的流重新 `enable`（它会改**全局**模块状态，所以排在后面）；③ 仍不行才放宽候选版本（`--nobest`）。**绝不用 `--skip-broken`** —— 它会让「装不上」返回 0，脚本误以为装好了。手工等价命令就是第 ① 条（那个 `*` 的引号必须留，否则会被你自己的 shell 展开成文件名）。日志里 `Invalid configuration value: failovermethod=…` 是**无害警告**（旧版 yum 的选项，dnf 不认识），不是失败原因。长期建议迁到 Rocky / AlmaLinux。
-
-安装完成会注册全局 `kepler` 命令，输入编号回车即可执行（也可直接 `kepler 4` 一步到位）：
-
-| 编号 | 作用 | 说明 |
-| --- | --- | --- |
-| 1 | 重新安装 | 按已保存配置重新拉取源码并安装，数据目录不动 |
-| 2 | 修改初始管理员用户名 | 停服后原子改配置，改完自动拉起 |
-| 3 | 修改初始管理员密码 | 同上，密码经管道传入，不出现在命令行与日志里 |
-| 4 | 修改应用端口 | 同步 `.env`、服务与 Nginx 反代配置 |
-| 5 | 卸载 | 清理服务、应用、数据、证书配置与全局命令 |
-| 0 | 退出 | — |
-
-> 菜单顶部会显示当前**安装令牌**（仅「部署模式且尚未初始化」时才有），可直接抄走 —— 不必再去翻 `journalctl`。
-
-常用参数：`--domain`（必填）、`--port`、`--https-port`、`--http-port`、`--dir`、`--data-dir`、`--mode systemd|docker`、`--tls auto|acme|file|none`、`--mirror cn`（国内加速）、`--skip-node` / `--skip-deps` / `--skip-nginx` / `--skip-service`（自行接管某一步）。
-
-HTTPS 证书默认向 **ZeroSSL** 申请（acme.sh 可用 `--email` 自动换取 EAB，零手工；走 HTTP-01 校验）。**不建议默认用 Let's Encrypt**：国内服务器经常连不上它的境外 API，而且它按「注册域名/公共后缀」7 天限发证书，公共后缀（如 `*.l.cd`、`*.github.io`）下所有人共享配额，极易被 `rateLimited`（429）限流，反复签不下来。
-
-| 参数 | 作用 | 说明 |
-| --- | --- | --- |
-| `--ca zerossl\|letsencrypt\|litessl` | 选择 CA | 默认 `zerossl`；`litessl` 是亚数 TrustAsia 的免费 DV 证书，国内可直连 |
-| `--eab-kid <KID>` | EAB 凭据 | LiteSSL 必需；到 [litessl.com](https://www.litessl.com) 注册后生成 |
-| `--eab-hmac-key <密钥>` | EAB 凭据 | LiteSSL 必需；只经命令行交给 acme.sh，**不写入部署状态文件** |
-| `--force-cert` | 强制重签证书 | 默认策略是「已装好且仍在有效期内的正式证书 → 重装直接跳过申请」，本开关压过该跳过 |
-
-> 换 CA **不等于**换个接口地址：LiteSSL 与 ZeroSSL 的 ACME 接口都声明 `externalAccountRequired: true`，必须带 EAB（外部账户绑定）凭据。ZeroSSL 可由 acme.sh 用 `--email` 自动换取 EAB；LiteSSL 必须手工取。`--tls` 也可以直接写 CA 名，如 `--tls litessl`。
->
-> 例（ZeroSSL，推荐，零手工）：`sudo bash deploy.sh --domain s3.example.com --ca zerossl --email you@example.com`
->
-> 例（LiteSSL，国内直连）：`sudo bash deploy.sh --domain s3.example.com --ca litessl --eab-kid <KID> --eab-hmac-key <密钥>`
->
-> 拿不到 EAB、又连不上其它 CA 时，可以先用 `--tls file` 挂上你自备的证书，或 `--tls none` 只跑 HTTP，之后再换回 ACME —— **证书步骤失败会直接中断部署**：本版本已移除自签名证书（它会被浏览器判为不安全，也换不来 WebAuthn 等需要「安全上下文」的功能），脚本不再拿一张浏览器不认的证书把站点「跑起来」。
->
-> **证书自检**：脚本不再只看「文件在不在」，而是要求证书**内容真的可用** —— 能解析出 subject / issuer 且都有实值、且与私钥配对。只判文件非空的实现会把「所有字段都是空白」的证书当成签发成功（`openssl req -x509 -subj "/"` 就会产出这种证书，`nginx -t` 也照样通过），用户拿到的是一个浏览器判定不安全、点开证书信息一片空白的站点。装完证书后脚本还会**核对「浏览器实际看到的是哪一份」**：带 SNI 连本机 HTTPS 端口取回实际证书、按 SHA-256 指纹与刚安装的文件比对。若两者不一致会直接点名原因（最常见的是用 `www.` 访问却只配了主域，于是退回到面板/旧站点在 443 上的 `default_server`）。自查命令：
->
-> ```bash
-> openssl x509 -in /etc/kepler/ssl/acme/fullchain.pem -noout -subject -issuer -dates   # 本地装的这份
-> curl -vkI https://你的域名/ 2>&1 | grep -E 'subject|issuer'                          # 浏览器看到的那份
-> ```
->
-> 两者不一致时，按提示排查：① 访问的域名与配置的 `--domain` **完全一致**（含 `www.` 前缀）；② 停用面板/旧站点在 443 上的默认站点；③ 前面挂了 CDN 的话，证书要在 CDN 侧配置。
-
-> 部署状态保存在 `/etc/kepler/deploy.conf`（0600）：修改端口、重新安装都以它为准，避免重跑时参数丢失；卸载会一并清除该文件。
-
-若更习惯用镜像方式：
-
-```bash
-docker build -t s3-manager .
-docker run -d -p 3000:3000 -p 3443:3443 -v s3-data:/app/data s3-manager
-```
-
-镜像基于 `node:24.22.1-alpine`，多阶段构建；以非 root 用户 `node` 运行，`tini` 作为 PID 1 转发信号，`/app/data` 声明为数据卷（**主密钥与配置都在此目录，务必持久化**）。`.dockerignore` 已排除 `data/`，不会将本机密钥打入镜像。
-
----
-
-<h2 id="readme-section8">5. 首次配置</h2>
+<h2>4. 首次配置</h2>
 
 ---
 
@@ -230,11 +130,11 @@ docker run -d -p 3000:3000 -p 3443:3443 -v s3-data:/app/data s3-manager
 
 ---
 
-<h1 id="readme-section9">四、使用指南</h1>
+<h1>四、使用指南</h1>
 
 ---
 
-<h2 id="readme-section10">1. 常用操作</h2>
+<h2>1. 常用操作</h2>
 
 ---
 
@@ -250,7 +150,7 @@ docker run -d -p 3000:3000 -p 3443:3443 -v s3-data:/app/data s3-manager
 
 ---
 
-<h2 id="readme-section11">2. 断点续传</h2>
+<h2>2. 断点续传</h2>
 
 ---
 
@@ -260,7 +160,7 @@ docker run -d -p 3000:3000 -p 3443:3443 -v s3-data:/app/data s3-manager
 
 ---
 
-<h2 id="readme-section12">3. 文件加密</h2>
+<h2>3. 文件加密</h2>
 
 ---
 
@@ -281,7 +181,7 @@ docker run -d -p 3000:3000 -p 3443:3443 -v s3-data:/app/data s3-manager
 
 ---
 
-<h2 id="readme-section13">4. 分享与审计</h2>
+<h2>4. 分享与审计</h2>
 
 ---
 
@@ -296,7 +196,7 @@ docker run -d -p 3000:3000 -p 3443:3443 -v s3-data:/app/data s3-manager
 
 ---
 
-<h2 id="readme-section14">5. 用户管理与 Windows Hello</h2>
+<h2>5. 用户管理与 Windows Hello</h2>
 
 ---
 
@@ -344,19 +244,18 @@ docker run -d -p 3000:3000 -p 3443:3443 -v s3-data:/app/data s3-manager
 
 ---
 
-<h2 id="readme-section15">6. 安全告知</h2>
+<h2>6、模拟支付配置</h2>
 
----
+此处以支付宝为例，允许用户在没有支付宝商户资质的情况下进行支付相关测试。
 
-> 本项目为个人项目，未经企业级安全审计，请勿直接用于企业生产环境。
+① 打开并登录 [[支付宝沙箱](https://open.alipay.com/develop/sandbox/app)]；<br>
+② 点击左侧“沙箱应用”，将 AppID 复制到 Kepler 支付配置的“应用 ID”中，接口加签方式选择“系统默认密钥”-“公钥模式”；<br>
+③ 点击“查看”，复制应用私钥（此处要选择“非 JAVA 语言”）、支付宝公钥、网关地址到 Kepler 支付配置的相对应的编辑框中；<br>
+④ 点击“沙箱工具”，下载安装沙箱版支付宝；<br>
+⑤ 点击“沙箱账号”，在沙箱版支付宝中登录页面中提供的**买家**账号，进行付款测试；<br>
+⑥ 此时可随意设置金额进行测试，沙箱版支付宝不会扣除任何现实的金钱。
 
-设计取舍与技术限制的完整清单见 [Develop_Document.md](./Develop_Document.md)。
-
-> **反向代理必须保留原始 `Host`。** 写操作的 CSRF 校验在「同源自定义头」之外，还要求 `Origin` / `Referer` 的主机与本次请求的 `Host` 一致（R24-06）。Nginx 反代请使用 `proxy_set_header Host $host;`（`deploy.sh` 生成的配置已如此）；若某个代理把 `Host` 改写成上游地址（如 `127.0.0.1:3000`），则**所有写操作会被 403** 拦下。
-
----
-
-<h2 id="readme-section16">7. 付费下载</h2>
+<h2>7. 付费下载</h2>
 
 ---
 
@@ -366,7 +265,7 @@ docker run -d -p 3000:3000 -p 3443:3443 -v s3-data:/app/data s3-manager
 
 ---
 
-<h2 id="readme-section17">8. 订单管理</h2>
+<h2>8. 订单管理</h2>
 
 ---
 
@@ -391,7 +290,7 @@ docker run -d -p 3000:3000 -p 3443:3443 -v s3-data:/app/data s3-manager
 
 ---
 
-<h2 id="readme-section18">9. 负载均衡（API Key 空间配额）</h2>
+<h2>9. 负载均衡（API Key 空间配额）</h2>
 
 ---
 
@@ -411,7 +310,7 @@ docker run -d -p 3000:3000 -p 3443:3443 -v s3-data:/app/data s3-manager
 
 ---
 
-<h1 id="readme-section19">五、开源协议</h1>
+<h1>五、开源协议</h1>
 
 ---
 

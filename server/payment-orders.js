@@ -550,21 +550,26 @@ function listForUser(userId) {
 /**
  * R64：「恢复购买」的唯一判定点 —— 订单号 → 可作为下载凭证的订单。
  *
- * 需求前提：**只有「支付成功」的订单**能取回下载权限。因此这里按顺序回答四件事：
+ * 需求前提：**只有「支付成功」的订单**能取回下载权限。因此这里按顺序回答五件事：
  *   ① 订单号存在吗（不存在 / 不属于本链接一律给**同一条**文案，避免把订单号
  *      是否存在变成可探测的预言机）；
  *   ② 它是**这条链接**的订单吗（权威判据是订单上的 `linkId`，不是订单号里的
  *      `linkUid` —— 后者只是派生值，换派生口径不该让历史订单失效）；
  *   ③ 它支付成功了吗（`pending` / `failed` / `refunded` 都拒绝，并各给一条能
  *      指导下一步的文案）；
- *   ④ 通过则返回订单，由路由签发该链接的支付凭证（`orderToken`）。
+ *   ④ R86：**买它的人是不是当前登录者**（登录态成交的订单只认原账号；游客订单不设限）；
+ *   ⑤ 通过则返回订单，由路由签发该链接的支付凭证（`orderToken`）。
  *
  * @param {string} no 用户输入的订单号（已归一化）
  * @param {string} linkId 当前分享链接 id
- * @param {{maxUses?: number}} [opts] R65：同一订单号可成功取回的次数上限
- *   （`0` / 缺省 = 不限制；判据在**本函数**里，调用方不得另写一份）
+ * @param {{maxUses?: number, viewerId?: string}} [opts]
+ *   `maxUses` —— R65：同一订单号可成功取回的次数上限（`0` / 缺省 = 不限制；
+ *   判据在**本函数**里，调用方不得另写一份）；
+ *   `viewerId` —— R86：当前请求者已登录的账号 id（游客传空串 / 不传）。
+ *   ⚠️ 只有订单带 `userId` 时它才被使用，且判据同样只在本函数里。
  * @returns {{ok: boolean, reason: string, order: object|null, message: string}}
  *   reason: '' | 'invalid' | 'mismatch' | 'pending' | 'failed' | 'refunded' | 'used_up'
+ *         | 'need_login' | 'wrong_user'
  *
  * ⚠️ **成功时这里会把 `restoreCount` 加一并落盘**：「取回次数」必须在**判定与发放的
  * 同一处**递增，否则两个并发请求会同时读到旧计数（都能过闸门，实际取回 N+1 次）。
@@ -587,6 +592,40 @@ function claimForLink(no, linkId, opts) {
     };
   }
   if (o.status === 'paid') {
+    /**
+     * R86：**账号归属闸门**（本次新增的唯一限制）。
+     *
+     * 规则：订单是在**登录状态下**完成的（`userId` 非空）⇒ 必须由**同一个账号**
+     * 登录后才能凭订单号取回；**游客订单**（`userId` 为空）任何情况下都能凭订单号取回
+     * —— 后者没有「原账号」可依，加限制等于把凭证作废。
+     *
+     * ⚠️ 必须排在取回次数判定**之前**：归属不符的人不该消耗原主的取回额度，
+     * 否则拿到订单号的人只要反复提交就能把额度试光，等于替买主把凭证作废。
+     *
+     * 两种拒绝给**不同** reason（路由据此决定「去登录」还是「切换账号」按钮），
+     * 但都**不回显订单归属者的账号名 / id** —— reason 只区分「请求者自己登没登录」，
+     * 不回答「这单是谁买的」。也因此两类都返回 `order: null`，杜绝上层误渲染。
+     */
+    const owner = String(o.userId || '');
+    if (owner) {
+      const viewer = String((opts && opts.viewerId) || '');
+      if (!viewer) {
+        return {
+          ok: false,
+          reason: 'need_login',
+          order: null,
+          message: '该订单是在登录状态下完成的，请先登录购买时使用的账号，再凭订单号取回下载权限。',
+        };
+      }
+      if (viewer !== owner) {
+        return {
+          ok: false,
+          reason: 'wrong_user',
+          order: null,
+          message: '该订单是在另一个账号下完成的，请切换到购买时使用的账号后再试。',
+        };
+      }
+    }
     /**
      * R65：取回次数上限。只在 `paid` 之后判、在 `paid` 之内加 —— 未支付 / 已退款 /
      * 已失败的订单本来就取不到，不该消耗这个额度。

@@ -2643,6 +2643,19 @@ function restorePage(res, l, opts = {}) {
     });
   }
   const err = opts.error ? `<div class="warn">${esc(opts.error)}</div>` : '';
+  /**
+   * R86：订单归属闸门拦下时，光给一句话不够 —— 用户需要一个**能点的按钮**。
+   *   `login`  = 压根没登录（去买这单的账号）→ 「去登录」
+   *   `switch` = 登录了，但不是买它的人 → 「切换账号」
+   * 两者都带 `next` 回到**本条分享**：登录完回来，订单号还在他手里，再输一次即可。
+   * 刻意不把 `next` 指向 `/restore`：登录页只对分享路径放行，多一段会让跳转更难推理。
+   */
+  const loginHref = `/?next=${encodeURIComponent('/s/' + l.id)}`;
+  const loginBtn = opts.loginHint === 'login'
+    ? `<a class="btn primary" href="${esc(loginHref)}" style="text-align:center;text-decoration:none">去登录</a>`
+    : (opts.loginHint === 'switch'
+      ? `<a class="btn primary" href="${esc(loginHref)}" style="text-align:center;text-decoration:none">切换账号</a>`
+      : '');
   renderPage(res, opts.error ? 400 : 200, {
     title: '恢复购买',
     head: `<div class="center-head">
@@ -2658,7 +2671,9 @@ function restorePage(res, l, opts = {}) {
         <button class="btn primary" type="submit">取回下载权限</button>
       </form>
       <div class="pay-note">订单号是 36 位字母数字组合（区分大小写），可在支付成功页、
-        历史订单页看到，也可在付款后留意保存。只有<b>支付成功</b>的订单才能取回下载权限。</div>
+        历史订单页看到，也可在付款后留意保存。只有<b>支付成功</b>的订单才能取回下载权限。
+        在<b>登录状态</b>下完成的订单，须用购买时的同一个账号取回。</div>
+      ${loginBtn}
       <a class="btn ghost" href="/s/${esc(l.id)}" style="text-align:center;text-decoration:none">返回文件页</a>`,
   });
 }
@@ -2783,7 +2798,9 @@ router.get('/s/:id/restore', (req, res) => {
  *
  * 判定全部收口在 `paymentOrders.claimForLink()`：订单号存在、属于本链接、
  * **且状态是「支付成功」** 才会返回订单（需求末句「所有功能的前提是该订单号
- * 状态为支付成功」，在这里兑现）。通过后签发的就是**正常的已支付票据**
+ * 状态为支付成功」，在这里兑现）。R86 起还多一道**账号归属**闸门：在登录状态下
+ * 成交的订单只能由同一个账号取回，游客订单不受限 —— 判据同样只住在那个函数里，
+ * 这里只负责把「当前登录的是谁」传下去。通过后签发的就是**正常的已支付票据**
  * —— 与真正付完款时下发的那枚一模一样，因此后续所有下载路径（页面、`/dl`、
  * `HEAD /dl`）都不需要为本功能加任何分支。
  */
@@ -2797,6 +2814,11 @@ router.post('/s/:id/restore', asyncHandler(async (req, res) => {
   }
 
   const ip = security.clientIp(req);
+  /**
+   * R86：账号归属闸门的判据来源 —— 与页面右上角「已登录」用的是同一处
+   * （`shareUser()`，它读 `res.locals.shareUser`，由顶部中间件统一注入）。
+   */
+  const me = shareUser(req);
   /**
    * R65：先看是不是已被「连续输错」封禁。
    *
@@ -2837,14 +2859,25 @@ router.post('/s/:id/restore', asyncHandler(async (req, res) => {
     return restorePage(res, l, { error: '订单号格式不正确，请核对后重新输入。' });
   }
 
-  const r = paymentOrders.claimForLink(no, l.id, { maxUses: cfg.maxUses });
+  const r = paymentOrders.claimForLink(no, l.id, {
+    maxUses: cfg.maxUses,
+    /**
+     * R86：把「当前登录的是谁」交给唯一判定点 —— 归属闸门只住在 `claimForLink()` 里，
+     * 路由不另写一份。未登录时 `shareUser()` 返回 null，传空串（等价于「游客请求」）。
+     */
+    viewerId: me ? me.id : '',
+  });
   if (!r.ok) {
     /**
      * 「取回次数已用完」**不算输错**：那是一笔真实存在、确实付过款的订单，
      * 只是额度用尽。把它计入失败次数会让「反复用自己的订单号重试」的人被封，
      * 而封禁要针对的是猜号，不是额度。
+     *
+     * R86：同理，「账号归属不符」（`need_login` / `wrong_user`）也不算输错 ——
+     * 订单真实存在、钱也真付过，只是请求者身份不对。若计入，买主换了设备、
+     * 忘了先登录就多试两次，就会被封 24 小时 —— 挡住的是主人，不是猜号的。
      */
-    if (r.reason !== 'used_up') {
+    if (r.reason !== 'used_up' && r.reason !== 'need_login' && r.reason !== 'wrong_user') {
       const g = restoreGuard.noteFail(ip, cfg.maxFails);
       if (g.justBanned) {
         statsStore.addLog({
@@ -2857,7 +2890,12 @@ router.post('/s/:id/restore', asyncHandler(async (req, res) => {
       action: 'share.restore', level: 'warn',
       detail: `分享页恢复购买失败（链接 ${l.id}，原因：${r.reason}，IP：${ip}）`,
     });
-    return restorePage(res, l, { error: r.message });
+    return restorePage(res, l, {
+      error: r.message,
+      loginHint: r.reason === 'need_login'
+        ? 'login'
+        : (r.reason === 'wrong_user' ? 'switch' : ''),
+    });
   }
 
   // 成功：连击计数归零（失败次数是「连续」语义，成功一次就从头算）

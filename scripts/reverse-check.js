@@ -1405,9 +1405,15 @@ const CASES = [
        */
       name: 'D1-07 · 一键安装命令退回「curl … | sudo bash」（去掉 -f 后 404 会被存成脚本）',
       file: 'README.md',
+      /**
+       * ⚠️ R86：README 的精简版删掉了「带 --domain 的第二处一键命令」，原锚点（指向那处）
+       * 当场失效 —— 而 anchor 失效=这条对照等于没登记。改指**仅存的那处**（"三、手动部署"
+       * 下面的第一条），守的仍是同一件事：必须 `-fLo` 先落盘、再 `&& sudo bash`，
+       * 不得退回裸管道。docs-sync 里「不得写成 curl … | bash」的逐行断言也指向同一行。
+       */
       anchor: 'curl -fLo /tmp/kepler-deploy.sh https://raw.githubusercontent.com/xingsen2005/Kepler/main/deploy.sh \\\n'
-        + '  && sudo bash /tmp/kepler-deploy.sh --domain s3.example.com',
-      replacement: 'curl -fsSL https://raw.githubusercontent.com/xingsen2005/Kepler/main/deploy.sh | sudo bash -s -- --domain s3.example.com',
+        + '  && sudo bash /tmp/kepler-deploy.sh',
+      replacement: 'curl -fsSL https://raw.githubusercontent.com/xingsen2005/Kepler/main/deploy.sh | sudo bash',
       testFile: 'docs-sync.test.js',
       minFail: 1,
     },
@@ -11148,6 +11154,81 @@ const CASES = [
       anchor: '<td class="ord-no-wrap${dimExtra}">${gatewayNoCell(o)}</td>',
       replacement: '<td class="ord-no-wrap${dimExtra}"></td>',
       testFile: 'audit85-regressions.test.js',
+      minFail: 1,
+    },
+
+    /* ---------------- R86（1.9.21）：订单号取回新增「账号归属」限制 ---------------- */
+    {
+      /**
+       * 最容易犯的那个「顺手」：把「登录者必须等于订单的 userId」写成**无条件**判据。
+       * `userId` 对游客是空串，空串与任何登录者都不等 ⇒ 无主订单当场全废，
+       * 与需求「未登录完成购买的订单任何情况下都能取回」正好相反。
+       */
+      name: 'R86-01a · 归属闸门对游客订单也生效（无主单被锁死）',
+      file: 'server/payment-orders.js',
+      anchor: '    if (owner) {',
+      replacement: '    if (true) { // R86 反向变异：游客单也走归属校验',
+      testFile: 'audit86-regressions.test.js',
+      // 判定层 R86-01 + HTTP 层 R86-11（游客单不再 303）
+      minFail: 2,
+    },
+    {
+      name: 'R86-02a · 未登录不再拦（need_login 分支失效）',
+      file: 'server/payment-orders.js',
+      anchor: '      if (!viewer) {',
+      replacement: '      if (false) { // R86 反向变异：未登录也放行',
+      testFile: 'audit86-regressions.test.js',
+      // 判定层 R86-02 + HTTP 层 R86-08（「去登录」按钮不再出现）
+      minFail: 2,
+    },
+    {
+      name: 'R86-03a · 换个账号也能取回（归属比对失效）',
+      file: 'server/payment-orders.js',
+      anchor: '      if (viewer !== owner) {',
+      replacement: '      if (false) { // R86 反向变异：谁都能取',
+      testFile: 'audit86-regressions.test.js',
+      // R86-03 + R86-05（错账号那条不再报 wrong_user）+ R86-06 + R86-09（HTTP）+ R86-12
+      minFail: 5,
+    },
+    {
+      /**
+       * 顺序错位：额度判定跑到归属之前 ⇒ 陌生人能靠「额度已用完」确认这单存在且有主。
+       */
+      name: 'R86-04a · 取回额度判定跑到归属闸门之前（先报 used_up 再报 wrong_user）',
+      file: 'server/payment-orders.js',
+      anchor: "    const owner = String(o.userId || '');",
+      replacement: "    {\n      const m0 = Number(opts && opts.maxUses);\n      const l0 = Number.isFinite(m0) && m0 > 0 ? Math.floor(m0) : 0;\n      if (l0 > 0 && Math.max(0, Number(o.restoreCount) || 0) >= l0) {\n        return { ok: false, reason: 'used_up', order: o, message: 'x' };\n      }\n    }\n    const owner = String(o.userId || '');",
+      testFile: 'audit86-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R86-05a · 归属不符也计入「连续输错」（买主换设备就被自己锁死）',
+      file: 'server/share-routes.js',
+      anchor: "    if (r.reason !== 'used_up' && r.reason !== 'need_login' && r.reason !== 'wrong_user') {",
+      replacement: "    if (r.reason !== 'used_up') {",
+      testFile: 'audit86-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R86-06a · 归属被拦时不给登录入口（只剩一句文案，无处可点）',
+      file: 'server/share-routes.js',
+      /**
+       * ⚠️ 必须整段换成空串，**不能只把首个分支改成 `false && ...`** ——
+       * 那样三元会落到 else 分支，`wrong_user` 照样拿到「切换账号」按钮，
+       * 只有 R86-08 变红（实测 fail=1），R86-09 的按钮就失去反向覆盖了。
+       */
+      anchor: "      loginHint: r.reason === 'need_login'\n        ? 'login'\n        : (r.reason === 'wrong_user' ? 'switch' : ''),",
+      replacement: "      loginHint: '',",
+      testFile: 'audit86-regressions.test.js',
+      // R86-08（去登录）+ R86-09（切换账号）
+      minFail: 2,
+    },
+    {
+      name: 'R86-07a · 恢复页不再提前告知「登录态成交须同账号取回」',
+      file: 'server/share-routes.js',
+      anchor: '        在<b>登录状态</b>下完成的订单，须用购买时的同一个账号取回。</div>',
+      replacement: '        </div>',
+      testFile: 'audit86-regressions.test.js',
       minFail: 1,
     },
   ];

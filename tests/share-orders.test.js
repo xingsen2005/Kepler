@@ -215,7 +215,14 @@ test('R64-04 · claimForLink：只有「支付成功」放行；未支付 / 已�
   const l2 = await makePaidLink('claim-2.txt');
 
   const paid = makeOrder(l1, { userId: 'u-payed' });
-  assertEqual(paymentOrders.claimForLink(paid.orderNo, l1.id).ok, true, '已支付订单应可取回');
+  /**
+   * ⚠️ R86 起「已支付」不再是**充分**条件：这单是在登录态下成交的（带了 `userId`），
+   * 必须由同一个账号请求才放行。本用例只验「支付成功」这一维，故显式带上原账号；
+   * 归属闸门本身（未登录 / 换了账号）由 `audit86-regressions.test.js` 覆盖 ——
+   * 若这里也铺开，两条用例会重复断言同一件事。
+   */
+  assertEqual(paymentOrders.claimForLink(paid.orderNo, l1.id, { viewerId: 'u-payed' }).ok, true,
+    '已支付订单应由购买时的账号取回');
 
   const pending = paymentOrders.create({ linkId: l1.id, platform: 'alipay', amountFen: 500, currency: 'CNY' });
   assertEqual(paymentOrders.claimForLink(pending.orderNo, l1.id).reason, 'pending',
