@@ -30,6 +30,8 @@
 
 const crypto = require('crypto');
 const qrcode = require('./qrcode');
+// 密钥结构判定（PEM / 裸 Base64 / PKCS#1 / PKCS#8）的**唯一实现点**，保存校验器共用
+const pemKey = require('./pem-key');
 
 const TIMEOUT_MS = 10000;
 const ALIPAY_GATEWAY = 'https://openapi.alipay.com/gateway.do';
@@ -40,17 +42,39 @@ function paypalHost(mode) {
   return String(mode || '').toLowerCase() === 'live' ? 'https://api-m.paypal.com' : 'https://api-m.sandbox.paypal.com';
 }
 
+/** PEM 包裹：每 64 字符折行，与各家控制台导出 / openssl 输出的形态一致 */
+function wrapPem(label, body) {
+  const wrapped = String(body).replace(/(.{64})/g, '$1\n');
+  return `-----BEGIN ${label}-----\n${wrapped}\n-----END ${label}-----`;
+}
+
 /**
- * 私钥归一化：允许 PEM，也允许「裸 Base64 密钥体」（支付设置页的校验器两者都放行）。
- * 裸 Base64 一律按 PKCS#8 包裹 —— 支付宝与微信商户平台下载的私钥都是 PKCS#8。
+ * 私钥归一化：PEM 原样返回；裸 Base64 体则**先认 ASN.1 结构，再补 PEM 头**。
+ *
+ * ⚠️ 这里曾经只做一件事：给裸 Base64 一律补 `-----BEGIN PRIVATE KEY-----`（PKCS#8）。
+ * 而 PKCS#1（`RSA PRIVATE KEY`）与 PKCS#8 的裸 Base64 体**都以 `MIIE` 开头**
+ * —— PKCS#8 是 `MIIE…IBADANBgkq`（算法标识紧跟在版本号后），PKCS#1 是
+ * `MIIE…IBAAKCgQEA`（版本号后直接是模数）—— 只看前缀根本分不出来。于是从
+ * 支付宝「密钥工具」或 `openssl rsa -traditional` 导出的 PKCS#1 私钥会被硬套成
+ * PKCS#8 头，OpenSSL 在**解码阶段**就失败，报
+ * `error:1E08010C:DECODER routines::unsupported`。这条报错发生在本地签名，
+ * 请求**根本没发出去**，所以现场看起来像"网关拒签"，实际是密钥格式没对上。
+ *
+ * 现在交给 `pem-key.js`（**唯一实现点**，保存校验器用的是同一份判据）真解析：
+ * 把密钥体当 DER，依次按 PKCS#8 / PKCS#1 / SEC1 解一遍，任一成功即采用。
+ *
+ * 解不出来时**退回旧行为**（按 PKCS#8 补头）—— 那说明粘贴的内容本身不是密钥
+ * （被截断 / 混进了公钥），让失败留在签名那一刻，由 OpenSSL 给出确切原因；
+ * 这里猜一句"格式不对"只会把有用的报错吞掉。
  */
 function normalizePrivateKey(raw) {
   const s = String(raw || '').trim();
   if (!s) return '';
   if (/-----BEGIN/.test(s)) return s;
   const body = s.replace(/[\s\r\n]/g, '');
-  const wrapped = body.replace(/(.{64})/g, '$1\n');
-  return `-----BEGIN PRIVATE KEY-----\n${wrapped}\n-----END PRIVATE KEY-----`;
+  const parsed = pemKey.normalizePrivateKey(s);
+  if (parsed) return parsed;
+  return wrapPem('PRIVATE KEY', body);
 }
 
 function rsaSign(content, privateKey, signType) {
@@ -58,14 +82,21 @@ function rsaSign(content, privateKey, signType) {
   return crypto.createSign(algo).update(content, 'utf8').sign(normalizePrivateKey(privateKey), 'base64');
 }
 
-/** 与 normalizePrivateKey 对称：裸 Base64 按 X.509 SubjectPublicKeyInfo 包裹 */
+/**
+ * 与 `normalizePrivateKey` 对称：裸 Base64 按结构识别后包裹。
+ *
+ * 支付宝公钥是 X.509 SubjectPublicKeyInfo（裸体以 `MIIBI` 开头），但 openssl 也能
+ * 导出 PKCS#1 的 `RSA PUBLIC KEY`（裸体 `MIIBCgKCAQEA…`）。只认 SPKI 的话，后者
+ * 会被补上错误的 PEM 头，验签恒失败 —— 与上面私钥那一半是同一个缺陷的两种表现。
+ */
 function normalizePublicKey(raw) {
   const s = String(raw || '').trim();
   if (!s) return '';
   if (/-----BEGIN/.test(s)) return s;
   const body = s.replace(/[\s\r\n]/g, '');
-  const wrapped = body.replace(/(.{64})/g, '$1\n');
-  return `-----BEGIN PUBLIC KEY-----\n${wrapped}\n-----END PUBLIC KEY-----`;
+  const parsed = pemKey.normalizePublicKey(s);
+  if (parsed) return parsed;
+  return wrapPem('PUBLIC KEY', body);
 }
 
 /**

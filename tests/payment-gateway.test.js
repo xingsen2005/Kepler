@@ -215,9 +215,37 @@ test('paypalHost：live 走生产域名，其余一律沙箱（避免误用生�
  * 4 · 私钥归一化
  * ================================================================== */
 
-test('normalizePrivateKey：PEM 原样返回，裸 Base64 按 PKCS#8 包裹', () => {
+test('normalizePrivateKey：裸 PKCS#1 密钥体必须被识别（1E08010C 的成因）', () => {
+  // PKCS#1 与 PKCS#8 的**裸 Base64 体都以 MIIE 开头**，前缀分不出来：
+  //   PKCS#8 → MIIE…IBADANBgkq    PKCS#1 → MIIE…IBAAKCgQEA
+  // 旧实现一律补 `-----BEGIN PRIVATE KEY-----`（PKCS#8 头），于是 PKCS#1 体被套错头，
+  // OpenSSL 在**解码阶段**就失败：error:1E08010C:DECODER routines::unsupported ——
+  // 请求根本没发出去，管理员却以为是网关拒绝。
+  const p1 = crypto.createPrivateKey(RSA_PRIV).export({ type: 'pkcs1', format: 'pem' });
+  const bare1 = String(p1).replace(/-----[^-]+-----/g, '').replace(/\s/g, '');
+  const bare8 = RSA_PRIV.replace(/-----[^-]+-----/g, '').replace(/\s/g, '');
+  assertEqual(bare1.slice(0, 4), 'MIIE', '前提：PKCS#1 裸体确实以 MIIE 开头（否则本用例无效）');
+  assertEqual(bare8.slice(0, 4), 'MIIE', '前提：PKCS#8 裸体同样以 MIIE 开头');
+
+  const out1 = gw.normalizePrivateKey(bare1);
+  const out8 = gw.normalizePrivateKey(bare8);
+  // 归一化后只有一种形态：PKCS#8 PEM
+  assert(out1.startsWith('-----BEGIN PRIVATE KEY-----'), 'PKCS#1 裸体应被识别并统一为 PKCS#8');
+  assert(out8.startsWith('-----BEGIN PRIVATE KEY-----'), 'PKCS#8 裸体应统一为 PKCS#8');
+
+  // 判据落在「真的能签名」上，而不是「头补对了」—— 补对头但内容错同样会 1E08010C
+  for (const [name, pem] of [['PKCS#1 裸体', out1], ['PKCS#8 裸体', out8]]) {
+    const sig = crypto.createSign('RSA-SHA256').update('kepler').sign(pem, 'base64');
+    const ok = crypto.createVerify('RSA-SHA256').update('kepler').verify(RSA_PUB, sig, 'base64');
+    assertEqual(ok, true, `${name} 归一化后必须能完成签名并验签通过`);
+  }
+});
+
+test('normalizePrivateKey：无可解析结构时退回旧形态（让 OpenSSL 报确切原因）', () => {
   // 输出统一 trim（密钥前后的空行无意义，且各家控制台复制出来常带换行）
   assertEqual(gw.normalizePrivateKey(RSA_PRIV), RSA_PRIV.trim(), '已是 PEM 时除首尾空白外不改动');
+  // 解不出结构 → 不猜，仍按 PKCS#8 包裹，把「为什么解不开」留给 OpenSSL 报原文。
+  // 这与上面的用例是一对：**能解出来才归一化，解不出来不臆断**。
   const body = 'QUJDREVGR0hJSktMTU5PUFFSU1RVVldYWVowMTIzNDU2Nzg5YWJjZGVmZ2hpamtsbW5vcHFyc3R1dnd4eXo=';
   const out = gw.normalizePrivateKey(body);
   assert(out.startsWith('-----BEGIN PRIVATE KEY-----'), '应补上 PEM 头');

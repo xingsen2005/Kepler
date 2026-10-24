@@ -10442,6 +10442,96 @@ const CASES = [
       testFile: 'audit78-regressions.test.js',
       minFail: 1,
     },
+
+    /* ---------------- R79：支付密钥真实解析（L1/L2）+ 等待页按钮无反应 ---------------- */
+    {
+      /**
+       * L1 退回「不解析、一律补 PKCS#8 头」——正是 `1E08010C:DECODER routines::unsupported`
+       * 的成因：PKCS#1 裸体（同样以 `MIIE` 开头）被套上 PKCS#8 标签，OpenSSL 解码即失败。
+       * 判据落在「签名能否被配对公钥验签」，故撤销后 R79-01 必红。
+       */
+      name: 'R79-01a · 私钥归一化退回「按前缀猜结构」（裸 PKCS#1 被套错头 ⇒ 1E08010C）',
+      file: 'server/payment-gateway.js',
+      anchor: '  const parsed = pemKey.normalizePrivateKey(s);\n  if (parsed) return parsed;',
+      replacement: "  const parsed = ''; // R79 反向变异：不解析，直接按 PKCS#8 包裹\n  if (parsed) return parsed;",
+      testFile: 'audit79-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * L2 退回「头尾成对 / 字符集 + 长度」的近似判据 ⇒ 公钥贴进私钥框、`'A'×240`、
+       * 带口令私钥、截断 PEM 全部重新放行。
+       * 两层同时变红：R79-02（真实 HTTP 保存端点）与 R79-03（校验器本身）——`minFail: 2`。
+       */
+      name: 'R79-02a · 私钥校验器退回「只看头尾标记 / 只看长度」（四类错填重新放行）',
+      file: 'server/payment-providers.js',
+      anchor: "  privateKey(v) {\n    const c = pemKey.classify(v);\n    if (c && c.kind === 'private' && c.type === 'rsa') return true;\n    return pemKey.explain('private', v);\n  },",
+      replacement: "  privateKey(v) {\n    // R79 反向变异：退回只看形状的近似判据\n    const s = String(v);\n    if (/-----BEGIN [A-Z ]*PRIVATE KEY-----/.test(s) && /-----END [A-Z ]*PRIVATE KEY-----/.test(s)) return true;\n    if (s.replace(/[\\s\\r\\n]/g, '').length >= 200) return true;\n    return '不是有效的私钥';\n  },",
+      testFile: 'audit79-regressions.test.js',
+      minFail: 2,
+    },
+    {
+      /**
+       * 公钥侧单独退回。只有 R79-03 会红（R79-02 只走 `privateKey` 字段），故 `minFail: 1`
+       * —— 这也是「应该红几条」这个问题的答案，比"红了至少一条"更严。
+       */
+      name: 'R79-03a · 公钥校验器退回「只看头尾标记」（私钥可被贴进公钥框）',
+      file: 'server/payment-providers.js',
+      anchor: "  publicKey(v) {\n    const c = pemKey.classify(v);\n    if (c && c.kind === 'public' && c.type === 'rsa') return true;\n    return pemKey.explain('public', v);\n  },",
+      replacement: "  publicKey(v) {\n    // R79 反向变异：退回只看形状的近似判据\n    const s = String(v);\n    if (/-----BEGIN [A-Z ]*PUBLIC KEY-----/.test(s) && /-----END [A-Z ]*PUBLIC KEY-----/.test(s)) return true;\n    if (s.replace(/[\\s\\r\\n]/g, '').length >= 100) return true;\n    return '不是有效的公钥';\n  },",
+      testFile: 'audit79-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * 「点了没反应」的原始形态：无条件 303 回 `/s/:id`，结果码丢了。
+       * 等待页因此原样重画，`checked=pending` / `checked=recent` 都拿不到 ⇒
+       * R79-04 与 R79-05 同时红（前者要 pending、后者要 recent），`minFail: 2`。
+       */
+      name: 'R79-04a · /pay/check 退回「无条件 303 回分享页」（结果码丢失 ⇒ 按钮点了没反应）',
+      file: 'server/share-routes.js',
+      anchor: "  const outcome = await finalizeOrderThrottled(l, order);\n  const back = '/s/' + encodeURIComponent(l.id);\n  if (outcome === 'pending' || outcome === 'throttled') {\n    return res.redirect(303, back + '?checked=' + (outcome === 'pending' ? 'pending' : 'recent'));\n  }\n  return res.redirect(303, back);",
+      replacement: "  // R79 反向变异：丢掉结果码，一律回分享页\n  await finalizeOrderThrottled(l, order);\n  return res.redirect(303, '/s/' + l.id);",
+      testFile: 'audit79-regressions.test.js',
+      minFail: 2,
+    },
+    {
+      /**
+       * 更细的一种：节流命中（**本轮没出网**）也报 `checked=pending`，
+       * 等于告诉用户"已向网关查询"——把"没查"说成"查了没到账"。
+       * 只有 R79-05 会红（R79-04 走的是首次点击），故 `minFail: 1`。
+       */
+      name: 'R79-05a · 节流命中时也谎称「已向网关查询」（把没查说成查了没到账）',
+      file: 'server/share-routes.js',
+      anchor: "    return res.redirect(303, back + '?checked=' + (outcome === 'pending' ? 'pending' : 'recent'));",
+      replacement: "    return res.redirect(303, back + '?checked=' + (outcome === 'pending' ? 'pending' : 'pending'));",
+      testFile: 'audit79-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * 查单确认已到账却不回报 `paid` ⇒ 已经付过钱的人被留在等待页，
+       * 而订单其实已经落库为 paid（状态与界面脱节）。
+       */
+      name: 'R79-06a · 查单已到账仍回报 pending（已付款用户被留在等待页）',
+      file: 'server/share-routes.js',
+      anchor: "  if (st === 'paid') return 'paid';",
+      replacement: "  if (st === 'paid') return 'pending'; // R79 反向变异",
+      testFile: 'audit79-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * `?restart=1` 被忽略 ⇒ 等待页 / 失败页上的「重新支付」又变回自环：
+       * GET 回来仍旧命中 pending / failed 分支，页面原样重画。
+       */
+      name: 'R79-07a · 忽略 ?restart=1（等待页 / 失败页的「重新支付」变回死路）',
+      file: 'server/share-routes.js',
+      anchor: "    const restart = req.query.restart === '1';",
+      replacement: '    const restart = false; // R79 反向变异：忽略 restart',
+      testFile: 'audit79-regressions.test.js',
+      minFail: 1,
+    },
   ];
 
 module.exports = { runCase, CASES, parseArgs };

@@ -13,6 +13,7 @@ const fs = require('fs');
 const os = require('os');
 const path = require('path');
 const http = require('http');
+const crypto = require('crypto');
 const test = require('node:test');
 const { after } = require('node:test');
 const { assert, assertEqual, ROOT } = require('./helpers');
@@ -22,17 +23,28 @@ const pp2 = require(path.join(ROOT, 'server', 'payment-rules.js'));
 
 /* ------------------------------------------------------------------ *
  * 合法样例：三家平台各一份"照官方文档填对"的凭证
+ *
+ * 密钥**现场生成真实 RSA 密钥对**，不再用截断的假字符串。
+ * 原因：私钥 / 公钥校验器已改为**真的解析**（`pem-key.js`），假密钥必然解析失败 ——
+ * 用假密钥写「合法样例应通过」就等于断言「解析器不工作」，两边只能活一个。
+ * 真实密钥对还顺带让「非法样例」的断言有了对照物：同一把钥匙的公钥形态必须被私钥框拒绝。
  * ------------------------------------------------------------------ */
-const PEM_PRIVATE = [
-  '-----BEGIN PRIVATE KEY-----',
-  'MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDk3VvP3nQ7mXq',
-  '-----END PRIVATE KEY-----',
-].join('\n');
-const PEM_PUBLIC = [
-  '-----BEGIN PUBLIC KEY-----',
-  'MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA4t1b0oZ0nQ7mXqAAAAA',
-  '-----END PUBLIC KEY-----',
-].join('\n');
+const KEY_PAIR = crypto.generateKeyPairSync('rsa', { modulusLength: 2048 });
+/** PKCS#8（支付宝密钥工具 / 微信 apiclient_key.pem 的默认形态） */
+const PEM_PRIVATE = KEY_PAIR.privateKey.export({ type: 'pkcs8', format: 'pem' }).trim();
+/** PKCS#1（`openssl genrsa` 传统输出；与 PKCS#8 的裸体都以 MIIE 开头，前缀分不出） */
+const PEM_PRIVATE_PKCS1 = KEY_PAIR.privateKey.export({ type: 'pkcs1', format: 'pem' }).trim();
+/** SPKI（`-----BEGIN PUBLIC KEY-----`） */
+const PEM_PUBLIC = KEY_PAIR.publicKey.export({ type: 'spki', format: 'pem' }).trim();
+/** PKCS#1 公钥（`-----BEGIN RSA PUBLIC KEY-----`） */
+const PEM_PUBLIC_PKCS1 = KEY_PAIR.publicKey.export({ type: 'pkcs1', format: 'pem' }).trim();
+/** 控制台「复制密钥」按钮常给的**裸 Base64 密钥体**（无 PEM 头） */
+const BARE_PRIVATE = PEM_PRIVATE.replace(/-----[^-]+-----/g, '').replace(/\s/g, '');
+const BARE_PUBLIC = PEM_PUBLIC.replace(/-----[^-]+-----/g, '').replace(/\s/g, '');
+/** 带口令的私钥：本系统不保存口令，必须在校验阶段就被点名 */
+const ENCRYPTED_PRIVATE = KEY_PAIR.privateKey
+  .export({ type: 'pkcs8', format: 'pem', cipher: 'aes-256-cbc', passphrase: 'test-pass' })
+  .trim();
 
 const VALID = {
   alipay: {
@@ -193,22 +205,42 @@ test('未知平台与空输入不会误判为通过', () => {
  * 3 · 密钥 / URL 专用校验器
  * ================================================================== */
 
-test('私钥校验器：接受 PEM 与长 Base64，拒绝垃圾内容', () => {
+test('私钥校验器：真的解析为 RSA 私钥，四类真实错填一律拒绝', () => {
   const probe = (v) => pp.VALIDATORS.privateKey(v);
-  assert(probe(PEM_PRIVATE) === true, 'PEM 私钥应通过');
-  assert(probe('-----BEGIN RSA PRIVATE KEY-----\nMIIEow\n-----END RSA PRIVATE KEY-----') === true, 'PKCS#1 私钥应通过');
-  assert(probe('A'.repeat(240)) === true, '长 Base64 密钥体应通过');
+  // ---- 应当通过：同一把钥匙的三种合法粘贴形态 ----
+  assert(probe(PEM_PRIVATE) === true, 'PKCS#8 PEM 应通过');
+  assert(probe(PEM_PRIVATE_PKCS1) === true, 'PKCS#1 PEM 应通过（openssl 传统输出）');
+  assert(probe(BARE_PRIVATE) === true, '裸 Base64 密钥体应通过（控制台常只给这一种）');
+  assert(probe(`说明文字\n\n${PEM_PRIVATE}\n\n更多说明`) === true, '整段带说明文字的粘贴应通过');
+
+  // ---- 应当拒绝：旧判据（头尾成对 / 字符集 + 长度）会全部放行的四种真实错填 ----
+  // ① 把公钥贴进私钥框 —— 头尾标记同样成对，只有真解析才能识破
+  assert(typeof probe(PEM_PUBLIC) === 'string', '公钥不应通过私钥校验');
+  assert(typeof probe(BARE_PUBLIC) === 'string', '裸 Base64 公钥不应通过私钥校验');
+  // ② 长度达标的垃圾：Base64 字符集合法、解码后长度也像样
+  assert(typeof probe('A'.repeat(240)) === 'string', '够长的垃圾 Base64 应被拒');
+  // ③ 带口令的加密私钥：无口令必然解不开，要说「带口令」而不是「格式不对」
+  assert(typeof probe(ENCRYPTED_PRIVATE) === 'string', '带口令的私钥应被拒');
+  assert(/口令/.test(probe(ENCRYPTED_PRIVATE)), '加密私钥的提示应指出「有口令」这一真实原因');
+  // ④ 头尾成对但中间被截断（粘贴不全最常见的形态）
+  assert(typeof probe('-----BEGIN RSA PRIVATE KEY-----\nMIIEow\n-----END RSA PRIVATE KEY-----') === 'string', '截断的 PEM 应被拒');
+  assert(typeof probe('-----BEGIN PRIVATE KEY-----\nMIIE\n') === 'string', '缺少结尾标记的 PEM 应被拒');
   assert(typeof probe('garbage') === 'string', '垃圾内容应被拒且给出原因');
   assert(typeof probe('A'.repeat(50)) === 'string', '过短的 Base64 应被拒');
-  // 头尾必须成对，只有开头没有结尾不算 PEM
-  assert(typeof probe('-----BEGIN PRIVATE KEY-----\nMIIE\n') === 'string', '缺少结尾标记的 PEM 应被拒');
 });
 
-test('公钥校验器：接受 PEM 与长 Base64，拒绝垃圾内容', () => {
+test('公钥校验器：真的解析为 RSA 公钥，且不接受私钥', () => {
   const probe = (v) => pp.VALIDATORS.publicKey(v);
-  assert(probe(PEM_PUBLIC) === true, 'PEM 公钥应通过');
-  assert(probe('MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8A'.repeat(6)) === true, '长 Base64 公钥应通过');
+  assert(probe(PEM_PUBLIC) === true, 'SPKI PEM 应通过');
+  assert(probe(PEM_PUBLIC_PKCS1) === true, 'PKCS#1 公钥应通过');
+  assert(probe(BARE_PUBLIC) === true, '裸 Base64 公钥体应通过');
+  // 私钥必须被拒：OpenSSL 能从私钥导出公钥，`createPublicKey` 对它**也会成功**，
+  // 所以「公钥解得开」不能当作「这确实是公钥」—— 校验器必须先认私钥再认公钥。
+  assert(typeof probe(PEM_PRIVATE) === 'string', '私钥不应通过公钥校验');
+  assert(typeof probe(BARE_PRIVATE) === 'string', '裸 Base64 私钥不应通过公钥校验');
   assert(typeof probe('not a key') === 'string', '垃圾内容应被拒');
+  // 旧判据曾放行：把合法前缀重复拼接出来的"看起来像公钥"的假体
+  assert(typeof probe('MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8A'.repeat(6)) === 'string', '伪造的 Base64 公钥应被拒');
 });
 
 test('网关 URL 校验器：强制 https，拒绝 http 与非法地址', () => {
@@ -234,8 +266,8 @@ test('publicView 不回传任何敏感字段的值，只给「是否已配置」
     assertEqual(view.values[f.key], '', `敏感字段 ${f.key} 不应回传值`);
     assertEqual(view.configured[f.key], true, `敏感字段 ${f.key} 应标记为已配置`);
   }
-  // 已保存的公钥明文绝不能出现在返回结构里
-  assert(!JSON.stringify(view).includes('MIIBIjANBgkq'), '返回内容不得包含密钥明文片段');
+  // 已保存的公钥明文绝不能出现在返回结构里（用真实密钥体前 16 位做指纹）
+  assert(!JSON.stringify(view).includes(BARE_PUBLIC.slice(0, 16)), '返回内容不得包含密钥明文片段');
   // 非敏感字段照常回显
   assertEqual(view.values.appId, '2021004100000000', '非敏感字段应回显');
 });
@@ -252,7 +284,8 @@ test('maskSecret 不泄露完整明文', () => {
   assert(!m.includes('IiJjKkLlMmNn'), '掩码不得保留中段明文');
   assert(m.startsWith('EeFf') && m.endsWith('SsTt'), '掩码保留首尾各 4 位便于核对');
   const pem = pp.maskSecret(PEM_PRIVATE);
-  assert(!pem.includes('MIIEvQIBADANBgkqhkiG9w0BAQEFAASCBKcwggSjAgEAAoIBAQDk3VvP3nQ7mXq'), 'PEM 掩码不得含密钥体');
+  assert(!pem.includes(BARE_PRIVATE.slice(0, 48)), 'PEM 掩码不得含密钥体');
+  assert(pem.includes('-----BEGIN PRIVATE KEY-----'), 'PEM 掩码应保留首行标记，便于确认贴的是哪一种');
   assertEqual(pp.maskSecret(''), '', '空值掩码为空');
 });
 

@@ -15,40 +15,43 @@
  */
 
 const { assertSafeEndpoint } = require('./endpoint-guard');
+// 密钥结构判定（PEM / 裸 Base64 / PKCS#1 / PKCS#8）的**唯一实现点**，签名侧共用
+const pemKey = require('./pem-key');
 
 /* ============================ 字段级校验器 ============================ */
-
-/** 是否是 PEM 包裹的密钥 / 证书（允许头尾前后有空行与说明文字） */
-function isPemLike(v, marker) {
-  const s = String(v);
-  const begin = new RegExp('-----BEGIN [A-Z ]*' + marker + '-----');
-  const end = new RegExp('-----END [A-Z ]*' + marker + '-----');
-  return begin.test(s) && end.test(s);
-}
-
-/** 是否是"裸" Base64 密钥体（未带 PEM 头的单行 / 多行 Base64） */
-function isBase64Blob(v, minLen) {
-  const body = String(v).replace(/[\s\r\n]/g, '');
-  if (body.length < minLen) return false;
-  return /^[A-Za-z0-9+/=_-]+$/.test(body);
-}
 
 /**
  * 字段级校验器表
  * 每个校验器返回 true 表示通过，返回字符串表示失败原因。
  */
 const VALIDATORS = {
-  /** 私钥：PEM（PKCS#1 / PKCS#8 / EC）或裸 Base64 密钥体 */
+  /**
+   * 私钥：必须**真的能解析成 RSA 私钥**。
+   *
+   * 旧判据是「头尾标记成对」`||`「是一段够长的 Base64」，两者都只看字符、从不解析，
+   * 于是四类真实错填全部通过校验并落盘：把**公钥**贴进私钥框、`'A'.repeat(240)`、
+   * 带口令的加密私钥、只粘了 BEGIN/END 而中间被截断的空壳 PEM。
+   * 落盘之后，错误要到**签名那一刻**才由 OpenSSL 暴露成
+   * `error:1E08010C:DECODER routines::unsupported` —— 管理员看到的是密码学库错误码，
+   * 而不是「你贴错了框」，且此时配置早已保存成功，排查方向被彻底带偏。
+   *
+   * 现在判据只有一条：`pem-key.classify()` 能否把它认成**这一类材料**（私钥 / 公钥），
+   * 且 `asymmetricKeyType === 'rsa'`（支付宝 RSA2 / 微信 APIv3 都不接受 EC / Ed25519）。
+   * `classify()` 而不是 `decodeKey()`：后者对**私钥**喂给公钥校验器时也会成功
+   * （OpenSSL 能从私钥导出公钥），于是「私钥贴进公钥框」会被判成格式正确。
+   * 解不出时返回 `pemKey.explain()` 给出的**可照做**的说法（贴错框 / 有口令 / 粘贴不全 /
+   * 不是 RSA 各有一句，按真实出错频率排序），不再复述底层报错。
+   */
   privateKey(v) {
-    if (isPemLike(v, 'PRIVATE KEY') || isPemLike(v, 'RSA PRIVATE KEY') || isPemLike(v, 'EC PRIVATE KEY')) return true;
-    if (isBase64Blob(v, 200)) return true;
-    return '不是有效的私钥：应为 PEM 格式（-----BEGIN PRIVATE KEY-----）或至少 200 字符的 Base64 密钥体';
+    const c = pemKey.classify(v);
+    if (c && c.kind === 'private' && c.type === 'rsa') return true;
+    return pemKey.explain('private', v);
   },
-  /** 公钥：PEM（PUBLIC KEY / RSA PUBLIC KEY）或裸 Base64 密钥体 */
+  /** 公钥：同上，必须真的解析为 RSA 公钥（SPKI / PKCS#1 两种结构都接受） */
   publicKey(v) {
-    if (isPemLike(v, 'PUBLIC KEY') || isPemLike(v, 'RSA PUBLIC KEY')) return true;
-    if (isBase64Blob(v, 100)) return true;
-    return '不是有效的公钥：应为 PEM 格式（-----BEGIN PUBLIC KEY-----）或至少 100 字符的 Base64 密钥体';
+    const c = pemKey.classify(v);
+    if (c && c.kind === 'public' && c.type === 'rsa') return true;
+    return pemKey.explain('public', v);
   },
   /**
    * 网关 / 回调地址：必须为 https，且**不得指向回环 / 内网 / 云元数据地址**（SEC-03 / R17-02）。
@@ -129,7 +132,7 @@ const PLATFORMS = {
         key: 'privateKey', official: 'private_key', label: '应用私钥', input: 'textarea', required: true, secret: true,
         placeholder: '-----BEGIN PRIVATE KEY-----\n…\n-----END PRIVATE KEY-----',
         validator: 'privateKey', maxLength: 8192,
-        hint: 'RSA2 / SM2 应用私钥，用于请求签名。支持 PEM 或单行 Base64。',
+        hint: '应用私钥（RSA2 / RSA 签名用）。PKCS#8 或 PKCS#1、整段 PEM 或仅 Base64 密钥体都可，保存时会自动校验并统一；SM2 国密密钥本系统暂不支持。',
       },
       {
         key: 'alipayPublicKey', official: 'alipay_public_key', label: '支付宝公钥', input: 'textarea', required: true, secret: true,
@@ -203,7 +206,7 @@ const PLATFORMS = {
         key: 'privateKey', official: 'private_key', label: '商户 API 私钥', input: 'textarea', required: true, secret: true,
         placeholder: '-----BEGIN PRIVATE KEY-----\n…\n-----END PRIVATE KEY-----',
         validator: 'privateKey', maxLength: 8192,
-        hint: 'apiclient_key.pem 的内容（PKCS#8 PEM）。证书与私钥由商户平台下载。',
+        hint: 'apiclient_key.pem 的内容。必须是无口令的 RSA 私钥（PKCS#8 PEM 或仅 Base64 密钥体），保存时会自动校验。',
       },
       {
         key: 'subMchId', official: 'sub_mchid', label: '子商户号', input: 'text', required: false,
@@ -403,12 +406,14 @@ function validate(platformId, values) {
 /**
  * 掩码：仅用于界面提示是否"看起来像已配置"，任何情况下都不回传完整明文。
  * PEM 类密钥头尾固定，中间打码并标注字符数。
+ *
+ * 「是不是 PEM」同样取自 `pem-key.split()`，与校验器、签名侧共用一处判定 ——
+ * 单独留一份只认标记的正则，就会在「标签拼错 / 只粘了半截」时与校验器给出相反结论。
  */
 function maskSecret(v) {
   const s = String(v == null ? '' : v);
   if (!s) return '';
-  if (isPemLike(s, 'PRIVATE KEY') || isPemLike(s, 'RSA PRIVATE KEY') || isPemLike(s, 'EC PRIVATE KEY')
-    || isPemLike(s, 'PUBLIC KEY') || isPemLike(s, 'RSA PUBLIC KEY')) {
+  if (pemKey.split(s).pem) {
     const first = s.trim().split(/\r?\n/)[0];
     return `${first} … 已配置（共 ${s.length} 字符）`;
   }

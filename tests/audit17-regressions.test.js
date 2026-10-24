@@ -137,11 +137,18 @@ test('R17-01 · 取 IP 只有一份实现，WebDAV 复用同一套守卫判定',
 /* R17-02 · 支付宝网关地址必须过 SSRF 主机校验                             */
 /* ==================================================================== */
 
-/** 照官方文档填对的一份支付宝凭证（网关字段留空 → 用默认值） */
+/**
+ * 照官方文档填对的一份支付宝凭证（网关字段留空 → 用默认值）
+ *
+ * 密钥现场生成：私钥 / 公钥校验器已改为**真的解析**（`server/pem-key.js`），
+ * 截断的假 PEM 必然被拒 —— 用它写「合法凭证整体通过」的对照组，等于断言校验器不工作。
+ */
+const CRYPTO = require('crypto');
+const ALIPAY_KEYS = CRYPTO.generateKeyPairSync('rsa', { modulusLength: 2048 });
 const VALID_ALIPAY = {
   appId: '2021004100000000',
-  privateKey: '-----BEGIN PRIVATE KEY-----\nMIIEvQIBADANBgkqhkiG9w0BAQEFAASC\n-----END PRIVATE KEY-----',
-  alipayPublicKey: '-----BEGIN PUBLIC KEY-----\nMIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8A\n-----END PUBLIC KEY-----',
+  privateKey: ALIPAY_KEYS.privateKey.export({ type: 'pkcs8', format: 'pem' }).trim(),
+  alipayPublicKey: ALIPAY_KEYS.publicKey.export({ type: 'spki', format: 'pem' }).trim(),
   signType: 'RSA2',
 };
 

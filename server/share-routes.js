@@ -920,14 +920,64 @@ function orderMetaRows(order, extra) {
 }
 
 /**
+ * 「我已完成支付，立即查询」点击之后**到底发生了什么** —— 必须给用户一个明确的答案。
+ *
+ * 缺陷形态（用户报告「点按钮没有任何反应」）：
+ *   按钮 → `POST /s/:id/pay/check` → 命中 3 秒查单节流 ⇒ `finalizeOrderThrottled()`
+ *   直接 `return false`（**一个网关请求都没发**）→ 无条件 303 回 `/s/:id` →
+ *   该处 `payer.state` 仍是 `pending` ⇒ 重新渲染**一模一样**的等待页。
+ *   页面每 3 秒自动轮询一次，人工点击几乎必然落在节流窗口内 ⇒ 每次点击都"什么也没发生"：
+ *   既没有重新查单，也没有任何文字变化，更没有重新发起支付的入口。
+ *
+ * 修法分两层，缺一层都还是"没反应"：
+ *   ① **如实回报**：查了就说查过（`pending`）、没查就说没查以及上次是几秒前（`recent`）。
+ *      不把「节流跳过」说成「网关说还没付」—— 那是编造事实，会让人误以为已扣款却没到账。
+ *   ② **给出下一步**：等待页补上「重新发起支付」入口（此前只有二维码页有，且那条链接是死路）。
+ *
+ * `checked` 只接受下面这几个固定取值，页面**不接收也不回显任何自由文本**。
+ */
+function payCheckNotice(checked, order) {
+  if (checked === 'pending') {
+    return {
+      kind: 'warn',
+      text: '已向支付网关查询，暂未确认到账。'
+        + '支付平台通常需要几秒到几十秒同步，本页会继续自动查询；若刚刚才付完，请稍等再看。'
+        + '若已扣款但长时间无变化，请带上下方订单号联系客服。',
+    };
+  }
+  if (checked === 'recent') {
+    // 下界取 1 秒：节流只有 3 秒，"0 秒前"在页面上读起来像故障，而它想表达的是"就在刚才"。
+    // 精度损失（实际可能是 0.2 秒前）远小于把一句人话写成机器口径的代价。
+    const sec = Math.max(1, statusQueryAgeSec(order.id));
+    return {
+      kind: 'warn',
+      text: `上一次查询在 ${sec} 秒前，结果仍是「支付中」；`
+        + `为避免把网关查单配额刷光，同一订单最多每 ${Math.round(STATUS_QUERY_MIN_GAP_MS / 1000)} 秒查询一次，`
+        + '稍候会自动再查一次，也可以直接重新发起支付。',
+    };
+  }
+  return null;
+}
+
+/** 上次查单距今几秒（从未查过返回 0）—— 只用于文案，不做任何判定 */
+function statusQueryAgeSec(orderId) {
+  const t = statusQueryAt.get(orderId);
+  if (!t) return 0;
+  return Math.max(0, Math.floor((Date.now() - t) / 1000));
+}
+
+/**
  * 支付中：等待支付结果。
  *
  * 页面每 3 秒轮询一次 `/s/:id/pay/status`；服务端在轮询时**主动向网关查单**
  * （见 payment-gateway 的设计说明），确认到账后置为已支付，页面随即自动放行。
  * 轮询只解决"能不能自动刷新"，**不参与支付结果的判定**。
+ *
+ * @param {string} [checked] 刚从 `/pay/check` 回来时携带的结果码（见 payCheckNotice）
  */
-function payingPage(res, l, order) {
+function payingPage(res, l, order, checked) {
   const p = paymentProviders.platform(order.platform);
+  const notice = payCheckNotice(checked, order);
   renderPage(res, 200, {
     title: '等待支付结果',
     head: `<div class="center-head">
@@ -940,9 +990,11 @@ function payingPage(res, l, order) {
         ${orderMetaRows(order, '<div><span>支付状态</span><b id="pay-state">支付中…</b></div>')}
       </div>
       <div class="pay-note">请在<b>${esc(p ? p.name : order.platform)}</b>完成支付。支付成功后本页会自动放行，无需其他操作。</div>
+      ${notice ? `<div class="${notice.kind}" style="margin-top:12px">${esc(notice.text)}</div>` : ''}
       <form method="POST" action="/s/${esc(l.id)}/pay/check">
         <button class="btn primary" type="submit">我已完成支付，立即查询</button>
       </form>
+      <a class="btn ghost" href="/s/${esc(l.id)}?restart=1" style="display:block;text-align:center;text-decoration:none">重新发起支付</a>
       ${orderNoBox(order.orderNo || order.id)}
       <script src="/js/pay-poll.js" data-link-id="${esc(l.id)}" defer></script>
       ${orderNoScript()}`,
@@ -968,7 +1020,7 @@ function qrPayPage(res, l, order, charge) {
         ${orderMetaRows(order, '<div><span>支付状态</span><b id="pay-state">等待扫码…</b></div>')}
       </div>
       <div class="pay-note">二维码由本服务本地生成，有效期以${esc(p ? p.name : '微信支付')}为准；若二维码过期，请返回上一步重新发起支付。</div>
-      <a class="btn ghost" href="/s/${esc(l.id)}" style="text-align:center;text-decoration:none">放弃并重新发起</a>
+      <a class="btn ghost" href="/s/${esc(l.id)}?restart=1" style="text-align:center;text-decoration:none">放弃并重新发起</a>
       ${orderNoBox(order.orderNo || order.id)}
       <script src="/js/pay-poll.js" data-link-id="${esc(l.id)}" defer></script>
       ${orderNoScript()}`,
@@ -989,7 +1041,7 @@ function payFailedPage(res, l, order) {
       <div class="meta">
         <div><span>需付金额</span><b>¥${paymentRules.formatAmount(order.amountFen)}</b></div>
       </div>
-      <a class="btn primary" href="/s/${esc(l.id)}" style="text-align:center;text-decoration:none">重新支付</a>`,
+      <a class="btn primary" href="/s/${esc(l.id)}?restart=1" style="text-align:center;text-decoration:none">重新支付</a>`,
     below: paidBelowHtml(l, res),
   });
 }
@@ -1256,8 +1308,19 @@ router.get('/s/:id', async (req, res) => {
         below: paidBelowHtml(l, res),
       });
     }
-    if (payer.state === 'pending') return payingPage(res, l, payer.order);
-    if (payer.state === 'failed') return payFailedPage(res, l, payer.order);
+    /**
+     * `?restart=1` = 用户主动要求**重新发起支付**（等待页 / 失败页 / 二维码页上的那个按钮）。
+     *
+     * 必须让它落到 `payPage`（渠道选择页），而不是又渲染一遍「等待支付」——
+     * 旧实现把「重新支付」写成 `href="/s/ID"`，于是 GET 回来仍然命中下面这两个分支，
+     * 页面原样重画一遍，用户点了等于没点。这条死路同时也是二维码页「放弃并重新发起」的成因。
+     *
+     * 只对 `pending` / `failed` 生效：`paid` 已在上面提前返回（已支付的人不能被诱导再付一次），
+     * `refunded` 本来就落到 `payPage`。
+     */
+    const restart = req.query.restart === '1';
+    if (payer.state === 'pending' && !restart) return payingPage(res, l, payer.order, req.query.checked);
+    if (payer.state === 'failed' && !restart) return payFailedPage(res, l, payer.order);
     // 已退款：票据仍然有效（能认出这个人），但不再放行下载 —— 复用付费页让他重新支付
     if (payer.state === 'refunded') {
       return payPage(res, l, ps, paySnapshot().available, '', refundNote(), couponStateFor(l, req));
@@ -1767,13 +1830,21 @@ async function finalizeOrder(l, order) {
  * 刷光（PayPal 一次 = 取 token + 查订单两步），进而把真实支付的确认挤掉。
  * 这与 `/pay/notify` 处已写明的推理是同一件事 —— 那里补了限流，这里漏了。
  *
- * @returns {Promise<boolean>} 本轮是否真的发起了查单（节流命中则为 false）
+ * **返回值从 boolean 改为结果码**：`false` 这一个布尔值把「刚查过、还是支付中」和
+ * 「一次都没查」压成同一件事，调用方只能一律当作"无事发生"（这正是按钮点了没反应的原因）。
+ * 现在把「有没有真的出网」与「出网之后看到什么状态」分开表达，调用方才能给出如实的回答。
+ *
+ * @returns {Promise<'paid'|'failed'|'pending'|'throttled'>}
+ *   `throttled` —— 命中 3 秒节流，**本轮一个网关请求都没发**（不得对外说成"网关说没付"）。
  */
 async function finalizeOrderThrottled(l, order) {
-  if (!statusQueryDue(order)) return false;
+  if (!statusQueryDue(order)) return 'throttled';
   noteStatusQuery(order.id);
-  await finalizeOrder(l, order);
-  return true;
+  const fresh = await finalizeOrder(l, order);
+  const st = fresh && fresh.status;
+  if (st === 'paid') return 'paid';
+  if (st === 'failed') return 'failed';
+  return 'pending';
 }
 
 /**
@@ -1815,15 +1886,33 @@ router.get('/s/:id/pay/return', asyncHandler(async (req, res) => {
   return res.redirect(303, '/s/' + l.id);
 }));
 
-/** 手动触发一次查单（「我已完成支付」按钮） */
+/**
+ * 手动触发一次查单（「我已完成支付」按钮）。
+ *
+ * 旧实现**无条件** 303 回 `/s/:id`，而那条 GET 在 `pending` 时渲染的是同一个等待页 ——
+ * 于是这个按钮的三种真实结果（已到账 / 查了但还是没到账 / 3 秒内刚查过、这次根本没查）
+ * 在界面上完全一样：页面原样重画，一个字都不变。用户只能说"点了没反应"。
+ *
+ * 现在把结果码放进 `?checked=` 带回去（PRG：刷新不会重复提交），由等待页如实显示：
+ *   · `pending` → 「已向支付网关查询，暂未确认到账」
+ *   · `recent`  → 「上一次查询在 N 秒前……这次没有重复查询」（**不谎称查过**）
+ * 已到账 / 已失败不必带码：`/s/:id` 会直接渲染下载页或失败页，本身就是最明确的回答。
+ *
+ * R8-20 的两道闸都不动：`payCheckLimiter` 仍在这个端点最前面，订单级 3 秒节流仍在
+ * `finalizeOrderThrottled` 里 —— 本次只改「怎么回答」，不改「允许多频繁地出网」。
+ */
 router.post('/s/:id/pay/check', asyncHandler(async (req, res) => {
   const l = shareStore.get(req.params.id);
   if (!l) return statePage(res, 'notfound');
   const order = paymentOrders.verifyToken(l.id, getCookie(req, payCookieName(l.id)));
   if (!order || order.linkId !== l.id) return res.redirect(303, '/s/' + l.id);
   if (payCheckRateLimited(req, res, l)) return undefined; // R8-20
-  await finalizeOrderThrottled(l, order);
-  return res.redirect(303, '/s/' + l.id);
+  const outcome = await finalizeOrderThrottled(l, order);
+  const back = '/s/' + encodeURIComponent(l.id);
+  if (outcome === 'pending' || outcome === 'throttled') {
+    return res.redirect(303, back + '?checked=' + (outcome === 'pending' ? 'pending' : 'recent'));
+  }
+  return res.redirect(303, back);
 }));
 
 /**
