@@ -11114,6 +11114,42 @@ const CASES = [
       testFile: 'audit84-regressions.test.js',
       minFail: 1,
     },
+
+    /* ---------------- R85（1.9.20）：两个订单号都要看得见 ---------------- */
+    {
+      name: 'R85-01a · 订单号块不再提示「商户订单号」（买家看到的短号无处可对）',
+      file: 'server/share-routes.js',
+      anchor: '        <div class="orderno-tip">请妥善保存：订单号是售后和取回下载权限的唯一凭证。${gwTip}</div>',
+      replacement: '        <div class="orderno-tip">请妥善保存：订单号是售后和取回下载权限的唯一凭证。</div>',
+      testFile: 'audit85-regressions.test.js',
+      // 中转页 / 二维码页 / 等待页三处渲染都靠这个块，去掉必然三条全红
+      minFail: 3,
+    },
+    {
+      name: 'R85-02a · 中转页改回传字符串（object → orderNo || id），短号又丢了',
+      file: 'server/share-routes.js',
+      anchor: '跳转后请勿关闭支付页面；支付完成后回到本站即可继续下载。</div>\n      ${orderNoBox(order)}',
+      replacement: '跳转后请勿关闭支付页面；支付完成后回到本站即可继续下载。</div>\n      ${orderNoBox(order.orderNo || order.id)}',
+      testFile: 'audit85-regressions.test.js',
+      // 中转页行为红 + R85-03 的「4 个渲染点都传对象」计数红
+      minFail: 2,
+    },
+    {
+      name: 'R85-03a · 商户单号单元格优先取 orderNo（两列显示同一个长号 = 等于没加）',
+      file: 'public/js/ordermgr.js',
+      anchor: "export function gatewayNoCell(o) {\n  const id = o && o.id ? String(o.id) : '';",
+      replacement: "export function gatewayNoCell(o) {\n  const id = o && o.id ? String(o.orderNo || o.id) : '';",
+      testFile: 'audit85-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R85-04a · 表格行不再渲染商户单号单元格（纯函数全绿、界面却少一列）',
+      file: 'public/js/ordermgr.js',
+      anchor: '<td class="ord-no-wrap${dimExtra}">${gatewayNoCell(o)}</td>',
+      replacement: '<td class="ord-no-wrap${dimExtra}"></td>',
+      testFile: 'audit85-regressions.test.js',
+      minFail: 1,
+    },
   ];
 
 module.exports = { runCase, CASES, parseArgs };

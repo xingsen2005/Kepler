@@ -422,10 +422,31 @@ function paidBelowHtml(l, res) {
  *
  * 复制走 `public/js/share-order.js`（同源普通脚本，CSP 不允许内联脚本）；
  * 脚本不可用时订单号本身就是可选中的文本，仍能手工抄下来。
+ *
+ * ## R85：为什么还要显示「商户订单号」
+ *
+ * 本系统有**两个**订单号（`payment-orders.js` 头部的表）：
+ *  · `orderNo`（36 位）—— 用户看的、售后与「恢复购买」用的，就是这个块里的大号；
+ *  · `id`（16 位）—— **支付网关侧的商户单号**（`out_trade_no`），因为微信 v3 的
+ *    `out_trade_no` 最长 32 位，36 位塞不进去（塞了微信渠道直接不可用）。
+ *
+ * 用户在支付宝/微信收银台上看到的是**短的**那个，于是「两边订单号不一样」成了一个
+ * 反复出现的售后问题，更麻烦的是：那个短号原先**界面上任何地方都看不到**，管理员
+ * 拿大号去商家后台检索必然搜不到。这里把两者并列写清楚，买家自述「支付宝页面上
+ * 是 xxxx」时一眼能对上。
+ *
+ * @param {object|null} order 订单（内部形态即可）
+ * @returns {string} 空串表示没有订单号可展示
  */
-function orderNoBox(no) {
-  const v = String(no || '');
+function orderNoBox(order) {
+  const o = order || {};
+  const v = String(o.orderNo || o.id || '');
   if (!v) return '';
+  const gw = String(o.id || '');
+  // 只有两者真的不同才提示 —— 历史订单（没有 orderNo）两个值相等，多写一句只会让人困惑
+  const gwTip = gw && gw !== v
+    ? `<br>收银台（支付宝 / 微信 / PayPal）上的「商户订单号」显示为 <code class="orderno-gw">${esc(gw)}</code>，与本订单号是同一次支付，售后核对时请用它检索。`
+    : '';
   return `
       <div class="orderno-box">
         <div class="orderno-label">订单号</div>
@@ -433,7 +454,7 @@ function orderNoBox(no) {
           <code class="orderno" id="order-no">${esc(v)}</code>
           <button class="copybtn" type="button" data-copy-order="${esc(v)}">复制</button>
         </div>
-        <div class="orderno-tip">请妥善保存：订单号是售后和取回下载权限的唯一凭证。</div>
+        <div class="orderno-tip">请妥善保存：订单号是售后和取回下载权限的唯一凭证。${gwTip}</div>
       </div>`;
 }
 
@@ -889,7 +910,7 @@ function infoPage(res, l, opts = {}) {
         ${extra}
       </div>
       <a class="btn primary" href="/s/${esc(l.id)}/dl" style="text-align:center;text-decoration:none">下载文件</a>
-      ${opts.order ? orderNoBox(opts.order.orderNo || opts.order.id) + orderNoScript() : ''}`,
+      ${opts.order ? orderNoBox(opts.order) + orderNoScript() : ''}`,
     below: opts.below,
   });
 }
@@ -1119,7 +1140,7 @@ function jumpPage(res, l, order, url) {
         style="display:block;text-align:center;text-decoration:none">前往${esc(name)}支付</a>
       <div class="pay-note">本页只是中转：订单已经创建，金额与订单号都已确定。
         跳转后请勿关闭支付页面；支付完成后回到本站即可继续下载。</div>
-      ${orderNoBox(order.orderNo || order.id)}
+      ${orderNoBox(order)}
       ${orderNoScript()}`,
     below: paidBelowHtml(l, res),
   });
@@ -1145,7 +1166,7 @@ function payingPage(res, l, order, checked) {
         <button class="btn primary" type="submit">我已完成支付，立即查询</button>
       </form>
       <a class="btn ghost" href="/s/${esc(l.id)}?restart=1" style="display:block;text-align:center;text-decoration:none">重新发起支付</a>
-      ${orderNoBox(order.orderNo || order.id)}
+      ${orderNoBox(order)}
       <script src="/js/pay-poll.js" data-link-id="${esc(l.id)}" defer></script>
       ${orderNoScript()}`,
     below: paidBelowHtml(l, res),
@@ -1171,7 +1192,7 @@ function qrPayPage(res, l, order, charge) {
       </div>
       <div class="pay-note">二维码由本服务本地生成，有效期以${esc(p ? p.name : '微信支付')}为准；若二维码过期，请返回上一步重新发起支付。</div>
       <a class="btn ghost" href="/s/${esc(l.id)}?restart=1" style="text-align:center;text-decoration:none">放弃并重新发起</a>
-      ${orderNoBox(order.orderNo || order.id)}
+      ${orderNoBox(order)}
       <script src="/js/pay-poll.js" data-link-id="${esc(l.id)}" defer></script>
       ${orderNoScript()}`,
     below: paidBelowHtml(l, res),
@@ -1668,7 +1689,7 @@ function listPage(res, l, v, opts = {}) {
         ${pagerHtml(l, page, pages)}
         ${actions}
       </form>
-      ${opts.order ? orderNoBox(opts.order.orderNo || opts.order.id) : ''}
+      ${opts.order ? orderNoBox(opts.order) : ''}
       ${keysJson}
       <script src="/js/share-list.js" data-link-id="${esc(l.id)}" defer></script>
       ${opts.order ? orderNoScript() : ''}`,

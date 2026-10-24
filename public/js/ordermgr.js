@@ -40,6 +40,27 @@ function fmtLink(o) {
   return `<button class="mini-btn" data-act="copy" title="${escapeHtml(o.linkUrl)}">复制链接</button>`;
 }
 
+/**
+ * R85：「商户单号」单元格 —— 支付网关侧的 `out_trade_no`，就是订单的内部 `id`。
+ *
+ * 为什么这列必须存在：支付宝/微信收银台上显示的就是这个**短**号（微信 v3 的
+ * `out_trade_no` 最长 32 位，36 位的用户订单号塞不进去，见 `payment-orders.js`
+ * 头部那张表）。而这列原先**界面上任何地方都没有** ⇒ 管理员拿 36 位订单号去
+ * 商家后台检索，永远搜不到，只能对着「钱到了但对不上哪一笔」发呆。
+ *
+ * 抽成纯函数是为了能直接断言输出（表格是 `render()` 里拼的字符串，没法单点驱动）。
+ *
+ * @param {object} o `/payment/orders` 的行
+ * @returns {string}
+ */
+export function gatewayNoCell(o) {
+  const id = o && o.id ? String(o.id) : '';
+  if (!id) return '<span class="ord-dash">—</span>';
+  return `<code title="支付网关侧的商户订单号（out_trade_no）：在支付宝 / 微信 / PayPal 商家后台按它检索本笔订单">`
+    + `${escapeHtml(id)}</code>`
+    + `<button class="mini-btn" data-act="copy-gw" title="复制商户单号">复制</button>`;
+}
+
 function fmtDownloaded(o) {
   if (o.downloadedAt) {
     return `<span class="ord-yes" title="${escapeHtml(fmtTime(o.downloadedAt))}">已下载</span>`;
@@ -260,7 +281,8 @@ function render() {
 
   box.innerHTML = ban + `<table class="lk-table">
     <thead><tr>
-      <th>文件</th><th>文件链接</th><th>订单号</th>
+      <th>文件</th><th>文件链接</th><th title="用户可见的 36 位订单号：售后与「恢复购买」的凭证">订单号</th>
+      <th title="支付网关侧的商户订单号（out_trade_no）：在支付宝 / 微信 / PayPal 商家后台按它检索本笔订单">商户单号</th>
       <th title="优惠前的链接标价">原价</th><th title="优惠后应支付的金额">应付</th>
       <th title="这张订单上实际减掉的金额">优惠</th><th title="实际收到的金额（未支付时为空）">实付</th>
       <th title="本笔订单使用的优惠券">优惠券</th>
@@ -293,6 +315,7 @@ function render() {
           <td class="lk-file${dimExtra}" title="${escapeHtml(o.fileKey || o.fileName)}">${escapeHtml(o.fileName || '(未记录文件名)')}</td>
           <td>${fmtLink(o)}</td>
           <td class="ord-no-wrap${dimExtra}" title="${escapeHtml(o.tradeNo || '')}">${escapeHtml(o.orderNo || o.id)}</td>
+          <td class="ord-no-wrap${dimExtra}">${gatewayNoCell(o)}</td>
           <td${dim}>${disc ? escapeHtml(yuan(orig)) : '<span class="ord-dash">' + escapeHtml(yuan(orig)) + '</span>'}</td>
           <td${dim}><b style="color:#b45309">${escapeHtml(yuan(payable))}</b></td>
           <td${dim}>${disc ? `<span style="color:#047857">−${escapeHtml(yuan(disc))}</span>` : '<span class="ord-dash">—</span>'}</td>
@@ -314,6 +337,7 @@ function render() {
     tr.querySelectorAll('[data-act]').forEach((btn) => {
       btn.onclick = () => {
         if (btn.dataset.act === 'copy') copyUrl(o);
+        else if (btn.dataset.act === 'copy-gw') copyGatewayNo(o);
         else if (btn.dataset.act === 'refund') refund(o);
       };
     });
@@ -328,6 +352,27 @@ async function copyUrl(o) {
   } catch (e) {
     openModal({
       title: '分享链接', body: `<textarea readonly style="width:100%;height:72px;border:1px solid var(--border-strong);border-radius:6px;padding:8px;font-size:12px;resize:none">${escapeHtml(url)}</textarea>`,
+      foot: [{ text: '关闭' }],
+    });
+  }
+}
+
+/**
+ * R85：复制商户单号（支付网关侧的 `out_trade_no`）。
+ *
+ * 与 `copyUrl()` 同一套降级策略：剪贴板 API 不可用（非安全上下文 / 权限被拒）时
+ * 弹一个只读输入框让人手工复制 —— 对这一列来说尤其重要，因为它的唯一用途就是
+ * **粘到商家后台的搜索框里**，复制不到就等于没有这一列。
+ */
+async function copyGatewayNo(o) {
+  const id = o && o.id ? String(o.id) : '';
+  if (!id) return;
+  try {
+    await navigator.clipboard.writeText(id);
+    toast('商户单号已复制到剪贴板', { type: 'success' });
+  } catch (e) {
+    openModal({
+      title: '商户单号', body: `<input readonly value="${escapeHtml(id)}" style="width:100%;border:1px solid var(--border-strong);border-radius:6px;padding:8px;font-size:12px" title="全选手动复制">`,
       foot: [{ text: '关闭' }],
     });
   }
