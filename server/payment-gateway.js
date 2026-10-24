@@ -148,6 +148,21 @@ function alipaySignPayload(params) {
   return keys.map((k) => `${k}=${params[k]}`).join('&');
 }
 
+/**
+ * 网关地址归一化（R80）：去掉片段、去掉空白。
+ *
+ * 「网关地址」是管理员手填的输入框，粘贴时常带上行尾空白或一个 `#`（有人习惯
+ * 从文档里连带拷贝锚点）。而 `alipayBuildUrl` 是在地址**尾部**接查询串的：
+ * 一旦 base 里带 `#`，`?app_id=…&sign=…` 就整串落进**片段**里 —— 浏览器不会把片段
+ * 发给服务器，支付宝收到的是一个**没有任何参数**的请求，回一个空白/参数错误页。
+ * 用户看到的是「点了立即支付，跳过去一片空白」，而服务端日志一切正常。
+ * 片段在网关地址里没有任何语义，直接剥掉。
+ */
+function gatewayBase(raw) {
+  const s = String(raw == null ? '' : raw).trim() || ALIPAY_GATEWAY;
+  return s.split('#')[0].trim();
+}
+
 /** 组装支付宝网关跳转 URL（含 sign） */
 function alipayBuildUrl(gateway, params, privateKey, signType) {
   const payload = alipaySignPayload(params);
@@ -158,8 +173,29 @@ function alipayBuildUrl(gateway, params, privateKey, signType) {
     .sort()
     .map((k) => `${k}=${encodeURIComponent(all[k])}`)
     .join('&');
-  const base = String(gateway || ALIPAY_GATEWAY);
+  const base = gatewayBase(gateway);
   return base + (base.includes('?') ? '&' : '?') + query;
+}
+
+/**
+ * 签名算法归一化（R80）。
+ *
+ * `rsaSign()` 只有两档：`RSA` → SHA1，其余一律 SHA256。于是配置里选 **SM2（国密）**
+ * 时会出现「URL 写着 `sign_type=SM2`、签名却是 RSA-SHA256」—— 支付宝必然回
+ * `ILLEGAL_SIGN`，而本系统这边**本地一切成功**：订单建好了、跳转也发生了。
+ * 使用者看到的只是「点完跳到支付宝，报了个错」，无从判断是配置问题。
+ *
+ * 因此这里在下单**之前**就明确拒绝，并把「改哪里」说出来。查单侧 `alipayVerify()`
+ * 对 SM2 早已是同一种态度（本地无法验签 → 明确 false），两处口径就此一致。
+ */
+const ALIPAY_SIGN_TYPES = ['RSA2', 'RSA'];
+function alipaySignType(raw) {
+  const st = String(raw == null ? '' : raw).trim().toUpperCase() || 'RSA2';
+  if (ALIPAY_SIGN_TYPES.indexOf(st) < 0) {
+    throw new Error(`签名算法「${st}」本系统暂不支持（只有 RSA2 / RSA 两种），`
+      + '请在「系统设置 → 支付设置 → 支付宝」把签名算法改为 RSA2 后重试');
+  }
+  return st;
 }
 
 function alipayTimestamp() {
@@ -171,12 +207,15 @@ function alipayTimestamp() {
 }
 
 async function alipayCreate(cfg, { order, subject, returnUrl, notifyUrl }) {
+  // 先归一化签名算法：非 RSA2/RSA 在这里就抛，页面会显示「创建支付订单失败：…」，
+  // 而不是带着一个必然被网关拒绝的 sign_type 跳过去（见 alipaySignType）。
+  const signType = alipaySignType(cfg.signType);
   const params = {
     app_id: cfg.appId,
     method: 'alipay.trade.page.pay',
     format: 'JSON',
     charset: 'utf-8',
-    sign_type: cfg.signType || 'RSA2',
+    sign_type: signType,
     timestamp: alipayTimestamp(),
     version: '1.0',
     return_url: returnUrl,
@@ -190,7 +229,7 @@ async function alipayCreate(cfg, { order, subject, returnUrl, notifyUrl }) {
   };
   if (cfg.appCertSn) params.app_cert_sn = cfg.appCertSn;
   if (cfg.rootCertSn) params.alipay_root_cert_sn = cfg.rootCertSn;
-  const url = alipayBuildUrl(cfg.gateway || ALIPAY_GATEWAY, params, cfg.privateKey, cfg.signType);
+  const url = alipayBuildUrl(cfg.gateway, params, cfg.privateKey, signType);
   return { kind: 'redirect', url, tradeNo: '' };
 }
 

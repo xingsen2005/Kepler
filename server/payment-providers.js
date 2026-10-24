@@ -145,9 +145,9 @@ const PLATFORMS = {
         options: [
           { value: 'RSA2', label: 'RSA2（SHA256，推荐）' },
           { value: 'RSA', label: 'RSA（SHA1，旧版）' },
-          { value: 'SM2', label: 'SM2（国密）' },
+          { value: 'SM2', label: 'SM2（国密，本系统暂不支持）' },
         ],
-        hint: '需与开放平台上该应用配置的加签方式一致。',
+        hint: '需与开放平台上该应用配置的加签方式一致。⚠️ 本系统只有 RSA 签名实现：选 SM2 会在点击「立即支付」时被明确拒绝（提示改回 RSA2），因为国密签名需要 SM2 实现，本地不具备。',
       },
       {
         key: 'gateway', official: 'gateway', label: '网关地址', input: 'text', required: false,

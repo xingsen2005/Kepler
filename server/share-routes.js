@@ -88,6 +88,28 @@ router.use(express.json({ limit: '256kb' }));
  * 拒绝只会误伤脚本化使用。
  */
 const SAFE_METHOD_SET = new Set(security.SAFE_METHODS || ['GET', 'HEAD', 'OPTIONS']);
+
+/**
+ * R80：跨站拒绝的**呈现形态**必须跟着调用方走。
+ *
+ * 旧实现对两种调用方一律 `res.status(403).json(...)`：
+ *  · `fetch` / `XHR` 看到 JSON 是对的（前端能读 error）；
+ *  · 但**表单提交**（密码页、付费页的「立即支付」）是浏览器**整页导航** —— 用户会
+ *    落到一片 `{"error":"请求来源校验失败，已拒绝（CSRF 防护）"}` 上：地址栏跳到了
+ *    `/s/xxx/pay`，页面既不是报错页也没有任何可点的东西。被人描述成
+ *    「点了立即支付没有任何反应」一点也不奇怪 —— 本项目历史上就记过同一句话。
+ * 判据用 `Accept`：表单导航一定带 `text/html`，`fetch` 的默认值是「任意类型」（前端显式
+ * 设 JSON 时更明确）。
+ */
+function rejectCrossSite(req, res, why) {
+  statsStore.addLog({ action: 'share.csrf', level: 'warn', detail: `跨站 ${req.method} ${req.path} 已拒绝（${why}）` });
+  const accept = String(req.headers.accept || '').toLowerCase();
+  if (accept.indexOf('text/html') >= 0) {
+    return statePage(res, 'crosssite');
+  }
+  return res.status(403).json({ error: '请求来源校验失败，已拒绝（CSRF 防护）' });
+}
+
 router.use((req, res, next) => {
   if (SAFE_METHOD_SET.has(req.method)) return next();
   if (String(req.path || '').indexOf('/pay/notify/') === 0) return next();
@@ -120,10 +142,7 @@ router.use((req, res, next) => {
       const proto = security.requestIsSecure(req) ? 'https:' : 'http:';
       ok = u.protocol === proto && u.host === String(req.headers.host || '');
     } catch (e) { ok = false; }
-    if (!ok) {
-      statsStore.addLog({ action: 'share.csrf', level: 'warn', detail: `跨站 ${req.method} ${req.path} 已拒绝（Origin：${origin}）` });
-      return res.status(403).json({ error: '请求来源校验失败，已拒绝（CSRF 防护）' });
-    }
+    if (!ok) return rejectCrossSite(req, res, `Origin：${origin}`);
     return next(); // Origin 明确同源，直接放行
   }
 
@@ -134,10 +153,7 @@ router.use((req, res, next) => {
     secure: security.requestIsSecure(req), // R27-03：与上面同一判据（Referer 回退分支同病）
     hasTicket: false,
   });
-  if (!v.allow) {
-    statsStore.addLog({ action: 'share.csrf', level: 'warn', detail: `跨站 ${req.method} ${req.path} 已拒绝（${v.reason}）` });
-    return res.status(403).json({ error: '请求来源校验失败，已拒绝（CSRF 防护）' });
-  }
+  if (!v.allow) return rejectCrossSite(req, res, v.reason);
   return next();
 });
 
@@ -836,6 +852,35 @@ function infoPage(res, l, opts = {}) {
   });
 }
 
+/**
+ * R80：「发起支付的点击**没有**创建订单」时的原因码（`?e=`）。
+ *
+ * 起因是一次真实反馈：「填写正确的应用ID、私钥、公钥、网关地址，点击『立即支付』
+ * 没有任何反应」。`POST /s/:id/pay` 当时有三条**静默**分支 —— 都是
+ * `res.redirect(303, '/s/' + l.id)`：付费功能刚被停用、密码票据失效、订单已支付。
+ * 页面随即被重画一次，绝大多数情况下**看起来与刚才一模一样**（或者只是变成
+ * 免费/已支付页），没有一个字说明「你刚才那次点击为什么不算数」。
+ *
+ * 现在一律带上原因码回到 `/s/:id`，由该页如实解释。**只认白名单里的固定文案**，
+ * 不接收也不回显任何自由文本（避免把查询串变成反射点）。
+ */
+const PAY_E_NOTICE = {
+  'pay-off': {
+    kind: 'warn',
+    text: '本次点击没有创建支付订单：该链接的付费功能刚刚被停用（或支付渠道被关闭），文件现在可以直接免费下载。',
+  },
+  paid: {
+    kind: 'ok',
+    text: '你已完成这笔订单的支付，本次点击没有新建订单，可直接下载。',
+  },
+};
+
+/** 读取 `?e=` 原因码（白名单外的值一律当作没有） */
+function payNoticeFromQuery(q) {
+  const k = String((q && q.e) || '');
+  return Object.prototype.hasOwnProperty.call(PAY_E_NOTICE, k) ? PAY_E_NOTICE[k] : null;
+}
+
 /** 付费页：展示金额与可选渠道，提交后创建订单 */
 
 function payPage(res, l, ps, available, err, note = '', coupon = null) {
@@ -890,12 +935,14 @@ function payPage(res, l, ps, available, err, note = '', coupon = null) {
       ${err ? `<div class="warn">${esc(err)}</div>` : ''}
       ${note ? `<div class="warn">${esc(note)}</div>` : ''}
       ${priceHtml}
-      <form method="POST" action="/s/${esc(l.id)}/pay">
+      <form method="POST" action="/s/${esc(l.id)}/pay" data-pay-submit="1">
         ${applied ? `<input type="hidden" name="coupon" value="${esc(c.code)}">` : ''}
         <div class="pay-opts">${opts}</div>
         <button class="btn primary" type="submit">立即支付</button>
       </form>
-      ${couponBox}`,
+      <div id="pay-submit-note" class="warn" role="status" hidden></div>
+      ${couponBox}
+      <script src="/js/pay-poll.js" data-link-id="${esc(l.id)}" defer></script>`,
     below: paidBelowHtml(l, res),
   });
 }
@@ -1287,6 +1334,8 @@ router.get('/s/:id', async (req, res) => {
 
   // ---- 付费下载（第四种限制）----
   const ps = paidStateFor(l);
+  // R80：刚被 `POST /s/:id/pay` 退回来说明原因（见 PAY_E_NOTICE）
+  const eNote = payNoticeFromQuery(req.query);
   if (ps.effective) {
     const payer = payerStateFor(l, req);
     if (payer.state === 'paid') {
@@ -1300,8 +1349,9 @@ router.get('/s/:id', async (req, res) => {
         // 非法值由 listPage 收敛到 1，单文件页忽略它。
         page: req.query.page,
         extraRows: paidRows,
-        note: '支付已完成，可直接下载。',
-        noteKind: 'ok',
+        // R80：从「已支付却点了立即支付」退回来时，说明这次点击为什么不算数
+        note: eNote ? eNote.text : '支付已完成，可直接下载。',
+        noteKind: eNote ? eNote.kind : 'ok',
         // R64：订单号是取回下载权限的唯一凭证 —— 已支付页必须给出完整号码
         order: payer.order,
         // R64：卡片下方的「查看历史订单 / 恢复购买」
@@ -1333,11 +1383,14 @@ router.get('/s/:id', async (req, res) => {
   if (ps.required) {
     return infoPage(res, l, {
       page: req.query.page,
-      note: paymentRules.REASON_TEXT[ps.reason] || '该文件当前可免费下载。',
+      // R80：若是刚点了「立即支付」被退回来的，原因码的说明优先（它更贴合用户当下在做的事）
+      note: eNote ? eNote.text : (paymentRules.REASON_TEXT[ps.reason] || '该文件当前可免费下载。'),
+      noteKind: eNote ? eNote.kind : 'warn',
     });
   }
 
-  return infoPage(res, l, { page: req.query.page });
+  // R80：落到这里说明这条链接**本来就不收费**（`?e=pay-off` 的另一半：付费勾选已被取消）
+  return infoPage(res, l, { page: req.query.page, note: eNote ? eNote.text : '', noteKind: eNote ? eNote.kind : 'warn' });
 });
 
 /* ------------------------------ R51：列表页 ------------------------------ */
@@ -1644,12 +1697,33 @@ router.post('/s/:id/pay', asyncHandler(async (req, res) => {
   if (!l) return statePage(res, 'notfound');
   const st = shareStore.status(l);
   if (st !== 'active') return statePage(res, st, shareStore.view(l));
+  /**
+   * R80：下面三次「拒绝发起支付」原本都是 `res.redirect(303, '/s/' + l.id)` ——
+   * 页面上**一个字都不会变**（多数情况下 `/s/:id` 又渲染回同一张付费页）。
+   * 用户看到的就是「点击『立即支付』没有任何反应」。三条都必须留下可读的原因：
+   *   ① 密码票据失效 / 没有票据 → 直接渲染密码页并说明「请先验证访问密码」；
+   *   ② 付费功能刚被停用 → 带 `?e=pay-off` 回去，由 `/s/:id` 解释「文件已转免费」；
+   *   ③ 订单已支付 → 带 `?e=paid` 回去，由 `/s/:id` 说明「已完成支付，未新建订单」。
+   * 同时三条都写审计日志，管理员事后能查到「钱没少，是被哪一道闸挡下的」。
+   */
   if (l.passwordHash && !shareStore.verifyToken(l, getCookie(req, cookieName(l.id)))) {
-    return res.redirect(303, '/s/' + l.id);
+    statsStore.addLog({
+      action: 'share.pay', level: 'warn',
+      detail: `已拒绝发起支付：未持有效访问密码票据（链接 ${l.id}，IP：${security.clientIp(req)}）`,
+    });
+    return passwordPage(res, l, true,
+      '访问密码的验证状态已失效（可能是浏览器清理了 Cookie，或换了浏览器/隐身窗口），请重新输入访问密码后再支付。');
   }
 
   const ps = paidStateFor(l);
-  if (!ps.effective) return res.redirect(303, '/s/' + l.id); // 已转免费，无需支付
+  if (!ps.effective) {
+    // 已转免费 / 支付被停用 / 无可用渠道：不该建单，但必须说清楚
+    statsStore.addLog({
+      action: 'share.pay', level: 'warn',
+      detail: `已拒绝发起支付：付费当前不生效（链接 ${l.id}，原因：${ps.reason || 'unknown'}，IP：${security.clientIp(req)}）`,
+    });
+    return res.redirect(303, '/s/' + l.id + '?e=pay-off');
+  }
 
   // 限流：同一 IP 对同一链接的支付发起（防止刷订单）
   const ip = security.clientIp(req);
@@ -1659,7 +1733,23 @@ router.post('/s/:id/pay', asyncHandler(async (req, res) => {
   const platform = String((req.body && req.body.platform) || '');
   const available = paySnapshot().available;
   if (!available.includes(platform)) {
-    return payPage(res, l, ps, available, '请选择一个可用的支付方式', '', couponStateFor(l, req));
+    /**
+     * R80：文案要能照做。`!platform` 与「渠道刚被停用」是两件事：
+     *  · 表单没带 `platform`（页面上一个单选都没有 / 被插件移除 / 用了过期页面），
+     *    说「请选择支付方式」等于让用户去点一个不存在的东西；
+     *  · 带了但不在可用集，说明配置在这几秒内变了，得让他刷新重来。
+     * 两种情况都记一条日志 —— 这条分支**不会**在正常流程里出现，出现了就是线索。
+     */
+    const msg = !platform
+      ? (available.length
+        ? '没有收到所选的支付方式（页面可能已过期），请刷新本页后重新选择。'
+        : '当前没有任何可用的支付渠道，无法发起支付，请联系分享者检查支付设置。')
+      : `你选择的支付方式（${platform}）当前不可用，可能是刚刚被停用，请刷新本页后重新选择。`;
+    statsStore.addLog({
+      action: 'share.pay', level: 'warn',
+      detail: `已拒绝发起支付：支付方式不可用（链接 ${l.id}，提交「${platform || '空'}」，可用：${available.join(',') || '无'}）`,
+    });
+    return payPage(res, l, ps, available, msg, '', couponStateFor(l, req));
   }
 
   // R14-05：动单之前先问「这个人现在是什么支付态」—— 与 `GET /s/:id`（:571）和
@@ -1670,8 +1760,12 @@ router.post('/s/:id/pay', asyncHandler(async (req, res) => {
   //   ② 每次点击都新建订单，是 R14-03「灌单挤出在途订单」的直接推手。
   const payer = payerStateFor(l, req);
   if (payer.state === 'paid') {
-    // 已付即放行：不再建单，也不动票据
-    return res.redirect(303, '/s/' + l.id);
+    // 已付即放行：不再建单，也不动票据。R80：带上原因码，让 `/s/:id` 说明「这次点击为什么没建单」
+    statsStore.addLog({
+      action: 'share.pay', level: 'warn',
+      detail: `已拒绝发起支付：该浏览器在本链接上已有已支付订单（链接 ${l.id}，订单 ${payer.order ? payer.order.id : '-'}）`,
+    });
+    return res.redirect(303, '/s/' + l.id + '?e=paid');
   }
 
   let order;
@@ -1788,9 +1882,25 @@ router.post('/s/:id/pay', asyncHandler(async (req, res) => {
   }
   if (charge.tradeNo) paymentOrders.setTradeNo(order.id, charge.tradeNo);
 
-  if (charge.kind === 'qrcode') return qrPayPage(res, l, order, charge);
+  if (charge.kind === 'qrcode' && (charge.svg || charge.codeUrl)) return qrPayPage(res, l, order, charge);
   if (charge.kind === 'redirect' && charge.url) return res.redirect(302, charge.url);
-  return payingPage(res, l, order);
+  /**
+   * R80：`createCharge` 说「成功了」，却没给出任何**能付款的入口**时，绝不能落到 `payingPage`。
+   *
+   * 那一页写着「订单已创建，请在支付宝完成支付后返回本页」—— 可用户既没有被送去支付平台，
+   * 也没有二维码，「我已完成支付」按钮点下去自然永远是「支付中」。这正是
+   * 「点了立即支付没有任何反应」的另一条隐蔽路径：**订单建了，收银台没给**。
+   * 网关实现一旦回归（kind 拼错 / url 为空），这里必须当场说清楚而不是静默降级。
+   */
+  paymentOrders.markFailed(order.id, '支付渠道未返回可用的收银台地址');
+  releaseCouponForOrder(order);
+  statsStore.addLog({
+    action: 'share.pay', level: 'error',
+    detail: `分享链接 ${l.id} 订单 ${order.id} 下单异常：渠道 ${chargePlatform} 返回 kind=${charge.kind || '空'}，无收银台地址`,
+  });
+  return payPage(res, l, ps, available,
+    `创建支付订单失败：支付渠道（${chargePlatform}）没有返回可用的收银台地址，请检查该渠道的网关地址配置后重试`,
+    '', couponStateFor(l, req));
 }));
 
 /**

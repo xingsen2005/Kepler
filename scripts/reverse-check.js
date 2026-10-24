@@ -10532,6 +10532,126 @@ const CASES = [
       testFile: 'audit79-regressions.test.js',
       minFail: 1,
     },
+    {
+      /**
+       * R80 的原始形态：`!ps.effective` 时 `res.redirect(303, '/s/' + l.id)` ——
+       * 页面被原样重画一次，一个字都不解释。撤掉原因码后 R80-01 必红。
+       */
+      name: 'R80-01a · 付费停用时退回「静默 303 回分享页」（点了没有任何反应）',
+      file: 'server/share-routes.js',
+      anchor: "    return res.redirect(303, '/s/' + l.id + '?e=pay-off');",
+      replacement: "    return res.redirect(303, '/s/' + l.id); // R80 反向变异：静默回去",
+      testFile: 'audit80-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * 密码票据失效时静默 303 ⇒ 用户既没看到密码框，也不知道该去哪输密码。
+       */
+      name: 'R80-02a · 密码票据失效时退回「静默 303」而不是渲染密码页',
+      file: 'server/share-routes.js',
+      anchor: "    return passwordPage(res, l, true,\n      '访问密码的验证状态已失效（可能是浏览器清理了 Cookie，或换了浏览器/隐身窗口），请重新输入访问密码后再支付。');",
+      replacement: "    return res.redirect(303, '/s/' + l.id); // R80 反向变异：静默回去",
+      testFile: 'audit80-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * 已支付分支静默 303 ⇒ `/s/:id` 只是换成"已支付页"，没有一个字说明
+       * 「你刚才那次点击为什么没有建单」。
+       */
+      name: 'R80-03a · 已支付再点退回「静默 303」（不说明这次没有新建订单）',
+      file: 'server/share-routes.js',
+      anchor: "    return res.redirect(303, '/s/' + l.id + '?e=paid');",
+      replacement: "    return res.redirect(303, '/s/' + l.id); // R80 反向变异：静默回去",
+      testFile: 'audit80-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * 跨站拒绝退回「一律 JSON」⇒ 表单导航的用户落到一片 `{"error":…}` 上，
+       * 这与本项目历史上记档的「提交无反应」是同一现象。
+       */
+      name: 'R80-04a · 跨站拒绝退回「一律返回裸 JSON」（表单提交者看到一片 JSON）',
+      file: 'server/share-routes.js',
+      anchor: "  if (accept.indexOf('text/html') >= 0) {\n    return statePage(res, 'crosssite');\n  }",
+      replacement: "  // R80 反向变异：不再区分调用方，一律 JSON",
+      testFile: 'audit80-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * `rsaSign()` 只有 RSA / 非 RSA 两档 ⇒ SM2 会被静默当成 RSA-SHA256，
+       * 而 URL 里写着 `sign_type=SM2`：本地一切成功，支付宝必然 ILLEGAL_SIGN。
+       */
+      name: 'R80-05a · SM2 不再本地拒绝（静默降级成 RSA 签名，跳过去被网关拒）',
+      file: 'server/payment-gateway.js',
+      anchor: '  const signType = alipaySignType(cfg.signType);',
+      replacement: "  const signType = cfg.signType || 'RSA2'; // R80 反向变异：不做任何校验",
+      testFile: 'audit80-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * 网关地址里的 `#` 会把整串签名参数压进**片段**：浏览器不把片段发给服务器，
+       * 支付宝收到空请求 —— 页面"跳过去了"，却一片空白。
+       */
+      name: 'R80-06a · 网关地址不再剥掉 # 片段（签名参数全落进片段）',
+      file: 'server/payment-gateway.js',
+      anchor: "  return s.split('#')[0].trim();",
+      replacement: '  return s; // R80 反向变异：不剥片段',
+      testFile: 'audit80-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * 渠道说"成功"却没给收银台时静默降到「等待支付」页：用户既没被送去支付平台
+       * 也没有二维码，那个「我已完成支付」按钮永远查不到东西。
+       */
+      name: 'R80-07a · 无收银台地址时静默降级到等待支付页（订单建了、收银台没给）',
+      file: 'server/share-routes.js',
+      anchor: "  paymentOrders.markFailed(order.id, '支付渠道未返回可用的收银台地址');",
+      replacement: "  if (!charge.url) return payingPage(res, l, order); // R80 反向变异：静默降级\n"
+        + "  paymentOrders.markFailed(order.id, '支付渠道未返回可用的收银台地址');",
+      testFile: 'audit80-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * 支付表单不带 `data-pay-submit` ⇒ 脚本认不出它，点击的即时反馈与兜底提示
+       * 一起消失（R80-08 直接断挂点，R80-09 靠假 DOM 真跑）。
+       */
+      name: 'R80-08a · 支付表单去掉 data-pay-submit 标记（脚本无从接管提交反馈）',
+      file: 'server/share-routes.js',
+      anchor: '<form method="POST" action="/s/${esc(l.id)}/pay" data-pay-submit="1">',
+      replacement: '<form method="POST" action="/s/${esc(l.id)}/pay">',
+      testFile: 'audit80-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * 脚本不再接管提交 ⇒ 按钮不变灰、提示位不出现、12 秒兜底也不会响：
+       * 页面在"什么都没发生"与"其实被浏览器吞了"之间毫无区分能力。
+       */
+      name: 'R80-09a · pay-poll 不再接管支付表单（提交后依旧毫无反馈）',
+      file: 'public/js/pay-poll.js',
+      anchor: "  const form = document.querySelector ? document.querySelector('form[data-pay-submit]') : null;\n  if (!form) return;",
+      replacement: '  const form = null; // R80 反向变异：不接管表单\n  if (!form) return;',
+      testFile: 'audit80-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * 轮询不再以「页面上有没有 #pay-state」为开关 ⇒ 付费页（此时还没有订单）
+       * 每 3 秒白打一次 `/pay/status`。
+       */
+      name: 'R80-10a · 轮询不再按 #pay-state 开关（付费页也每 3 秒打一次 /pay/status）',
+      file: 'public/js/pay-poll.js',
+      anchor: '  if (stateBox()) {',
+      replacement: '  if (true) { // R80 反向变异：无条件轮询',
+      testFile: 'audit80-regressions.test.js',
+      minFail: 1,
+    },
   ];
 
 module.exports = { runCase, CASES, parseArgs };
