@@ -57,6 +57,17 @@ function yuan(fen) {
   return `¥${(Number(fen || 0) / 100).toFixed(2)}`;
 }
 
+/**
+ * R88：券的优惠描述（**唯一实现点**，表格 / 删除确认共用）。
+ *
+ * 「满 50 减 5」与「减 5」在账上完全不同：前者在金额不足时根本不能用。
+ * 只把面额写出来，管理员在列表里看不出这两张券的差别。
+ */
+function fmtDiscount(c) {
+  const min = Number(c.minSpendFen) || 0;
+  return min > 0 ? `满 ${yuan(min)} 减 ${yuan(c.amountFen)}` : yuan(c.amountFen);
+}
+
 function fmtUses(c) {
   return `已用 ${Number(c.used) || 0} / ${Number(c.maxUses) > 0 ? Number(c.maxUses) : '∞'}`;
 }
@@ -118,11 +129,11 @@ function rowOf(c) {
     <td><input type="checkbox" class="cp-ck"${checked ? ' checked' : ''}></td>
     <td><code class="cp-code" title="点击复制">${escapeHtml(c.code)}</code></td>
     <td title="${escapeHtml((c.type === 'links' ? (c.linkIds || []).join('\n') : (c.userIds || []).join('\n')))}">${escapeHtml(fmtScope(c))}</td>
-    <td><b style="color:#b45309">${escapeHtml(yuan(c.amountFen))}</b></td>
+    <td style="white-space:nowrap"><b style="color:#b45309">${escapeHtml(fmtDiscount(c))}</b></td>
     <td>${escapeHtml(fmtUses(c))}</td>
     <td>${c.perUserOnce ? '<span class="lk-badge ok">是</span>' : '<span class="lk-dash">—</span>'}</td>
     <td${dim}>${escapeHtml(fmtWindow(c))}</td>
-    <td><span class="lk-badge ${sm.cls}">${sm.label}</span></td>
+    <td><span class="lk-badge ${sm.cls}">${escapeHtml(sm.label)}</span></td>
     <td class="lk-acts">
       <button class="mini-btn" data-act="toggle">${c.disabled ? '启用' : '停用'}</button>
       <button class="mini-btn danger" data-act="del">删除</button>
@@ -310,7 +321,7 @@ async function toggleOne(c) {
 async function removeOne(c) {
   const ok = await confirmDialog({
     title: '删除优惠券',
-    message: `确定删除券码 <b>${escapeHtml(c.code)}</b>（${escapeHtml(yuan(c.amountFen))}）吗？<br><br>`
+    message: `确定删除券码 <b>${escapeHtml(c.code)}</b>（${escapeHtml(fmtDiscount(c))}）吗？<br><br>`
       + '<span style="color:var(--text-2)">删除后该券码<b>立即失效</b>，已支付的订单不受影响；此操作不可恢复。</span>',
     okText: '删除', danger: true, allowHtml: true,
   });
@@ -384,6 +395,11 @@ function openGenerate() {
       <label for="${p}-amount">优惠金额（元）</label>
       <input type="number" id="${p}-amount" class="full" min="0.01" step="0.01" value="1.00" autocomplete="off">
       <div class="hint">优惠后最低支付 0.01 元；券面额大于文件价格时，实际优惠封顶到「原价 − 0.01 元」。</div>
+    </div>
+    <div class="form-item">
+      <label for="${p}-minspend">使用门槛「满 xx 减 xx」（元）</label>
+      <input type="number" id="${p}-minspend" class="full" min="0" step="0.01" value="0" autocomplete="off">
+      <div class="hint">填 <b>0</b> 或留空 = 无门槛（直减券）。门槛按分享链接的<b>原价</b>比较：原价不足时这张券对本单不可用，买家会看到「需满 ¥xx」。门槛与「适用范围」相互独立，可同时限制。</div>
     </div>
     <div class="form-item">
       <label for="${p}-uses">总使用次数</label>
@@ -475,6 +491,11 @@ async function submitGenerate(overlay, p, close, linkPicker, userPicker) {
   const amountRaw = String(overlay.querySelector(`#${p}-amount`).value || '').trim();
   const amount = Number(amountRaw);
   if (!Number.isFinite(amount) || amount < 0.01) { toast('优惠金额至少 0.01 元', { type: 'warn' }); return; }
+  // R88：门槛留空 = 无门槛；填了就必须是 ≥ 0.01 元的正数（0.004 这类会被服务端拒收，先在本地拦住）
+  const minSpendRaw = String(overlay.querySelector(`#${p}-minspend`).value || '').trim();
+  const minSpend = minSpendRaw === '' ? 0 : Number(minSpendRaw);
+  if (!Number.isFinite(minSpend) || minSpend < 0) { toast('使用门槛须为不小于 0 的数字（0 = 无门槛）', { type: 'warn' }); return; }
+  if (minSpend > 0 && Math.round(minSpend * 100) < 1) { toast('使用门槛最低 0.01 元；不需要门槛请填 0', { type: 'warn' }); return; }
   const usesRaw = String(overlay.querySelector(`#${p}-uses`).value || '').trim();
   const maxUses = usesRaw === '' ? 0 : Number(usesRaw);
   if (!Number.isInteger(maxUses) || maxUses < 0) { toast('总使用次数须为不小于 0 的整数（0 = 不限制）', { type: 'warn' }); return; }
@@ -486,7 +507,7 @@ async function submitGenerate(overlay, p, close, linkPicker, userPicker) {
   }
 
   const body = {
-    count, type, amount, maxUses,
+    count, type, amount, minSpend, maxUses,
     perUserOnce: Boolean(overlay.querySelector(`#${p}-once`).checked),
     startAt, expireAt,
     note: String(overlay.querySelector(`#${p}-note`).value || '').trim(),

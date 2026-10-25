@@ -444,6 +444,20 @@ function normalizeRule(r) {
   delete o.bucketId;
   o.kind = normalizeKind(o.kind);
   o.speedLimit = coerceSpeedLimit(o.speedLimit);
+  /**
+   * R87：`methods` 必须在这里归一 —— 它是**判定用字段**，而 `matchRules()` /
+   * `speedLimitFor()` 都直接读 `r.methods.length`。
+   *
+   * `addRule` / `updateRule` 走的是唯一实现点 `normalizeMethods()`，但「配置备份导入」
+   * （`replaceAllRules` → 读盘 `load()`）把**外部 JSON 里的规则**原样塞进来：只要其中
+   * 一条缺 `methods`（或写成字符串/数字），`r.methods` 就是 `undefined`，全局 IP 守卫
+   * 中间件在**每个请求**上抛 `TypeError: Cannot read properties of undefined (reading 'length')`
+   * → 全站 500，而管理接口在同一个进程里同样不可用，只能手工改数据文件才能恢复。
+   *
+   * 归一化点只有这一个（与 `kind` / `speedLimit` / `bucketIds` 同一处），
+   * 因此「读盘」与「导入」两条入口天然同口径。
+   */
+  o.methods = normalizeMethods(o.methods);
   const cached = o._parsed;
   const stale = !cached || cached.text !== String(o.target || '').trim();
   const corrupt = Boolean(cached && cached.v6 && !Buffer.isBuffer(cached.bytes));

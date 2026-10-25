@@ -1125,6 +1125,10 @@ input.full { width: 100%; }
 .wd-card-sub { font-size: 11.5px; color: var(--text-2); margin-top: 2px; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
 .wd-card-sub code { font-family: Consolas, monospace; color: #374151; }
 .wd-pw { font-family: Consolas, monospace; color: #374151; }
+/* R89：卡片上的「可见范围」标签 —— 未绑定（能看整个桶）用警示色，绑定用户用中性绿 */
+.wd-scope { padding: 0 6px; border-radius: 9px; font-size: 10.5px; line-height: 16px; display: inline-block; }
+.wd-scope.all { background: #fef3c7; color: #b45309; }
+.wd-scope.own { background: #e6f7ed; color: #16a34a; }
 .wd-acts { white-space: nowrap; display: flex; gap: 4px; }
 .wd-acts .mini-btn.danger { color: var(--danger); border-color: #f3c1c1; }
 .wd-acts .mini-btn.danger:hover { background: var(--tint-bad); color: var(--danger); }

@@ -4,6 +4,7 @@
  */
 const { express, configStore, statsStore, shareStore, paymentProviders, paymentRules } = require('./_context');
 const { getClient, p, normalizeKey, badRequest, listAllInfo } = require('../s3');
+const userSpace = require('../user-space'); // R89：分享快照必须落**绝对** key（见 toSpacePaths）
 const { roleOf, requireConfig, mapLimit } = require('./_shared');
 const { parseSpeedLimitInput } = require('../limits');
 // R50：二维码生成器 —— 与微信支付 Native 下单用的是**同一个**零依赖实现
@@ -173,6 +174,21 @@ function collectPaths(body) {
 }
 
 /**
+ * R89：相对路径 → 桶内**绝对** key（分享快照必须存绝对 key）。
+ *
+ * 分享链接是**无会话**的（`share-routes.js` 挂在 `/s/...` 上，不经过 `/api` 的
+ * 鉴权中间件，因此没有 `requestContext`），下载时不可能再补算空间根 ——
+ * 所以快照里必须是绝对 key，`items[]` 一旦存了相对 key，链接建得出来、
+ * 点开却恒 404，而且要等用户投诉才会发现。
+ *
+ * 反过来，这里若**不加根**，`buildSnapshot` 的 `headObject` 会被 `s3.js` 的
+ * 兜底断言判成越界（普通用户永远建不出分享）。
+ */
+function toSpacePaths(cfg, rels) {
+  return rels.map((r) => userSpace.toAbs(cfg.spaceRoot, r));
+}
+
+/**
  * 构建条目快照（创建时冻结，上限 {@link shareStore.SNAPSHOT_MAX}）。
  *
  * 两个刻意的取舍：
@@ -248,7 +264,9 @@ router.post('/links', async (req, res) => {
     if (!paths.length) return res.status(400).json({ error: '请选择要分享的文件或文件夹' });
     const params = parseLinkParams(b);
 
-    const snap = await buildSnapshot({ client, cfg, paths });
+    // R89：加空间根（见 toSpacePaths 的说明）。越界/伪造的 key 由这里收口成「自己的
+    // 命名空间下不存在」，再由 buildSnapshot 报 404 —— 与「文件真的不存在」同一句文案。
+    const snap = await buildSnapshot({ client, cfg, paths: toSpacePaths(cfg, paths) });
     if (snap.error) return res.status(snap.status || 400).json({ error: snap.error });
     if (!snap.items.length) return res.status(400).json({ error: '请选择要分享的文件或文件夹' });
 

@@ -517,7 +517,7 @@ function encCookieOptions() {
   return {
     httpOnly: true,
     sameSite: 'lax',
-    secure: !!security.IS_DEPLOY,
+    secure: security.cookieSecure(), // R87：与主会话同一判据
     maxAge: encStore.TOKEN_TTL_MS,
     path: '/s/', // 只发给分享路由，绝不进入 /api/**
   };
@@ -2525,7 +2525,7 @@ function shareCookieOptions(id) {
   return {
     httpOnly: true,
     sameSite: 'lax',
-    secure: !!security.IS_DEPLOY, // 部署模式（非回环）下强制仅经 HTTPS 传输
+    secure: security.cookieSecure(), // R87：与主会话同一判据（"确实在用 HTTPS"，不再只是部署模式）
     maxAge: COOKIE_MAX_AGE,
     path: '/',
   };
@@ -2769,7 +2769,7 @@ router.post('/s/:id/logout', (req, res) => {
     path: '/',
     httpOnly: true,
     sameSite: 'lax',
-    secure: !!security.IS_DEPLOY,
+    secure: security.cookieSecure(), // R87：与主会话同一判据
   });
   return res.redirect(303, l ? '/s/' + encodeURIComponent(l.id) : '/');
 });

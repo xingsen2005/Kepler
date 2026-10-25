@@ -744,6 +744,14 @@ const COUPON_MAX_TARGETS = 200;
 const COUPON_AMOUNT_MIN_FEN = 1;
 const COUPON_AMOUNT_MAX_FEN = 10000000;
 
+/**
+ * R88：使用门槛（「满 xx 减 xx」的 **xx**）的上限。
+ *
+ * 与优惠金额同档：门槛只是一个用来比较的整数，没有任何计算，上限的作用是
+ * 防止「填一个天文数字」把券变成永远不可用（那是纯粹的配置错误，不是业务表达）。
+ */
+const COUPON_MIN_SPEND_MAX_FEN = COUPON_AMOUNT_MAX_FEN;
+
 /** 单张券最多保留多少条核销台账（超出丢最旧；`used` 计数始终准确） */
 const COUPON_USES_MAX = 200;
 
@@ -794,6 +802,29 @@ function parseCouponAmountInput(v) {
   const fen = Math.round(n * 100);
   if (fen < COUPON_AMOUNT_MIN_FEN) return { ok: false, error: '优惠金额最低 0.01 元' };
   if (fen > COUPON_AMOUNT_MAX_FEN) return { ok: false, error: `优惠金额不能超过 ${COUPON_AMOUNT_MAX_FEN / 100} 元` };
+  return { ok: true, value: fen };
+}
+
+/**
+ * R88：使用门槛（元）→ 分。**留空 / 0 = 无门槛**（存量券与「直减券」的语义）。
+ *
+ * 与 `parseCouponAmountInput` 的差别只有两处，但都关系到「能不能存下一张坏券」：
+ *  · `0` 是合法值（`amount` 的 0 必须拒绝，因为 0 元券等于免费；门槛 0 等于叠加的
+ *    「满 0 减」，与直减券完全等价 —— 拒绝它反而让「改成无门槛」变成一个做不到的动作）；
+ *  · 小于 1 分但大于 0 的值（如 `0.004`）**显式报错**而不是四舍五入成 0：静默归一会
+ *    把「我明明填了门槛」变成一张无门槛券，而管理员看不出是被自己填的小数吃掉的。
+ */
+function parseCouponMinSpendInput(v) {
+  if (v === undefined || v === null || v === '') return { ok: true, value: 0 };
+  const n = Number(v);
+  if (!Number.isFinite(n)) return { ok: false, error: '使用门槛必须是数字' };
+  if (n < 0) return { ok: false, error: '使用门槛不能为负数' };
+  if (n === 0) return { ok: true, value: 0 };
+  const fen = Math.round(n * 100);
+  if (fen < COUPON_AMOUNT_MIN_FEN) return { ok: false, error: '使用门槛最低 0.01 元；不需要门槛请留空或填 0' };
+  if (fen > COUPON_MIN_SPEND_MAX_FEN) {
+    return { ok: false, error: `使用门槛不能超过 ${COUPON_MIN_SPEND_MAX_FEN / 100} 元` };
+  }
   return { ok: true, value: fen };
 }
 
@@ -924,6 +955,7 @@ module.exports = {
   COUPON_CODE_ALPHABET, COUPON_CODE_LEN, COUPON_CODE_RE,
   COUPON_BATCH_MAX, COUPON_NOTE_MAX, COUPON_MAX_USES_MAX, COUPON_TYPES,
   COUPON_MAX_TARGETS, COUPON_AMOUNT_MIN_FEN, COUPON_AMOUNT_MAX_FEN, COUPON_USES_MAX,
+  COUPON_MIN_SPEND_MAX_FEN, parseCouponMinSpendInput,
   normalizeCouponCode, normalizeCouponType,
   parseCouponCodeInput, parseCouponCountInput, parseCouponAmountInput,
   parseCouponMaxUsesInput, parseCouponTimeInput, parseCouponIdsInput, parseCouponNoteInput,

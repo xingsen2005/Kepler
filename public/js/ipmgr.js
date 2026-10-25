@@ -119,7 +119,7 @@ function ruleTableHtml(rules, withSpeed) {
       ${rules.map((r) => `<tr data-id="${escapeHtml(r.id)}">
         <td class="lk-file" style="font-family:Consolas,monospace">${escapeHtml(r.target)}</td>
         <td>${scopeCell(r)}</td>
-        <td>${r.methods && r.methods.length ? r.methods.map((m) => `<span class="ipg-method${['PUT', 'POST', 'DELETE'].includes(m) ? ' m-write' : ''}">${m}</span>`).join(' ') : '<span class="bk-sub">全部方法</span>'}</td>
+        <td>${r.methods && r.methods.length ? r.methods.map((m) => `<span class="ipg-method${['PUT', 'POST', 'DELETE'].includes(m) ? ' m-write' : ''}">${escapeHtml(m)}</span>`).join(' ') : '<span class="bk-sub">全部方法</span>'}</td>
         ${withSpeed ? `<td><span class="lk-badge warn">${escapeHtml(speedText(r.speedLimit))}</span></td>` : ''}
         <td>${escapeHtml(r.remark || '')}</td>
         <td>${r.enabled ? '<span class="lk-badge ok">生效中</span>' : '<span class="lk-badge">已禁用</span>'}</td>

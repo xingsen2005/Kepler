@@ -8,6 +8,8 @@
  *    type,                           // 适用范围：'any' 无门槛 | 'links' 限特定链接 | 'users' 限特定用户
  *    linkIds, userIds,               // type 对应的目标集合（另一侧为空数组）
  *    amountFen,                      // 优惠金额（**分**，整数）
+ *    minSpendFen,                    // 【R88】使用门槛（**分**，整数）：`0` = 无门槛（直减券）
+ *                                    //   —— 「满 minSpendFen 减 amountFen」就是这个字段加面额
  *    maxUses, used,                  // 总使用次数（0 = 不限制）与实际核销次数
  *    perUserOnce,                    // 是否「每个用户只能使用一次」
  *    startAt, expireAt,              // 生效 / 到期时刻（null = 立即可用 / 永久有效）
@@ -30,6 +32,14 @@
  *    可同时开启的开关。同时开启的语义是「两者都要满足」，界面上却极容易被读成
  *    「任一满足」；需求原文也是「类型限制：A、B、C」这种并列关系。
  *
+ * ④ 【R88】**「满 xx 减 xx」是 `minSpendFen` 字段，不是第四种 `type`**。
+ *    两个维度的区别值得写清楚，因为「加一种券类型」是上手时最自然的想法：
+ *     · `type` 回答的是 **「谁能用、在哪些链接上用」**；
+ *     · 门槛回答的是 **「这笔订单够不够格用」**。
+ *    把「满减」塞进 `type` 会立刻与 `links` / `users` 互斥 —— 于是「只在某个链接上
+ *    满 50 减 10」这种再正常不过的配置就表达不出来了，正是 ③ 刻意避开的那个错误。
+ *    故门槛是**与 `type` 正交**的独立字段，`0` 即直减券（存量券缺这个字段 ⇒ 行为不变）。
+ *
  * ## 身份（identity）怎么来
  *
  * 分享页是**匿名可达**的，付款人未必登录。故身份由 `identityFrom()` 统一给出：
@@ -46,7 +56,7 @@ const path = require('path');
 const secureStore = require('./secure-store');
 const {
   COUPON_CODE_ALPHABET, COUPON_CODE_LEN, COUPON_CODE_RE,
-  COUPON_MAX_TARGETS, COUPON_TYPES, COUPON_USES_MAX,
+  COUPON_MAX_TARGETS, COUPON_TYPES, COUPON_USES_MAX, COUPON_MIN_SPEND_MAX_FEN,
   normalizeCouponCode, normalizeCouponType,
 } = require('./limits');
 
@@ -72,9 +82,29 @@ const COUPON_FAIL_TEXT = {
   wrong_user: '该优惠券仅限指定用户使用，请先登录对应账户',
   already_used: '您已使用过该优惠券',
   no_price: '当前分享链接无需付费，无法使用优惠券',
+  /**
+   * 【R88】门槛不足。`{min}` 由 `validateForUse()` 按这张券的实际门槛填值 ——
+   * 只说「未达到使用门槛」等于让买家自己去猜差多少，而**差多少正是他唯一需要知道的**。
+   */
+  below_threshold: '该优惠券需满 {min} 才能使用，当前商品金额不足',
 };
 
 let cache = null;
+
+/** 分 → 「¥50.00」。文案里出现的金额一律经此，避免各调用点各写一套 toFixed */
+function fenText(fen) {
+  return `¥${(Math.max(0, Math.floor(Number(fen) || 0)) / 100).toFixed(2)}`;
+}
+
+/**
+ * 文案模板填值（`{min}` 这类占位符）。**只替换模板里真实出现的键**，
+ * 未提供的键原样保留 —— 宁可显示一个 `{min}`，也不要把 `undefined` 印给买家看。
+ */
+function fillText(tpl, vars) {
+  const s = String(tpl == null ? '' : tpl);
+  if (!vars) return s;
+  return s.replace(/\{(\w+)\}/g, (m, k) => (Object.prototype.hasOwnProperty.call(vars, k) ? String(vars[k]) : m));
+}
 
 function ensureDataDir() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -119,6 +149,19 @@ function normalizeUses(raw) {
 }
 
 /**
+ * 【R88】门槛值的落盘归一（**唯一实现点**）。
+ *
+ * `generate` / `update` / `bulkUpdate` 三处都要写这个字段 —— 各写一份的话，
+ * 迟早出现「生成时能填 999999 元、批量修改却能填到天文数字」这种同一字段两套规则。
+ * 非法值一律退化为 `0`（无门槛）：与 `normalizeRecord` 同一条理由，门槛是可降级的字段。
+ */
+function clampMinSpend(v) {
+  const n = Math.floor(Number(v) || 0);
+  if (!Number.isFinite(n) || n <= 0) return 0;
+  return Math.min(n, COUPON_MIN_SPEND_MAX_FEN);
+}
+
+/**
  * 单条记录归一化。非法记录**整条丢弃**（码不合规 / 金额非正），
  * 与 `invite-store.normalize` 同一条理由：留着只会让管理员看见一行
  * 「有效」却怎么都用不了。
@@ -133,6 +176,14 @@ function normalizeRecord(r, seen, warn) {
   const type = normalizeCouponType(r.type);
   const amountFen = Number(r.amountFen);
   if (!Number.isInteger(amountFen) || amountFen <= 0) { warn.drop += 1; return null; }
+  /**
+   * 【R88】门槛归一：非正数一律当 `0`（无门槛），超上限 clamp 到上限。
+   *
+   * 这里**不丢弃整条记录**（与 `amountFen` 的处置不同）：金额坏了的券「减多少」无从
+   * 得知，留着它只会让买家看到一张面额错误的券；而门槛坏了的券仍然可以退化成
+   * 直减券用 —— 丢掉它等于因为一个可选字段把整张已发出去的券作废。
+   */
+  const minSpendFen = clampMinSpend(r.minSpendFen);
 
   const maxUses = Number(r.maxUses);
   const used = Number(r.used);
@@ -150,6 +201,7 @@ function normalizeRecord(r, seen, warn) {
     linkIds: type === 'links' ? linkIds : [],
     userIds: type === 'users' ? userIds : [],
     amountFen,
+    minSpendFen,
     maxUses: Number.isInteger(maxUses) && maxUses > 0 ? maxUses : 0,
     used: Number.isInteger(used) && used > 0 ? used : 0,
     perUserOnce: Boolean(r.perUserOnce),
@@ -260,6 +312,7 @@ function view(r, now = Date.now()) {
     linkIds: Array.isArray(r.linkIds) ? r.linkIds.slice() : [],
     userIds: Array.isArray(r.userIds) ? r.userIds.slice() : [],
     amountFen: Number(r.amountFen) || 0,
+    minSpendFen: Number(r.minSpendFen) || 0,
     maxUses,
     used,
     remaining: maxUses > 0 ? Math.max(0, maxUses - used) : null,
@@ -344,7 +397,10 @@ function computePayable(originalFen, discountFen) {
  * @returns {{ok:false, reason:string, message:string} | {ok:true, coupon:object, originalFen:number, discountFen:number, payableFen:number}}
  */
 function validateForUse({ code, link, identity, userId, now = Date.now() }) {
-  const fail = (reason) => ({ ok: false, reason, message: COUPON_FAIL_TEXT[reason] || COUPON_FAIL_TEXT.not_found });
+  const fail = (reason, vars) => ({
+    ok: false, reason,
+    message: fillText(COUPON_FAIL_TEXT[reason] || COUPON_FAIL_TEXT.not_found, vars),
+  });
 
   const normalized = normalizeCouponCode(code);
   if (!normalized) return fail('not_found');
@@ -369,8 +425,23 @@ function validateForUse({ code, link, identity, userId, now = Date.now() }) {
     if (!who || (Array.isArray(c.identities) ? c.identities : []).indexOf(who) >= 0) return fail('already_used');
   }
 
+  const minSpend = Number(c.minSpendFen) || 0;
   const original = Number(link && link.paid && link.paid.amountFen) || 0;
   if (original <= 0) return fail('no_price');
+
+  /**
+   * 【R88】门槛判定（「满 xx 减 xx」）。
+   *
+   * ⚠️ 必须排在 `no_price` **之后**：一条免付费链接上填一张满减券，买家该看到
+   * 「当前分享链接无需付费」，而不是「未满 50 元」—— 后者暗示「多买点就能用」，
+   * 而这里根本没有可买的东西。
+   *
+   * 比较的量是 `link.paid.amountFen`（这张链接的**原价**），不是券后价：
+   * 门槛定义在「商品金额」上，与是否叠加其它优惠无关（本版本也只允许一张券）。
+   */
+  if (minSpend > 0 && original < minSpend) {
+    return fail('below_threshold', { min: fenText(minSpend) });
+  }
 
   const calc = computePayable(original, c.amountFen);
   return {
@@ -448,12 +519,12 @@ function releaseByOrder(orderId) {
 /**
  * 批量生成优惠券。
  *
- * @param {object} o `{ count, type, linkIds, userIds, amountFen, maxUses, perUserOnce, startAt, expireAt, note, createdBy }`
+ * @param {object} o `{ count, type, linkIds, userIds, amountFen, minSpendFen, maxUses, perUserOnce, startAt, expireAt, note, createdBy }`
  *   —— 数值与时间的合法性由路由层用 `limits.js` 的解析器挡过，这里只做落盘归一。
  * @returns {Array<object>} 新生成的记录视图（按生成顺序）
  */
 function generate({
-  count, type, linkIds, userIds, amountFen, maxUses,
+  count, type, linkIds, userIds, amountFen, minSpendFen, maxUses,
   perUserOnce, startAt, expireAt, note, createdBy,
 }) {
   const store = load();
@@ -475,6 +546,7 @@ function generate({
       linkIds: t === 'links' ? (Array.isArray(linkIds) ? linkIds.slice(0, COUPON_MAX_TARGETS) : []) : [],
       userIds: t === 'users' ? (Array.isArray(userIds) ? userIds.slice(0, COUPON_MAX_TARGETS) : []) : [],
       amountFen: Math.max(1, Math.floor(Number(amountFen) || 0)),
+      minSpendFen: clampMinSpend(minSpendFen),
       maxUses: Number.isInteger(Number(maxUses)) && Number(maxUses) > 0 ? Number(maxUses) : 0,
       used: 0,
       perUserOnce: Boolean(perUserOnce),
@@ -509,6 +581,7 @@ function bulkUpdate(ids, patch) {
     if (p.disabled !== undefined) r.disabled = Boolean(p.disabled);
     if (p.maxUses !== undefined) r.maxUses = Number(p.maxUses) > 0 ? Number(p.maxUses) : 0;
     if (p.amountFen !== undefined) r.amountFen = Math.max(1, Math.floor(Number(p.amountFen) || 0));
+    if (p.minSpendFen !== undefined) r.minSpendFen = clampMinSpend(p.minSpendFen);
     if (p.expireAt !== undefined) r.expireAt = isoOrNull(p.expireAt);
     if (p.startAt !== undefined) r.startAt = isoOrNull(p.startAt);
     if (p.note !== undefined) r.note = typeof p.note === 'string' ? p.note : '';
@@ -527,6 +600,7 @@ function update(id, patch) {
   if (p.disabled !== undefined) r.disabled = Boolean(p.disabled);
   if (p.maxUses !== undefined) r.maxUses = Number(p.maxUses) > 0 ? Number(p.maxUses) : 0;
   if (p.amountFen !== undefined) r.amountFen = Math.max(1, Math.floor(Number(p.amountFen) || 0));
+  if (p.minSpendFen !== undefined) r.minSpendFen = clampMinSpend(p.minSpendFen);
   if (p.expireAt !== undefined) r.expireAt = isoOrNull(p.expireAt);
   if (p.startAt !== undefined) r.startAt = isoOrNull(p.startAt);
   if (p.note !== undefined) r.note = typeof p.note === 'string' ? p.note : '';

@@ -324,7 +324,7 @@ function render() {
           <td${dim}>${escapeHtml(o.platformName || o.platform || '—')}</td>
           <td${dim}>${escapeHtml(fmtTime(o.createdAt))}</td>
           <td${dim}>${fmtTimeOrDash(o.paidAt)}</td>
-          <td><span class="lk-badge ${sm.cls}"${refundTitle ? ` title="${refundTitle}"` : ''}>${sm.label}</span></td>
+          <td><span class="lk-badge ${sm.cls}"${refundTitle ? ` title="${refundTitle}"` : ''}>${escapeHtml(sm.label)}</span></td>
           <td${dim}>${fmtDownloaded(o)}</td>
           <td class="lk-acts">${fmtActions(o)}</td>
         </tr>`;

@@ -19,6 +19,7 @@ const { requireAdmin, apiHandler } = require('./_shared');
 const {
   COUPON_TYPES, normalizeCouponType,
   parseCouponCountInput, parseCouponAmountInput, parseCouponMaxUsesInput,
+  parseCouponMinSpendInput,
   parseCouponTimeInput, parseCouponIdsInput, parseCouponNoteInput,
 } = require('../limits');
 
@@ -59,6 +60,16 @@ function buildPatch(b, partial) {
     const r = parseCouponAmountInput(b.amount);
     if (!r.ok) throw Object.assign(new Error(r.error), { status: 400 });
     patch.amountFen = r.value;
+  }
+  /**
+   * R88：「满 xx 减 xx」的门槛。**允许显式改成 0**（无门槛）—— 故这里用
+   * `!== undefined` 而不是真值判断：`minSpend: 0` 是一个必须能生效的动作
+   * （与 `disabled: false`、`maxUses: 0` 同一类陷阱）。
+   */
+  if (b.minSpend !== undefined) {
+    const r = parseCouponMinSpendInput(b.minSpend);
+    if (!r.ok) throw Object.assign(new Error(r.error), { status: 400 });
+    patch.minSpendFen = r.value;
   }
   if (b.startAt !== undefined) {
     const r = parseCouponTimeInput(b.startAt, '开始时间');
@@ -119,6 +130,10 @@ router.post('/coupons', requireAdmin, apiHandler(async (req, res) => {
   const amt = parseCouponAmountInput(b.amount);
   if (!amt.ok) throw Object.assign(new Error(amt.error), { status: 400 });
 
+  // R88：「满 xx 减 xx」的门槛（留空 = 无门槛的直减券）
+  const minSpend = parseCouponMinSpendInput(b.minSpend);
+  if (!minSpend.ok) throw Object.assign(new Error(minSpend.error), { status: 400 });
+
   const mu = parseCouponMaxUsesInput(b.maxUses === undefined ? 0 : b.maxUses);
   if (!mu.ok) throw Object.assign(new Error(mu.error), { status: 400 });
 
@@ -148,6 +163,7 @@ router.post('/coupons', requireAdmin, apiHandler(async (req, res) => {
     linkIds,
     userIds,
     amountFen: amt.value,
+    minSpendFen: minSpend.value,
     maxUses: mu.value,
     perUserOnce: Boolean(b.perUserOnce),
     startAt: st.value,
@@ -160,7 +176,10 @@ router.post('/coupons', requireAdmin, apiHandler(async (req, res) => {
     action: 'coupon.generate', level: 'info',
     // 日志只记数量与配置，不记券码本身（与邀请码同：审计日志是明文 JSONL）
     detail: `管理员「${req.authUser.username}」生成 ${made.length} 张优惠券`
-      + `（${TYPE_LABEL[type] || type}；优惠 ¥${(amt.value / 100).toFixed(2)}`
+      + `（${TYPE_LABEL[type] || type}；`
+      + (minSpend.value > 0
+        ? `满 ¥${(minSpend.value / 100).toFixed(2)} 减 ¥${(amt.value / 100).toFixed(2)}`
+        : `优惠 ¥${(amt.value / 100).toFixed(2)}`)
       + `；次数=${mu.value || '不限'}；每人一次=${b.perUserOnce ? '是' : '否'}`
       + `；有效期=${st.value || '立即'} ~ ${ex.value || '永久'}`
       + `${type === 'links' ? `；链接 ${linkIds.length} 个` : ''}`

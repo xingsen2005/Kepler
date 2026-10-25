@@ -59,4 +59,32 @@ function setActiveBucketId(id) {
   if (s) s.activeBucketId = id || '';
 }
 
-module.exports = { runWith, current, token, role, activeBucketId, setActiveBucketId };
+/** 当前请求所属用户的 id（无上下文时返回空串） */
+function userId() {
+  const s = current();
+  return s && s.userId ? s.userId : '';
+}
+
+/**
+ * 当前上下文的存储空间根（R89）。空串 = **无作用域**，即管理层视角或内部调用。
+ *
+ * 与 `role()` 的宽松回退**刻意不同**：角色判不准只是少一个按钮，空间判不准
+ * 是看到别人的字节。故这里在「角色说是 user、却没有 userId」时**抛错**
+ * （fail-closed），而不是像 `configStore.sessionRole()` 那样回退成 admin。
+ */
+function spaceRoot() {
+  const s = current();
+  if (!s) return '';
+  const role = s.role ? String(s.role) : '';
+  const uid = s.userId ? String(s.userId) : '';
+  if (!role) return '';           // 内部调用 / WebDAV 等无角色上下文
+  if (role !== 'user') return '';  // root / admin 看全部
+  if (!uid) {
+    const e = new Error('会话缺少用户标识，无法确定存储空间');
+    e.status = 500;
+    throw e;
+  }
+  return require('./user-space').rootForUserId(uid);
+}
+
+module.exports = { runWith, current, token, role, userId, spaceRoot, activeBucketId, setActiveBucketId };

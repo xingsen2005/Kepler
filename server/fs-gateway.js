@@ -178,19 +178,44 @@ function bufferStream(stream, maxBytes = MAX_WRITE_BUFFER) {
   return new Promise((resolve, reject) => {
     const chunks = [];
     let total = 0;
+    let ended = false;
+    let settled = false;
+    const fail = (e) => { if (!settled) { settled = true; reject(e); } };
     stream.on('data', (chunk) => {
       total += chunk.length;
       if (total > maxBytes) {
         stream.destroy();
         const e = new Error(`上传数据超过上限（${Math.round(maxBytes / 1024 / 1024)}MB），请使用管理端的分片上传`);
         e.status = 413;
-        reject(e);
+        fail(e);
         return;
       }
       chunks.push(chunk);
     });
-    stream.on('end', () => resolve(Buffer.concat(chunks)));
-    stream.on('error', reject);
+    stream.on('end', () => {
+      if (settled) return;
+      ended = true;
+      settled = true;
+      resolve(Buffer.concat(chunks));
+    });
+    stream.on('error', fail);
+    /**
+     * R87：**客户端中途断开也必须结算这个 Promise**。
+     *
+     * 旧实现只听 `end` / `error`。而一个被对端掐断的上传（WebDAV PUT 到一半断网、
+     * 浏览器取消）在多数 Node 版本上只触发 `aborted` + `close`，**不触发 `error`** ——
+     * 于是这个 Promise 永远悬着：`writeObject()` 里的 `await bufferStream(...)` 不返回，
+     * `finally { release() }` 不执行，`MAX_WRITE_STREAMS`（=2）的槽位被永久占死。
+     * 断两次，**整站所有 WebDAV 写入**（含上传、MOVE、MKCOL 的写路径）一起挂死，
+     * 只有重启进程才能恢复。
+     *
+     * 判据用「正常 `end` 之前就 `close`」= 提前关闭。`end` 之后自动销毁也会 `close`，
+     * 因此必须靠 `ended` 标记区分，否则每次成功上传都会被判失败。
+     */
+    stream.on('close', () => {
+      if (ended || settled) return;
+      fail(Object.assign(new Error('上传连接已中断（客户端提前断开）'), { status: 400 }));
+    });
   });
 }
 
@@ -561,6 +586,38 @@ async function deletePrefixAll(client, cfg, key, onDeleted, opts = {}) {
     rounds += 1;
   }
   return { count: deleted, bytes, truncated, rounds, stalled };
+}
+
+/**
+ * 按**快照**删除一批已知 key（不做任何重新列举）。
+ *
+ * R87：`rename` / `move` 的目录分支此前是「列举快照 → 复制 → `deletePrefixAll`」，
+ * 而 `deletePrefixAll` 会在删除那一刻**重新列举**整个前缀。两次列举之间的窗口里，
+ * 任何人往该目录新上传一个对象，它都**没被复制**（不在快照里）却**会被删掉**
+ * —— 静默、不可逆的数据丢失。目录越大、搬运越久，窗口越宽。
+ *
+ * 同一文件里的 `movePrefix`（WebDAV）删的正是快照，两条实现口径不一致，这里补齐。
+ * 语义与 `deletePrefixAll` 对齐：批量走 `deleteMultipleConfirmed`（唯一判据实现点），
+ * 只把**本批确认删除**的 key 交给 `onDeleted`（清解密元数据 / 标分享失效）。
+ *
+ * @returns {Promise<{count:number, truncated:boolean, failed:string[]}>}
+ *   `truncated=true` 表示有对象没删干净（调用方必须如实上报，不能当成功）。
+ */
+async function deleteKeysAll(client, cfg, keys, onDeleted) {
+  const all = (Array.isArray(keys) ? keys : []).filter(Boolean);
+  let deleted = 0;
+  const failed = [];
+  for (let i = 0; i < all.length; i += 1000) {
+    const batch = all.slice(i, i + 1000);
+    const res = await deleteMultipleConfirmed(client, cfg, batch);
+    deleted += res.okKeys.length;
+    if (onDeleted && res.okKeys.length) onDeleted(res.okKeys);
+    if (res.okKeys.length < batch.length) {
+      const okSet = new Set(res.okKeys);
+      for (const k of batch) if (!okSet.has(k)) failed.push(k);
+    }
+  }
+  return { count: deleted, truncated: failed.length > 0, failed };
 }
 
 /**
@@ -1122,6 +1179,8 @@ module.exports = {
   deletePrefix,
   // R23-03：前缀递归删除的唯一实现点（fs / buckets / WebDAV 三条入口共用）
   deletePrefixAll,
+  // R87：按**快照**删除已知 key（rename / move 目录分支用，杜绝「重新列举」窗口）
+  deleteKeysAll,
   copyObject,
   moveObject,
   movePrefix,
@@ -1134,6 +1193,8 @@ module.exports = {
   rangeServable,
   // 仅供测试：暴露加密读取信号量，用于验证「错误销毁不会把计数减成负数」(FUN-02)
   __test__: {
+    // R87：上传流缓冲的提前关闭判据（写信号量槽位泄漏的根因所在）
+    bufferStream,
     acquireEncryptReader,
     makeEncryptReaderReleaser,
     activeCount: () => activeEncryptReaders,

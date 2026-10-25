@@ -16,7 +16,7 @@
  * 旧实现只有前者，于是「管理员」这个角色既表示「能进用户管理」，又隐含「能管任何人」——
  * 管理员之间可以互相删除的越权漏洞正是由此而来。
  */
-const { express, configStore, statsStore, authSession, emailCode } = require('./_context');
+const { express, configStore, statsStore, authSession, emailCode, security } = require('./_context');
 /**
  * R71：**「谁能管谁」的唯一接口层判定点** —— R78 起实现搬到 `_shared.js`。
  *
@@ -168,6 +168,23 @@ router.put('/users/me', async (req, res) => {
     }
 
     if (needsCurrent) {
+      /**
+       * R87：本端点会做一次**口令哈希校验**，必须按 IP 限流。
+       *
+       * `configStore.verifyUserPassword` 是 scrypt（N=131072），单次约几十到上百毫秒
+       * CPU。此前这条路径**没有任何 limiter**（SEC-05 只给 `routes/webauthn.js` 挂了
+       * `passwordLimiter`），于是有两重后果：
+       *  ① 任何登录用户并发提交即可拖死进程内**全部** scrypt 路径（登录 / WebDAV / 备份）；
+       *  ② 会话被劫持者可以无限速地爆破 `currentPassword`，通过后改密码 + 改邮箱，
+       *     把真实所有者永久锁在门外 —— 这一步本应被「知道当前密码」挡住。
+       * 限流键与 webauthn 那条**刻意分开**（`users-me:` 前缀）：两个端点的预算互不挤占。
+       */
+      const ip = security.clientIp(req) || 'unknown';
+      const rl = security.passwordLimiter('users-me:' + ip);
+      if (!rl.ok) {
+        res.setHeader('Retry-After', String(rl.retryAfter));
+        return res.status(429).json({ error: `操作过于频繁，请 ${rl.retryAfter} 秒后重试` });
+      }
       // 校验走 `configStore.verifyUserPassword`（与登录、WebDAV 认证共用的同一份
       // scrypt 校验实现，不另写一套比较）。
       const current = String(b.currentPassword == null ? '' : b.currentPassword);
@@ -321,6 +338,41 @@ router.put('/users/:id', requireAdmin, async (req, res) => {
     const isSelf = target.id === (req.authUser && req.authUser.id);
     if (!isSelf && denyIfCannotManage(req, res, target, '编辑')) return;
     const b = req.body || {};
+    /**
+     * R87：**编辑自己**时，改密码 / 改邮箱必须先校验当前密码。
+     *
+     * 这条与 `/users/me` 是同一道闸（R21-09 就是这么加的），但当时只加在了 `/users/me`
+     * 上。而 `isSelf` 分支**跳过了** `denyIfCannotManage`，随后 `patch.password`
+     * 直接落库 —— 于是「会话被劫持的管理员」只要对自己的 id 调一次本端点，
+     * 就能在**不知道当前密码**的前提下改密 + 改邮箱，再靠 `sensitive` 触发的
+     * 全会话失效把真实所有者永久锁出。换句话说 R21-09 保护的正是这类人，
+     * 却留了一条同义的旁路。
+     *
+     * 判定与 `/users/me` 完全同源（`touchesCred` 的两条判据、提示文案、日志动作都对齐）。
+     */
+    if (isSelf) {
+      const changesPassword = b.password !== undefined && b.password !== '';
+      const changesEmail = b.email !== undefined;
+      if (changesPassword || changesEmail) {
+        const ip = security.clientIp(req) || 'unknown';
+        const rl = security.passwordLimiter('users-self-edit:' + ip);
+        if (!rl.ok) {
+          res.setHeader('Retry-After', String(rl.retryAfter));
+          return res.status(429).json({ error: `操作过于频繁，请 ${rl.retryAfter} 秒后重试` });
+        }
+        const current = String(b.currentPassword == null ? '' : b.currentPassword);
+        if (!current) {
+          return res.status(400).json({ error: '请输入当前密码以确认身份', needCurrentPassword: true });
+        }
+        if (!(await configStore.verifyUserPassword(target.id, current))) {
+          statsStore.addLog({
+            action: 'users.update', level: 'warn',
+            detail: `用户「${target.username}」自助变更（密码 / 邮箱）：当前密码校验失败`,
+          });
+          return res.status(403).json({ error: '当前密码不正确' });
+        }
+      }
+    }
     /**
      * R71：**角色字段的闸门**。
      *

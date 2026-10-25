@@ -48,6 +48,8 @@
 const crypto = require('crypto');
 const configStore = require('./config-store');
 const ipGuard = require('./ip-guard');
+// R87：导入落库前的端点校验必须与正常保存路径**同一实现**（含 DNS 解析级复核）
+const { assertSafeEndpointResolved } = require('./endpoint-guard');
 
 /** 明文实时码的抬头（便于肉眼识别与版本演进） */
 const CODE_HEAD = 'KEPLER-CONFIG-V1';
@@ -537,9 +539,8 @@ async function open(sealedCode, backupPassword) {
  * 调用方必须先过 `canImport()`；本函数**不做**这道判断（它是「怎么写」的实现点，
  * 「准不准写」是路由层的职责），但会在写完后 `flush()`，避免去抖窗口内进程退出丢配置。
  */
-function apply(data) {
+async function apply(data) {
   if (!data || typeof data !== 'object') throw badCode('备份内容为空');
-
   // ① API Key + 负载均衡（同一条记录：`quotaBytes` 就是「负载均衡」里的空间上限）
   const creds = data.credentials || {};
   const credentials = (Array.isArray(creds.credentials) ? creds.credentials : []).map(sanitizeCredential);
@@ -548,6 +549,28 @@ function apply(data) {
   const bk = data.buckets || {};
   const buckets = (Array.isArray(bk.buckets) ? bk.buckets : []).map(sanitizeBucket);
   const activeBucketId = String(bk.activeBucketId || '');
+
+  /**
+   * R87：**落库之前**逐条过端点安全校验 —— 与「API Key / 存储桶」正常保存路径同源。
+   *
+   * 正常路径（`addCredential` / `updateCredential` / `addBucket`）在写入前会调
+   * `assertSafeEndpoint`，R69 又给对象存储端点补了**解析级**复核
+   * （`assertSafeEndpointResolved`：域名解析到内网 / 元数据地址即拒绝）。
+   * 导入路径此前一条都没有：`apply()` 把外部 JSON 里的 `endpoint` 原样
+   * `configStore.save()` 进去，而 `save()` 对 endpoint 零校验。
+   *
+   * 后果不是「配错了用不了」这么简单：一旦端点落库，它就**跨密钥轮换存活**——
+   * 管理员之后在界面上重填真实 AccessKey / SecretKey（这一步只改密钥、不动端点），
+   * 真实的 AK/SK 就被发往那个被植入的地址。也就是说「导入一份别人的导出码」
+   * 可以变成一次凭证外发。
+   *
+   * 放在这里（解析完、写之前）而不是写完之后：导入是**整体覆盖**，写到一半再拒
+   * 只会留下半份配置。解析失败（离线 / 内网 DNS 不可达）时该函数本身放行，
+   * 与正常保存路径的语义一致。
+   */
+  for (const ent of credentials.concat(buckets)) {
+    if (ent.endpoint) await assertSafeEndpointResolved(ent.endpoint);
+  }
 
   configStore.save({
     credentials,
@@ -631,7 +654,15 @@ function apply(data) {
   const ag = sanitizeAgreements(data.agreements);
   configStore.saveAgreements({ terms: ag.terms, privacy: ag.privacy });
 
-  configStore.flush();
+  /**
+   * R87：`flush()` **必须 await**。
+   *
+   * `configStore.flush()` 返回的是落盘队列（Promise）。旧实现丢弃返回值，于是
+   * 「导入成功」的响应会先于磁盘写入发出：此时进程若被容器重启 / OOM 杀掉，
+   * 界面已经告诉管理员「导入完成」，磁盘上却还是旧配置（或写到一半）。
+   * 导入是一次**整体覆盖**，它必须是「要么全都在盘上、要么明确报错」。
+   */
+  await configStore.flush();
   return summarize(collect());
 }
 

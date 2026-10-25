@@ -450,6 +450,16 @@ function accountCardHTML(a, w) {
   const username = escapeHtml(a.username || '');
   const serverUrl = escapeHtml(w.serverUrl || webdavFallbackUrl(w));
   const hasPw = a.hasPassword ? '已设置' : '未设置';
+  /**
+   * R89：把「这个账户能看多少」直接写在卡片上。
+   *
+   * 未绑定时用**警示色**而不是普通灰：它是「能访问整个桶」的管理账户，
+   * 而这正是本轮要消灭的那种「配好了、却没人意识到是全开的」状态。
+   */
+  const ownerUser = a.ownerUserId ? (usersState || []).find((u) => u.id === a.ownerUserId) : null;
+  const scope = !a.ownerUserId
+    ? '<span class="wd-scope all">全部文件（管理账户）</span>'
+    : `<span class="wd-scope own">仅 <b>${escapeHtml(ownerUser ? ownerUser.username : '已删除的用户')}</b> 的目录</span>`;
   return `<div class="wd-card">
     <div class="wd-card-main">
       <div class="wd-card-app">${accName}<span class="wd-badge ${w.running ? 'run' : ''}">${w.running ? '运行中' : '已停用'}</span></div>
@@ -457,6 +467,7 @@ function accountCardHTML(a, w) {
         <span>用户名：<code>${username}</code></span>
         <span>服务器：<code>${serverUrl}</code></span>
         <span>密码：<span class="wd-pw" data-pw="${a.id}">${'•'.repeat(8)}（${hasPw}）</span></span>
+        <span>可见范围：${scope}</span>
       </div>
     </div>
     <div class="wd-acts">
@@ -492,6 +503,13 @@ function showAccountForm(account) {
   const isEdit = !!account;
   const form = document.createElement('div');
   form.className = 'wd-form';
+  /**
+   * R89：「绑定用户」是这个表单里**安全含义最重**的一项 —— 不绑定就是管理账户
+   * （能读写整个桶）。因此下拉里默认项写的是「不绑定（可访问全部文件）」而不是
+   * 一个空标签，并把后果直接写进 hint，避免管理员以为「留空 = 无害默认」。
+   */
+  const ownerId = isEdit ? (account.ownerUserId || '') : '';
+  const bindable = (usersState || []).filter((u) => !isStaffRole(u.role));
   form.innerHTML = `
     <div class="form-item">
       <label>应用名称 <span class="req">*</span></label>
@@ -509,6 +527,17 @@ function showAccountForm(account) {
     <div class="form-item">
       <label>确认密码 ${isEdit ? '<span class="hint" style="margin-left:6px">留空则不修改</span>' : '<span class="req">*</span>'}</label>
       <input type="password" id="wd-f-confirm" maxlength="128" placeholder="${isEdit ? '留空保持原密码不变' : '再次输入密码'}" autocomplete="new-password">
+    </div>
+    <div class="form-item">
+      <label>绑定用户</label>
+      <select id="wd-f-owner">
+        <option value="" ${ownerId === '' ? 'selected' : ''}>不绑定（可访问全部文件）</option>
+        ${bindable.map((u) => `<option value="${escapeHtml(u.id)}" ${ownerId === u.id ? 'selected' : ''}>${escapeHtml(u.username)}${u.role === 'user' ? '' : `（${roleLabel(u.role)}）`}</option>`).join('')}
+      </select>
+      <div class="hint">
+        绑定到某个普通用户后，该账户<b>只能读写这个用户的目录</b>（与网页端看到的内容一致）；
+        <b>不绑定 = 管理账户</b>，可访问整个存储桶的全部文件。
+      </div>
     </div>
     ${!isEdit ? `<div class="hint"><b> 此功能可能产生大量读、上传和下载流量。</b></div>` : ''}
   `;
@@ -546,6 +575,16 @@ async function saveAccountFromForm(overlay, close, account) {
   if (isEdit && password && password !== confirm) { toast('两次输入的密码不一致', { type: 'error' }); return; }
 
   const body = { appName: appName.trim(), username: username.trim() };
+  /*
+   * R89：`ownerUserId` **必须无条件带上**（含空串）。
+   *
+   * 服务端的 PATCH 语义是「字段出现才改」：只在选了用户时才带的话，管理员把
+   * 「绑定用户」改回「不绑定」就会被静默忽略 —— 界面显示已解绑、实际还绑着，
+   * 而表现是「这个账户怎么还是只能看一个目录」。空串是「解绑」的合法指令，
+   * 与 `minSpend: 0` / `disabled: false` 完全同构。
+   */
+  const ownerEl = overlay.querySelector('#wd-f-owner');
+  body.ownerUserId = ownerEl ? ownerEl.value : '';
   if (password) body.password = password;
   if (password) body.confirmPassword = confirm;
 

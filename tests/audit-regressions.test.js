@@ -565,8 +565,19 @@ test('SEC-10 · 分享访问令牌与密码哈希绑定，改密码即失效（�
   assert(!shareStore.verifyToken(linkA, 'x'.repeat(63)), '长度不符的令牌应被拒绝');
 
   const routes = readSrc('server/share-routes.js');
-  assert(/secure:\s*!!?security\.IS_DEPLOY/.test(routes),
-    '分享解锁 Cookie 在部署模式下必须带 Secure');
+  /**
+   * R87：判据从「静态 `!!IS_DEPLOY`」升级为「与主会话同一个 `security.cookieSecure()`」。
+   *
+   * SEC-10 的本意是「部署模式下分享解锁 Cookie 必须带 Secure」，这条意图不变；但
+   * R69 已经把「部署模式」细化为「浏览器**确实**在用 HTTPS」（`IS_DEPLOY && (有证书 ||
+   * 在可信反代之后)`），而分享侧四处下发点当时没跟上 —— 在「无证书 + 无反代」的纯 HTTP
+   * 部署里给访客 Cookie 打 `Secure`，浏览器直接丢弃，密码解锁变成死循环。
+   * 因此这里断言的形态也随之从「写了 IS_DEPLOY」改为「用的是那个唯一判据」。
+   */
+  assert(/secure:\s*security\.cookieSecure\(\)/.test(routes),
+    '分享解锁 Cookie 必须走 `security.cookieSecure()`（与主会话同一判据：部署模式 + 确实有 HTTPS）');
+  assert(!/secure:\s*!!security\.IS_DEPLOY/.test(routes),
+    '不得再用静态 `!!IS_DEPLOY` —— 纯 HTTP 部署（支持形态）下访客 Cookie 会被浏览器丢弃');
 });
 
 /* ==================================================================

@@ -830,11 +830,39 @@ class S3Client {
         });
         return { Body: out, headers: headerObject(res.headers), statusCode: res.status };
       }
+      /**
+       * R87：缓冲分支同样是「总时长」计时 —— `timeoutTimer` 从 `fetch()` 起算，
+       * 一直罩到 `arrayBuffer()` 读完，于是「body 传得久」被当成「请求超时」。
+       * 大对象走缓冲路径（打包 / 备份 / 校验类内部调用）时会被同样掐断。
+       * 这里改用与流式分支**同一判据**：握手完成即清请求级计时器，之后按**空闲**判死。
+       */
+      clearTimeout(timeoutTimer);
+      const bufIdleMs = Number(params.__timeoutMs) || this.timeout;
+      let bufIdle = null;
+      const bufStop = () => { if (bufIdle) { clearTimeout(bufIdle); bufIdle = null; } };
+      const bufArm = () => {
+        bufStop();
+        bufIdle = setTimeout(() => { try { abort(); } catch (e) { /* 已结束 */ } }, bufIdleMs);
+        if (bufIdle.unref) bufIdle.unref();
+      };
       try {
-        const buf = Buffer.from(await res.arrayBuffer());
-        return { Body: buf, headers: headerObject(res.headers), statusCode: res.status };
+        const reader = res.body.getReader();
+        const chunks = [];
+        bufArm();
+        for (;;) {
+          const { value, done } = await reader.read();
+          if (done) break;
+          bufArm(); // 收到数据即重置：只要还在流动就不算超时
+          chunks.push(Buffer.from(value));
+        }
+        return { Body: Buffer.concat(chunks), headers: headerObject(res.headers), statusCode: res.status };
+      } catch (e) {
+        const err = (e && e.name === 'AbortError')
+          ? Object.assign(new Error(`上游数据传输停滞超过 ${Math.round(bufIdleMs / 1000)} 秒，已中断`), { code: 'IdleTimeout', statusCode: 504 })
+          : e;
+        throw err;
       } finally {
-        clearTimeout(timeoutTimer);
+        bufStop();
       }
     });
   }
@@ -1000,10 +1028,32 @@ class S3Client {
        * 若把默认值放在厂商值之前，US3 的分块复制就会发出 64MB 分片并被 400 拒绝。
        */
       const PART = Math.max(8 * 1024 * 1024, Number(params.PartSize) || this.fixedPartBytes || 64 * 1024 * 1024);
+      /**
+       * R87：**先算分片数，再开工**。
+       *
+       * S3 协议对单个分片上传/分片复制硬性限制 10000 片。旧实现只在循环之后由
+       * `multipartComplete` 报错 —— 此时前 10000 片**已经全部传完**：默认 64MB 分片下
+       * 对应 640GB，白烧数小时上行流量与云端请求费，最后得到一个语焉不详的失败。
+       * 错误必须发生在「第一个字节之前」。
+       *
+       * 用 `status` 而非 `statusCode` 是有意的：路由层 `e.status ? e : translateError(e)`
+       * 会把带 `status` 的错误原样透出，这条文案才到得了用户眼前
+       * （`translateError` 会把任何未登记的上游错误折叠成「操作失败，请重试」）。
+       */
+      const partCount = Math.max(1, Math.ceil(total / PART));
+      if (partCount > 10000) {
+        const err = new Error(
+          `对象过大，无法一次复制：按当前分片大小（${Math.round(PART / 1024 / 1024)}MB）需要 ${partCount} 片，`
+          + '超出对象存储 10000 片的单次上限。'
+        );
+        err.status = 400;
+        err.code = 'TooManyParts';
+        throw err;
+      }
       const init = await this.multipartInit({ Bucket: bucket, Key: key });
       const uploadId = init.UploadId;
       try {
-        const count = Math.max(1, Math.ceil(total / PART));
+        const count = partCount;
         const parts = [];
         for (let i = 0; i < count; i++) {
           const start = i * PART;

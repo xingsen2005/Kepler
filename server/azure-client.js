@@ -42,7 +42,7 @@
  *    依赖这份白名单决定「能不能清加密元数据 / 标记分享链接失效」，多报一个都是数据事故。
  */
 const crypto = require('crypto');
-const { Readable } = require('stream');
+const { Readable, Transform } = require('stream');
 const { pipeline } = require('stream');
 // XML 提取的三个小工具与 s3-client 共用一份实现（避免两套正则各自漂移）
 const { tag, tagAll, unescapeXml } = require('./s3-client');
@@ -300,8 +300,9 @@ class AzureBlobClient {
       err.code = 'RedirectNotAllowed';
       throw err;
     }
-    // 流式消费的调用方自己清定时器（见 getObject）
-    if (spec.rawBody) return { res, headers: res.headers, status: res.status, timer };
+    // 流式消费的调用方自己清定时器（见 getObject）。R87：连 `ctl` 一并交出 ——
+    // 空闲看门狗要能在「body 卡住」时真正掐断底层连接，而不只是本地 destroy。
+    if (spec.rawBody) return { res, headers: res.headers, status: res.status, timer, ctl };
     let text = '';
     try { text = await res.text(); } catch (e) { text = ''; }
     clearTimeout(timer);
@@ -503,7 +504,7 @@ class AzureBlobClient {
       const { bucket, key } = this._ctx(params);
       const headers = {};
       if (params.Range) headers.range = String(params.Range);
-      const { res, timer } = await this._request({
+      const { res, timer, ctl } = await this._request({
         method: 'GET', bucket, key, headers, rawBody: true, timeoutMs: params.__timeoutMs,
       });
       if (!res.ok) {
@@ -522,12 +523,50 @@ class AzureBlobClient {
       const clear = () => clearTimeout(timer);
       const out = params.Output;
       if (out && typeof out.pipe === 'function') {
+        /* R87：**请求级计时器到此为止，后面按「空闲」判死，而不是按「总时长」。**
+         *
+         * 这是 R78 在 S3 适配器上修过的同一个缺陷，Azure 侧当时没跟着改：
+         * `timer` 从 `fetch()` 发出时就启动、默认 `AZURE_TIMEOUT_MS`（120 秒），
+         * 只有 body 的 `end`/`close`/`error` 才清。于是「整个 body 的传输总时长
+         * > 120 秒」必然被 `ctl.abort()` 掐断 —— 一个 2GB 对象在 10MB/s 的链路上
+         * 要 200 秒，下载到 120 秒处硬中断，而前端看到的只是「网络错误」。
+         * Azure 桶的**全部**下载路径（/fs/download、分享、WebDAV、打包）都走这里，
+         * 因此「大文件必挂」是稳定可复现的，不是偶发。
+         *
+         * 改法同 S3：握手完成即清掉请求级计时器，改挂空闲看门狗 —— 每收到一块
+         * 就重置，连续 `timeoutMs` 一个字节都没有才掐断。
+         */
+        clearTimeout(timer);
+        const idleMs = Number(params.__timeoutMs) || this.timeout;
         const stream = Readable.fromWeb(res.body);
-        stream.once('end', clear);
-        stream.once('close', clear);
-        stream.once('error', clear);
-        pipeline(stream, out, (pipeErr) => {
-          clear();
+        let idleTimer = null;
+        const stopIdle = () => { if (idleTimer) { clearTimeout(idleTimer); idleTimer = null; } };
+        const armIdle = () => {
+          stopIdle();
+          idleTimer = setTimeout(() => {
+            idleTimer = null;
+            const err = new Error(`上游数据传输停滞超过 ${Math.round(idleMs / 1000)} 秒，已中断`);
+            err.code = 'IdleTimeout';
+            err.statusCode = 504; // 网关超时：与「凭据被拒(401)」严格区分，避免前端误判登出
+            try { if (ctl) ctl.abort(); } catch (e) { /* 已结束 */ }
+            stream.destroy(err);
+          }, idleMs);
+          if (idleTimer.unref) idleTimer.unref(); // 不把进程钉在事件循环里
+        };
+        /**
+         * ⚠️ 「每块重置」必须做在**透传 Transform** 里，不能用 `stream.on('data')`：
+         * 给可读流挂 `data` 会立刻把它切进 flowing 模式，而此刻 `pipeline` 还没接上，
+         * 头几个分块会被丢掉（下载出来的文件短一截，且没有任何报错）。
+         */
+        const idle = new Transform({
+          transform(chunk, enc, cb) { armIdle(); cb(null, chunk); },
+        });
+        idle.once('end', stopIdle);
+        idle.once('close', stopIdle);
+        idle.once('error', stopIdle);
+        armIdle(); // 覆盖「响应头到了、body 一个字节都不来」这一档
+        pipeline(stream, idle, out, (pipeErr) => {
+          stopIdle();
           if (pipeErr) out.destroy(pipeErr);
         });
         return { headers: outHeaders, statusCode: res.status };

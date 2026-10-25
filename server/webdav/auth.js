@@ -7,6 +7,7 @@
  */
 const configStore = require('../config-store');
 const security = require('../security');
+const requestContext = require('../request-context');
 const { webdavLock } = require('./defs');
 
 /* ------------------------------ 认证与 HTTPS 守卫 ------------------------------ */
@@ -89,7 +90,30 @@ async function authMiddleware(req, res, next) {
   }
   webdavLock.reset(lockKey);
   req.webdavUser = r.account;
-  next();
+  /**
+   * R89：把 WebDAV 账户的**空间归属**接进请求上下文。
+   *
+   * 这是整个 R89 里 WebDAV 侧唯一需要新增的接线点 —— 后续所有 `p()` 调用都会经
+   * `s3.assertScoped()` 自动收窄，不必逐条改 PROPFIND / PUT / MOVE / COPY。
+   *
+   * - 绑定了用户 → 以该用户的身份建立上下文（`role: 'user'` ⇒ 有空间根）；
+   * - 未绑定 → `role: 'admin'`（管理账户，可读写整个桶）。这是**既有的**语义，
+   *   老账户不会因为升级而突然看不到自己原来的文件。
+   * - 绑定的用户已被删除 → **403**，绝不回退成「未绑定」。否则删掉一个普通用户
+   *   就等于把他手里的 WebDAV 凭据升级成管理员凭据（同一坑在 `removeUser` 里
+   *   也会连带删除账户，这里是第二层）。
+   */
+  const owner = String(r.account && r.account.ownerUserId || '');
+  if (owner && !configStore.findUserRawById(owner)) {
+    return res.status(403).type('text/plain')
+      .send('403 Forbidden：该 WebDAV 账户绑定的站点用户已不存在，请联系管理员重新绑定');
+  }
+  requestContext.runWith({
+    token: '',
+    userId: owner,
+    role: owner ? 'user' : 'admin',
+    activeBucketId: '',
+  }, () => next());
 }
 
 module.exports = { unauthorized, authMiddleware };

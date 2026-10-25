@@ -959,9 +959,39 @@ function effective(isAdmin) {
     bucketId: b ? b.id : '',
     bucketRemark: b ? b.remark || '' : '',
     quotaBytes: b ? (Number.isFinite(Number(b.quotaBytes)) ? Number(b.quotaBytes) : 0) : 0,
+    /*
+     * R89：存储空间根。空串 = 无作用域（管理层看全桶 / 内部调用 / 无会话路径）。
+     *
+     * 只有 `effective()` 产出它；`effectiveForBucket()` **刻意不产** —— 那条路径
+     * 服务的是分享下载、桶用量统计、上传会话清理，它们的 key 一律是**绝对**语义，
+     * 加了作用域反而会因为「分享者的空间根 ≠ 下载者的」而全部失效。
+     */
+    spaceRoot: admin ? '' : sessionSpaceRoot(),
     domains: cfg.domains || { primary: '', backup: '' },
     updatedAt: cfg.updatedAt,
   };
+}
+
+/**
+ * R89：当前请求的存储空间根（**唯一读取入口**）。
+ *
+ * 与 `sessionRole()` 的区别在**失败方向**：角色判不准只是少一个按钮，
+ * 空间判不准就是看到别人的文件。故这里**不吞** `spaceRoot()` 抛的错
+ * （那正是「角色是 user 却没有 userId」的 fail-closed 分支），只吞 require 失败。
+ */
+function sessionSpaceRoot() {
+  let ctx;
+  try {
+    ctx = require('./request-context');
+  } catch (e) {
+    return '';
+  }
+  try {
+    return ctx.spaceRoot ? ctx.spaceRoot() : '';
+  } catch (e) {
+    if (e && e.status === 500) throw e;
+    return '';
+  }
 }
 
 /** 同 {@link effective}；`requireConfig()` 与所有 /api/fs/* 操作读端都经由此处 */
@@ -2297,11 +2327,48 @@ function accountView(a, showPassword) {
     id: a.id,
     appName: a.appName,
     username: a.username,
+    /**
+     * R89：该账户绑定的**站点用户 id**（空串 = 未绑定 = 管理权限，可读写整个桶）。
+     *
+     * 为什么绑 `userId` 而不绑 `username`：用户名可被管理员改，改完账户就指向
+     * 一个不存在的空间 —— 表现为「WebDAV 能连上、但目录全空」，且找不到原因。
+     */
+    ownerUserId: a.ownerUserId || '',
     hasPassword: Boolean(a.passwordSealed),
     createdAt: a.createdAt || '',
     updatedAt: a.updatedAt || '',
     password: showPassword ? openPassword(a.passwordSealed) : undefined,
   };
+}
+
+/**
+ * R89：校验「要绑定的用户」存在（空串 = 有意不绑定，直接放行）。
+ *
+ * 不做静默回退：写错一个 id 就当「未绑定」，等于把一个本该受限的账户
+ * 悄悄升级成能看全部 —— 正是本次要消灭的那类「看起来配好了、实际没生效」。
+ */
+function normalizeOwnerUserId(v) {
+  if (v === undefined) return undefined;
+  const id = String(v == null ? '' : v).trim();
+  if (!id) return '';
+  const target = findUserRawById(id);
+  if (!target) {
+    throw Object.assign(new Error('要绑定的用户不存在，请重新选择'), { status: 400 });
+  }
+  /**
+   * R89：**管理层不需要、也不应该绑定**。
+   *
+   * 根用户 / 管理员的存储空间根是空串（他们看的就是整个桶），把 WebDAV 账户绑到
+   * 他们身上会得到一个 `u/<id>/` 的空目录 —— 界面上看不到、客户端里翻不到，
+   * 唯一可能的解释是「绑定坏了」，而那会把人引向排查错误的方向。
+   */
+  if (roles.isStaff(target.role)) {
+    throw Object.assign(
+      new Error('根用户 / 管理员本身没有独立存储空间（他们看到的就是整个桶），无需绑定；请选择普通用户'),
+      { status: 400 },
+    );
+  }
+  return id;
 }
 
 function getWebdav() {
@@ -2342,7 +2409,12 @@ function addWebdavAccount(b) {
     throw Object.assign(new Error('该登录用户名已被其它 WebDAV 账户占用，请换一个'), { status: 409 });
   }
   const now = new Date().toISOString();
-  const acc = { id: newId(), appName, username, passwordSealed: sealPassword(password), createdAt: now, updatedAt: now };
+  const acc = {
+    id: newId(), appName, username, passwordSealed: sealPassword(password),
+    // R89：绑定的站点用户（空串 = 不绑定）。落盘用 snake 风格一致的对象字面量即可。
+    ownerUserId: normalizeOwnerUserId(b && b.ownerUserId) || '',
+    createdAt: now, updatedAt: now,
+  };
   cfg.webdav.accounts.push(acc);
   persist(cfg);
   return accountView(acc, false);
@@ -2372,6 +2444,9 @@ function updateWebdavAccount(id, b) {
     if (password.length > 128) throw Object.assign(new Error('密码最长 128 个字符'), { status: 400 });
     acc.passwordSealed = sealPassword(password);
   }
+  // R89：`undefined` = 不改动；空串 = 显式解绑（退回管理权限）
+  const owner = normalizeOwnerUserId(b.ownerUserId);
+  if (owner !== undefined) acc.ownerUserId = owner;
   acc.updatedAt = new Date().toISOString();
   persist(cfg);
   return accountView(acc, false);
@@ -2432,7 +2507,14 @@ async function authenticateWebdav(username, password) {
   // 单次请求即可枚举出全部 WebDAV 账户名，再配合 webdavAuthLimiter 做定向爆破。
   // 同文件的 `authenticateUser` 无论用户名是否存在都走 scrypt，此处此前与它口径不一致。
   if (!constTimeEquals(password, plain)) { await dummyHash(password); return { ok: false }; }
-  return { ok: true, account: { id: acc.id, appName: acc.appName, username: acc.username } };
+  // R89：把绑定关系一并交出去 —— WebDAV 请求据此建立 requestContext 并收窄到该用户空间
+  return {
+    ok: true,
+    account: {
+      id: acc.id, appName: acc.appName, username: acc.username,
+      ownerUserId: acc.ownerUserId || '',
+    },
+  };
 }
 
 /* ============================ 用户管理（登录鉴权） ============================ */
@@ -3017,6 +3099,18 @@ function removeUser(id) {
     throw Object.assign(new Error('至少保留一个管理员账户'), { status: 400 });
   }
   cfg.users.splice(idx, 1);
+  /**
+   * R89：**同时吊销绑定到该用户的 WebDAV 账户**。
+   *
+   * 不处理的话会变成一次**提权**：账户的 `ownerUserId` 指向一个已不存在的用户，
+   * 而「空间根解析不出来」如果被宽松地当成「未绑定」，这个账户就从「只能看
+   * 自己的目录」变成「能看整个桶」—— 删掉一个普通用户，等于把他手里的 WebDAV
+   * 凭据升级成管理员凭据。故这里直接连带删除（`webdav/app.js` 另有一层
+   * fail-closed 兜底：绑定用户查不到时一律 403，绝不回退成「未绑定」）。
+   */
+  if (cfg.webdav && Array.isArray(cfg.webdav.accounts)) {
+    cfg.webdav.accounts = cfg.webdav.accounts.filter((a) => (a.ownerUserId || '') !== id);
+  }
   persist(cfg);
   return true;
 }

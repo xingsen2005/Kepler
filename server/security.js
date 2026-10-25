@@ -50,9 +50,110 @@ const TRUST_PROXY = String(process.env.TRUST_PROXY || '') === '1';
  */
 const TRUST_PROXY_HOPS = Math.max(0, Math.floor(Number(process.env.TRUST_PROXY_HOPS) || 0));
 
+/**
+ * R87：可信代理的**对端**允许集 —— 「这一次连接」到底是不是来自我们信任的反代。
+ *
+ * 这条是 INF-S1 / GRD-S1 / DAV-S2 的共同根因：`TRUST_PROXY=1` 此前是**唯一**判据，
+ * 它只回答「本实例部署在反代之后」，却从不回答「这一次连接来自反代吗」。于是
+ * `deploy.sh` 生成的 `HOST=0.0.0.0`（无防火墙）形态下，绕过 Nginx 直连应用端口的
+ * 请求只要自带一个随手写的 `X-Forwarded-For`，就能让 `clientIp()` 返回任意地址：
+ * 按 IP 的登录限流 / 失败锁定 / IP 屏蔽 / 分享限流 / 取回封禁**整条失效**，
+ * 甚至能把无辜第三方 IP 塞进黑名单（借刀封人）。
+ *
+ * 默认允许集 = **回环 + 私网**（RFC1918 / IPv6 ULA / 链路本地）：
+ *  - `deploy.sh` 生成的反代 `proxy_pass` 到 `127.0.0.1`，对端恒为回环；
+ *  - 容器化部署（反代与 Node 分处两个容器）对端是 docker 网段的私网地址。
+ * 这两类之外的直连（典型是公网上直接打应用端口）一律**不采信**转发头，
+ * 退回 socket 对端地址 —— 与「根本没开 `TRUST_PROXY`」完全同待遇。
+ *
+ * 需要更严格时用 `TRUST_PROXY_FROM=10.1.2.0/24,127.0.0.1` 显式收窄；
+ * `TRUST_PROXY_FROM=any` 恢复历史行为（等于把身份交给请求方，不推荐）。
+ */
+const TRUST_PROXY_FROM = String(process.env.TRUST_PROXY_FROM || '').trim();
+const TRUST_PROXY_FROM_ANY = /^(?:any|\*)$/i.test(TRUST_PROXY_FROM);
+const TRUST_PROXY_FROM_CIDRS = TRUST_PROXY_FROM && !TRUST_PROXY_FROM_ANY
+  ? TRUST_PROXY_FROM.split(',').map((s) => s.trim()).filter(Boolean)
+    .map(parseIpv4Cidr).filter(Boolean)
+  : [];
+
+/** 点分十进制 IPv4 → 32 位无符号整数（非法返回 null） */
+function ipv4ToInt(s) {
+  const parts = String(s == null ? '' : s).trim().split('.');
+  if (parts.length !== 4) return null;
+  let n = 0;
+  for (const p of parts) {
+    if (!/^\d{1,3}$/.test(p)) return null;
+    const v = Number(p);
+    if (v > 255) return null;
+    n = n * 256 + v;
+  }
+  return n >>> 0;
+}
+
+/** `10.0.0.0/8` / `127.0.0.1` → `{ base, mask }`；非 IPv4 返回 null（IPv6 请写 `any`） */
+function parseIpv4Cidr(s) {
+  const raw = String(s || '').trim();
+  const cut = raw.indexOf('/');
+  const base = ipv4ToInt(cut < 0 ? raw : raw.slice(0, cut));
+  if (base === null) return null;
+  const bits = cut < 0 ? 32 : Math.max(0, Math.min(32, Math.floor(Number(raw.slice(cut + 1))) || 0));
+  const mask = bits === 0 ? 0 : (0xffffffff << (32 - bits)) >>> 0;
+  return { base: (base & mask) >>> 0, mask };
+}
+
+/** 回环 / 私网 / 链路本地（IPv4 与 IPv6 的 ULA、链路本地、回环） */
+function isPrivateOrLoopbackIp(ip) {
+  const s = String(ip || '').trim();
+  if (!s) return false;
+  if (s === '::1') return true;
+  if (s.indexOf(':') >= 0) {
+    const l = s.toLowerCase();
+    // fc00::/7 = ULA；fe80::/10 = 链路本地
+    return /^f[cd]/.test(l) || /^fe[89ab]/.test(l);
+  }
+  const n = ipv4ToInt(s);
+  if (n === null) return false;
+  const a = n >>> 24;
+  const b = (n >>> 16) & 0xff;
+  return a === 127                        // 回环
+    || a === 10                           // 10/8
+    || (a === 172 && b >= 16 && b <= 31)  // 172.16/12
+    || (a === 192 && b === 168)           // 192.168/16
+    || (a === 169 && b === 254);          // 链路本地
+}
+
+/** 这次连接的**对端**是否可信（只有可信对端注入的转发头才会被采信） */
+function proxyPeerTrusted(req) {
+  if (TRUST_PROXY_FROM_ANY) return true;
+  const raw = (req && req.socket && req.socket.remoteAddress) || (req && req.ip) || '';
+  const ip = normalizeIp(String(raw || ''));
+  /**
+   * 拿不到对端信息（单元测试直接构造的 req、非 TCP 传输）时**不改变历史语义** ——
+   * 真实 HTTP 请求必然带 `socket.remoteAddress`，这条只是为「没有对端可判」留出口。
+   */
+  if (!ip) return true;
+  if (TRUST_PROXY_FROM_CIDRS.length) {
+    const n = ipv4ToInt(ip);
+    if (n === null) return false;
+    return TRUST_PROXY_FROM_CIDRS.some((c) => ((n & c.mask) >>> 0) === c.base);
+  }
+  return isPrivateOrLoopbackIp(ip);
+}
+
 /** 本进程是否加载到了可用的 TLS 证书（由 `index.js` 在启动时告知） */
 let TLS_AVAILABLE = false;
 function setTlsAvailable(v) { TLS_AVAILABLE = Boolean(v); }
+
+/**
+ * Cookie 是否该带 `Secure`（**唯一判据**）。
+ *
+ * R69 把「部署模式」细化为「浏览器确实在用 HTTPS」：本进程加载了证书，或位于
+ * 可信反代之后（按约定由反代终结 TLS）。R87 把它提成独立函数 —— 分享侧的
+ * 四处下发点此前仍用 `!!IS_DEPLOY`，在「无证书 + 无反代」的纯 HTTP 部署下
+ * 把每个访客 Cookie 都打上 `Secure`，浏览器直接丢弃：密码解锁死循环、
+ * 已付款者永远停在未支付页、退出登录失效。同一件事不能再有第二种口径。
+ */
+function cookieSecure() { return IS_DEPLOY && (TLS_AVAILABLE || TRUST_PROXY); }
 
 /** 会话 Cookie 的 Secure 属性（部署模式必须，避免明文 HTTP 泄露会话） */
 function secureCookieAttr() {
@@ -68,7 +169,7 @@ function secureCookieAttr() {
    * 现在只有两种"确实有 HTTPS"的形态才加：本进程加载了证书（`TLS_AVAILABLE`），
    * 或位于可信反代之后（`TRUST_PROXY`，按约定由它终结 TLS）。
    */
-  return (IS_DEPLOY && (TLS_AVAILABLE || TRUST_PROXY)) ? '; Secure' : '';
+  return cookieSecure() ? '; Secure' : '';
 }
 
 
@@ -156,6 +257,13 @@ function forwardedClientIp(req) {
   if (!TRUST_PROXY) return '';
   if (!hasForwardedHeader(req)) return '';
   /**
+   * R87：**先判对端，再读头**。
+   *
+   * 顺序不能反 —— 反了就等于「谁发头谁说了算」。`TRUST_PROXY=1` 只表示
+   * 「本实例在反代之后」，不表示「本次连接来自反代」。
+   */
+  if (!proxyPeerTrusted(req)) return '';
+  /**
    * R69：`TRUST_PROXY_HOPS`（默认为 0）—— 从**右**往左按可信跳数剥取。
    *
    * 默认取首段的语义只在「前置代理**重写**该头」时成立（`deploy.sh` 生成的模板正是
@@ -196,7 +304,7 @@ function forwardedClientIp(req) {
 function clientIpInfo(req) {
   const fwd = forwardedClientIp(req);
   if (fwd) return { ip: normalizeIp(fwd), fromForwarded: true };
-  if (TRUST_PROXY && hasForwardedHeader(req)) return { ip: '', fromForwarded: true };
+  if (TRUST_PROXY && proxyPeerTrusted(req) && hasForwardedHeader(req)) return { ip: '', fromForwarded: true };
   const raw = (req && req.socket && req.socket.remoteAddress) || (req && req.ip) || '';
   return { ip: normalizeIp(raw), fromForwarded: false };
 }
@@ -780,13 +888,13 @@ const emailCodeLimiter = createLimiter({ name: 'auth-email-code', windowMs: 10 *
 module.exports = {
   DEPLOY_HOST, IS_LOOPBACK, IS_DEPLOY, TRUST_PROXY, TRUST_PROXY_HOPS,
   SITE_DOMAIN, // R38：部署脚本写入的本站对外域名（「本站」允许集的权威来源）
-  secureCookieAttr, clientIp, setTlsAvailable, // R69：Secure 与实际 TLS 可用性对齐
+  secureCookieAttr, cookieSecure, clientIp, setTlsAvailable, // R69/R87：Secure 与实际 TLS 可用性对齐（唯一判据）
   // R69：账户级（跨 IP）低速计数 —— 只减速不锁死
   noteAccountFail, resetAccountFail, accountFailDelayMs,
   LIMITER_MAX_ENTRIES,
   // R17-01：唯一的 XFF 解析实现 + 「IP 及其来源」；R17-03：「这个地址是不是本站」
   // R22-02：`isIpLiteral` 是「转发头里的值是否可信」的唯一语法判据
-  normalizeIp, forwardedClientIp, clientIpInfo, normalizeHost, isOwnSiteHost,
+  normalizeIp, forwardedClientIp, clientIpInfo, proxyPeerTrusted, normalizeHost, isOwnSiteHost,
   isIpLiteral, hasForwardedHeader,
   requestIsSecure, // R27-03：唯一的「本次请求是否 HTTPS」判据
   httpsRedirectHost, isBindAllHost, configuredSiteHost,

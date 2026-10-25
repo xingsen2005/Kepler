@@ -348,6 +348,21 @@ app.use((err, req, res, next) => {
   const status = err.status || (err.type === 'entity.too.large' ? 413 : 500);
   let msg = err.message || '服务器内部错误';
   if (err.type === 'entity.too.large') msg = '请求体过大，超出上传大小限制';
+  /**
+   * R87：**5xx 不得回显原始 `err.message`**。
+   *
+   * 4xx 的 message 是本进程自己写的（「请求参数错误」「资源不存在」），可以给用户看；
+   * 而未被分类的异常（`next(err)` 透传上来的 `fs` / `net` / 第三方库错误）带的是
+   * 运行环境细节：Windows 上是 `ENOENT: no such file or directory, open
+   * 'C:\Users\…\data\config.enc'`，Linux 上是 `/opt/kepler/data/…` —— 匿名可触发
+   * （`pwa.js` 的 SW/manifest 生成、`routes/stats.js` 的健康检查都是无鉴权入口）。
+   * 这类路径泄露足以让攻击者推断部署结构、数据目录与进程用户。
+   *
+   * 判据用 express 的 `err.expose` 约定：`translateError()` 产出的错误是**固定文案**
+   * （已脱敏），显式标记 `expose` 后仍然透出；其余 5xx 一律换成固定文案。
+   * 原始信息仍完整写进服务端日志（下面那行 `console.error`），排查能力不下降。
+   */
+  if (status >= 500 && !err.expose) msg = '服务器内部错误';
   if (status >= 500) {
     console.error('[server]', err);
     if (err.rawMessage || err.s3Code) console.error('[server][detail]', err.s3Code || '', err.rawMessage || '');

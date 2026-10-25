@@ -115,14 +115,23 @@ function flushSync() {
 }
 process.on('exit', () => { try { flushSync(); } catch (e) { /* 退出阶段尽力而为 */ } });
 
-function create({ uploadId, key, bucket, region, size, chunkSize, provider, createdBy }) {
+function create({ uploadId, key, bucket, region, size, chunkSize, provider, createdBy, ownerId }) {
   const s = ensure();
   const id = require('crypto').randomBytes(12).toString('hex');
   const pid = provider || providers.DEFAULT_PROVIDER_ID;
   // SEC-07：记录创建者，使 /fs/sessions 能按用户过滤（避免泄露他人会话的桶名与对象键）
+  /*
+   * R89：`ownerId` 是**用户 id**，`createdBy` 仍是**用户名** —— 两者都要留。
+   *
+   * `createdBy` 不能丢：它会被写进对象元数据（属性面板的「上传者」显示的是人名），
+   * 而且历史会话只有它。但用户名**可以被管理员改**，拿它当归属判据的表现是
+   * 「改个名字，正在续传的任务全部无权操作」。故新增不可变的 `ownerId` 作判据，
+   * 旧会话缺它时退回比用户名（见 `routes/fs.js` 的 `assertSessionOwner`）。
+   */
   s[id] = {
     id, uploadId, key, bucket, region, provider: pid, size, chunkSize,
-    createdBy: createdBy || '', parts: {}, createdAt: Date.now(), updatedAt: Date.now(),
+    createdBy: createdBy || '', ownerId: ownerId || '',
+    parts: {}, createdAt: Date.now(), updatedAt: Date.now(),
   };
   persist();
   return s[id];
@@ -130,15 +139,16 @@ function create({ uploadId, key, bucket, region, size, chunkSize, provider, crea
 
 /**
  * 列出未完成会话。
- * @param {object} [opt] { createdBy } 指定时只返回该创建者的会话；
- *                       管理员（不传）返回全部。历史会话无 createdBy → 视为不属于任何普通用户。
+ * @param {object} [opt] { ownerId, createdBy } 指定时只返回该用户的会话（`ownerId` 优先，
+ *                       缺它时才按 `createdBy` 兜底）；管理员（不传）返回全部。
  */
 function list(opt) {
   const s = ensure();
   const all = Object.values(s);
+  const uid = opt && opt.ownerId;
   const who = opt && opt.createdBy;
-  if (!who) return all;
-  return all.filter((o) => o.createdBy === who);
+  if (!uid && !who) return all;
+  return all.filter((o) => (uid && o.ownerId ? o.ownerId === uid : o.createdBy === who));
 }
 
 function get(id) {

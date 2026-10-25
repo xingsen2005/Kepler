@@ -1409,12 +1409,12 @@ function renderBucketList() {
   ul.innerHTML = buckets.map((b) => {
     const display = b.remark || b.bucket;
     const sub = b.remark ? `${b.bucket} · ${b.region}` : b.region;
-    return `<li class="bucket-item ${b.id === activeId ? 'active' : ''}" data-id="${b.id}" title="${escapeHtml(b.bucket)}（${escapeHtml(b.region)}）">
+    return `<li class="bucket-item ${b.id === activeId ? 'active' : ''}" data-id="${escapeHtml(b.id)}" title="${escapeHtml(b.bucket)}（${escapeHtml(b.region)}）">
       <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" class="bk-ic"><path d="M4 8l2 12a2 2 0 0 0 2 1.7h8A2 2 0 0 0 18 20l2-12"/><path d="M3 8h18"/><path d="M8 8a4 4 0 0 1 8 0"/></svg>
       <span class="bk-text"><b>${escapeHtml(display)}</b><i>${escapeHtml(sub)}</i></span>
       <span class="bk-acts">
-        <button class="icon-btn small bk-edit" data-id="${b.id}" title="编辑备注 / 配额">${SVG.edit}</button>
-        ${isAdmin ? `<button class="icon-btn small bk-del" data-id="${b.id}" title="将存储桶从列表中移除">${SVG.close}</button>` : ''}
+        <button class="icon-btn small bk-edit" data-id="${escapeHtml(b.id)}" title="编辑备注 / 配额">${SVG.edit}</button>
+        ${isAdmin ? `<button class="icon-btn small bk-del" data-id="${escapeHtml(b.id)}" title="将存储桶从列表中移除">${SVG.close}</button>` : ''}
       </span>
     </li>`;
   }).join('');

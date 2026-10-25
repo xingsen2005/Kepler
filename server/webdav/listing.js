@@ -14,6 +14,12 @@ const { PROPFIND_CAP } = require('./defs');
 /* ------------------------------ 对象列举 ------------------------------ */
 
 async function requireS3() {
+  /**
+   * R89：`configStore.get()` 与 `effective()` 是同一实现，返回的 cfg 已带
+   * `spaceRoot`（绑定用户的账户拿到 `u/<id>/`，管理账户拿到空串）。
+   * `app.js` 的 `keyOf()` 据此给请求路径加根 —— 若这里是别的解析路径、
+   * 拿不到该字段，普通用户的 WebDAV 会直接看到整个桶。
+   */
   const cfg = configStore.get();
   // 地域仅在厂商要求时才必填（如又拍云 S3 兼容接口无需地域）
   const prov = providers.get(cfg && cfg.provider) || providers.resolve(cfg && cfg.provider);

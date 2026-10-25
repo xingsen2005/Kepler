@@ -26,6 +26,20 @@ const storageCacheMap = new Map();
 /** @type {Map<string, Promise<object>>} */
 const storageInflight = new Map();
 
+/**
+ * R89：用量缓存的键**必须含空间维度**。
+ *
+ * 缓存原本只按桶区分 —— 于是「谁先请求，谁的数字被所有人看到」：管理员先刷新一次，
+ * 桶级总量就被缓存下来，接下来 `delta` 时长内每个普通用户的状态栏拿到的都是
+ * **整个桶**的用量（这是「每个用户只看自己的那一部分」的直接反面）。
+ *
+ * 空串 = 管理层视角（桶级总量）。`adjustStorageCache()` 与之共用本函数，
+ * 否则「刚传完文件用量不动」会重新出现。
+ */
+function storageKeyOf(cfg) {
+  return bucketCacheKey(cfg) + '|' + String((cfg && cfg.spaceRoot) || '');
+}
+
 function cacheGet(key) {
   const hit = storageCacheMap.get(key);
   if (!hit) return null;
@@ -53,8 +67,8 @@ function cacheSet(key, data) {
  */
 function adjustStorageCache(delta, cfg) {
   if (!delta || !cfg) return;
-  let key;
-  try { key = bucketCacheKey(cfg); } catch (e) { return; }
+  let base;
+  try { base = bucketCacheKey(cfg); } catch (e) { return; }
   /**
    * R25：同一次增量**同时**喂给「按 API Key 的配额记账」（`bucket-stats.recordUsageDelta`）。
    *
@@ -64,11 +78,23 @@ function adjustStorageCache(delta, cfg) {
    * 记账是纯内存累加、不抛错；`adjustStorageCache` 本身仍保持「无缓存条目即静默空转」的语义。
    */
   recordUsageDelta(cfg, delta);
-  const hit = storageCacheMap.get(key);
-  if (!hit || !hit.data) return;
-  hit.data.usedBytes = Math.max(0, (hit.data.usedBytes || 0) + delta);
-  hit.data.statTime = new Date().toISOString();
-  hit.t = Date.now();
+  const root = String(cfg.spaceRoot || '');
+  const hit = storageCacheMap.get(base + '|' + root);
+  if (hit && hit.data) {
+    hit.data.usedBytes = Math.max(0, (hit.data.usedBytes || 0) + delta);
+    hit.data.statTime = new Date().toISOString();
+    hit.t = Date.now();
+  }
+  /**
+   * R89：非管理层的写入**失效**桶级（管理层）那条缓存，而不是猜一个增量。
+   *
+   * 桶级总量是**所有人**的合计，一次属于某个用户空间的写入到底让它涨了多少，
+   * 这里只知道总额（`delta`），不知道归属 —— 直接加进去数字是对的，但「桶级」
+   * 这条数字随后就没有记录者了（谁的写入都往它上面加，包括管理层自己的）。
+   * 与其维护一个没人能对账的混合账本，不如让它作废、让管理员的下次请求重新扫一遍：
+   * 代价是他最多晚 15 秒看到准确数字，收益是不再出现「两个来源各说一套」。
+   */
+  if (root) storageCacheMap.delete(base + '|');
 }
 
 // 实时上传/下载速率（近 10 秒平均）
@@ -91,7 +117,10 @@ router.get('/stats/speed', (req, res) => {
  */
 async function queryStorage(cfg) {
   const client = getClient(cfg);
-  const items = await listAll(client, cfg, '', { cap: LIMITS.SCAN });
+  // R89：普通用户只统计**自己那一段**（`cfg.spaceRoot`），管理层仍是桶级总量。
+  // 不加根的话，状态栏/仪表盘会向普通用户展示整个桶的用量 —— 既是聚合信息泄露，
+  // 也与他「只能看到自己那一部分」的界面自相矛盾。
+  const items = await listAll(client, cfg, String(cfg.spaceRoot || ''), { cap: LIMITS.SCAN });
   return {
     usedBytes: items.reduce((s, x) => s + x.size, 0),
     objectCount: items.length,
@@ -105,8 +134,9 @@ async function queryStorage(cfg) {
 router.get('/stats/storage', async (req, res) => {
   try {
     const cfg = requireConfig();
-    // 缓存键含 provider/凭据/桶/地域 —— 切换桶或多云同名桶时不会串用旧数字
-    const cacheKey = bucketCacheKey(cfg);
+    // 缓存键含 provider/凭据/桶/地域 —— 切换桶或多云同名桶时不会串用旧数字；
+    // R89 起还含**空间维度**（见 storageKeyOf）
+    const cacheKey = storageKeyOf(cfg);
     const cached = cacheGet(cacheKey);
     if (cached) return res.json(cached);
 
@@ -176,7 +206,20 @@ router.get('/health', (req, res) => {
     out.lastWriteAt = (cfg && cfg.updatedAt) || '';
   }
   const secureErr = secureStore.getLastWriteError();
-  if (secureErr) { out.ok = false; out.secureWriteError = secureErr; }
+  /**
+   * R87：只下发**文件名**，不下发绝对路径。
+   *
+   * `getLastWriteError()` 原样带着 `file`（如 `C:\Users\…\data\links.json` 或
+   * `/opt/kepler/data/config.enc`），而 `/health` 只要求登录、不挂 `requireAdmin`
+   * —— 任何普通用户都能读到本实例的磁盘布局与数据目录。
+   * `secure-store.js` 自己打印日志时用的就是 `path.basename()`，这里对齐同一口径。
+   */
+  if (secureErr) {
+    out.ok = false;
+    out.secureWriteError = Object.assign({}, secureErr, {
+      file: require('path').basename(String(secureErr.file || '')),
+    });
+  }
   const corruptFiles = secureStore.corruptList();
   if (corruptFiles.length) { out.ok = false; out.corruptFiles = corruptFiles; }
   res.status(out.ok ? 200 : 503).json(out);

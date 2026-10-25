@@ -2362,8 +2362,13 @@ const CASES = [
     {
       name: 'R21-09 · 自助改密不再校验当前密码（会话劫持即可永久接管账户）',
       file: 'server/routes/users.js',
-      anchor: "      const current = String(b.currentPassword == null ? '' : b.currentPassword);",
-      replacement: "      const current = 'correct-pw'; // 变异：等价于旧实现完全不校验当前密码",
+      // R87：`/users/:id` 的「编辑自己」分支新增了同一行当前密码取值，单行 anchor 因此
+      // 出现 2 次（`replace` 只替首处 ⇒ 变异可能打到 `/users/:id` 那条上，得到假绿）。
+      // 改为带上紧随其后的**唯一**判定行，仍锚在 `/users/me` 这一处。
+      anchor: "      const current = String(b.currentPassword == null ? '' : b.currentPassword);\n"
+        + '      if (!current) {',
+      replacement: "      const current = 'correct-pw'; // 变异：等价于旧实现完全不校验当前密码\n"
+        + '      if (!current) {',
       testFile: 'audit21-regressions.test.js',
       minFail: 1,
     },
@@ -2477,11 +2482,11 @@ const CASES = [
     {
       name: 'R22-03 · PROPFIND 出口退回裸发上游 message（泄漏请求 ID / 端点 / 密钥片段）',
       file: 'server/webdav/app.js',
-      anchor: '      return res.status(207).send(multistatus([propResponse(hrefFor(key), item)]));\n'
+      anchor: '      return res.status(207).send(multistatus([propResponse(spaceHref(key), item)]));\n'
         + '    } catch (e) {\n'
         + '      // R22-03：与其余同型 catch 同一口径 —— 上游原始 message 只进服务端日志\n'
         + "      if (!res.headersSent) res.status(e.status || 500).type('text/plain').send(davErrorMessage(e));",
-      replacement: '      return res.status(207).send(multistatus([propResponse(hrefFor(key), item)]));\n'
+      replacement: '      return res.status(207).send(multistatus([propResponse(spaceHref(key), item)]));\n'
         + '    } catch (e) {\n'
         + '      // R22-03：与其余同型 catch 同一口径 —— 上游原始 message 只进服务端日志\n'
         + "      if (!res.headersSent) res.status(e.status || 500).type('text/plain').send(e.message);",
@@ -2717,9 +2722,9 @@ const CASES = [
        */
       name: 'R23-04（棘轮）· 路由内联错误响应副本数增加 1（收敛点形同虚设）',
       file: 'server/routes/fs.js',
-      anchor: '    res.json(payload);\n}));\n',
+      anchor: '    res.json(relPayload(cfg.spaceRoot, payload));\n}));\n',
       replacement: '    const err = e.status ? e : translateError(e); // 棘轮反例：多复制一份\n'
-        + '    res.json(payload);\n}));\n',
+        + '    res.json(relPayload(cfg.spaceRoot, payload));\n}));\n',
       testFile: 'invariants.test.js',
       minFail: 1,
     },
@@ -3174,11 +3179,13 @@ const CASES = [
     {
       name: 'R28-02 · /fs/mkdir 的桶级配额闸门被摘除（quotaBytes 退回「只展示、零拦截」）',
       file: 'server/routes/fs.js',
-      anchor: '    const client = getClient(cfg);\n'
-        + '    await assertBucketQuota(client, cfg, { addBytes: 0 });\n'
-        + "    let key = normalizeKey(String((req.body || {}).path || ''));",
-      replacement: '    const client = getClient(cfg);\n'
-        + "    let key = normalizeKey(String((req.body || {}).path || ''));",
+      anchor: '    await assertBucketQuota(client, cfg, { addBytes: 0 });\n'
+        + "    const rel = normalizeKey(String((req.body || {}).path || ''));\n"
+        + "    if (!rel) throw badRequest('路径不能为空');\n"
+        + '    let key = absKey(cfg, rel);',
+      replacement: "    const rel = normalizeKey(String((req.body || {}).path || ''));\n"
+        + "    if (!rel) throw badRequest('路径不能为空');\n"
+        + '    let key = absKey(cfg, rel);',
       testFile: 'audit28-regressions.test.js',
       minFail: 1,
     },
@@ -3889,8 +3896,8 @@ const CASES = [
     {
       name: 'R34-01f · 摘掉 MKCOL 的根路径写保护（`MKCOL /` 从 409 变成真的建集合）',
       file: 'server/webdav/app.js',
-      anchor: '      const key = reqPathToKey(req.path);\n      if (!key) return res.status(409).end();',
-      replacement: '      const key = reqPathToKey(req.path);',
+      anchor: '      const key = spaceKey(req.path);\n      if (!key) return res.status(409).end();',
+      replacement: '      const key = spaceKey(req.path);',
       testFile: 'audit34-regressions.test.js',
       minFail: 1,
     },
@@ -4426,8 +4433,8 @@ const CASES = [
       // 新建文件夹的目录标记对象也要带上传者，否则文件夹属性永远只能显示「—」。
       name: 'R36-08d · mkdir 写入点不带上传者（文件夹属性永远显示「—」）',
       file: 'server/routes/fs.js',
-      anchor: "      Headers: uploaderMeta(req.authUser && req.authUser.username),\n    });\n    res.json({ ok: true, key });",
-      replacement: '      Headers: {},\n    });\n    res.json({ ok: true, key });',
+      anchor: "      Headers: uploaderMeta(req.authUser && req.authUser.username),\n    });\n    res.json({ ok: true, key: relKey(cfg.spaceRoot, key) });",
+      replacement: '      Headers: {},\n    });\n    res.json({ ok: true, key: relKey(cfg.spaceRoot, key) });',
       testFile: 'audit36-regressions.test.js',
       minFail: 1,
     },
@@ -4785,8 +4792,8 @@ const CASES = [
       // 没还原」，而是把系统导成**零管理员** —— 管理页打不开、也没有自助恢复通道。
       name: 'R38-02x · 导入顺手写了用户表（把系统导成零管理员 → 永久锁死）',
       file: 'server/backup.js',
-      anchor: '  configStore.flush();\n  return summarize(collect());',
-      replacement: '  configStore.save({ users: Array.isArray(data.users) ? data.users : [] });\n  configStore.flush();\n  return summarize(collect());',
+      anchor: '  await configStore.flush();\n  return summarize(collect());',
+      replacement: '  configStore.save({ users: Array.isArray(data.users) ? data.users : [] });\n  await configStore.flush();\n  return summarize(collect());',
       testFile: 'audit38-regressions.test.js',
       minFail: 1,
     },
@@ -11229,6 +11236,321 @@ const CASES = [
       anchor: '        在<b>登录状态</b>下完成的订单，须用购买时的同一个账号取回。</div>',
       replacement: '        </div>',
       testFile: 'audit86-regressions.test.js',
+      minFail: 1,
+    },
+
+    /* ================= R87：《全模块安全与功能审查报告》（GLM-5.3）================= */
+
+    {
+      name: 'R87-01a · XFF 信任退回「只看 TRUST_PROXY，不看对端」',
+      file: 'server/security.js',
+      anchor: "  if (!proxyPeerTrusted(req)) return '';",
+      replacement: '',
+      testFile: 'audit87-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R87-02a · 分享侧加密令牌 Cookie 退回静态 `!!IS_DEPLOY`',
+      file: 'server/share-routes.js',
+      anchor: "    secure: security.cookieSecure(), // R87：与主会话同一判据\n    maxAge: encStore.TOKEN_TTL_MS,",
+      replacement: "    secure: !!security.IS_DEPLOY,\n    maxAge: encStore.TOKEN_TTL_MS,",
+      testFile: 'audit87-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R87-03a · Azure 下载退回「请求级计时器一路罩到 body 结束」',
+      file: 'server/azure-client.js',
+      // 旧实现不清握手计时器：`timer` 从 fetch() 起算、body 结束时才清 ⇒ 传输总时长 > timeout 必断
+      anchor: '        clearTimeout(timer);\n        const idleMs = Number(params.__timeoutMs) || this.timeout;',
+      replacement: '        const idleMs = Number(params.__timeoutMs) || this.timeout;',
+      testFile: 'audit87-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R87-04a · normalizeRule 不再归一 methods（导入缺字段即全站 TypeError）',
+      file: 'server/ip-guard.js',
+      anchor: '  o.methods = normalizeMethods(o.methods);',
+      replacement: '',
+      testFile: 'audit87-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R87-05a · `/users/me` 的口令校验不再限流',
+      file: 'server/routes/users.js',
+      anchor: "      const rl = security.passwordLimiter('users-me:' + ip);",
+      replacement: '      const rl = { ok: true, retryAfter: 0 };',
+      testFile: 'audit87-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R87-06a · 编辑自己改密码不再校验当前密码',
+      file: 'server/routes/users.js',
+      anchor: '      if (changesPassword || changesEmail) {',
+      replacement: '      if (false && (changesPassword || changesEmail)) {',
+      testFile: 'audit87-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R87-07a · 备份导入落库前不再校验端点',
+      file: 'server/backup.js',
+      anchor: '    if (ent.endpoint) await assertSafeEndpointResolved(ent.endpoint);',
+      replacement: '    void ent;',
+      testFile: 'audit87-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R87-08a · 全局错误处理器对 5xx 直接回显 err.message',
+      file: 'server/index.js',
+      anchor: "  if (status >= 500 && !err.expose) msg = '服务器内部错误';",
+      replacement: '',
+      testFile: 'audit87-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R87-09a · rename 目录分支退回「按前缀重新列举再删」',
+      file: 'server/routes/fs.js',
+      anchor: '      const rm = await gateway.deleteKeysAll(client, cfg, items.map((item) => item.key),\n'
+        + '        (ks) => shareStore.markMissingByKeys(cfg.bucket, ks));',
+      replacement: '      const rm = await gateway.deletePrefixAll(client, cfg, key, '
+        + '(ks) => shareStore.markMissingByKeys(cfg.bucket, ks));',
+      testFile: 'audit87-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R87-10a · sliceCopyFile 不再预检 10000 片上限',
+      file: 'server/s3-client.js',
+      anchor: '      if (partCount > 10000) {',
+      replacement: '      if (false) {',
+      testFile: 'audit87-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R87-11a · 限速并发计数退回「工厂里就 +1」',
+      file: 'server/throttle.js',
+      anchor: '  const b = bucketFor(key, rate);',
+      replacement: '  const b = bucketFor(key, rate);\n  b.active = (b.active || 0) + 1;',
+      testFile: 'audit87-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R87-12a · 上传流不再听 close（提前断开时 Promise 永不结算）',
+      file: 'server/fs-gateway.js',
+      anchor: '    stream.on(\'close\', () => {\n      if (ended || settled) return;',
+      replacement: '    stream.on(\'close\', () => {\n      if (true) return;',
+      testFile: 'audit87-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R87-13a · normalizeKey 退回「子串包含 ..即拒」',
+      file: 'server/s3.js',
+      anchor: "  if (k.split('/').some((seg) => seg === '..')) throw badRequest('Key 不能包含 ..');",
+      replacement: "  if (k.includes('..')) throw badRequest('Key 不能包含 ..');",
+      testFile: 'audit87-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R87-14a · 订单徽章 label 退回未转义插值',
+      file: 'public/js/ordermgr.js',
+      anchor: '>${escapeHtml(sm.label)}</span>',
+      replacement: '>${sm.label}</span>',
+      testFile: 'audit87-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R87-15a · /api/health 退回直传含绝对路径的写错误对象',
+      file: 'server/routes/stats.js',
+      anchor: '    out.secureWriteError = Object.assign({}, secureErr, {\n'
+        + "      file: require('path').basename(String(secureErr.file || '')),\n"
+        + '    });',
+      replacement: '    out.secureWriteError = secureErr;',
+      testFile: 'audit87-regressions.test.js',
+      minFail: 1,
+    },
+    /* ---------------- R88：优惠券「满 xx 减 xx」 ---------------- */
+    {
+      name: 'R88-01a · 门槛解析允许「0.004 元」静默四舍五入成无门槛',
+      file: 'server/limits.js',
+      anchor: "  if (fen < COUPON_AMOUNT_MIN_FEN) return { ok: false, error: '使用门槛最低 0.01 元；不需要门槛请留空或填 0' };",
+      replacement: '  if (false) return { ok: false, error: \'x\' };',
+      testFile: 'coupon-threshold.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R88-02a · 门槛只进视图、不进记录（刷新即遗忘）',
+      file: 'server/coupon-store.js',
+      anchor: '      minSpendFen: clampMinSpend(minSpendFen),\n',
+      replacement: '',
+      testFile: 'coupon-threshold.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R88-03a · 取消门槛判定（满减券在任意低价链接上都能用）',
+      file: 'server/coupon-store.js',
+      anchor: '  if (minSpend > 0 && original < minSpend) {\n'
+        + "    return fail('below_threshold', { min: fenText(minSpend) });\n"
+        + '  }\n',
+      replacement: '',
+      testFile: 'coupon-threshold.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R88-04a · 门槛判定抢在 no_price 之前（免费链接答「未满 xx 元」）',
+      file: 'server/coupon-store.js',
+      anchor: "  if (original <= 0) return fail('no_price');",
+      replacement: "  if (original <= 0 && minSpend <= 0) return fail('no_price');",
+      testFile: 'coupon-threshold.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R88-05a · `minSpend: 0` 被真值判断吃掉（「去掉门槛」点了没反应）',
+      file: 'server/routes/coupon.js',
+      anchor: '  if (b.minSpend !== undefined) {',
+      replacement: '  if (b.minSpend) {',
+      testFile: 'coupon-threshold.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R88-06a · 优惠单元格退回裸面额（满减与直减长得一样）',
+      file: 'public/js/couponmgr.js',
+      anchor: '<b style="color:#b45309">${escapeHtml(fmtDiscount(c))}</b>',
+      replacement: '<b style="color:#b45309">${escapeHtml(yuan(c.amountFen))}</b>',
+      testFile: 'coupon-threshold.test.js',
+      minFail: 1,
+    },
+
+    /* ==================== R89 · 存储空间隔离（桶内前缀命名空间） ====================
+     *
+     * 本轮的失效方式有一个共同特征：**静态看处处都对，只有换一个身份去用才暴露** ——
+     * 管理员视角下所有断言全绿，普通用户却能看到、删掉别人的文件。因此每条对照都必须
+     * 在「已经建立 user 上下文」的前提下撤掉，且撤的必须是**收口点本身**，不是它的调用点。
+     */
+    {
+      name: 'R89-01a · 空间根退回无尾斜杠（`u/abc` 把 `u/abcd/` 一并放行）',
+      file: 'server/user-space.js',
+      anchor: "  return PREFIX + id + '/';",
+      replacement: '  return PREFIX + id;',
+      testFile: 'audit89-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R89-02a · 空间根判不准时回退成「看全部」（fail-open）',
+      file: 'server/request-context.js',
+      anchor: "    const e = new Error('会话缺少用户标识，无法确定存储空间');\n"
+        + '    e.status = 500;\n'
+        + '    throw e;',
+      replacement: "    return '';",
+      testFile: 'audit89-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R89-03a · `s3.p()` 的兜底断言被摘掉（绕过路由的绝对 key 直接放行）',
+      file: 'server/s3.js',
+      // 纯代码行 anchor：不能把行尾那句注释写进来，也不能跨过任何注释行
+      anchor: 'function assertScoped(params) {\n'
+        + '  const root = requestContext.spaceRoot();',
+      replacement: 'function assertScoped(params) {\n'
+        + '  if (params) return;\n'
+        + '  const root = requestContext.spaceRoot();',
+      testFile: 'audit89-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R89-04a · `/fs/list` 出口不剥空间根（普通用户看到 `u/<id>/` 前缀）',
+      file: 'server/routes/fs.js',
+      anchor: '    res.json(relPayload(cfg.spaceRoot, payload));\n}));\n',
+      replacement: '    res.json(payload);\n}));\n',
+      testFile: 'audit89-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R89-04b · `/fs/list` 缓存命中时漏剥根（同一目录第二次刷新多出一层前缀）',
+      file: 'server/routes/fs.js',
+      anchor: '    if (cached) { res.json(relPayload(cfg.spaceRoot, cached)); return; }',
+      replacement: '    if (cached) { res.json(cached); return; }',
+      testFile: 'audit89-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R89-05a · `/fs/tree` 不加空间根（侧边栏把整桶顶层目录列出来）',
+      file: 'server/routes/fs.js',
+      anchor: "    const prefix = absKey(cfg, normalizeKey(String(req.query.prefix || '')));\n"
+        + "    const data = await p(client, 'getBucket', {",
+      replacement: "    const prefix = normalizeKey(String(req.query.prefix || ''));\n"
+        + "    const data = await p(client, 'getBucket', {",
+      testFile: 'audit89-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R89-06a · `/fs/delete` 空路径守卫被摘掉（一个空串删空整个空间）',
+      file: 'server/routes/fs.js',
+      anchor: "    if (!paths.length) throw badRequest('未选择要删除的对象');\n"
+        + '    const rels = paths.map((raw) => normalizeKey(String(raw)));\n'
+        + "    if (rels.some((r) => !r)) throw badRequest('路径不能为空');\n"
+        + '    const keys = rels.map((r) => absKey(cfg, r));',
+      replacement: "    if (!paths.length) throw badRequest('未选择要删除的对象');\n"
+        + '    const keys = paths.map((raw) => absKey(cfg, normalizeKey(String(raw))));',
+      testFile: 'audit89-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R89-07a · 分享快照退回相对 key（链接建得出来、点开恒 404）',
+      file: 'server/routes/links.js',
+      anchor: '    const snap = await buildSnapshot({ client, cfg, paths: toSpacePaths(cfg, paths) });',
+      replacement: '    const snap = await buildSnapshot({ client, cfg, paths });',
+      testFile: 'audit89-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R89-08a · WebDAV 认证不把账户绑定关系接进请求上下文（仍可读写整桶）',
+      file: 'server/webdav/auth.js',
+      anchor: "    userId: owner,\n    role: owner ? 'user' : 'admin',",
+      replacement: "    userId: '',\n    role: 'admin',",
+      testFile: 'audit89-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R89-08b · 绑定用户已删时回退成「未绑定」（管理账户）',
+      file: 'server/webdav/auth.js',
+      anchor: '  if (owner && !configStore.findUserRawById(owner)) {',
+      replacement: '  if (false && owner && !configStore.findUserRawById(owner)) {',
+      testFile: 'audit89-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R89-09a · 删除用户时不吊销其 WebDAV 账户（删人 = 给凭据提权）',
+      file: 'server/config-store.js',
+      anchor: "    cfg.webdav.accounts = cfg.webdav.accounts.filter((a) => (a.ownerUserId || '') !== id);",
+      replacement: '    void 0;',
+      testFile: 'audit89-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R89-10a · 绑定用户 id 不校验存在性（写错即静默升级为「看全部」）',
+      file: 'server/config-store.js',
+      anchor: '  const target = findUserRawById(id);\n'
+        + '  if (!target) {\n'
+        + "    throw Object.assign(new Error('要绑定的用户不存在，请重新选择'), { status: 400 });\n"
+        + '  }',
+      // 替换必须**语法自洽**：直接把 if 换成 false 会留下 `target.role` 读 undefined
+      // 的 TypeError（那也会红，但红的原因就不是「不校验存在性」了）。
+      replacement: "  const target = findUserRawById(id) || { role: 'user' };",
+      testFile: 'audit89-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R89-11a · 用量统计退回整桶扫描（普通用户看到桶级总量）',
+      file: 'server/routes/stats.js',
+      anchor: "  const items = await listAll(client, cfg, String(cfg.spaceRoot || ''), { cap: LIMITS.SCAN });",
+      replacement: "  const items = await listAll(client, cfg, '', { cap: LIMITS.SCAN });",
+      testFile: 'audit89-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R89-11b · 用量缓存的键不含空间维度（谁先刷新，所有人看到他的数字）',
+      file: 'server/routes/stats.js',
+      anchor: '    const cacheKey = storageKeyOf(cfg);',
+      replacement: '    const cacheKey = bucketCacheKey(cfg);',
+      testFile: 'audit89-regressions.test.js',
       minFail: 1,
     },
   ];

@@ -36,8 +36,73 @@ const candidates = require('../search-candidates'); // 搜索候选集（带 TTL
 const { singleFlight } = require('../coalesce'); // R14-12：同目录并发请求合并（唯一实现点）
 // R37：下载限速的**唯一入口**（解析五层生效值 + 造出限速环节），三处出口共用
 const { makeThrottle } = require('../throttle');
+// R89：存储空间的**唯一实现点**（前缀命名空间 / 越界判定 / 存取方向）
+const userSpace = require('../user-space');
+// R89：上传会话的 key 是**绝对** key（init 时已加根），出口剥根需要当前请求的根
+const requestContext = require('../request-context');
 
 const router = express.Router();
+
+/* ------------------------- R89：用户存储空间 ------------------------- */
+
+/**
+ * 客户端相对 key → 桶内绝对 key（**本文件唯一入口**）。
+ *
+ * 规则只有一条：**进来的 key 一律是相对、出去的一律是相对**。
+ * 收口点加根、出口剥根，任何「有时绝对、有时相对」的分支最后都会演变成
+ * 「把根写进了文件名」（`u/abc/u/abc/a.txt`）。
+ */
+function absKey(cfg, rel) {
+  return userSpace.toAbs(cfg.spaceRoot, rel);
+}
+
+/**
+ * 绝对 key → 客户端相对 key。**只用于出口展示**：越界返回空串（`toRel` 的 null
+ * 不能被当成空串去继续做判定，判定一律走 `userSpace.assertOwned`）。
+ */
+function relKey(root, abs) {
+  const r = userSpace.toRel(root, abs);
+  return r === null ? '' : r;
+}
+
+/**
+ * 列举/搜索载荷剥根。
+ *
+ * ⚠️ **缓存里存的必须是绝对 key**：`list-cache` 的键含绝对前缀，管理员看
+ * `u/alice/` 与 alice 看自己根目录命中的是**同一条缓存**。若缓存里存相对 key，
+ * 管理员就会看到「少了 `u/alice/` 前缀」的路径，而 alice 反而正常 —— 一类
+ * 只在换身份时出现、几乎不可能被手工测出来的串味。
+ */
+function relPayload(root, payload) {
+  if (!root || !payload) return payload;
+  const out = Object.assign({}, payload);
+  if (typeof payload.prefix === 'string') out.prefix = relKey(root, payload.prefix);
+  if (Array.isArray(payload.contents)) {
+    out.contents = payload.contents.map((c) => Object.assign({}, c, { key: relKey(root, c.key) }));
+  }
+  if (Array.isArray(payload.prefixes)) {
+    out.prefixes = payload.prefixes.map((x) => Object.assign({}, x, { prefix: relKey(root, x.prefix) }));
+  }
+  if (typeof payload.nextMarker === 'string') out.nextMarker = relKey(root, payload.nextMarker);
+  if (typeof payload.key === 'string') out.key = relKey(root, payload.key);
+  if (Array.isArray(payload.items)) {
+    out.items = payload.items.map((c) => Object.assign({}, c, { key: relKey(root, c.key) }));
+  }
+  return out;
+}
+
+/** 批量操作的结果条目剥根（move / copy / delete 共用） */
+function relResults(root, list) {
+  if (!root || !Array.isArray(list)) return list;
+  return list.map((r) => {
+    if (!r || typeof r !== 'object') return r;
+    const o = Object.assign({}, r);
+    for (const f of ['path', 'key', 'from', 'to', 'newKey']) {
+      if (typeof r[f] === 'string') o[f] = relKey(root, r[f]);
+    }
+    return o;
+  });
+}
 
 const SIMPLE_THRESHOLD = 8 * 1024 * 1024; // 8MB 以下直传
 /**
@@ -87,8 +152,9 @@ function magicChunkCap(provider) {
 router.get('/fs/list', apiHandler(async (req, res) => {
     const cfg = requireConfig();
     const client = getClient(cfg);
-    const prefix = normalizeKey(String(req.query.prefix || ''));
-    const marker = String(req.query.marker || '');
+    // R89：客户端传的是**相对** key，进收口点时加空间根；出来时统一剥根
+    const prefix = absKey(cfg, normalizeKey(String(req.query.prefix || '')));
+    const marker = String(req.query.marker || '') ? absKey(cfg, String(req.query.marker)) : '';
     // LOW-28：单页上限取自 limits.js（旧实现在此硬编码 1000）
     const maxKeys = Math.min(LIMITS.LIST_PAGE, Math.max(1, Number(req.query.maxKeys) || 100));
     const delimiter = req.query.delimiter === '' ? '' : '/';
@@ -99,7 +165,10 @@ router.get('/fs/list', apiHandler(async (req, res) => {
     // 会让「两个厂商各有一个同名桶」互相串味。
     const cacheKey = listCache.keyOf(bucketCacheKey(cfg), prefix, marker, maxKeys, delimiter, 'list');
     const cached = listCache.get(cacheKey);
-    if (cached) { res.json(cached); return; }
+    // R89：缓存里存的是**绝对** key（见 relPayload 的说明），命中时同样要剥根 ——
+    // 否则同一目录「第一次刷新是相对路径、第二次变成 u/abc/...」，用户会看到
+    // 自己的文件突然多出一层前缀，且再点进去就拼出 `u/abc/u/abc/`。
+    if (cached) { res.json(relPayload(cfg.spaceRoot, cached)); return; }
 
     const data = await p(client, 'getBucket', {
       Bucket: cfg.bucket, Region: cfg.region,
@@ -134,7 +203,7 @@ router.get('/fs/list', apiHandler(async (req, res) => {
       nextMarker: data.NextMarker || lastKey,
     };
     listCache.set(cacheKey, payload);
-    res.json(payload);
+    res.json(relPayload(cfg.spaceRoot, payload));
 }));
 
 // 属性面板：文件 → 名称/创建时间/大小；文件夹 → 名称/创建时间/对象总数
@@ -142,8 +211,12 @@ router.get('/fs/stat', async (req, res) => {
   try {
     const cfg = requireConfig();
     const client = getClient(cfg);
-    const key = normalizeKey(String(req.query.path || ''));
-    if (!key) return res.status(400).json({ error: '缺少 path 参数' });
+    const rel = normalizeKey(String(req.query.path || ''));
+    // R89：空值判定必须看**相对**入参 —— 加根之后 `absKey(cfg, '')` 得到的是空间根本身
+    // （非空串），原守卫会静默失效：`/fs/stat` 变成「统计我整个空间」，`/fs/mkdir`
+    // 变成「在自己的根上写目录标记」。
+    if (!rel) return res.status(400).json({ error: '缺少 path 参数' });
+    const key = absKey(cfg, rel);
 
     if (key.endsWith('/')) {
       /**
@@ -168,7 +241,7 @@ router.get('/fs/stat', async (req, res) => {
        */
       const statKey = listCache.keyOf(bucketCacheKey(cfg), key, '', LIMITS.STAT, '', 'stat');
       const cachedStat = listCache.get(statKey);
-      if (cachedStat) return res.json(cachedStat);
+      if (cachedStat) return res.json(relPayload(cfg.spaceRoot, cachedStat));
 
       const payload = await singleFlight(`fs-stat:${statKey}`, async () => {
         // 排队期间可能已被别的请求填好（去重窗口内到达的请求不必再算一次）
@@ -200,14 +273,14 @@ router.get('/fs/stat', async (req, res) => {
         listCache.set(statKey, out);
         return out;
       });
-      return res.json(payload);
+      return res.json(relPayload(cfg.spaceRoot, payload));
     }
 
     // 文件
     const head = await p(client, 'headObject', { Bucket: cfg.bucket, Region: cfg.region, Key: key });
     const encMeta = encStore.getMeta(cfg.bucket, key);
     res.json({
-      ok: true, isFolder: false, key,
+      ok: true, isFolder: false, key: relKey(cfg.spaceRoot, key),
       name: baseName(key),
       size: encMeta ? encMeta.origSize : (Number(head.headers['content-length']) || 0), // 加密文件显示原始大小
       encrypted: !!encMeta, // 云端存储为密文
@@ -229,7 +302,8 @@ router.get('/fs/stat', async (req, res) => {
 router.get('/fs/search', apiHandler(async (req, res) => {
     const cfg = requireConfig();
     const client = getClient(cfg);
-    const prefix = normalizeKey(String(req.query.prefix || ''));
+    // R89：搜索起点同样加空间根 —— 传空 prefix 只能搜到「自己的根」，而不是整个桶
+    const prefix = absKey(cfg, normalizeKey(String(req.query.prefix || '')));
     const q = String(req.query.q || '').toLowerCase();
     const type = String(req.query.type || '');
     const from = String(req.query.from || '');   // YYYY-MM-DD（含）
@@ -237,7 +311,8 @@ router.get('/fs/search', apiHandler(async (req, res) => {
     const min = Number(req.query.min || 0);
     const max = req.query.max ? Number(req.query.max) : Infinity;
     const limit = Math.min(2000, Math.max(1, Number(req.query.limit) || 500));
-    const cursor = String(req.query.cursor || '');
+    // 游标是**绝对** key；空串必须保持空串（把空串交给 `absKey()` 会得到空间根本身）
+    const cursor = String(req.query.cursor || '') ? absKey(cfg, String(req.query.cursor)) : '';
     // 搜索范围：scope=current → 只搜当前目录（delimiter '/'），默认递归整个子树（''）
     const scope = String(req.query.scope || '') === 'current' ? 'current' : '';
     const delimiter = scope === 'current' ? '/' : '';
@@ -394,9 +469,10 @@ router.get('/fs/search', apiHandler(async (req, res) => {
     }
 
     res.json({
-      matches, scanned, limit,
+      matches: cfg.spaceRoot ? matches.map((m) => Object.assign({}, m, { key: relKey(cfg.spaceRoot, m.key) })) : matches,
+      scanned, limit,
       // 下一轮原样传回 cursor 即可续扫；空串表示已扫完整个目录
-      cursor: nextCursor,
+      cursor: relKey(cfg.spaceRoot, nextCursor),
       truncated: !exhausted,
       hint: !exhausted ? `该目录下还有未扫描的对象（本轮已扫描 ${scanned} 个），可继续搜索。` : '',
     });
@@ -410,12 +486,18 @@ router.post('/fs/mkdir', async (req, res) => {
      * R25：文件夹本身是 0 字节对象，不占空间 → `addBytes=0`（仅「已超额」时拒绝写入）
      * R28-02：**两层配额**都要判 —— 凭据级（该密钥名下合计）与桶级（该桶自身上限）。
      * 顺序：先凭据后桶，两条闸门的口径完全一致（严格大于才拒、0 = 无限制）。
+     *
+     * R89：下面那段「空值判定看**相对**入参」的说明写在这里，而不是紧贴 `const rel`
+     * —— 因为 R28-02 的反向变异 anchor 必须从闸门行**连续**跨到 `const rel`；
+     * 中间夹一行注释会让 anchor 剥注释后多出一个只剩空白的行而失配
+     * （注释抹成等长空白，换行还在）。这条注释的位置是被护栏绑定的，别挪。
      */
     await assertCredentialQuota(cfg.credentialId, { addBytes: 0 });
     const client = getClient(cfg);
     await assertBucketQuota(client, cfg, { addBytes: 0 });
-    let key = normalizeKey(String((req.body || {}).path || ''));
-    if (!key) throw badRequest('路径不能为空');
+    const rel = normalizeKey(String((req.body || {}).path || ''));
+    if (!rel) throw badRequest('路径不能为空');
+    let key = absKey(cfg, rel);
     if (!key.endsWith('/')) key += '/';
     // R36：文件夹的「创建者」同样落在目录标记对象的元数据上 —— 否则文件夹属性
     // 永远只能显示「—」，而需求明确要求文件夹显示创建者。
@@ -424,7 +506,7 @@ router.post('/fs/mkdir', async (req, res) => {
       Body: Buffer.alloc(0), ContentLength: 0,
       Headers: uploaderMeta(req.authUser && req.authUser.username),
     });
-    res.json({ ok: true, key });
+    res.json({ ok: true, key: relKey(cfg.spaceRoot, key) });
     statsStore.addLog({ action: 'fs.mkdir', detail: '创建文件夹 ' + key });
   } catch (e) {
     const err = e.status ? e : translateError(e);
@@ -440,7 +522,7 @@ router.put('/fs/upload/simple', express.raw({ type: () => true, limit: '64mb' })
   try {
     const cfg = requireConfig();
     const client = getClient(cfg);
-    const key = normalizeKey(String(req.query.path || ''));
+    const key = absKey(cfg, normalizeKey(String(req.query.path || '')));
     if (!req.body || !req.body.length) throw badRequest('请求体为空');
     // 上传排除规则校验（.DS_Store / Thumbs.db，服务端兜底）
     //
@@ -478,7 +560,7 @@ router.put('/fs/upload/simple', express.raw({ type: () => true, limit: '64mb' })
     // R8-03：反向同样要处理 —— 明文覆盖写入时必须清掉旧条目，否则本地还留着上一条
     // crypto/magic 记录 → 下载报错、或（magic 分支）静默拿到内容全错的文件。
     encStore.reconcileAfterWrite(cfg.bucket, key, enc ? enc.meta : null);
-    res.json({ ok: true, key, encrypted });
+    res.json({ ok: true, key: relKey(cfg.spaceRoot, key), encrypted });
     statsStore.sampleTraffic(stored, 0);
     statsStore.trackBucket(cfg.bucket, { up: stored });
     adjustStorageCache(stored, cfg);
@@ -495,12 +577,20 @@ router.post('/fs/upload/init', async (req, res) => {
   try {
     const cfg = requireConfig();
     const client = getClient(cfg);
-    const key = normalizeKey(String((req.body || {}).key || ''));
+    /**
+     * R89：`rel` 是客户端看到的相对 key，`key` 是桶内绝对 key。
+     *
+     * 两者**都要留**：加根之后 `key` 形如 `u/<id>/dir/a.txt`，若把 `key` 直接喂给
+     * 排除规则的文案，用户会在报错里看到一串自己的内部 id；而 `rel` 用于
+     * `assertNotExcluded` 与所有回包，保持「用户看到的世界」不变。
+     */
+    const rel = normalizeKey(String((req.body || {}).key || ''));
+    const key = absKey(cfg, rel);
     const size = Number((req.body || {}).size || 0);
     if (!key || !Number.isFinite(size) || size < 0) throw badRequest('参数错误');
 
     // 上传排除规则校验（前端选择阶段已过滤，此处为服务端兜底）
-    assertNotExcluded(key, String((req.body || {}).gitignore || ''), String((req.body || {}).gitignoreRel || ''));
+    assertNotExcluded(rel, String((req.body || {}).gitignore || ''), String((req.body || {}).gitignoreRel || ''));
 
     /**
      * R10-05：**simple / multipart 的分界必须感知加密模式**。
@@ -532,7 +622,7 @@ router.post('/fs/upload/init', async (req, res) => {
       providers.putObjectMaxBytes(cfg.provider)
     );
     if (size <= simpleLimit) {
-      return res.json({ mode: 'simple', key });
+      return res.json({ mode: 'simple', key: relKey(cfg.spaceRoot, key) });
     }
 
     /**
@@ -651,6 +741,9 @@ router.post('/fs/upload/init', async (req, res) => {
         uploadId: init.UploadId, key, bucket: cfg.bucket, region: cfg.region, size, chunkSize,
         provider: cfg.provider, // R7-01
         createdBy: (req.authUser && req.authUser.username) || '', // SEC-07：记录创建者供 /fs/sessions 过滤
+        // R89：用户名可被管理员改写，改写后「文件还在、人找不到」⇒ 归属判据用不可变的 id。
+        // createdBy 保留只为兼容**升级前**落盘的老会话（它们没有 ownerId）。
+        ownerId: (req.authUser && req.authUser.id) || '',
       });
     } else if (encStore.currentMode() === 'magic' && sess.chunkSize > magicChunkCap(sess.provider)) {
       /**
@@ -679,7 +772,7 @@ router.post('/fs/upload/init', async (req, res) => {
     }
     res.json({
       mode: 'multipart', sessionId: sess.id, chunkSize: sess.chunkSize,
-      uploadedParts, key,
+      uploadedParts, key: relKey(cfg.spaceRoot, key),
     });
     if (uploadedParts.length) statsStore.addLog({ action: 'fs.upload', detail: `断点续传恢复 ${key}（已传 ${uploadedParts.length} 分片）` });
   } catch (e) {
@@ -700,11 +793,21 @@ router.post('/fs/upload/init', async (req, res) => {
 function assertSessionOwner(sess, req) {
   if (!sess) return;
   if (req.authUser && roles.isStaff(req.authUser.role)) return;
-  const owner = String(sess.createdBy || '');
-  const me = String((req.authUser && req.authUser.username) || '');
-  if (owner && owner === me) return;
+  /*
+   * R89：判据换成**用户 id**。原先比 `username`，而用户名可被管理员修改 ——
+   * 改名之后，本人正在进行的分片任务会集体变成「无权操作」。
+   * 旧会话没有 `ownerId`（历史数据），退回比用户名，保持升级当口不掉任务。
+   */
+  const meId = String((req.authUser && req.authUser.id) || '');
+  const ownerId = String(sess.ownerId || '');
+  if (ownerId && meId && ownerId === meId) return;
+  if (!ownerId) {
+    const owner = String(sess.createdBy || '');
+    const me = String((req.authUser && req.authUser.username) || '');
+    if (owner && owner === me) return;
+  }
   // 无归属信息的是历史遗留会话：宁可拦下让管理员处置，也不默认放行
-  const e = new Error(owner ? '无权操作他人的上传任务' : '该上传任务缺少归属信息，仅管理员可操作');
+  const e = new Error(ownerId ? '无权操作他人的上传任务' : '该上传任务缺少归属信息，仅管理员可操作');
   e.status = 403;
   throw e;
 }
@@ -919,7 +1022,7 @@ router.post('/fs/upload/complete', async (req, res) => {
     // 旧密文所对应的元数据（同一 key 先前的加密上传），否则下载按旧参数还原 → 损坏。
     encStore.reconcileAfterWrite(sess.bucket, sess.key, encMeta);
     uploadSessions.remove(sess.id);
-    res.json({ ok: true, key: sess.key, encrypted: !!encMeta });
+    res.json({ ok: true, key: relKey(requestContext.spaceRoot(), sess.key), encrypted: !!encMeta });
     // R10-10：必须传完整 cfg（见 configForSession 的说明）。手拼的 `{bucket,region,provider,credentialId}`
     // 缺 secretId → 缓存键与统计页不一致 → 修正恒为静默空操作。
     // R27-04：增量取**实际字节**（旧实现取 `sess.size`，与真实写入量脱钩）。
@@ -981,9 +1084,15 @@ router.get('/fs/sessions', async (req, res) => {
   try {
     requireConfig();
     const isAdminUser = req.authUser && roles.isStaff(req.authUser.role);
-    const opt = isAdminUser ? undefined : { createdBy: (req.authUser && req.authUser.username) || '\u0000' };
+    // R89：优先按不可变 id 过滤；`list()` 对没有 ownerId 的老会话回退比 createdBy，
+    // 因此这里**两个维度一起传** —— 只传 ownerId 会让升级前建的可续传项从列表里消失
+    // （会话还在磁盘上，用户却看不到、也就续不上，等于分片永久悬空计费）。
+    const opt = isAdminUser ? undefined : {
+      ownerId: (req.authUser && req.authUser.id) || '',
+      createdBy: (req.authUser && req.authUser.username) || '\u0000',
+    };
     const list = uploadSessions.list(opt).map((s) => ({
-      sessionId: s.id, key: s.key, size: s.size, chunkSize: s.chunkSize,
+      sessionId: s.id, key: relKey(requestContext.spaceRoot(), s.key), size: s.size, chunkSize: s.chunkSize,
       uploadedCount: Object.keys(s.parts).length, updatedAt: s.updatedAt,
     }));
     res.json({ sessions: list });
@@ -1020,7 +1129,7 @@ router.head('/fs/download', async (req, res) => {
   try {
     const cfg = requireConfig();
     const client = getClient(cfg);
-    const key = normalizeKey(String(req.query.path || ''));
+    const key = absKey(cfg, normalizeKey(String(req.query.path || '')));
     const encMeta = encStore.getMeta(cfg.bucket, key);
     if (encMeta && encStore.passwordSet()) {
       // 令牌仅经请求头传递（S5）：与 GET 同一门禁
@@ -1048,7 +1157,7 @@ router.get('/fs/download', async (req, res) => {
   try {
     const cfg = requireConfig();
     const client = getClient(cfg);
-    const key = normalizeKey(String(req.query.path || ''));
+    const key = absKey(cfg, normalizeKey(String(req.query.path || '')));
     const traffic = { bytesDown: 0 };
     const encMeta = encStore.getMeta(cfg.bucket, key);
     if (encMeta && encStore.passwordSet()) {
@@ -1102,7 +1211,7 @@ router.get('/fs/thumb', async (req, res) => {
   try {
     const cfg = requireConfig();
     const client = getClient(cfg);
-    const key = normalizeKey(String(req.query.path || ''));
+    const key = absKey(cfg, normalizeKey(String(req.query.path || '')));
     if (THUMB_UNSAFE_RE.test(key)) {
       // R69：不给这类对象签直链（见 THUMB_UNSAFE_RE 的说明）
       res.status(200).type('svg').setHeader('Cache-Control', 'private, max-age=300');
@@ -1148,7 +1257,7 @@ router.get('/fs/presign', async (req, res) => {
   try {
     const cfg = requireConfig();
     const client = getClient(cfg);
-    const key = normalizeKey(String(req.query.path || ''));
+    const key = absKey(cfg, normalizeKey(String(req.query.path || '')));
     if (encStore.getMeta(cfg.bucket, key)) {
       const e = new Error('该文件已加密存储，预签名直链只会得到密文且绕过密码验证；请使用「下载」或带密码的分享链接');
       e.status = 409;
@@ -1426,9 +1535,11 @@ router.post('/fs/rename', async (req, res) => {
   try {
     const cfg = requireConfig();
     const client = getClient(cfg);
-    const key = normalizeKey(String((req.body || {}).path || ''));
+    // R89：空值判定看相对入参（见 /fs/stat 同款说明）
+    const rel = normalizeKey(String((req.body || {}).path || ''));
+    if (!rel) throw badRequest('路径不能为空');
+    const key = absKey(cfg, rel);
     const newName = String((req.body || {}).newName || '').trim();
-    if (!key) throw badRequest('路径不能为空');
     if (!newName || /[\\/:*?"<>|]/.test(newName)) throw badRequest('名称不能包含 \\ / : * ? " < > | 字符');
     // R14-13：`.` 与 `..` 必须挡在**写入侧**。名字校验的字符集不含点号，
     // 于是 `newName='..'` 会被拼成键 `a/..` 写进云端；而删除 / 移动 / stat 都要跑
@@ -1463,7 +1574,17 @@ router.post('/fs/rename', async (req, res) => {
       // rename 的目标已由 assertNoConflict 确认为空，这里传的是全部源相对键。
       encStore.migratePrefix(cfg.bucket, key, newKey, { overwriteRelKeys: new Set(relKeys) });
       // 源对象被删 → 指向它们的分享链接同步标记「文件已删除」（重命名后旧链接本就失效）
-      const rm = await gateway.deletePrefixAll(client, cfg, key, (ks) => shareStore.markMissingByKeys(cfg.bucket, ks));
+      /**
+       * R87：按**快照**删除，而不是重新列举。
+       *
+       * `deletePrefixAll` 会在删除那一刻重新列一遍前缀：从上面 `listAllExact` 到这一步
+       * 之间（大目录搬运期间可能几十秒），任何人往 `key` 下新上传的对象都**不在快照里**
+       * （因此没被复制到 newKey），却会被这一步删掉 —— **静默、不可逆的数据丢失**。
+       * 同一项目里 `fs-gateway.movePrefix`（WebDAV MOVE）删的正是快照，两条实现口径
+       * 本就不一致，这里对齐到更安全的那个。
+       */
+      const rm = await gateway.deleteKeysAll(client, cfg, items.map((item) => item.key),
+        (ks) => shareStore.markMissingByKeys(cfg.bucket, ks));
       if (rm.truncated) {
         // 源数据未删干净 —— 此时已复制出完整副本，源残留属重复占用，必须如实暴露
         const err = new Error(`重命名后清理源目录未完成（已删 ${rm.count} 个对象后仍被截断），请重试或手工清理 ${key}`);
@@ -1482,7 +1603,7 @@ router.post('/fs/rename', async (req, res) => {
       shareStore.markMissingByKeys(cfg.bucket, [key]);
       copied = 1;
     }
-    res.json({ ok: true, newKey, copied });
+    res.json({ ok: true, newKey: relKey(cfg.spaceRoot, newKey), copied });
     statsStore.addLog({ action: 'fs.rename', detail: `重命名 ${key} -> ${newKey}${isFolder ? `（共 ${copied} 个对象）` : ''}` });
   } catch (e) {
     const err = e.status ? e : translateError(e);
@@ -1497,13 +1618,17 @@ router.post('/fs/move', async (req, res) => {
     const cfg = requireConfig();
     const client = getClient(cfg);
     const paths = Array.isArray((req.body || {}).paths) ? req.body.paths : [];
-    let targetPrefix = normalizeKey(String((req.body || {}).targetPrefix || ''));
+    let targetPrefix = absKey(cfg, normalizeKey(String((req.body || {}).targetPrefix || '')));
     if (targetPrefix && !targetPrefix.endsWith('/')) targetPrefix += '/';
     if (!paths.length) throw badRequest('未选择要移动的对象');
     // R25：移动同桶内净占用不变 → `addBytes=0`（仅「已超额」时拒绝）
     await assertCredentialQuota(cfg.credentialId, { addBytes: 0 });
     await assertBucketQuota(client, cfg, { addBytes: 0 }); // R28-02：单桶上限
-    const keys = paths.map((raw) => normalizeKey(String(raw)));
+    // R89：每个源路径都加空间根（越界的那一项会在 `p()` 的兜底判据处被拒）
+    // 空路径同样先挡掉：加根后它等于空间根，会被当作「移动整个空间」而不是报错。
+    const rels = paths.map((raw) => normalizeKey(String(raw)));
+    if (rels.some((r) => !r)) throw badRequest('路径不能为空');
+    const keys = rels.map((r) => absKey(cfg, r));
     // 按下标回填、按入参顺序输出（目录串行 + 文件并发，两条路径不能打乱顺序）
     const results = new Array(keys.length).fill(null);
 
@@ -1564,7 +1689,9 @@ router.post('/fs/move', async (req, res) => {
           // 元数据迁移必须在删除源之前完成，否则中途失败会让密文失去元数据
           // R10-04：只清理"本次确实被覆盖写入"的目标条目（见 migratePrefix 的说明）
           encStore.migratePrefix(cfg.bucket, key, newKey, { overwriteRelKeys: new Set(relKeys) });
-          const rm = await gateway.deletePrefixAll(client, cfg, key, (ks) => shareStore.markMissingByKeys(cfg.bucket, ks));
+          // R87：同 rename —— 按快照删源，避免「搬运窗口内新上传的对象未复制却被删」
+          const rm = await gateway.deleteKeysAll(client, cfg, items.map((item) => item.key),
+            (ks) => shareStore.markMissingByKeys(cfg.bucket, ks));
           if (rm.truncated) {
             const err = new Error(`移动后清理源目录未完成（已删 ${rm.count} 个对象后仍被截断），请重试或手工清理 ${key}`);
             err.status = 500;
@@ -1592,7 +1719,7 @@ router.post('/fs/move', async (req, res) => {
     await mapLimit(fileIdx, 4, async (i) => { results[i] = await moveOne(keys[i]); });
 
     const out = results.map((r, i) => r || { path: keys[i], ok: false, error: '未处理' });
-    res.json({ ok: out.every((r) => r.ok), results: out });
+    res.json({ ok: out.every((r) => r.ok), results: relResults(cfg.spaceRoot, out) });
     statsStore.addLog({ action: 'fs.move', detail: `移动 ${paths.length} 项到 ${targetPrefix || '/'}（成功 ${out.filter((r) => r.ok).length}）` });
   } catch (e) {
     const err = e.status ? e : translateError(e);
@@ -1648,11 +1775,16 @@ router.post('/fs/copy', apiHandler(async (req, res) => {
     const client = getClient(cfg);
     const body = req.body || {};
     const paths = Array.isArray(body.paths) ? body.paths : [];
-    let targetPrefix = normalizeKey(String(body.targetPrefix || ''));
+    let targetPrefix = absKey(cfg, normalizeKey(String(body.targetPrefix || '')));
     if (targetPrefix && !targetPrefix.endsWith('/')) targetPrefix += '/';
     if (!paths.length) throw badRequest('未选择要复制的对象');
     const decisions = (body.decisions && typeof body.decisions === 'object') ? body.decisions : null;
-    const keys = paths.map((raw) => normalizeKey(String(raw)));
+    // R89：源与目标都落在本人空间内（目标为空时即本次的**空间根**，
+    // 顺带消掉了本条注释描述的老问题 —— 那时列举的已不是「整个桶」）。
+    // 空**源路径**要先挡掉：加根后它等于空间根，会被当作「复制整个空间」。
+    const rels = paths.map((raw) => normalizeKey(String(raw)));
+    if (rels.some((r) => !r)) throw badRequest('路径不能为空');
+    const keys = rels.map((r) => absKey(cfg, r));
 
     // 按下标回填、按入参顺序输出（与 /fs/move 同款：目录串行、文件并发，两条路径不能打乱顺序）
     const rootResult = new Array(keys.length).fill(null);
@@ -1902,7 +2034,7 @@ router.post('/fs/copy', apiHandler(async (req, res) => {
       addedBytes += w.tasks.reduce((m, t) => m + (Number(t.size) || 0), 0) - (overByRoot.get(w.i) || 0);
     }
     adjustStorageCache(Math.max(0, addedBytes), cfg);
-    res.json({ ok: out.every((r) => r.ok), results: out });
+    res.json({ ok: out.every((r) => r.ok), results: relResults(cfg.spaceRoot, out) });
     statsStore.addLog({
       action: 'fs.copy',
       detail: `复制 ${paths.length} 项到 ${targetPrefix || '/'}（成功 ${out.filter((r) => r.ok && !r.skipped).length}`
@@ -1923,8 +2055,21 @@ router.post('/fs/delete', async (req, res) => {
     const cfg = requireConfig();
     const client = getClient(cfg);
     const paths = Array.isArray((req.body || {}).paths) ? req.body.paths : [];
+    /**
+     * R89：删除是最危险的一条 —— 每个 key 都必须落在本人空间内。
+     *
+     * ⚠️ 空路径必须先挡掉：加根之后 `absKey(cfg, '')` 等于**空间根本身**（以 `/` 结尾），
+     * 会被下面的目录分支当成「删除这个目录」递归清空整个空间 —— 一个空字符串
+     * 就能把用户自己的全部文件删光，且 `deletePrefixAll` 是不可逆的。
+     *
+     * 这段说明写在 `if (!paths.length)` **之前**，不夹在守卫与 `const rels` 之间：
+     * R89-06 的反向变异 anchor 要连续跨过「未选择」→「rels」四行代码，
+     * 中间多一行注释会让 anchor 剥注释后失配（同 `/fs/mkdir` 的处理）。
+     */
     if (!paths.length) throw badRequest('未选择要删除的对象');
-    const keys = paths.map((raw) => normalizeKey(String(raw)));
+    const rels = paths.map((raw) => normalizeKey(String(raw)));
+    if (rels.some((r) => !r)) throw badRequest('路径不能为空');
+    const keys = rels.map((r) => absKey(cfg, r));
     // 结果按下标回填、最后按**入参顺序**输出：目录与文件走两条处理路径，
     // 不能让它们打乱顺序（前端按 results[i] 对应选中的第 i 项）
     const results = new Array(keys.length).fill(null);
@@ -2029,7 +2174,7 @@ router.post('/fs/delete', async (req, res) => {
     }
 
     const out = results.map((r, i) => r || { path: keys[i], ok: false, error: '未处理' });
-    res.json({ ok: out.every((r) => r.ok), deleted, results: out });
+    res.json({ ok: out.every((r) => r.ok), deleted, results: relResults(cfg.spaceRoot, out) });
     adjustStorageCache(-freedBytes, cfg); // 立即修正用量缓存
     statsStore.addLog({ action: 'fs.delete', detail: `删除 ${paths.length} 项（共 ${deleted} 个对象）`, level: 'warn' });
   } catch (e) {
@@ -2044,11 +2189,15 @@ router.get('/fs/tree', async (req, res) => {
   try {
     const cfg = requireConfig();
     const client = getClient(cfg);
-    const prefix = normalizeKey(String(req.query.prefix || ''));
+    // R89：这是**最容易被漏掉**的一处 —— 侧边栏树与 `/fs/list` 是两条独立的列举入口。
+    // 漏加根的表现很有欺骗性：`relKey()` 对越界前缀返回空串，于是普通用户的侧边栏
+    // 变成一列**空白条目**，看起来像前端渲染 bug，实际是把整个桶的顶层目录
+    // （含所有 `u/<别人的 id>/`）都列了出来。
+    const prefix = absKey(cfg, normalizeKey(String(req.query.prefix || '')));
     const data = await p(client, 'getBucket', {
       Bucket: cfg.bucket, Region: cfg.region, Prefix: prefix, Delimiter: '/', MaxKeys: 300,
     });
-    res.json({ prefix, folders: (data.CommonPrefixes || []).map((x) => x.Prefix) });
+    res.json({ prefix: relKey(cfg.spaceRoot, prefix), folders: (data.CommonPrefixes || []).map((x) => relKey(cfg.spaceRoot, x.Prefix)) });
   } catch (e) {
     const err = e.status ? e : translateError(e);
     res.status(err.status || 500).json({ error: err.message });

@@ -25,6 +25,34 @@ const {
 } = require('./listing');
 const { authMiddleware } = require('./auth');
 const { propResponse, multistatus } = require('./xml');
+// R89：WebDAV 侧的**唯一**空间收口点（见 keyOf / hrefOf）
+const userSpace = require('../user-space');
+const requestContext = require('../request-context');
+
+/* ------------------------------ R89：存储空间 ------------------------------ */
+
+/**
+ * 请求路径 → 桶内**绝对** key（进收口点加空间根）。
+ *
+ * 挂在 `reqPathToKey()` 外面一层，而不是给它加参数：调用点有 7 处（含 MOVE/COPY 的
+ * `Destination` 头），逐个传参必然漏掉某一处 —— 而漏掉的那处就是「普通用户能在
+ * 别人目录里建/删文件」。`.toAbs()` 对管理账户（根为空）是恒等变换，行为不变。
+ */
+function spaceKey(reqPath) {
+  return userSpace.toAbs(requestContext.spaceRoot(), reqPathToKey(reqPath));
+}
+
+/**
+ * 绝对 key → WebDAV `href`（出收口点剥空间根）。
+ *
+ * `toRel()` 对越界 key 返回 `null` —— 这里退回原 key 而不是空串：`spaceHref()` 只用于
+ * **展示**已列举出来的条目，真正越界的 key 在列举阶段就被空间根挡掉了；
+ * 退回原 key 至少不会把客户端指向挂载点根目录（那会让它在错误的层级上继续操作）。
+ */
+function spaceHref(key) {
+  const r = userSpace.toRel(requestContext.spaceRoot(), key);
+  return hrefFor(r === null ? key : r);
+}
 
 /* ------------------------------ Express 应用 ------------------------------ */
 
@@ -130,7 +158,7 @@ function buildApp() {
   const propfind = async (req, res) => {
     try {
       const { cfg, s3 } = await requireS3();
-      const key = reqPathToKey(req.path);
+      const key = spaceKey(req.path);
       const depth = String(req.headers.depth || '1').toLowerCase();
       res.setHeader('Content-Type', 'application/xml; charset=utf-8');
 
@@ -139,8 +167,8 @@ function buildApp() {
         const responses = [propResponse(MOUNT + '/', { dir: true, key: '', lm: '' })];
         if (depth !== '0') {
           const { files, dirs, truncated } = await listLevel(s3, cfg, '');
-          for (const d of dirs) responses.push(propResponse(hrefFor(d.key), d));
-          for (const f of files) responses.push(propResponse(hrefFor(f.key), f));
+          for (const d of dirs) responses.push(propResponse(spaceHref(d.key), d));
+          for (const f of files) responses.push(propResponse(spaceHref(f.key), f));
           if (truncated) {
             noteTruncation(res, 'PROPFIND Depth:1（根目录）', responses.length - 1, '/');
           }
@@ -152,18 +180,18 @@ function buildApp() {
       const isDir = key.endsWith('/');
       if (isDir) {
         // 目录标记对象可能不存在（虚拟目录），列举其内容即可证明存在
-        const responses = [propResponse(hrefFor(key), { dir: true, key, lm: '' })];
+        const responses = [propResponse(spaceHref(key), { dir: true, key, lm: '' })];
         if (depth !== '0') {
           if (depth === 'infinity') {
             const { items, truncated } = await listRecursive(s3, cfg, key);
-            for (const it of items) responses.push(propResponse(hrefFor(it.key), it));
+            for (const it of items) responses.push(propResponse(spaceHref(it.key), it));
             if (truncated) {
               noteTruncation(res, 'PROPFIND Depth:infinity', items.length, key);
             }
           } else {
             const { files, dirs, truncated } = await listLevel(s3, cfg, key);
-            for (const d of dirs) responses.push(propResponse(hrefFor(d.key), d));
-            for (const f of files) responses.push(propResponse(hrefFor(f.key), f));
+            for (const d of dirs) responses.push(propResponse(spaceHref(d.key), d));
+            for (const f of files) responses.push(propResponse(spaceHref(f.key), f));
             if (truncated) {
               noteTruncation(res, 'PROPFIND Depth:1', files.length + dirs.length, key);
             }
@@ -184,7 +212,7 @@ function buildApp() {
         size: Number(head.headers['content-length']) || 0,
         lm: head.headers['last-modified'] || '',
       };
-      return res.status(207).send(multistatus([propResponse(hrefFor(key), item)]));
+      return res.status(207).send(multistatus([propResponse(spaceHref(key), item)]));
     } catch (e) {
       // R22-03：与其余同型 catch 同一口径 —— 上游原始 message 只进服务端日志
       if (!res.headersSent) res.status(e.status || 500).type('text/plain').send(davErrorMessage(e));
@@ -200,7 +228,7 @@ function buildApp() {
   const getObject = async (req, res, headOnly) => {
     try {
       const { cfg } = await requireS3();
-      const key = reqPathToKey(req.path);
+      const key = spaceKey(req.path);
       if (!key || key.endsWith('/')) return res.status(405).type('text/plain').send('405 Method Not Allowed');
 
       /**
@@ -351,7 +379,7 @@ function buildApp() {
   app.put('*', async (req, res) => {
     try {
       const { cfg, s3 } = await requireS3();
-      let key = reqPathToKey(req.path);
+      let key = spaceKey(req.path);
       if (!key) return res.status(409).type('text/plain').send('409 Conflict：无法上传到根路径');
       if (key.endsWith('/')) {
         // R25：目录是 0 字节对象 → `addBytes=0`（仅「已超额」时拒绝）
@@ -413,7 +441,7 @@ function buildApp() {
     if (!inMount(req.path)) return next();
     try {
       const { cfg, s3 } = await requireS3();
-      const key = reqPathToKey(req.path);
+      const key = spaceKey(req.path);
       if (!key) return res.status(409).end();
       const dirKey = key.endsWith('/') ? key : key + '/';
       // R25：新建集合是 0 字节对象 → `addBytes=0`
@@ -439,7 +467,7 @@ function buildApp() {
     if (!inMount(req.path)) return next();
     try {
       const { cfg } = await requireS3();
-      const key = reqPathToKey(req.path);
+      const key = spaceKey(req.path);
       if (!key) return res.status(403).type('text/plain').send('403：禁止删除存储桶根');
       const userLabel = req.webdavUser ? `${req.webdavUser.username} 删除 ` : 'WebDAV 删除 ';
       // R25：删除**不设配额闸门**（删除是在释放空间，拦下它只会让用户更出不去）；
@@ -477,7 +505,7 @@ function buildApp() {
   async function moveCopy(req, res, isMove) {
     try {
       const { cfg, s3 } = await requireS3();
-      const srcKey = reqPathToKey(req.path);
+      const srcKey = spaceKey(req.path);
       const destHeader = req.headers.destination;
       if (!destHeader) return res.status(400).type('text/plain').send('400：缺少 Destination 头');
       let destUrl;
@@ -505,7 +533,7 @@ function buildApp() {
         return res.status(403).type('text/plain')
           .send('403 Forbidden：不支持跨主机 Destination');
       }
-      const dstKey = reqPathToKey(destPath);
+      const dstKey = spaceKey(destPath);
       if (!srcKey || !dstKey) return res.status(400).type('text/plain').send('400：源或目标路径无效');
       const overwrite = String(req.headers.overwrite || 'T').toUpperCase() !== 'F';
 

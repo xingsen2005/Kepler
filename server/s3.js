@@ -20,6 +20,9 @@ const { AzureBlobClient } = require('./azure-client');
 const { assertSafeEndpoint } = require('./endpoint-guard');
 const { LIMITS, resolveCap } = require('./limits');
 const listCache = require('./list-cache');
+// R89：存储空间作用域的**兜底判据**（见 `assertScoped`）
+const requestContext = require('./request-context');
+const userSpace = require('./user-space');
 
 const clients = new Map(); // 签名 -> 客户端实例缓存
 let clientsKey = '';
@@ -128,7 +131,81 @@ function getClient(cfg) {
  * 将 SDK 回调风格转为 Promise
  * @param {object} opts { noStat } noStat=true 时不计入按桶请求统计（内部轮询类调用）
  */
+/**
+ * R89：从 `CopySource` 里取出对象 key。
+ *
+ * 有两种形态（见 `copySource()`）：S3 兼容厂商的 `/bucket/key`，Azure 的
+ * 绝对 URL。key 部分是**百分号编码**过的，比对前必须解码，否则 `u/alice/a b.txt`
+ * 会与 `u/alice/a%20b.txt` 判成两个不同的东西（前者必然越界 → 合法复制被误拒）。
+ */
+function copySourceKeyOf(src) {
+  const s = String(src == null ? '' : src);
+  if (!s) return '';
+  let raw = '';
+  if (/^https?:\/\//i.test(s)) {
+    try { raw = new URL(s).pathname.replace(/^\/+/, ''); } catch (e) { return ''; }
+    // 绝对 URL 的第一段是账户 / 容器名，不是 key
+    const i = raw.indexOf('/');
+    raw = i < 0 ? '' : raw.slice(i + 1);
+  } else {
+    const body = s.replace(/^\/+/, '');
+    const i = body.indexOf('/');
+    raw = i < 0 ? '' : body.slice(i + 1);
+  }
+  try { return decodeURIComponent(raw); } catch (e) { return raw; }
+}
+
+/**
+ * R89：从一次 S3 调用的参数里收集「所有起 key 作用的字符串」。
+ *
+ * ⚠️ **新增 S3 方法若带 key 类参数，必须在这里登记**，否则兜底判据对它失效。
+ * 这是本函数唯一的维护负担，也是它存在的理由 —— 逐条路由加判据会漏，
+ * 而漏一处就是「普通用户能删别人的文件」。
+ */
+function scopedKeys(params) {
+  const q = params || {};
+  const out = [];
+  const push = (v) => {
+    if (typeof v !== 'string' || !v) return;
+    out.push(v);
+  };
+  push(q.Key);
+  push(q.Prefix);
+  push(q.Marker);          // 分页游标是绝对 key（首屏为空串）
+  if (typeof q.CopySource === 'string') push(copySourceKeyOf(q.CopySource));
+  const del = q.Delete;
+  if (del && Array.isArray(del.Objects)) {
+    for (const o of del.Objects) if (o && typeof o.Key === 'string') push(o.Key);
+  }
+  return out;
+}
+
+/**
+ * R89：存储空间兜底判据（fail-closed）。
+ *
+ * 为什么需要它：路由层已经用 `userSpace.toAbs()` 把客户端 key 转成绝对 key，
+ * 但只要将来**新增一个端点忘了转**，那就是静默越权。这里在**全部 S3 调用的
+ * 唯一入口** `p()` 上再判一次：普通会话上下文里的任何 key 只要不在本人空间内，
+ * 一律 404（不区分「不存在」与「不属于你」，避免变成存在性预言机）。
+ *
+ * 白名单是「没有作用域」本身：管理员、内部任务（清理 / 统计 / 自检）与
+ * 分享下载（走 `effectiveForBucket()`，key 是绝对语义）都拿不到 `spaceRoot`。
+ */
+function assertScoped(params) {
+  const root = requestContext.spaceRoot(); // 角色是 user 却无 userId 时这里抛 500（fail-closed）
+  if (!root) return;
+  for (const k of scopedKeys(params)) {
+    if (userSpace.isInside(root, k)) continue;
+    const e = new Error('对象不存在或无权访问');
+    e.status = 404;
+    e.code = 'SpaceDenied';
+    e.spaceDenied = true;
+    throw e;
+  }
+}
+
 function p(s3, method, params, opts) {
+  assertScoped(params);
   return new Promise((resolve, reject) => {
     s3[method](params, (err, data) => {
       // 按桶请求计数（跳过 request 原始调用：那是本系统自己的统计轮询）
@@ -183,6 +260,12 @@ function translateError(e) {
    * 本地会话语义的 401 由路由层自己抛，不经本函数，因此不受影响。
    */
   err.status = status === 401 ? 502 : (status >= 400 && status < 600 ? status : 500);
+  /**
+   * R87：本函数产出的 message 是**固定文案**（不含端点、密钥、路径），
+   * 因此对 5xx 也允许回显 —— 全局错误处理器凭 `expose` 区分「能给的」与
+   * 「可能带运行环境细节的原始 message」。
+   */
+  err.expose = true;
   err.s3Code = code;
   err.rawMessage = raw; // 仅服务端日志使用
   return err;
@@ -425,7 +508,24 @@ async function deleteMultipleConfirmed(s3, cfg, keys) {
 function normalizeKey(key) {
   if (typeof key !== 'string') throw badRequest('Key 必须为字符串');
   let k = key.replace(/\\/g, '/').replace(/^\/+/, '');
-  if (k.includes('..')) throw badRequest('Key 不能包含 ..');
+  /**
+   * R87①：**空字符必须拒绝**。
+   *
+   * `list-cache` / `search-candidates` 在把 key 拼成缓存键时会把 `\u0000` 剥掉，
+   * 于是 `a\0b` 与 `ab` 落进**同一个**缓存条目 —— 一个桶里存在这类 key 时，
+   * 目录内容会短暂「串味」（把 A 的列举结果给 B 看）。合法的对象 key 里没有 NUL，
+   * 在唯一入口拒掉，比在每条派生链路上各剥一次更可靠。
+   */
+  if (k.indexOf('\u0000') >= 0) throw badRequest('Key 不能包含空字符（\\u0000）');
+  /**
+   * R87②：`..` 必须按**路径段**判定，不能按子串。
+   *
+   * 旧写法 `k.includes('..')` 把合法文件名一并拒掉：`a..b.txt`、`report..final.pdf`
+   * 这类很常见的命名在上传 / 重命名时直接 400，且文案「Key 不能包含 ..」让人
+   * 完全看不出问题出在「连续两个点」而不是「上级目录」。
+   * 真正的穿越风险只来自**恰好等于 `..` 的整段**。
+   */
+  if (k.split('/').some((seg) => seg === '..')) throw badRequest('Key 不能包含 ..');
   return k;
 }
 

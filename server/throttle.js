@@ -212,7 +212,19 @@ function createThrottleTransform({ key, bytesPerSec }) {
    * 另一条半速甚至更少」，虽然聚合速率没超，但用户会看到「两个下载一快一慢」。
    * 这里按在跑的数量均分节拍额度，使**并发下载体验一致**（聚合上限不变）。
    */
-  b.active = (b.active || 0) + 1;
+  /**
+   * R87：并发计数**改为「第一次真有数据流过」时才登记**。
+   *
+   * 旧实现把 `b.active += 1` 放在工厂里、只在 `t.on('close')` 里减。可调用方是
+   * 「先建限速环节、再接线」：`/fs/download` 与 `/s/:id/dl` 都在 `streamDownload()`
+   * 之前 `makeThrottle()`，而中间任何一步失败（对象不存在、加密门禁 401、配额拒绝）
+   * 都会直接 return —— 这个 Transform 从没进过管线，`close` 永远不会触发，
+   * 计数就永久 +1。反复请求不存在的路径即可把同一个键的 `active` 堆到任意大，
+   * 于是 `perTick = cap / active` 把**合法**下载压到 10 B/s 量级，且进程内永不自愈。
+   *
+   * 登记放在 transform 首次回调里：没进过管线 = 没占过带宽额度 = 不该计入并发。
+   */
+  let registered = false;
 
   let buf = null;   // 在途 chunk（未放完的部分）
   let cbPending = null; // 放完才回调，形成对上游的背压
@@ -220,6 +232,7 @@ function createThrottleTransform({ key, bytesPerSec }) {
 
   const t = new Transform({
     transform(chunk, _enc, cb) {
+      if (!registered) { registered = true; b.active = (b.active || 0) + 1; }
       buf = chunk;
       cbPending = cb;
       // 立刻尝试投放一片，而不是先等一个节拍：否则**每个 chunk** 都要白等
@@ -268,7 +281,11 @@ function createThrottleTransform({ key, bytesPerSec }) {
     buf = null;
     cbPending = null;
     // 退出并发计数：剩下的连接立刻恢复各自应得的份额
-    b.active = Math.max(0, (b.active || 1) - 1);
+    // （只有登记过的才减 —— 没进过管线的实例从没加过，减了会把计数打成负数）
+    if (registered) {
+      registered = false;
+      b.active = Math.max(0, (b.active || 1) - 1);
+    }
   });
   return t;
 }

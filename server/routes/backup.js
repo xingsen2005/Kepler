@@ -133,7 +133,8 @@ router.post('/backup/import', requireAdmin, apiHandler(async (req, res) => {
     ), { status: 409 });
   }
   const data = await backup.open(b.code, b.backupPassword);
-  const summary = backup.apply(data);
+  // R87：apply 现在是 async（落盘前做端点解析级校验、并 await flush）
+  const summary = await backup.apply(data);
   res.json({ ok: true, summary });
 }));
 
