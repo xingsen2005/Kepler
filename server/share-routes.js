@@ -38,6 +38,8 @@ const paymentProviders = require('./payment-providers');
 const paymentRules = require('./payment-rules');
 const paymentOrders = require('./payment-orders');
 const paymentGateway = require('./payment-gateway');
+// R91：渠道品牌图形的**唯一实现点**（与后台「支付设置」经 `clientSchema()` 下发的是同一份）
+const paymentLogos = require('./payment-logos');
 // R62：优惠券 —— 校验 / 核销 / 退款回退的唯一实现点在 coupon-store
 const couponStore = require('./coupon-store');
 // R62：分享页也要能认出「已登录的人」—— 只有这样「限特定用户」与「每人一次」才成立
@@ -709,6 +711,15 @@ ${refresh ? `<meta http-equiv="refresh" content="0;url=${esc(refresh)}">` : ''}
   .coupon-form .btn { flex: 0 0 auto; width: auto; margin: 0; padding: 9px 14px;
     font-size: 13px; white-space: nowrap; }
   .pay-opts { margin: 16px 0 2px; }
+  /* R91：支付方式左侧的渠道图标。类名与后台「支付设置」的 .pv-logo 完全一致 ——
+     同一段 HTML（由 server/payment-logos.js 生成）在两处都能直接落地。
+     分享页是不带主题变量的独立文档，故这里用固定色值（与 public/css/style.css 的默认主题同色）。 */
+  .pv-logo { flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center;
+    width: 28px; height: 28px; padding: 4px; box-sizing: border-box;
+    background: #fff; border: 1px solid #e5e8ec; border-radius: 6px; overflow: hidden; }
+  .pv-logo svg { width: 100%; height: 100%; display: block; }
+  .pv-logo--sm { width: 22px; height: 22px; padding: 3px; border-radius: 5px; }
+  .pv-logo--lg { width: 40px; height: 40px; padding: 6px; border-radius: 9px; }
   .pay-opt { display: flex; align-items: center; gap: 9px; padding: 11px 12px;
     border: 1px solid #d5dbe3; border-radius: 8px; margin-bottom: 8px; cursor: pointer; font-size: 14px; }
   .pay-opt:hover { border-color: #0067c0; background: #f6faff; }
@@ -960,13 +971,36 @@ function payNoticeFromQuery(q) {
   return Object.prototype.hasOwnProperty.call(PAY_E_NOTICE, k) ? PAY_E_NOTICE[k] : null;
 }
 
-/** 付费页：展示金额与可选渠道，提交后创建订单 */
+/**
+ * 单个支付方式按钮的 HTML（R91：**图标在左、名称在右**）。
+ *
+ * 抽成独立函数是为了让"图标真的渲染出来了、而且在左边"这件事可以被**直接驱动**
+ * （见 `tests/audit91-regressions.test.js`）—— 只对着 `payPage` 的模板串做正则匹配
+ * 证明不了这个顺序，证明不了图形是否为空，也证明不了渠道缺失时会不会整页崩掉。
+ *
+ * `paymentProviders.platform(id)` 为空时退回渠道 id 的文字：旧实现直接取 `p.name`，
+ * 一个已下线的渠道 id 会让整张付费页变成 500。
+ */
+function payOptionHtml(id, checked) {
+  const p = paymentProviders.platform(id);
+  return `<label class="pay-opt"><input type="radio" name="platform" value="${esc(id)}"`
+    + `${checked ? ' checked' : ''}> `
+    + `${paymentLogos.logo(id, { size: 'sm' })}<span>${esc(p ? p.name : String(id))}</span></label>`;
+}
 
+/**
+ * 付费页：展示金额与可选渠道，提交后创建订单
+ *
+ * R91：支付方式按钮**左侧带渠道图标**。此前只有后台「支付设置」的渠道标签有图标，
+ * 前台这一页是一排纯文字 —— 同一个人在同一系统里看到两套呈现，而「云闪付 / 支付宝 /
+ * 微信」这几个词在纯文字下很难一眼扫到。图形与后台**同源**：`server/payment-logos.js`
+ * 是唯一实现点，后台那份由 `clientSchema()` 经接口下发，这里直接内联渲染。
+ *
+ * ⚠️ 必须是**内联** SVG：分享页是服务端渲染的独立文档，没有 `index.html` 那套雪碧，
+ * `<use href="#…">` 在这里只会画出空白（与 `fileIcons.inlineSvg()` 同一条理由）。
+ */
 function payPage(res, l, ps, available, err, note = '', coupon = null) {
-  const opts = available.map((id, i) => {
-    const p = paymentProviders.platform(id);
-    return `<label class="pay-opt"><input type="radio" name="platform" value="${esc(id)}"${i === 0 ? ' checked' : ''}> <span>${esc(p.name)}</span></label>`;
-  }).join('');
+  const opts = available.map((id, i) => payOptionHtml(id, i === 0)).join('');
   const c = coupon || null;
   const applied = Boolean(c && c.ok);
   /**
@@ -2430,7 +2464,7 @@ router.post('/pay/notify/:platform', asyncHandler(async (req, res) => {
   const platform = String(req.params.platform || '');
   if (!paymentProviders.isKnown(platform)) return res.status(404).end();
 
-  // 各网关的响应要求不同：支付宝要看到 success 字样，微信与 PayPal 只要 2xx
+  // 各网关的响应要求不同：支付宝要看到 success 字样，微信 / 云闪付 / PayPal 只要 2xx
   const done = () => (platform === 'alipay' ? res.type('text/plain').send('success') : res.status(200).json({ code: 'SUCCESS' }));
 
   // SEC-03 ①：限流必须**先于**任何凭据使用。通知会触发带真实商户密钥的网关查单，
@@ -2468,6 +2502,8 @@ router.post('/pay/notify/:platform', asyncHandler(async (req, res) => {
  *  - 微信：通知体是 APIv3 密钥下的 AES-256-GCM 密文，**解不出来就说明对方没有
  *    密钥**，解密成功本身即是认证（GCM 带认证标签）。因此这里要求 apiV3Key 已配置，
  *    解密失败由 resolveNotifiedOrder 一并判定；
+ *  - 云闪付：表单串 + RSA 签名（`signature` 字段），与查单响应同一套规则，
+ *    用银联验签公钥**本地**校验 —— 与支付宝同档，验不过即拒绝；
  *  - PayPal：官方只提供「回调验签 API」，本地无法离线验签（需要一次网络往返）。
  *    R69 起**真的去验**（`paypalVerifyWebhook`）：未配置 `Webhook ID` 时一律丢弃 ——
  *    旧实现这一支无条件 `{ok:true}`，等于把"匿名可触发的出站调用放大器"留在公网，
@@ -2488,6 +2524,18 @@ async function verifyNotified(platform, req) {
     if (!cfg.apiV3Key) return { ok: false, reason: '未配置 APIv3 密钥' };
     if (!b.resource || !b.resource.ciphertext) return { ok: false, reason: '通知缺少加密资源' };
     return { ok: true };
+  }
+  if (platform === 'unionpay') {
+    /**
+     * 云闪付（银联全渠道）：通知体是 `k=v&k=v` 表单串（已被 `express.urlencoded`
+     * 解析成对象），签名规则与查单响应**完全相同** —— 排序列出除 `signature` 之外的
+     * 非空参数，用银联公钥验 RSA。所以这里复用 `paymentGateway.unionpayVerify()`，
+     * 不另写一份判据（两份判据就是两个可能漂移的口径）。
+     */
+    if (!cfg.unionpayPublicKey) return { ok: false, reason: '未配置银联验签公钥' };
+    if (!b.signature) return { ok: false, reason: '通知缺少签名字段' };
+    if (paymentGateway.unionpayVerify(b, cfg.unionpayPublicKey, cfg.signMethod)) return { ok: true };
+    return { ok: false, reason: '签名校验失败' };
   }
   if (platform === 'paypal') {
     /**
@@ -2518,12 +2566,18 @@ async function verifyNotified(platform, req) {
  *  - 支付宝：表单字段 out_trade_no
  *  - PayPal：JSON 的 resource.id（即创建订单时拿到的网关订单号）
  *  - 微信：resource 经 APIv3 密钥解密后取 out_trade_no
+ *  - 云闪付：表单字段 orderId（**商户订单号**，即本系统的 orderNo，见
+ *    `payment-gateway.js` 的 `unionpayOrderId()` —— 银联不接受 base64url 的记录 id）
  * 定位不到就直接返回 null —— 通知只是提醒，查不到订单不做任何状态变更。
  */
 async function resolveNotifiedOrder(platform, req) {
   const b = req.body && typeof req.body === 'object' ? req.body : {};
   if (platform === 'alipay') {
     const no = String(b.out_trade_no || '');
+    return no ? paymentOrders.get(no) : null;
+  }
+  if (platform === 'unionpay') {
+    const no = String(b.orderId || '');
     return no ? paymentOrders.get(no) : null;
   }
   if (platform === 'paypal') {
@@ -3477,3 +3531,6 @@ module.exports = router;
 // 测试钩子（R24-01）：站点对外地址的选取阶梯是纯函数，导出以便在不起服务的前提下
 // 断言「未配置站点地址时不得信任任意请求 Host」这条纪律（与 buckets 的 __probeBucket 同例）。
 module.exports.__siteUrlFor = siteUrlFor;
+// 测试钩子（R91）：付费页单个支付方式按钮的 HTML —— 「图标在名称左侧」以及
+// 「图形与后台同源」这两条只有直接驱动它才能真被证明。
+module.exports.__payOptionHtml = payOptionHtml;

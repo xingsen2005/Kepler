@@ -11683,6 +11683,107 @@ const CASES = [
       testFile: 'audit90-regressions.test.js',
       minFail: 1,
     },
+
+    /* ==================== R91 · 云闪付（银联全渠道）+ 前台支付方式图标 ====================
+     *
+     * 这一轮的失效方式很集中：**全都"看起来还能用"**。
+     *  · 位置放错 —— 只有对照用户的要求才看得出来；
+     *  · 订单号用记录 id —— 本地校验全绿，到银联那边被判报文格式错误；
+     *  · txnTime 不按 createdAt 推导 —— 下单成功、查单永远「找不到原始交易」，
+     *    表现是「付了钱却一直停在支付中」；
+     *  · 查单不验签 —— 一切正常，只有伪造响应能白嫖；
+     *  · 通知不验签 —— 谁都能灌通知（白嫖查单配额）；
+     *  · 关单谎报 closed —— R90 的「先关后建」被绕过，双份付款的门重新打开。
+     */
+    {
+      name: 'R91-01a · 云闪付排到 PayPal 之后（用户要求的位置是微信与 PayPal 之间）',
+      file: 'server/payment-providers.js',
+      anchor: "const ORDER = ['alipay', 'wechat', 'unionpay', 'paypal'];",
+      replacement: "const ORDER = ['alipay', 'wechat', 'paypal', 'unionpay'];",
+      testFile: 'audit91-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R91-02a · clientSchema 不再下发渠道图形（后台标签退回纯文字）',
+      file: 'server/payment-providers.js',
+      anchor: '    logo: paymentLogos.logo(p.id, { size: \'sm\' }),',
+      replacement: "    logo: '',",
+      testFile: 'audit91-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R91-03a · 付费页的图标挪到名称右侧（用户要求的是左侧）',
+      file: 'server/share-routes.js',
+      anchor: '    + `${paymentLogos.logo(id, { size: \'sm\' })}<span>${esc(p ? p.name : String(id))}</span></label>`;',
+      replacement: '    + `<span>${esc(p ? p.name : String(id))}</span>${paymentLogos.logo(id, { size: \'sm\' })}</label>`;',
+      testFile: 'audit91-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R91-04a · 下单用记录 id 冒充商户订单号（base64url 含 - _，银联判报文格式错误）',
+      file: 'server/payment-gateway.js',
+      anchor: '    orderId: unionpayOrderId(order),\n    txnTime: unionpayTimeText(createdMs),',
+      replacement: '    orderId: String(order.id),\n    txnTime: unionpayTimeText(createdMs),',
+      testFile: 'audit91-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R91-05a · txnTime 不再由 createdAt 推导（下单与查单算出两个值 ⇒ 永远找不到原始交易）',
+      file: 'server/payment-gateway.js',
+      anchor: '  return unionpayTimeText(unionpayMsOf(order && order.createdAt));',
+      replacement: '  return unionpayTimeText(Date.now());',
+      testFile: 'audit91-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R91-06a · 查单不验签（伪造一条金额相符的「支付成功」即可白拿文件）',
+      file: 'server/payment-gateway.js',
+      anchor: '  if (!unionpayVerify(body, cfg.unionpayPublicKey, cfg.signMethod)) {',
+      replacement: '  if (false) {',
+      testFile: 'audit91-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R91-07a · 查询请求用 txnType=01（消费）而不是 00（查询）',
+      file: 'server/payment-gateway.js',
+      anchor: "  const params = Object.assign(unionpayCommonParams(cfg, '00', '00'), {",
+      replacement: "  const params = Object.assign(unionpayCommonParams(cfg, '01', '01'), {",
+      testFile: 'audit91-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R91-08a · 关单谎报 closed（R90 的「先关后建」就此被绕过）',
+      file: 'server/payment-gateway.js',
+      anchor: 'function unionpayCloseUnsupported() {\n  return {\n    ok: false, state: \'unsupported\',',
+      replacement: 'function unionpayCloseUnsupported() {\n  return {\n    ok: true, state: \'closed\',',
+      testFile: 'audit91-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R91-09a · 云闪付通知无条件放行（谁都能灌通知、白嫖商户查单配额）',
+      file: 'server/share-routes.js',
+      anchor: '    if (paymentGateway.unionpayVerify(b, cfg.unionpayPublicKey, cfg.signMethod)) return { ok: true };\n'
+        + "    return { ok: false, reason: '签名校验失败' };",
+      replacement: '    return { ok: true };',
+      testFile: 'audit91-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R91-10a · 通知按记录 id 定位订单（银联送来的是 orderId=orderNo，永远查不到）',
+      file: 'server/share-routes.js',
+      anchor: "    const no = String(b.orderId || '');",
+      replacement: "    const no = String(b.id || '');",
+      testFile: 'audit91-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R91-11a · 分享页 .pv-logo 去掉 flex:0 0 auto（长渠道名把图标压变形）',
+      file: 'server/share-routes.js',
+      anchor: '  .pv-logo { flex: 0 0 auto; display: inline-flex; align-items: center; justify-content: center;',
+      replacement: '  .pv-logo { display: inline-flex; align-items: center; justify-content: center;',
+      testFile: 'audit91-regressions.test.js',
+      minFail: 1,
+    },
   ];
 
 module.exports = { runCase, CASES, parseArgs };

@@ -1,10 +1,11 @@
 /**
  * 真实支付网关适配器（零依赖，基于 Node 内置 crypto + 全局 fetch）
  *
- * 支持三个渠道，各自选用**最适合 PC 浏览器场景**的下单方式：
- *   alipay  电脑网站支付 alipay.trade.page.pay → 跳转支付宝收银台（无需二维码）
- *   wechat  Native 支付 APIv3 → 返回 code_url，由自研 qrcode.js 渲染二维码
- *   paypal  Orders v2 → 跳转 PayPal 审批页，回调后再 capture 收款
+ * 支持四个渠道，各自选用**最适合 PC 浏览器场景**的下单方式：
+ *   alipay   电脑网站支付 alipay.trade.page.pay → 跳转支付宝收银台（无需二维码）
+ *   wechat   Native 支付 APIv3 → 返回 code_url，由自研 qrcode.js 渲染二维码
+ *   unionpay 银联全渠道网关支付 frontTransReq.do → 跳转银联收银台（可在其中选云闪付）
+ *   paypal   Orders v2 → 跳转 PayPal 审批页，回调后再 capture 收款
  *
  * ┌──────────────────────────────────────────────────────────────────────┐
  * │ 关键设计：支付结果一律以「服务端主动查单」为准，不采信异步通知的内容。      │
@@ -33,8 +34,7 @@ const qrcode = require('./qrcode');
 // 密钥结构判定（PEM / 裸 Base64 / PKCS#1 / PKCS#8）的**唯一实现点**，保存校验器共用
 const pemKey = require('./pem-key');
 
-const TIMEOUT_MS = 10000;
-/**
+const TIMEOUT_MS = 10000;/**
  * R81：「用户正盯着屏幕等」的那一次下单，**整体**只给 9 秒。
  *
  * 单次出站 10 秒（`TIMEOUT_MS`）是给「查单」这种后台动作定的 —— 没人盯着。
@@ -46,6 +46,14 @@ const TIMEOUT_MS = 10000;
 const CHARGE_TIMEOUT_MS = 9000;
 const ALIPAY_GATEWAY = 'https://openapi.alipay.com/gateway.do';
 const WECHAT_HOST = 'https://api.mch.weixin.qq.com';
+/**
+ * 银联全渠道**前台交易**网关（云闪付渠道）。
+ *
+ * 与支付宝网关一样可以由管理员改（测试环境换成银联给的联调地址），因此走
+ * `payment-providers.js` 的 `httpsUrl` 校验器（https + 拒回环/内网/云元数据）。
+ * 这里的常量只是「没填时用什么」。
+ */
+const UNIONPAY_GATEWAY = 'https://gateway.95516.com/gateway/api/frontTransReq.do';
 
 /** PayPal 的沙箱 / 生产域名（凭证不通用，由配置里的 mode 决定） */
 function paypalHost(mode) {
@@ -733,6 +741,287 @@ async function paypalVerifyWebhook(cfg, headers, event) {
   return json.verification_status === 'SUCCESS';
 }
 
+/* ============================ 云闪付（银联全渠道） ============================ */
+
+/**
+ * 云闪付**没有独立的聚合开放平台** —— 它本身就是银联的支付产品，商户端接的仍是
+ * **银联全渠道网关支付**（B2C，`frontTransReq.do`）：把浏览器送到银联收银台，
+ * 用户在那里选「云闪付」扫码、或用云闪付 App 跳转付款。
+ *
+ * 与另外三家相比有两处**结构性差异**，都体现在下面的实现里：
+ *
+ *  1. **报文不是 JSON，是 `k=v&k=v` 的表单串**。请求用 GET 查询串（前台跳转）或
+ *     form 表单（后台请求），响应也是同一个形状。所以这里不用 `JSON.parse`，
+ *     而用 `unionpayParseForm()`，并且**逐字段 URL 解码**。
+ *  2. **"一笔交易"由三要素确定**：`merId + orderId + txnTime`。`txnTime` 是下单那一刻
+ *     的北京时间，查询时必须原样回送 —— 本系统**不额外存这个字段**，而是从
+ *     `order.createdAt` **确定性重算**（见 `unionpayTxnTime()`）。同一个订单在「下单」
+ *     与「查单」两处必然算出同一个值，于是不需要给订单表加列，也不存在"存了但没更新"
+ *     的漂移。
+ */
+
+/** 银联的 txnTime / payTimeout 都是北京时间的 `yyyyMMddHHmmss` */
+function unionpayTimeText(ms) {
+  const d = new Date(ms + 8 * 3600 * 1000);
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getUTCFullYear()}${p(d.getUTCMonth() + 1)}${p(d.getUTCDate())}`
+    + `${p(d.getUTCHours())}${p(d.getUTCMinutes())}${p(d.getUTCSeconds())}`;
+}
+
+/** 订单创建时刻（毫秒）。缺失/不可解析时退回当下 —— 老订单查不到就按"未支付"处理 */
+function unionpayMsOf(createdAt) {
+  const t = Date.parse(String(createdAt == null ? '' : createdAt));
+  return Number.isFinite(t) ? t : Date.now();
+}
+
+/**
+ * 订单发送时间（`txnTime`）—— **必须与下单时送出的一致**，否则查询会「找不到原始交易」。
+ * 从 `order.createdAt` 重算而不是另存一个字段，理由见本节开头。
+ */
+function unionpayTxnTime(order) {
+  return unionpayTimeText(unionpayMsOf(order && order.createdAt));
+}
+
+/**
+ * 商户订单号（`orderId`）。
+ *
+ * ⚠️ 银联的要求是「8~40 位字母或数字，**不能含 `-` 或 `_`**」。本系统的记录 id 是
+ * `base64url`（`payment-orders.js` 的 `newId()`），**恰好会包含这两个字符**，
+ * 直接送过去会被判报文格式错误。所以用 `orderNo`（36 位纯 base62 字母数字，见
+ * `order-no.js`）—— 它同时是用户手里那张「取回凭据」，商户后台与银联对账时也能直接对上。
+ *
+ * 拿不到合规订单号时**明确抛错**而不是就地变形：截断/替换会造出两个不同订单映射到
+ * 同一个 `orderId` 的可能，那等于用一个更隐蔽的问题换掉一个显式报错。
+ */
+function unionpayOrderId(order) {
+  const no = String((order && order.orderNo) || '').trim();
+  if (!/^[0-9A-Za-z]{8,40}$/.test(no)) {
+    throw new Error('银联要求商户订单号为 8~40 位字母数字（不能含 - 或 _），'
+      + '当前订单没有合规的订单号，请重新发起支付');
+  }
+  return no;
+}
+
+/**
+ * 待签串：参数按 key 升序、剔除 `signature` 本身与空值，`k=v` 用 `&` 连接，值**不做** URL 编码。
+ * 与支付宝的规则一致（两家都来自同一套"表单签名"惯例），但字段名不同 —— 银联叫
+ * `signature`，支付宝叫 `sign`，所以不能共用同一个函数。
+ */
+function unionpaySignPayload(params) {
+  return Object.keys(params)
+    .filter((k) => k !== 'signature' && params[k] !== undefined && params[k] !== null && params[k] !== '')
+    .sort()
+    .map((k) => `${k}=${params[k]}`)
+    .join('&');
+}
+
+/**
+ * 签名方法归一化。
+ *
+ * 银联的 `signMethod` 只有这几档：`01` = RSA（SHA1，缺省）、`11` = RSA + SHA256、
+ * `12` = SM3（国密）。本系统只有 RSA 实现，`12` 与支付宝的 SM2 一样**在下单前**
+ * 就明确拒绝 —— 否则会带着一个必然被网关拒签的值跳过去，本地却一切"成功"。
+ */
+const UNIONPAY_SIGN_METHODS = { '01': 'RSA', '11': 'RSA2' };
+
+function unionpaySignMethod(raw) {
+  const m = String(raw == null ? '' : raw).trim() || '01';
+  if (!UNIONPAY_SIGN_METHODS[m]) {
+    throw new Error(`签名方法「${m}」本系统暂不支持（只有 RSA 的 01 / 11 两种，SM3 未实现），`
+      + '请在「系统设置 → 支付设置 → 云闪付」把签名方法改为 01 或 11 后重试');
+  }
+  return m;
+}
+
+/**
+ * 网关地址归一化：**复用 `gatewayBase()`**，只为它补一个云闪付的默认值。
+ *
+ * 刻意不把「剥 `#` 片段」再抄一遍 —— 那是同一件事的第二个实现点，
+ * 以后修一处漏一处时，两家网关的地址处理就会悄悄分叉。
+ */
+function unionpayGatewayBase(raw) {
+  return gatewayBase(String(raw == null ? '' : raw).trim() || UNIONPAY_GATEWAY);
+}
+
+/** 请求参数里与具体交易无关的公共部分 */
+function unionpayCommonParams(cfg, txnType, txnSubType) {
+  const p = {
+    version: '5.1.0',
+    encoding: 'UTF-8',
+    signMethod: unionpaySignMethod(cfg.signMethod),
+    txnType,
+    txnSubType,
+    // 000201 = B2C 网关支付（云闪付就在这个产品下）
+    bizType: '000201',
+    merId: cfg.merId,
+    // accessType=0 商户直连；channelType=07 互联网（PC/平板）
+    accessType: '0',
+    channelType: '07',
+  };
+  if (cfg.certId) p.certId = cfg.certId;
+  return p;
+}
+
+/** 加签：排序串 → RSA → base64，写进 `signature` 字段 */
+function unionpaySignParams(params, cfg) {
+  const method = unionpaySignMethod(cfg.signMethod);
+  return rsaSign(unionpaySignPayload(params), cfg.privateKey, UNIONPAY_SIGN_METHODS[method]);
+}
+
+/**
+ * 组装带签名的请求 URL。
+ *
+ * 银联前台网关 `frontTransReq.do` 同时接受 GET 与 POST。这里用 **GET**：
+ * 它就是一个纯 URL，能直接塞进 `jumpPage()` 的 meta refresh 与 `<a href>`
+ * （R83 的「表单 POST 之后不许跨域 3xx」因此天然不适用 —— 本渠道根本不需要 POST）。
+ */
+function unionpayBuildUrl(gateway, params, cfg) {
+  const all = Object.assign({}, params, { signature: unionpaySignParams(params, cfg) });
+  const query = Object.keys(all)
+    .filter((k) => all[k] !== undefined && all[k] !== null && all[k] !== '')
+    .sort()
+    .map((k) => `${k}=${encodeURIComponent(all[k])}`)
+    .join('&');
+  const base = unionpayGatewayBase(gateway);
+  return base + (base.includes('?') ? '&' : '?') + query;
+}
+
+/**
+ * 解析银联的表单串响应（`respCode=00&respMsg=...`）。
+ *
+ * 值是按 UTF-8 **URL 编码**过的（中文 `respMsg` 一律 `%E4%...`），必须逐字段解码；
+ * 但解码函数遇到不合法的 `%` 转义会抛 `URIError` —— 一条畸形响应不该让整次查单
+ * 变成未捕获异常，所以**单字段解码失败就保留原文**，交给随后的验签去判真假。
+ */
+function unionpayParseForm(text) {
+  const s = String(text == null ? '' : text).trim();
+  const out = {};
+  if (!s) return out;
+  const dec = (v) => {
+    try { return decodeURIComponent(String(v).replace(/\+/g, ' ')); } catch (e) { return String(v); }
+  };
+  for (const seg of s.split('&')) {
+    if (!seg) continue;
+    const at = seg.indexOf('=');
+    if (at < 0) continue;
+    const k = dec(seg.slice(0, at));
+    if (k) out[k] = dec(seg.slice(at + 1));
+  }
+  return out;
+}
+
+/**
+ * 校验银联响应的签名（查单响应、后台通知共用）。
+ *
+ * 与支付宝 `alipayVerifySync()` 是同一个道理：**网关地址是管理员可改的**，
+ * 一个能通过「https + 非内网」校验的地址完全可以返回一条金额相符的"支付成功"。
+ * 金额对账拦得住"金额不同"，拦不住"金额相同的伪造成功"，所以必须验签。
+ *
+ * @param {object} params      响应/通知参数（含 `signature`）
+ * @param {string} publicKey   银联验签公钥（PEM 或裸 Base64）
+ * @param {string} [signMethod] 与下单时同一档（01 / 11）
+ * @returns {boolean} 验不过一律 false（调用方按 `state:'error'` fail-closed）
+ */
+function unionpayVerify(params, publicKey, signMethod) {
+  const p = params && typeof params === 'object' ? params : {};
+  const sign = String(p.signature || '').trim();
+  const key = normalizePublicKey(publicKey);
+  if (!sign || !key) return false;
+  let method;
+  try { method = unionpaySignMethod(signMethod); } catch (e) { return false; }
+  const algo = UNIONPAY_SIGN_METHODS[method] === 'RSA2' ? 'RSA-SHA256' : 'RSA-SHA1';
+  try {
+    return crypto.createVerify(algo).update(unionpaySignPayload(p), 'utf8').verify(key, sign, 'base64');
+  } catch (e) {
+    return false;
+  }
+}
+
+/** 分（整数文本）→ 分。空值返回 NaN（**不能**用 0 兜底，见 `fenFromYuan` 的注释） */
+function fenFromIntText(v) {
+  const s = String(v == null ? '' : v).trim();
+  if (!s) return NaN;
+  const n = Number(s);
+  return Number.isFinite(n) ? Math.round(n) : NaN;
+}
+
+/** 银联订单的有效期：30 分钟（从下单那一刻算，不额外配置） */
+const UNIONPAY_PAY_TIMEOUT_MS = 30 * 60 * 1000;
+
+async function unionpayCreate(cfg, { order, returnUrl, notifyUrl }) {
+  // 先归一化签名方法：SM3 在这里就抛，页面显示「创建支付订单失败：…」，
+  // 而不是带着一个必然被拒签的值把用户送到银联。
+  unionpaySignMethod(cfg.signMethod);
+  const fen = Number(order && order.amountFen);
+  if (!Number.isInteger(fen) || fen <= 0) throw new Error('订单金额异常，无法向银联下单');
+  const createdMs = unionpayMsOf(order && order.createdAt);
+  const params = Object.assign(unionpayCommonParams(cfg, '01', '01'), {
+    orderId: unionpayOrderId(order),
+    txnTime: unionpayTimeText(createdMs),
+    payTimeout: unionpayTimeText(createdMs + UNIONPAY_PAY_TIMEOUT_MS),
+    txnAmt: String(fen),
+    currencyCode: '156',
+  });
+  /**
+   * `frontUrl` / `backUrl` 由调用方给出，且**必须是真的能访问到的**地址 ——
+   * 银联会按 `backUrl` 主动投递后台通知。本系统对通知的态度是"只当触发信号"，
+   * 但地址不通会让「用户付完就关掉浏览器」这条路径退化成纯靠人工。
+   */
+  if (returnUrl) params.frontUrl = returnUrl;
+  if (notifyUrl) params.backUrl = notifyUrl;
+  const url = unionpayBuildUrl(cfg.gateway, params, cfg);
+  return { kind: 'redirect', url, tradeNo: '' };
+}
+
+async function unionpayQuery(cfg, order) {
+  const params = Object.assign(unionpayCommonParams(cfg, '00', '00'), {
+    orderId: unionpayOrderId(order),
+    txnTime: unionpayTxnTime(order),
+  });
+  const url = unionpayBuildUrl(cfg.gateway, params, cfg);
+  const r = await fetchWithTimeout(url, undefined, 'text');
+  const body = unionpayParseForm(r.body);
+  if (!body.respCode) {
+    return { paid: false, state: 'error', tradeNo: '', failReason: '银联返回内容无法识别' };
+  }
+  /**
+   * 验签在**读任何业务字段之前**（"检查前先使用"的同一条铁律）。
+   * 注意用的是**响应参数**而不是原始文本：银联的签名是对"排序后的参数串"做的，
+   * 与报文里的字段顺序、编码方式都无关。
+   */
+  if (!unionpayVerify(body, cfg.unionpayPublicKey, cfg.signMethod)) {
+    return {
+      paid: false, state: 'error', tradeNo: '',
+      failReason: '银联响应签名校验失败：无法确认这条响应来自银联。'
+        + '请检查「支付设置 → 云闪付」里的**银联验签公钥**是否为银联提供的验签证书导出的公钥，'
+        + '以及签名方法是否与入网约定一致（01 / 11）',
+    };
+  }
+  if (body.respCode !== '00') {
+    // 34 = 原始交易不存在：用户还没在银联侧完成付款，算"未支付"而不是"出错"
+    if (body.respCode === '34') return { paid: false, state: 'pending', tradeNo: '', failReason: '' };
+    return {
+      paid: false, state: 'error', tradeNo: '',
+      failReason: `${body.respMsg || '查询失败'}（${body.respCode}）`,
+    };
+  }
+  const tradeNo = String(body.queryId || '');
+  if (body.origRespCode === '00') {
+    // I-5：先对账再认账（txnAmt 是「分」的整数文本）
+    const amt = checkPaidAmount(order, fenFromIntText(body.txnAmt),
+      Number.isFinite(fenFromIntText(body.txnAmt)) ? `${(fenFromIntText(body.txnAmt) / 100).toFixed(2)} 元` : '');
+    if (!amt.ok) return { paid: false, state: 'error', tradeNo, failReason: amt.reason };
+    return { paid: true, state: 'paid', tradeNo, failReason: '' };
+  }
+  /**
+   * `respCode=00` 但 `origRespCode` 不是 00：原始交易存在、只是还没成功（等待付款 /
+   * 用户中途放弃）。**一律留在 `pending`**，不推断成 `failed` —— 银联的
+   * `origRespCode` 取值集合很宽（含各类"处理中"），凭一个不认识的值就把订单判死，
+   * 会让「其实付成功的人」看到"支付未完成"并去付第二次。
+   */
+  return { paid: false, state: 'pending', tradeNo, failReason: '' };
+}
+
 /* ============================ 关单（PAY-F1） ============================ */
 
 /**
@@ -839,6 +1128,26 @@ function paypalCloseUnsupported() {
   };
 }
 
+/**
+ * 云闪付（银联全渠道）：**没有"关闭未支付订单"的接口**。
+ *
+ * 查过全渠道的交易类型表：`31` 是消费撤销、`32/33` 是预授权撤销，三者都要求
+ * `origQryId`（**原始交易的查询流水号**），而本系统走的是「跳转收银台」模式 ——
+ * 那个 `queryId` 只出现在银联回给浏览器的同步应答里，服务端从未见过它。
+ * 未支付订单本来就由 `payTimeout`（下单时送 30 分钟）自动失效，不存在"关不掉就
+ * 永远能付"的问题。
+ *
+ * 所以不编造端点，如实回 `unsupported`：调用方留痕后继续建新单。
+ * 残余风险与 PayPal 同一个形状 —— 若用户在两个标签页里各付一次，需人工退款。
+ */
+function unionpayCloseUnsupported() {
+  return {
+    ok: false, state: 'unsupported',
+    error: '云闪付（银联全渠道）不提供关闭未支付订单的接口，被放弃的订单会由 payTimeout '
+      + '（下单时 30 分钟）自动失效；若用户仍完成支付，需人工退款',
+  };
+}
+
 /* ============================ 统一入口 ============================ */
 
 /** 从 URL 里取主机名，只用于错误文案（不含路径/查询串，绝不回显任何密钥） */
@@ -940,13 +1249,13 @@ async function cancelBody(res) {
 
 /**
  * 下单
- * @param {string} platform alipay | wechat | paypal
+ * @param {string} platform alipay | wechat | unionpay | paypal
  * @param {object} cfg     该平台保存的凭证
  * @param {object} opts    { order, subject, returnUrl, notifyUrl, cancelUrl }
  * @returns {Promise<{ok: boolean, kind?: string, url?: string, codeUrl?: string, svg?: string, tradeNo?: string, error?: string}>}
  */
 async function createCharge(platform, cfg, opts) {
-  const run = { alipay: alipayCreate, wechat: wechatCreate, paypal: paypalCreate }[platform];
+  const run = { alipay: alipayCreate, wechat: wechatCreate, unionpay: unionpayCreate, paypal: paypalCreate }[platform];
   if (!run) return { ok: false, error: `未知的支付平台：${platform}` };
   /**
    * R81：整条下单链路共用**一个**截止时刻（而不是每个出站请求各 10 秒）。
@@ -974,7 +1283,7 @@ async function createCharge(platform, cfg, opts) {
  * @returns {Promise<{paid: boolean, state: 'paid'|'pending'|'failed'|'error', tradeNo: string, failReason: string, error?: string}>}
  */
 async function queryCharge(platform, cfg, order) {
-  const run = { alipay: alipayQuery, wechat: wechatQuery, paypal: paypalQuery }[platform];
+  const run = { alipay: alipayQuery, wechat: wechatQuery, unionpay: unionpayQuery, paypal: paypalQuery }[platform];
   if (!run) return { paid: false, state: 'error', tradeNo: '', failReason: `未知的支付平台：${platform}` };
   try {
     return await run(cfg, order);
@@ -993,7 +1302,7 @@ async function queryCharge(platform, cfg, order) {
  * @returns {Promise<{ok: boolean, state: 'closed'|'not_found'|'paid'|'unsupported'|'error', error?: string}>}
  */
 async function closeCharge(platform, cfg, order) {
-  const run = { alipay: alipayClose, wechat: wechatClose, paypal: paypalCloseUnsupported }[platform];
+  const run = { alipay: alipayClose, wechat: wechatClose, unionpay: unionpayCloseUnsupported, paypal: paypalCloseUnsupported }[platform];
   if (!run) return { ok: false, state: 'error', error: `未知的支付平台：${platform}` };
   try {
     return await run(cfg, order);
@@ -1003,7 +1312,7 @@ async function closeCharge(platform, cfg, order) {
 }
 
 module.exports = {
-  TIMEOUT_MS, CHARGE_TIMEOUT_MS, ALIPAY_GATEWAY, WECHAT_HOST,
+  TIMEOUT_MS, CHARGE_TIMEOUT_MS, ALIPAY_GATEWAY, WECHAT_HOST, UNIONPAY_GATEWAY,
   paypalHost, normalizePrivateKey, normalizePublicKey,
   alipaySignPayload, alipayBuildUrl, alipayTimestamp, alipayVerify,
   // R84：同步响应验签（M-1）—— 导出以便直接驱动「原文切片」与「验签口径」这两处纯函数
@@ -1011,6 +1320,11 @@ module.exports = {
   // R84（L-1）：金额对账的文案分叉（「查不到金额」vs「金额不符」）要能被直接断言
   checkPaidAmount,
   wechatSignPayload, wechatAuthorization, wechatDecryptResource,
+  // R91（云闪付）：待签串 / 签名方法归一化 / 订单号与 txnTime 的确定性推导 /
+  // 表单串解析 / 响应验签 —— 全是纯函数，导出是为了让行为测试直接驱动它们
+  // （银联没有可用的公开测试商户号，这五处是"能在本地证明对"的全部）
+  UNIONPAY_SIGN_METHODS, unionpaySignPayload, unionpaySignMethod, unionpayOrderId,
+  unionpayTxnTime, unionpayTimeText, unionpayBuildUrl, unionpayParseForm, unionpayVerify,
   paypalVerifyWebhook,
   // R84（L-4）：事件类型白名单 + 时间新鲜度判定 —— 导出以便直接驱动这三条分支
   paypalEventCheck, PAYPAL_EVENT_TYPES, PAYPAL_TRANSMISSION_SKEW_MS,

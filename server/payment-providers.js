@@ -17,6 +17,8 @@
 const { assertSafeEndpoint } = require('./endpoint-guard');
 // 密钥结构判定（PEM / 裸 Base64 / PKCS#1 / PKCS#8）的**唯一实现点**，签名侧共用
 const pemKey = require('./pem-key');
+// 渠道品牌图形的**唯一实现点**：后台（接口下发）与前台分享页（服务端渲染）共用
+const paymentLogos = require('./payment-logos');
 
 /* ============================ 字段级校验器 ============================ */
 
@@ -236,6 +238,71 @@ const PLATFORMS = {
     ],
   },
 
+  // ---------------------------------------------------------------- 云闪付（银联全渠道）
+  /**
+   * 云闪付**没有独立的「聚合网关」开放平台**：它自己就是银联的支付产品，
+   * 商户侧接的仍然是**银联全渠道**（网关支付 / B2C，`frontTransReq.do`），
+   * 用户在收银台上选「云闪付」扫码或跳转云闪付 App 完成付款。
+   *
+   * 因此本渠道的字段就是银联全渠道的入网三件套：商户号 + 签名私钥 + 银联验签公钥。
+   * 与另外三家一样**按官方命名**（merId / certId / signMethod），方便使用者对照入网材料。
+   *
+   * ⚠️ 银联下发的是 `.pfx` / `.p12` 证书包，而本系统全链路只认 PEM。这不是偷懒：
+   * 另外三家的签名实现（`payment-gateway.js` 的 `rsaSign`）都基于 PEM，为一家渠道
+   * 单独引入 PKCS#12 解析会让「密钥长什么样」出现两套口径。openssl 一条命令即可转换，
+   * 提示里写了具体命令。
+   */
+  unionpay: {
+    id: 'unionpay',
+    name: '云闪付',
+    shortName: 'UnionPay',
+    doc: '银联开放平台 / 全渠道入网材料（商户号 merId、签名证书、银联验签证书）',
+    fields: [
+      {
+        key: 'merId', official: 'merId', label: '商户号', input: 'text', required: true,
+        placeholder: '例如 777290058110048',
+        pattern: '^\\d{15}$', patternHint: '15 位纯数字', maxLength: 15,
+        hint: '银联分配的 15 位商户代码（merId），与订单号、订单发送时间一起唯一确定一笔交易。',
+      },
+      {
+        key: 'privateKey', official: '签名私钥', label: '商户签名私钥', input: 'textarea', required: true, secret: true,
+        placeholder: '-----BEGIN PRIVATE KEY-----\n…\n-----END PRIVATE KEY-----',
+        validator: 'privateKey', maxLength: 8192,
+        hint: '入网下发的签名证书（.pfx / .p12）里的**私钥**，需先导出成 PEM：'
+          + 'openssl pkcs12 -in acp.pfx -nocerts -nodes -out key.pem（再取其中 PRIVATE KEY 段）。'
+          + '带口令的私钥本系统无法使用，导出时不要加 -passout。',
+      },
+      {
+        key: 'unionpayPublicKey', official: '验签公钥', label: '银联验签公钥', input: 'textarea', required: true, secret: true,
+        placeholder: '-----BEGIN PUBLIC KEY-----\n…\n-----END PUBLIC KEY-----',
+        validator: 'publicKey', maxLength: 8192,
+        hint: '银联提供的验签证书（根证书）导出的公钥，用于校验查单响应与后台通知的签名'
+          + '（openssl x509 -in acp.cer -pubkey -noout）。填错会让所有查单被判「签名不符」。',
+      },
+      {
+        key: 'certId', official: 'certId', label: '证书 ID', input: 'text', required: false,
+        placeholder: '签名证书的 Serial Number',
+        pattern: '^[0-9A-Za-z]{1,128}$', patternHint: '1 ~ 128 位字母数字', maxLength: 128,
+        hint: '签名私钥证书的 Serial Number（部分入网协议要求在请求报文里上送）。不确定就留空。',
+      },
+      {
+        key: 'signMethod', official: 'signMethod', label: '签名方法', input: 'select', required: true, default: '01',
+        options: [
+          { value: '01', label: '01 · RSA + SHA1（缺省）' },
+          { value: '11', label: '11 · RSA + SHA256' },
+        ],
+        hint: '两者都是 RSA，只是摘要算法不同，必须与入网时约定的签名方法一致。',
+      },
+      {
+        key: 'gateway', official: 'gateway', label: '网关地址', input: 'text', required: false,
+        default: 'https://gateway.95516.com/gateway/api/frontTransReq.do',
+        validator: 'httpsUrl', maxLength: 256,
+        placeholder: 'https://gateway.95516.com/gateway/api/frontTransReq.do',
+        hint: '银联全渠道**前台交易**网关。生产用默认地址即可；联调环境请换成银联给的测试网关地址。',
+      },
+    ],
+  },
+
   // ---------------------------------------------------------------- PayPal
   paypal: {
     id: 'paypal',
@@ -279,8 +346,17 @@ const PLATFORMS = {
   },
 };
 
-/** 界面展示顺序 */
-const ORDER = ['alipay', 'wechat', 'paypal'];
+/**
+ * 界面展示顺序
+ *
+ * ⚠️ 这里的顺序 = 后台「支付设置」的渠道标签顺序 = **前台付费页的支付方式顺序**
+ * （`share-routes.js` 的 `payPage()` 直接按 `available` 遍历，而 `available` 来自
+ * `paymentRules.availableChannels()` → `list()`）。改一处即两处同时生效，
+ * 不要在任何一端另写一份顺序。
+ *
+ * 云闪付排在微信与 PayPal 之间：国内渠道挨着国内渠道，境外渠道单独收尾。
+ */
+const ORDER = ['alipay', 'wechat', 'unionpay', 'paypal'];
 
 /* ============================ 查询接口 ============================ */
 
@@ -309,6 +385,12 @@ function field(platformId, key) {
 /**
  * 可序列化的平台定义（下发前端用于渲染表单）
  * 与服务端用的是同一份数据，pattern 因此天然同步；前端做即时提示，服务端做最终裁定。
+ *
+ * `logo` 是**渠道品牌图形的内联 SVG 字符串**（含 `<span class="pv-logo">` 外层容器），
+ * 出处只有 `payment-logos.js` 一处，与前台分享页渲染的是同一份字节。
+ * 它是本接口唯一一段「可以原样写进 innerHTML」的值 —— 内容来自代码内的常量，
+ * 不含任何用户输入，因此在 `paysettings.js` 里直接插入而不做转义
+ * （转义会把 `<path` 变成文本）。其余字段一律照旧 `escapeHtml`。
  */
 function clientSchema() {
   return list().map((p) => ({
@@ -316,6 +398,7 @@ function clientSchema() {
     name: p.name,
     shortName: p.shortName,
     doc: p.doc,
+    logo: paymentLogos.logo(p.id, { size: 'sm' }),
     fields: p.fields.map((f) => ({
       key: f.key,
       official: f.official,

@@ -65,15 +65,23 @@ const VALID = {
     clientSecret: 'EeFfGgHhIiJjKkLlMmNnOoPpQqRrSsTtUuVvWwXxYyZz0123456789012345',
     mode: 'sandbox',
   },
+  // R91：云闪付（银联全渠道）—— 商户号 + 签名私钥 + 银联验签公钥
+  unionpay: {
+    merId: '777290058110048',
+    privateKey: PEM_PRIVATE,
+    unionpayPublicKey: PEM_PUBLIC,
+    signMethod: '01',
+  },
 };
 
 /* ================================================================== *
  * 1 · 注册表基本契约
  * ================================================================== */
 
-test('注册表覆盖支付宝 / 微信支付 / PayPal 三家，且顺序稳定', () => {
-  assertEqual(pp.list().length, 3, '应有三个支付平台');
-  assertEqual(pp.ORDER.join(','), 'alipay,wechat,paypal', '展示顺序应稳定');
+test('注册表覆盖支付宝 / 微信支付 / 云闪付 / PayPal 四家，且顺序稳定', () => {
+  // R91：云闪付插在微信与 PayPal 之间（用户明确要求的位置）
+  assertEqual(pp.list().length, 4, '应有四个支付平台');
+  assertEqual(pp.ORDER.join(','), 'alipay,wechat,unionpay,paypal', '展示顺序应稳定');
   for (const id of pp.ORDER) {
     assert(pp.isKnown(id), `${id} 应被识别`);
     assert(pp.platform(id).fields.length > 0, `${id} 应有字段定义`);
@@ -88,13 +96,16 @@ test('字段按各平台官方命名，未被强行统一成同一个键名', ()
   for (const id of pp.ORDER) {
     keysets[id] = pp.platform(id).fields.filter((f) => f.required).map((f) => f.key).sort().join(',');
   }
-  assertEqual(new Set(Object.values(keysets)).size, 3, `三家必填字段集合不应相同：${JSON.stringify(keysets)}`);
+  assertEqual(new Set(Object.values(keysets)).size, 4, `四家必填字段集合不应相同：${JSON.stringify(keysets)}`);
 
   // 各自官方字段名确实来自官方文档
   assertEqual(pp.field('alipay', 'appId').official, 'app_id', '支付宝应用 ID 官方字段名');
   assertEqual(pp.field('wechat', 'mchId').official, 'mchid', '微信支付商户号官方字段名');
   assertEqual(pp.field('wechat', 'apiV3Key').official, 'api_v3_key', '微信支付 APIv3 密钥官方字段名');
   assertEqual(pp.field('wechat', 'certSerialNo').official, 'serial_no', '微信支付证书序列号官方字段名');
+  assertEqual(pp.field('unionpay', 'merId').official, 'merId', '云闪付商户号官方字段名');
+  assertEqual(pp.field('unionpay', 'certId').official, 'certId', '云闪付证书 ID 官方字段名');
+  assertEqual(pp.field('unionpay', 'signMethod').official, 'signMethod', '云闪付签名方法官方字段名');
   assertEqual(pp.field('paypal', 'clientId').official, 'client_id', 'PayPal Client ID 官方字段名');
   assertEqual(pp.field('paypal', 'clientSecret').official, 'client_secret', 'PayPal Secret 官方字段名');
 
@@ -395,7 +406,7 @@ test('超长输入先被长度上限拦截，不会进入正则分支', () => {
 
 test('clientSchema 与服务端同源且可直接序列化', () => {
   const schema = pp.clientSchema();
-  assertEqual(schema.length, 3, '应有三份平台定义');
+  assertEqual(schema.length, 4, '应有四份平台定义');
   const json = JSON.stringify(schema); // 不应抛错（含循环引用 / 函数会失败）
   assert(json.length > 0, 'schema 应可序列化');
   for (const p of schema) {

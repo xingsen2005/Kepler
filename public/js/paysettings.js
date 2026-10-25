@@ -11,7 +11,6 @@
 import { API } from './api.js';
 import { toast, escapeHtml, confirmDialog, fmtTime, isStaffRole } from './util.js';
 import { App } from './main.js';
-import { paymentLogo } from './payment-logos.js';
 
 let wired = false;
 let schema = []; // 平台定义（服务端下发）
@@ -88,8 +87,14 @@ function renderTabs() {
       let tip = '未启用';
       if (st.enabled && st.complete) { dot = 'on'; tip = '已启用 · 可用于收款'; }
       else if (st.enabled) { dot = 'part'; tip = '已启用 · 待补全凭证'; }
+      /**
+       * `p.logo` 是服务端下发的一段内联 SVG 标记（出处只有 `server/payment-logos.js`），
+       * 与前台分享页渲染的是同一份字节 —— **不能**过 `escapeHtml`，否则 `<path` 会
+       * 变成文本。它是本模块唯一一段原样写入 innerHTML 的值（内容为代码内常量）。
+       * 老版本服务端不下发该字段时退化为纯文字标签，不至于整排标签空白。
+       */
       return `<button type="button" class="pay-tab${p.id === currentId ? ' active' : ''}${st.enabled ? '' : ' off'}" data-id="${escapeHtml(p.id)}" title="${tip}">
-        ${paymentLogo(p.id, { size: 'sm' })}
+        ${p.logo || ''}
         <span>${escapeHtml(p.name)}</span>
         <i class="pay-dot ${dot}"></i>
       </button>`;

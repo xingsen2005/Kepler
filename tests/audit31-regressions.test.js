@@ -154,7 +154,6 @@ export const App = {
 };
 `;
 
-const PAYLOGOS_STUB = `export const paymentLogo = () => '';`;
 const WEBAUTHN_STUB = `
 export const registerWindowsHello = async () => ({});
 export const webauthnReadiness = () => ({ available: false });
@@ -172,7 +171,6 @@ function makeSandbox({ withSyssettings = false } = {}) {
   w('util.js', UTIL_STUB);
   w('main.js', MAIN_STUB);
   if (withSyssettings) {
-    w('payment-logos.js', PAYLOGOS_STUB);
     w('webauthn.js', WEBAUTHN_STUB);
     w('paysettings.js', PAYSETTINGS_STUB);
     fs.copyFileSync(JS('syssettings.js'), path.join(dir, 'syssettings.js'));
@@ -189,7 +187,6 @@ function makeSandbox({ withSyssettings = false } = {}) {
     // 规则。它不 import 任何东西（只用全局 document），拷真实的那一份即可。
     fs.copyFileSync(JS('anchornav.js'), path.join(dir, 'anchornav.js'));
   } else {
-    w('payment-logos.js', PAYLOGOS_STUB);
     fs.copyFileSync(JS('paysettings.js'), path.join(dir, 'paysettings.js'));
   }
   return dir;

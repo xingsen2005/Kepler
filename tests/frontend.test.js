@@ -36,7 +36,8 @@ function syntaxOk(src) {
 }
 
 test('前端模块数量符合预期（未意外增删）', () => {
-  assertEqual(MODULES.length, 35, `public/js 模块数应为 35，实际 ${MODULES.length}（新增/删除模块时请同步此基线）`);
+  // R91：渠道图形搬到服务端（server/payment-logos.js）后，前端 payment-logos.js 已删除 —— 35 → 34
+  assertEqual(MODULES.length, 34, `public/js 模块数应为 34，实际 ${MODULES.length}（新增/删除模块时请同步此基线）`);
   assert(MODULES.includes('webauthn.js'), '应包含 webauthn.js（Windows Hello 前端模块）');
   assert(MODULES.includes('profile.js'), '应包含 profile.js（「编辑资料」自助弹窗）');
   assert(MODULES.includes('ordermgr.js'), '应包含 ordermgr.js（订单管理页）');
