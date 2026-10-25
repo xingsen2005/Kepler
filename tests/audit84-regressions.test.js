@@ -108,6 +108,12 @@ const couponStore = require(SERVER('coupon-store.js'));
 const paymentGateway = require(SERVER('payment-gateway.js'));
 const shareRoutes = require(SERVER('share-routes.js'));
 
+/**
+ * R90（PAY-F1）：换券同样是「先关旧单、再建新单」。单测不出网。
+ * 关单本身的语义（closed / paid / unsupported / error）见 `audit90-regressions.test.js`。
+ */
+paymentGateway.closeCharge = async () => ({ ok: true, state: 'closed' });
+
 /** 下单桩：记录每次下单的渠道 / 订单号 */
 const charges = [];
 paymentGateway.createCharge = async (platform, cfg, opts) => {

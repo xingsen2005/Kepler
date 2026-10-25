@@ -247,6 +247,12 @@ test('R21-06 · 回调地址必须指向**实际下单渠道**；R82 起「换�
   paymentRules.resolvePaidState = () => ({ required: true, effective: true, amountFen: 100, currency: 'CNY', reason: '' });
   paymentProviders.isConfigured = () => true;
 
+  /**
+   * R90（PAY-F1）：换渠道会先在网关侧关单。单测不出网 —— 关单的四种结果
+   * （closed / paid / unsupported / error）由 audit90 单独覆盖。
+   */
+  paymentGateway.closeCharge = async () => ({ ok: true, state: 'closed' });
+
   const captured = [];
   const origCharge = paymentGateway.createCharge;
   paymentGateway.createCharge = async (platform, cfg, opts) => {
@@ -348,9 +354,25 @@ test('R21-09 · PUT /users/me 改密码必须先验证当前密码', async () =>
     assertEqual(updated.length, 1, 'R21-09：校验通过后应落库一次');
     assertEqual(updated[0].password, 'new-password-1', 'R21-09：落库的必须是新密码');
 
-    /* ---- 正向对照：只改用户名（不动凭据）→ 不需要当前密码 ---- */
+    /**
+     * ---- R90 变更：只改用户名**同样**要当前密码 ----
+     *
+     * 此处原本断言「不涉及凭据的改名不应被拦」。R90 复核后判定那条结论是**错的**：
+     * 用户名是登录凭据的另一半，会话劫持者改掉它之后，真实所有者用惯用用户名
+     * 直接登不进来（显示「用户名或密码错误」），而找回渠道（邮箱）可能同时已被换掉。
+     * 它与改密同级，属于「拿到会话 ⇒ 永久接管」的同一条路径，因此并入同一道闸门。
+     * 判据**收紧**而非放宽，故原断言按新契约改写，不是被删掉。
+     */
     const onlyName = await request(srv.port, 'PUT', '/api/users/me', { body: { username: 'renamed' } });
-    assertEqual(onlyName.status, 200, `R21-09：不涉及凭据的改名不应被拦，实际 ${onlyName.status}`);
+    assertEqual(onlyName.status, 400,
+      `R90：只改用户名也必须校验当前密码，实际 ${onlyName.status}`);
+    assert(/当前密码/.test(onlyName.raw || ''), 'R90：拒绝文案必须说清缺的是当前密码');
+
+    const nameOk = await request(srv.port, 'PUT', '/api/users/me', {
+      body: { username: 'renamed', currentPassword: 'correct-pw' },
+    });
+    assertEqual(nameOk.status, 200, `R90：带对了当前密码就应放行，实际 ${nameOk.status} ${nameOk.raw}`);
+    assertEqual(updated[updated.length - 1].username, 'renamed', 'R90：落库的必须是新用户名');
   } finally {
     await srv.close();
   }

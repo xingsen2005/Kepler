@@ -69,7 +69,8 @@ export const ops = {
       toast('正在重命名…');
       await API.rename(key, name, item ? item.size : 0);
       toast('重命名完成', { type: 'success' });
-      explorerRefresh();
+      // R90：这里原本连着调了两次 explorerRefresh() —— 每次都是一整轮 /fs/list
+      // 往返，用户看到的是「重命名完成后列表闪一下再闪一下」。一次就够。
       explorerRefresh();
     } catch (e) {
       toast('重命名失败：' + e.message, { type: 'error' });

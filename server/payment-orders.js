@@ -736,6 +736,29 @@ function markRefunded(id) {
   return o;
 }
 
+/**
+ * R90（PAY-F1）：记录「网关侧关单」的结果。
+ *
+ * **只记账，不改 `status`** —— 状态仍由 `markFailed()` 决定，这里回答的是另一个
+ * 问题：「那笔单在支付平台那里真的关掉了吗？」。两者必须分开：
+ * `status=failed` 而 `closeState=error` 意味着「本系统认为它作废了，但支付平台上
+ * 可能还活着」—— 这正是人工对账时要找的那几笔。
+ *
+ * @param {string} id
+ * @param {string} state closed | not_found | paid | unsupported | error
+ * @param {string} [error] 失败原因（成功时清空，避免留下上一次的残留）
+ */
+function setCloseState(id, state, error) {
+  const o = get(id);
+  if (!o) return null;
+  o.closeState = String(state || '');
+  if (error) o.closeError = String(error).slice(0, 300);
+  else delete o.closeError;
+  o.updatedAt = new Date().toISOString();
+  persist();
+  return o;
+}
+
 /** 记录网关侧的订单号（查单 / 对账用） */
 function setTradeNo(id, tradeNo) {
   const o = get(id);
@@ -889,6 +912,7 @@ module.exports = {
   flush, // R14-09：去抖落盘的强制刷写（优雅停机 / 测试）
   isDegraded, // R84（M-3）：订单存储读不出来时为 true —— 上游据此拒绝收款 / 显示告警
   markPaid, markFailed, markRefunded, markDownloaded, setTradeNo,
+  setCloseState, // R90（PAY-F1）：网关侧关单结果的记账（与 status 正交）
   orderToken, verifyToken, payerState, view,
   bucketOf, // R48：来源桶（快照优先、回退到现存链接）—— 收入统计按桶归集的唯一实现点
 };

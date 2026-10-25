@@ -283,6 +283,22 @@ function releaseCouponForOrder(order) {
   return couponStore.releaseByOrder(order.id);
 }
 
+/**
+ * R90（PAY-F1）：在**网关侧**关掉被放弃的在途订单。
+ *
+ * 只做本地 `markFailed()` 是不够的：那只是本系统的记账，**网关侧那笔订单仍然可付**。
+ * 用户很可能还开着刚才那个收银台（或二维码页面），随手一扫就是第二次付款 ——
+ * 而本系统只认一笔（票据指向新单），另一笔只能在异步通知里以「已支付」出现，
+ * 需要人工对照退款。换渠道 / 换券因此必须先把旧单**在网关那里关掉**。
+ *
+ * @param {object} order 被放弃的在途订单（`status === 'pending'`）
+ * @returns {Promise<{ok:boolean, state:string, error?:string}>} 见 `closeCharge()` 的五档状态
+ */
+async function closeSupersededOrder(order) {
+  const cfg = (configStore.getPayment().platforms || {})[order.platform] || {};
+  return paymentGateway.closeCharge(order.platform, cfg, order);
+}
+
 /** R84（L-3）：判定「同一笔单的重复提交」的时间窗口 */
 const TWIN_WINDOW_MS = 5000;
 
@@ -2021,6 +2037,69 @@ router.post('/s/:id/pay', asyncHandler(async (req, res) => {
        * 用户说「我明明用了券」，得能一眼看出旧单是被换渠道废的，还是被换券废的。
        */
       const byCoupon = couponChanged && pendingOrder.platform === platform;
+      const switchText = byCoupon
+        ? `更换优惠券（${pendingCode || '无券'} → ${submittedCode || '无券'}）`
+        : `更换支付渠道（${pendingOrder.platform} → ${platform}）`;
+
+      /**
+       * R90（PAY-F1）：**先关网关单，再建新单**。
+       *
+       * 顺序不能反：若先建新单、再关旧单，那么「关不掉」的时候新单已经在网关了，
+       * 用户两笔都能付 —— 想回滚也回不掉。先关的好处是失败时**什么都没发生**，
+       * 用户重试一次即可。
+       *
+       * 三种结果分开处理：
+       *  · `closed` / `not_found` ⇒ 旧单已死或从未真正下单，继续；
+       *  · `paid` ⇒ **用户其实已经付过这笔**，绝不能建第二单；以主动查单为准
+       *    （`queryCharge` 才是「已支付」的唯一可信来源），确认后标记已付并让页面
+       *    去交付那一笔；
+       *  · `unsupported`（PayPal 无 cancel/void 端点）⇒ 留痕后继续，残余风险见日志；
+       *  · `error` ⇒ 不知道旧单死活 ⇒ **有疑问就不放行**（钱的安全优先于本次便利）。
+       */
+      const closeRes = await closeSupersededOrder(pendingOrder);
+      paymentOrders.setCloseState(pendingOrder.id, closeRes.state, closeRes.error);
+
+      if (closeRes.state === 'paid') {
+        /**
+         * ⚠️ 这里**不能**自己 `queryCharge` + `markPaid()`。
+         *
+         * `markPaid()` 在全库只允许**一处**调用（`SEC-05` 的硬计数护栏：不允许存在
+         * 「绕过网关确认、自行把订单置为已支付」的第二个入口）。虽然本分支确实先查了单，
+         * 但多写一处调用点就等于给护栏开了个口子 —— 下一个改这里的人未必还会查。
+         *
+         * `finalizeOrder()` 正是「查单 → 按结果落状态」的唯一实现点，直接复用它：
+         * 判据留在原处，调用点也不增加。
+         */
+        const settled = await finalizeOrder(l, pendingOrder);
+        if (settled && settled.status === 'paid') {
+          statsStore.addLog({
+            action: 'share.pay', level: 'warn',
+            detail: `分享链接 ${l.id} 的订单 ${pendingOrder.id} 在换${byCoupon ? '券' : '渠道'}时发现**已完成支付**：`
+              + '已按该笔交付，本次不再建新单（IP：' + ip + '）',
+          });
+          return res.redirect(303, '/s/' + encodeURIComponent(l.id) + '?e=paid');
+        }
+      }
+      if (!closeRes.ok && closeRes.state !== 'unsupported') {
+        statsStore.addLog({
+          action: 'share.pay', level: 'error',
+          detail: `分享链接 ${l.id} ${switchText}失败：网关侧未能关闭在途订单 ${pendingOrder.id}`
+            + `（${closeRes.error || closeRes.state}），为避免双份付款，本次**不再建新单**（IP：${ip}）`,
+        });
+        return payPage(res, l, ps, available,
+          `原支付方式的订单还不确定是否已关闭（${closeRes.error || '网关未响应'}），`
+          + '为避免同一件商品被付两次，本次没有创建新订单。请稍后重试，'
+          + '或回到原支付页面完成支付后再刷新本页。',
+          '', couponStateFor(l, req));
+      }
+      if (closeRes.state === 'unsupported') {
+        statsStore.addLog({
+          action: 'share.pay', level: 'warn',
+          detail: `分享链接 ${l.id} ${switchText}：旧订单 ${pendingOrder.id} 无法在网关侧关闭`
+            + `（${closeRes.error || '该渠道不支持'}）；若买家仍完成支付，需人工退款`,
+        });
+      }
+
       paymentOrders.markFailed(pendingOrder.id, byCoupon
         ? `已更换优惠券（${pendingCode || '无券'} → ${submittedCode || '无券'}），原在途订单作废`
         : '已更换支付方式，原在途订单作废');

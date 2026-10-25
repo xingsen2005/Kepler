@@ -107,9 +107,9 @@ router.put('/users/me', async (req, res) => {
 
     const patch = {};
     /**
-     * R21-09 + R54②：哪些改动需要**二次确认当前密码**。
+     * R21-09 + R54② + R90：哪些改动需要**二次确认当前密码**。
      *
-     * 密码与邮箱各自都能通向「永久接管账户」，因此同款处理：
+     * 用户名、密码、邮箱三者都能通向「永久接管账户」，因此同款处理：
      *  · 改密 —— R21-09 的理由：会话一旦被劫持（XSS、共享机器未登出、Cookie 泄露），
      *    攻击者可以直接改密，把真正的 owner 锁在外面，**"拿到会话"直接升级为
      *    "永久接管账户"**；
@@ -117,12 +117,30 @@ router.put('/users/me', async (req, res) => {
      *    就能走「忘记密码」把账户永久接管，而**验证码对此毫无帮助**（收件箱本来
      *    就在他手上）。所以"通过验证码"证明的是"这个地址归我"，**证明不了"是我"**；
      *    证明"是我"的仍然是当前密码。两者缺一不可。
+     *  · 改用户名 —— R90：它是登录凭据的另一半，改掉之后真实所有者**连登录都进不去**，
+     *    详见下方那段注释。
      */
     let needsCurrent = false;
     /** 邮箱确实发生了变化（用于日志，以及"成功后核销验证码"） */
     let emailChanged = false;
 
-    if (b.username !== undefined) patch.username = b.username;
+    /**
+     * R90：**改用户名同样要当前密码**。
+     *
+     * 旧实现只对「密码 / 邮箱」要求 `currentPassword`，用户名被漏掉了 —— 而用户名
+     * 是**登录凭据的另一半**：会话劫持者把它改掉之后，真实所有者用惯用的用户名
+     * 直接**登不进来**（提示「用户名或密码错误」），受害者的第一反应是「我记错密码了」，
+     * 于是不断重试、走「忘记密码」—— 而找回邮件只会发到（可能也被改掉的）邮箱。
+     * 这是与改密同级的**永久接管**路径，且绕过成本更低（不需要知道旧密码）。
+     *
+     * 与邮箱那一条的区别：邮箱要**两把钥匙**（验证码证明"地址归我" + 当前密码证明"是我"），
+     * 用户名没有可验证的"归属"对象，因此只要当前密码这一把 —— 但必须有。
+     * 提交值与原值相同时**不算改动**（表单每次都会把原值带上来）。
+     */
+    if (b.username !== undefined) {
+      if (String(b.username) !== String(me.username)) needsCurrent = true;
+      patch.username = b.username;
+    }
 
     if (b.password !== undefined && b.password !== '') {
       if (b.confirmPassword !== undefined && String(b.confirmPassword) !== String(b.password)) {
@@ -192,7 +210,7 @@ router.put('/users/me', async (req, res) => {
         return res.status(400).json({ error: '请输入当前密码以确认身份', needCurrentPassword: true });
       }
       if (!(await configStore.verifyUserPassword(me.id, current))) {
-        statsStore.addLog({ action: 'users.self-update', level: 'warn', detail: `用户「${me.username}」自助变更（密码 / 邮箱）：当前密码校验失败` });
+        statsStore.addLog({ action: 'users.self-update', level: 'warn', detail: `用户「${me.username}」自助变更（用户名 / 密码 / 邮箱）：当前密码校验失败` });
         return res.status(403).json({ error: '当前密码不正确' });
       }
     }

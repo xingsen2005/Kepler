@@ -113,6 +113,13 @@ const couponStore = require(SERVER('coupon-store.js'));
 const paymentGateway = require(SERVER('payment-gateway.js'));
 const shareRoutes = require(SERVER('share-routes.js'));
 
+/**
+ * R90（PAY-F1）：换渠道 / 换券时会**先在网关侧关单**再建新单。
+ * 单测不能真出网（也不该依赖支付宝/微信的可用性），这里钉成「已关闭」。
+ * 关单失败 / 已支付 / 渠道不支持三条分支由 `audit90-regressions.test.js` 单独覆盖。
+ */
+paymentGateway.closeCharge = async () => ({ ok: true, state: 'closed' });
+
 /** 下单桩：记录每次下单的渠道 / 回调地址 / 订单号，并让路由走到 302 */
 const captured = [];
 const origCharge = paymentGateway.createCharge;

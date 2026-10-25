@@ -40,6 +40,14 @@ const { makeThrottle } = require('../throttle');
 const userSpace = require('../user-space');
 // R89：上传会话的 key 是**绝对** key（init 时已加根），出口剥根需要当前请求的根
 const requestContext = require('../request-context');
+/**
+ * FS-S1：上传数据面的内存闸门。
+ *
+ * ⚠️ 它**必须排在 `express.raw(...)` 之前** —— `express.raw` 是中间件，进入
+ * handler 时请求体已经整个躺在内存里了，此时再判「太大」对内存没有任何帮助。
+ * 详见 `server/upload-gate.js` 的模块注释。
+ */
+const uploadGate = require('../upload-gate');
 
 const router = express.Router();
 
@@ -518,7 +526,7 @@ router.post('/fs/mkdir', async (req, res) => {
 /* ============================ 上传（含断点续传） ============================ */
 
 // 小文件直传（<= 8MB），raw body；加密模式开启时在本地完成加密后才上传
-router.put('/fs/upload/simple', express.raw({ type: () => true, limit: '64mb' }), async (req, res) => {
+router.put('/fs/upload/simple', uploadGate.gate(), express.raw({ type: () => true, limit: '64mb' }), async (req, res) => {
   try {
     const cfg = requireConfig();
     const client = getClient(cfg);
@@ -813,7 +821,7 @@ function assertSessionOwner(sess, req) {
 }
 
 // 分片上传：上传单个分片（加密开启时按分片加密后上传）
-router.put('/fs/upload/chunk', express.raw({ type: () => true, limit: '64mb' }), async (req, res) => {
+router.put('/fs/upload/chunk', uploadGate.gate(), express.raw({ type: () => true, limit: '64mb' }), async (req, res) => {
   try {
     requireConfig();
     const sess = uploadSessions.get(String(req.query.session || ''));

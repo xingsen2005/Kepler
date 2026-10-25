@@ -10615,8 +10615,16 @@ const CASES = [
        */
       name: 'R80-05a · SM2 不再本地拒绝（静默降级成 RSA 签名，跳过去被网关拒）',
       file: 'server/payment-gateway.js',
-      anchor: '  const signType = alipaySignType(cfg.signType);',
-      replacement: "  const signType = cfg.signType || 'RSA2'; // R80 反向变异：不做任何校验",
+      // R90：alipayClose 里也有同样的一行 ⇒ 必须带上「后面紧跟的是 page.pay」这段
+      // 独有上下文，否则 replace 只替首处，变异会打到关单分支上（假绿）
+      anchor: '  const signType = alipaySignType(cfg.signType);\n'
+        + '  const params = {\n'
+        + '    app_id: cfg.appId,\n'
+        + "    method: 'alipay.trade.page.pay',",
+      replacement: "  const signType = cfg.signType || 'RSA2'; // R80 反向变异：不做任何校验\n"
+        + '  const params = {\n'
+        + '    app_id: cfg.appId,\n'
+        + "    method: 'alipay.trade.page.pay',",
       testFile: 'audit80-regressions.test.js',
       minFail: 1,
     },
@@ -10991,8 +10999,10 @@ const CASES = [
        */
       name: 'R84-02a · 同步响应对「重新序列化后的 JSON」验签（原文切片丢了）',
       file: 'server/payment-gateway.js',
-      anchor: "  const content = alipayRawNode(raw, 'alipay_trade_query_response');",
-      replacement: "  const content = JSON.stringify(json && json.alipay_trade_query_response); // R84 反向变异：重新序列化",
+      // R90：验签的节点名已参数化（关单/查单各一个）⇒ 锚点改到新的写法上。
+      // 变异语义不变：**不取原文切片**，改成重新序列化 —— 正是 R84 要守的那条。
+      anchor: "  const content = alipayRawNode(raw, nodeKey || 'alipay_trade_query_response');",
+      replacement: "  const content = JSON.stringify(json && json[nodeKey || 'alipay_trade_query_response']); // R84 反向变异：重新序列化",
       testFile: 'audit84-regressions.test.js',
       minFail: 1,
     },
@@ -11551,6 +11561,126 @@ const CASES = [
       anchor: '    const cacheKey = storageKeyOf(cfg);',
       replacement: '    const cacheKey = bucketCacheKey(cfg);',
       testFile: 'audit89-regressions.test.js',
+      minFail: 1,
+    },
+
+    /* ==================== R90 · 四个历史待办（PAY-F1 / FS-S1 / 改名 / ops.js） ====================
+     *
+     * 这一轮的失效方式分两类，撤的时候要分清：
+     *  · **结构类**（闸门的位置、关单与建单的先后）—— 撤掉之后功能照常，只有并发或
+     *    「旧收银台还开着」这种非主流程才暴露；
+     *  · **判据类**（验签、已支付单独成档）—— 撤掉之后一切正常，只有伪造响应或
+     *    用户已经付过钱的时候才错，而那时错的是钱。
+     */
+    {
+      name: 'R90-01a · 上传闸门的并发上限被摘掉（并发数不限）',
+      file: 'server/upload-gate.js',
+      anchor: '  if (state.count + 1 > limitCount) {',
+      replacement: '  if (false) {',
+      testFile: 'audit90-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R90-02a · 上传闸门的在途字节上限被摘掉（只限并发挡不住超大文件）',
+      file: 'server/upload-gate.js',
+      anchor: '  if (state.bytes + want > limitBytes) {',
+      replacement: '  if (false) {',
+      testFile: 'audit90-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R90-03a · 响应结束时不再归还名额（名额只减不增，最终整站不能上传）',
+      file: 'server/upload-gate.js',
+      anchor: "    res.on('close', () => release(r.ticket));",
+      replacement: '    void r.ticket;',
+      testFile: 'audit90-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R90-04a · 闸门挂到 express.raw 之后（请求体已进内存，闸门形同虚设）',
+      file: 'server/routes/fs.js',
+      anchor: "router.put('/fs/upload/simple', uploadGate.gate(), express.raw({ type: () => true, limit: '64mb' }), async (req, res) => {",
+      replacement: "router.put('/fs/upload/simple', express.raw({ type: () => true, limit: '64mb' }), uploadGate.gate(), async (req, res) => {",
+      testFile: 'audit90-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R90-05a · 改用户名不置 needsCurrent（服务端不校验当前密码）',
+      file: 'server/routes/users.js',
+      anchor: '      if (String(b.username) !== String(me.username)) needsCurrent = true;',
+      replacement: '      if (false) needsCurrent = true;',
+      // 行为后果只能从 HTTP 层看到：R90-06 是源码层判据（needsCurrent = true 还在，
+      // 只是进了死分支），真正会红的是 audit21 里那条「只改用户名 → 400」的用例
+      testFile: 'audit21-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R90-06a · 前端改用户名不带 currentPassword（裸奔到服务端才被拦）',
+      file: 'public/js/profile.js',
+      anchor: "      if (!currentPw) { showMsg('修改用户名前请先输入当前密码', 'bad'); return; }\n"
+        + '      body.currentPassword = currentPw;',
+      replacement: "      if (!currentPw) { showMsg('修改用户名前请先输入当前密码', 'bad'); return; }",
+      testFile: 'audit90-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R90-07a · 换渠道不关网关单（旧收银台仍可付 ⇒ 双份付款，PAY-F1 原缺陷）',
+      file: 'server/share-routes.js',
+      anchor: '      const closeRes = await closeSupersededOrder(pendingOrder);\n'
+        + '      paymentOrders.setCloseState(pendingOrder.id, closeRes.state, closeRes.error);',
+      replacement: "      const closeRes = { ok: true, state: 'closed' };",
+      testFile: 'audit90-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R90-08a · 关单失败也照建新单（两笔都能付，想回滚也回不掉）',
+      file: 'server/share-routes.js',
+      anchor: "      if (!closeRes.ok && closeRes.state !== 'unsupported') {",
+      replacement: '      if (false) {',
+      testFile: 'audit90-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R90-09a · 旧单其实已支付却仍建新单（让付过钱的人再付一次）',
+      file: 'server/share-routes.js',
+      anchor: "      if (closeRes.state === 'paid') {",
+      replacement: '      if (false) {',
+      testFile: 'audit90-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R90-10a · 支付宝关单响应不验签（伪造网关即可让旧单看起来已关闭）',
+      file: 'server/payment-gateway.js',
+      anchor: "  if (!alipayVerifySync(raw, json, cfg, 'alipay_trade_close_response')) {",
+      replacement: '  if (false) {',
+      testFile: 'audit90-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R90-11a · 微信 ORDERPAID 并进 error（丢掉「用户已经给过钱」这一档）',
+      file: 'server/payment-gateway.js',
+      anchor: "  if (code === 'ORDERPAID') return { ok: false, state: 'paid', error: '该订单已完成支付' };",
+      replacement: "  if (code === 'ORDERPAID') return { ok: false, state: 'error', error: '该订单已完成支付' };",
+      testFile: 'audit90-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R90-12a · 关单结果不落库（对账时看不出「本地作废但网关可能还活着」）',
+      file: 'server/payment-orders.js',
+      anchor: "  o.closeState = String(state || '');",
+      replacement: "  o.closeState = '';",
+      testFile: 'audit90-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R90-13a · 重命名后又刷两次列表（一次重命名打两轮 /fs/list）',
+      file: 'public/js/ops.js',
+      anchor: '      // 往返，用户看到的是「重命名完成后列表闪一下再闪一下」。一次就够。\n'
+        + '      explorerRefresh();',
+      replacement: '      // 往返，用户看到的是「重命名完成后列表闪一下再闪一下」。一次就够。\n'
+        + '      explorerRefresh();\n'
+        + '      explorerRefresh();',
+      testFile: 'audit90-regressions.test.js',
       minFail: 1,
     },
   ];

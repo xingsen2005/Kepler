@@ -333,7 +333,7 @@ function alipayRawNode(raw, key) {
 }
 
 /**
- * 校验支付宝**同步响应**（查单等）的签名 —— R21-04 的闭合点。
+ * 校验支付宝**同步响应**（查单 / 关单等）的签名 —— R21-04 的闭合点。
  *
  * ⚠️ 绝不能复用 `alipayVerify()`：那个是给**异步通知**用的，待签串是
  * 「参数按 key 升序、`k=v` 用 `&` 连接」；同步响应签的是**原始 JSON 子串**。
@@ -345,13 +345,17 @@ function alipayRawNode(raw, key) {
  * 拦得住「金额不同」，拦不住「金额相同的伪造成功」。微信/PayPal 的主机名是代码内的
  * 常量，不受这一条影响。
  *
+ * @param {string} [nodeKey] 响应里承载业务字段的那个节点名。**必须与本次调用对应**：
+ *        查单是 `alipay_trade_query_response`、关单是 `alipay_trade_close_response`。
+ *        R90（PAY-F1）新增关单时踩过一次「写死查单节点名」—— 关单响应会被判成
+ *        「签名不对」，而真实原因只是取错了切片位置。
  * @returns {boolean} 验不过一律 false（调用方按 `state:'error'` 处理，fail-closed）
  */
-function alipayVerifySync(raw, json, cfg) {
+function alipayVerifySync(raw, json, cfg, nodeKey) {
   const sign = String((json && json.sign) || '').trim();
   const key = normalizePublicKey(cfg && cfg.alipayPublicKey);
   if (!sign || !key) return false;
-  const content = alipayRawNode(raw, 'alipay_trade_query_response');
+  const content = alipayRawNode(raw, nodeKey || 'alipay_trade_query_response');
   if (!content) return false;
   const st = String((cfg && cfg.signType) || (json && json.sign_type) || 'RSA2').toUpperCase();
   if (st === 'SM2') return false; // 国密需 SM2 实现，本地不具备 —— 明确拒绝而非放行
@@ -428,7 +432,7 @@ function wechatAuthorization(method, canonicalUrl, body, cfg, { timestamp, nonce
     + `signature="${signature}",timestamp="${timestamp}",serial_no="${cfg.certSerialNo}"`;
 }
 
-async function wechatRequest(method, path, cfg, body, deadline) {
+async function wechatRequestRaw(method, path, cfg, body, deadline) {
   const timestamp = String(Math.floor(Date.now() / 1000));
   const nonce = crypto.randomBytes(16).toString('hex');
   const raw = body === undefined || body === null ? '' : JSON.stringify(body);
@@ -450,11 +454,24 @@ async function wechatRequest(method, path, cfg, body, deadline) {
   const text = r.body == null ? '' : String(r.body);
   let json = null;
   try { json = text ? JSON.parse(text) : null; } catch (e) { /* 非 JSON */ }
+  /**
+   * R90（PAY-F1）：**状态码要能被调用方读到**。
+   *
+   * 关单接口（`/close`）的成功是 `204 No Content`，而「订单不存在 / 已关闭 / 已支付」
+   * 分别用 404 / 400 + 错误码表达 —— 这些正是判断「还需不需要继续」的依据。
+   * 旧实现只返回解析后的 JSON、非 2xx 直接抛 Error（错误码随之丢失），
+   * 于是关单侧无法区分「其实已经付了」与「网关临时故障」。故把原始状态抽出来。
+   */
+  return { ok: r.ok, status: r.status, json: json || null, text };
+}
+
+async function wechatRequest(method, path, cfg, body, deadline) {
+  const r = await wechatRequestRaw(method, path, cfg, body, deadline);
   if (!r.ok) {
-    const msg = (json && (json.message || json.detail)) || text || `HTTP ${r.status}`;
+    const msg = (r.json && (r.json.message || r.json.detail)) || r.text || `HTTP ${r.status}`;
     throw new Error(String(msg).slice(0, 300));
   }
-  return json || {};
+  return r.json || {};
 }
 
 async function wechatCreate(cfg, { order, subject, notifyUrl }, deadline) {
@@ -716,6 +733,112 @@ async function paypalVerifyWebhook(cfg, headers, event) {
   return json.verification_status === 'SUCCESS';
 }
 
+/* ============================ 关单（PAY-F1） ============================ */
+
+/**
+ * 关闭网关侧的订单 —— **换渠道 / 换券时必须先做这一步**。
+ *
+ * ## 不关会怎样
+ *
+ * 换渠道时本系统把旧单标成 `failed` 就不再管它了，而**网关侧那笔订单仍然可付**：
+ * 用户很可能在另一个标签页/手机上调出过原来的收银台（或者就是刚才那个二维码还开着），
+ * 随手一扫 —— 于是**同一件商品被付了两次**。本系统只认其中一笔（票据指向新单），
+ * 另一笔只会在异步通知里以「已支付」的面目出现，需要人工对照退款。
+ *
+ * 「本地标失败」与「网关侧关闭」是两件事：前者只是本系统的记账，后者才让那份
+ * 支付凭证真正失效。PAY-F1 要补的就是后者。
+ *
+ * ## 返回值语义（调用方据此决定放不放行新单）
+ *
+ * | state        | 含义                                        | 调用方该做什么 |
+ * |--------------|---------------------------------------------|----------------|
+ * | `closed`     | 网关已关闭（幂等，重复关同样返回它）        | 继续建新单 |
+ * | `not_found`  | 网关侧压根没有这笔（用户从未跳到收银台）    | 继续建新单 |
+ * | `paid`       | 这笔**已经付掉了**                          | **绝不建新单**，去确认并交付那一笔 |
+ * | `unsupported`| 网关不提供关单接口（PayPal）                | 继续建新单，但要留痕 |
+ * | `error`      | 没关成、也不知道支付状态                    | **有疑问就不放行**，让用户稍后重试 |
+ *
+ * `paid` 单独成一档的原因：它是**唯一**一个「用户已经给过钱」的状态。把它和
+ * `error` 混在一起，就会让「其实已经付过的人」被引导去付第二次。
+ */
+
+/**
+ * 支付宝关单（`alipay.trade.close`）。
+ *
+ * 与查单一样，**验签在读业务字段之前** —— 否则等于先相信了不可信的输入。
+ */
+async function alipayClose(cfg, order) {
+  const signType = alipaySignType(cfg.signType);
+  const params = {
+    app_id: cfg.appId,
+    method: 'alipay.trade.close',
+    format: 'JSON',
+    charset: 'utf-8',
+    sign_type: signType,
+    timestamp: alipayTimestamp(),
+    version: '1.0',
+    biz_content: JSON.stringify({ out_trade_no: order.id }),
+  };
+  const url = alipayBuildUrl(cfg.gateway || ALIPAY_GATEWAY, params, cfg.privateKey, signType);
+  const r = await fetchWithTimeout(url, undefined, 'text');
+  const raw = String(r.body == null ? '' : r.body);
+  let json = null;
+  try { json = raw ? JSON.parse(raw) : null; } catch (e) { json = null; }
+  const node = json && json.alipay_trade_close_response;
+  if (!node) return { ok: false, state: 'error', error: '支付宝返回内容无法识别' };
+  if (!alipayVerifySync(raw, json, cfg, 'alipay_trade_close_response')) {
+    return {
+      ok: false, state: 'error',
+      error: '支付宝关单响应签名校验失败：无法确认这条响应来自支付宝，请检查「支付设置 → 支付宝」里的支付宝公钥',
+    };
+  }
+  if (node.code === '10000') return { ok: true, state: 'closed' };
+  // 交易不存在 ⇒ 用户从未真正跳到收银台，网关侧没有可付的单，等价于已关闭
+  if (node.sub_code === 'ACQ.TRADE_NOT_EXIST') return { ok: true, state: 'not_found' };
+  return {
+    ok: false, state: 'error',
+    error: `${node.sub_msg || node.msg || '关单失败'}${node.sub_code ? `（${node.sub_code}）` : ''}`,
+  };
+}
+
+/**
+ * 微信关单（`POST /v3/pay/transactions/out-trade-no/{id}/close`，成功回 204）。
+ *
+ * 三种「其实不需要关」的结果都归到 `closed` / `not_found`：
+ *  · `ORDER_NOT_EXIST` ⇒ 用户没扫过码，网关侧没这笔；
+ *  · `ORDER_CLOSED`    ⇒ 已被关掉（幂等重入）；
+ *  · 404               ⇒ 同上，按不存在处理。
+ * `ORDERPAID` 必须单独返回 `paid` —— 用户已经付了，此时再建新单就是让他付第二次。
+ */
+async function wechatClose(cfg, order) {
+  const path = `/v3/pay/transactions/out-trade-no/${encodeURIComponent(order.id)}/close`;
+  const r = await wechatRequestRaw('POST', path, cfg, { mchid: cfg.mchId });
+  if (r.status === 204 || r.ok) return { ok: true, state: 'closed' };
+  const code = String((r.json && r.json.code) || '');
+  if (code === 'ORDER_NOT_EXIST' || r.status === 404) return { ok: true, state: 'not_found' };
+  if (code === 'ORDER_CLOSED') return { ok: true, state: 'closed' };
+  if (code === 'ORDERPAID') return { ok: false, state: 'paid', error: '该订单已完成支付' };
+  const msg = (r.json && (r.json.message || r.json.detail)) || r.text || `HTTP ${r.status}`;
+  return { ok: false, state: 'error', error: String(msg).slice(0, 300) };
+}
+
+/**
+ * PayPal：**没有关单接口**。
+ *
+ * 查过官方 Orders v2 的七个端点（create / show / update / confirm-payment-source /
+ * authorize / capture / track），其中**没有** cancel 或 void：`CREATED` / `APPROVED`
+ * 状态的订单既不能取消也不能作废（官方论坛与 Stack Overflow 上同一结论，v1 的
+ * `DELETE /v1/checkout/orders/{id}` 在 v2 已取消）。所以这里不编造端点，如实回
+ * `unsupported`，由调用方**留痕后继续**，并把这个残余风险写进日志。
+ */
+function paypalCloseUnsupported() {
+  return {
+    ok: false, state: 'unsupported',
+    error: 'PayPal 订单不支持主动关闭（Orders v2 无 cancel/void 端点），'
+      + '被放弃的订单只能等其自然过期；若买家仍完成支付，需人工退款',
+  };
+}
+
 /* ============================ 统一入口 ============================ */
 
 /** 从 URL 里取主机名，只用于错误文案（不含路径/查询串，绝不回显任何密钥） */
@@ -861,6 +984,24 @@ async function queryCharge(platform, cfg, order) {
   }
 }
 
+/**
+ * 关闭网关侧订单（PAY-F1）
+ *
+ * 与 `queryCharge` 的区别：这里**绝不**把「没能确认」当成成功。关单失败时
+ * 必须让调用方知道「旧单可能还活着」，从而决定要不要放行新单。
+ *
+ * @returns {Promise<{ok: boolean, state: 'closed'|'not_found'|'paid'|'unsupported'|'error', error?: string}>}
+ */
+async function closeCharge(platform, cfg, order) {
+  const run = { alipay: alipayClose, wechat: wechatClose, paypal: paypalCloseUnsupported }[platform];
+  if (!run) return { ok: false, state: 'error', error: `未知的支付平台：${platform}` };
+  try {
+    return await run(cfg, order);
+  } catch (e) {
+    return { ok: false, state: 'error', error: String((e && e.message) || e).slice(0, 300) };
+  }
+}
+
 module.exports = {
   TIMEOUT_MS, CHARGE_TIMEOUT_MS, ALIPAY_GATEWAY, WECHAT_HOST,
   paypalHost, normalizePrivateKey, normalizePublicKey,
@@ -874,4 +1015,7 @@ module.exports = {
   // R84（L-4）：事件类型白名单 + 时间新鲜度判定 —— 导出以便直接驱动这三条分支
   paypalEventCheck, PAYPAL_EVENT_TYPES, PAYPAL_TRANSMISSION_SKEW_MS,
   createCharge, queryCharge,
+  // R90（PAY-F1）：网关侧关单 —— 换渠道 / 换券时必须先关掉被放弃的那笔，
+  // 否则旧收银台仍可付款，同一件商品会被付两次
+  closeCharge,
 };

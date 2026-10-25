@@ -57,9 +57,9 @@ export function openProfileDialog() {
       </div>
     </div>
     <div class="form-item">
-      <label>当前密码 <span class="hint" style="margin-left:6px">修改密码 / 邮箱 / 调整 Windows Hello 时必填</span></label>
+      <label>当前密码 <span class="hint" style="margin-left:6px">修改用户名 / 密码 / 邮箱 / 调整 Windows Hello 时必填</span></label>
       <input type="password" id="p-f-current" maxlength="128" placeholder="用于确认身份" autocomplete="current-password">
-      <div class="hint">改动密码或邮箱前需重新输入一次当前密码 —— 会话被盗用时光有会话不足以改掉你的凭据。</div>
+      <div class="hint">改动用户名、密码或邮箱前需重新输入一次当前密码 —— 会话被盗用时光有会话不足以改掉你的凭据。</div>
     </div>
     <div class="form-item">
       <label>新密码 <span class="hint" style="margin-left:6px">留空则不修改密码</span></label>
@@ -219,6 +219,17 @@ export function openProfileDialog() {
     if (password !== confirm) { showMsg('两次输入的密码不一致', 'bad'); return; }
 
     const body = { username: username.trim() };
+    /**
+     * R90：**改用户名也要当前密码**（服务端同一口径）。
+     *
+     * 用户名是登录凭据的另一半：会话被劫持时，攻击者改掉用户名就能让真实所有者
+     * 连登录页都过不去（"用户名或密码错误"）。它与改密、改邮箱同级，因此同样
+     * 先在前端拦一次，省掉一次必然失败的往返。
+     */
+    if (username.trim() !== String(me.username || '')) {
+      if (!currentPw) { showMsg('修改用户名前请先输入当前密码', 'bad'); return; }
+      body.currentPassword = currentPw;
+    }
     if (password) {
       // R21-09：服务端要求二次确认当前密码；前端先拦一次，省掉一次必然失败的往返
       if (!currentPw) { showMsg('修改密码前请先输入当前密码', 'bad'); return; }
