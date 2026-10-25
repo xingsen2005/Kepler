@@ -468,14 +468,20 @@ test('R17-04 · 包装后的处理器抛错必须返回 500，而不是让请求
   }
 });
 
-test('R17-04 · 8 处无顶层 try 的 async 处理器必须全部包上 asyncHandler', () => {
+test('R17-04 · 9 处无顶层 try 的 async 处理器必须全部包上 asyncHandler', () => {
   // 逐条精确锚定（用注册语句本体，避免「文件里随便有个 asyncHandler 就算过」）
   const expectations = [
     [ROUTES_ENC, ["router.post('/enc/unlock', asyncHandler(async (req, res) => {"]],
     [ROUTES_STATS, ["router.get('/stats/logs', requireAdmin, asyncHandler(async (req, res) => {"]],
     [SHARE_ROUTES, [
       "router.post('/s/:id/pay', asyncHandler(async (req, res) => {",
-      "router.get('/s/:id/pay/return', asyncHandler(async (req, res) => {",
+      /**
+       * R92：支付回跳的 GET 与 POST 共用同一个 handler（银联前台通知是跨站 POST 表单），
+       * 因此这里是**两条注册、一处包装** —— 判据仍要钉住「两个方法都被包装」，
+       * 否则漏掉 POST 时 Express 4 不会捕获 async 抛错，云闪付回跳会永久挂起。
+       */
+      "router.get('/s/:id/pay/return', asyncHandler(handlePayReturn));",
+      "router.post('/s/:id/pay/return', asyncHandler(handlePayReturn));",
       "router.post('/s/:id/pay/check', asyncHandler(async (req, res) => {",
       "router.get('/s/:id/pay/status', asyncHandler(async (req, res) => {",
       "router.post('/pay/notify/:platform', asyncHandler(async (req, res) => {",
@@ -493,13 +499,16 @@ test('R17-04 · 8 处无顶层 try 的 async 处理器必须全部包上 asyncHa
         + '（Express 4 不捕获 async 抛错，公开匿名可达的路径一旦抛错就是永久挂起）');
     }
   }
-  assert.strictEqual(total, 8,
-    `本轮台账是 8 处无顶层 try 的 async 处理器，实际钉了 ${total} 处 —— 清单变了请同步报告`);
+  assert.strictEqual(total, 9,
+    `本轮台账是 9 处无顶层 try 的 async 处理器，实际钉了 ${total} 处 —— 清单变了请同步报告`);
 
-  // 下界自检：这三份文件里被包装的 async 处理器总数不得少于 8
+  // 下界自检：这三份文件里被包装的 async 处理器总数不得少于 9
+  // R92：计数从 `asyncHandler(async` 放宽为 `asyncHandler(` —— 支付回跳已改成
+  // `asyncHandler(handlePayReturn)`（两个方法共用一个 handler），再按旧形状数会少 2 处，
+  // 让这条自检变成「扫描范围失效」的误报来源。
   const wrappedCount = [ROUTES_ENC, ROUTES_STATS, SHARE_ROUTES]
-    .map((f) => (read(f).match(/asyncHandler\(async/g) || []).length)
+    .map((f) => (read(f).match(/asyncHandler\(/g) || []).length)
     .reduce((a, b) => a + b, 0);
-  assert.ok(wrappedCount >= 8,
-    `asyncHandler 包装数应 ≥ 8，实际 ${wrappedCount}（扫描范围可能已失效）`);
+  assert.ok(wrappedCount >= 9,
+    `asyncHandler 包装数应 ≥ 9，实际 ${wrappedCount}（扫描范围可能已失效）`);
 });

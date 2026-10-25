@@ -16,8 +16,8 @@
  *  - 敏感字段（密钥 / 证书 / Secret）任何情况下都不回传明文，只回传「是否已配置」；
  *  - 审计日志只记录"哪个平台、改了什么开关"，绝不记录字段值。
  */
-const { express, configStore, statsStore, paymentProviders, paymentRules, paymentOrders, shareStore, security, couponStore } = require('./_context');
-const { requireAdmin } = require('./_shared');
+const { express, configStore, statsStore, paymentProviders, paymentRules, paymentOrders, shareStore, security, couponStore, paymentGateway, paymentLogos } = require('./_context');
+const { requireAdmin, asyncHandler } = require('./_shared');
 
 const router = express.Router();
 
@@ -166,6 +166,30 @@ router.post('/payment/orders/:id/refund', requireAdmin, (req, res) => {
 });
 
 /**
+ * 渠道品牌图形（内联 SVG）——与 `GET /api/payment/config` **分开下发**。
+ *
+ * R92：四个渠道的内联 SVG 合计约 19 KB（云闪付一个就 8 条路径），塞进配置接口会让
+ * 那份响应从 ~9 KB 涨到 ~25 KB。而配置接口是「每次打开支付设置都要拉」的，
+ * 图形却是**恒定不变**的代码内常量 —— 用一份每次都传的字节去换一个可以缓存一周的东西，
+ * 是这个接口唯一能把体积压下来的地方。
+ *
+ * 因此：配置接口只给平台定义（`clientSchema()` 已不再含 `logo`），图形走这里，
+ * 带 `private, max-age=604800`（一周）。Express 默认会为响应算 ETag，
+ * 过期后重访也是 304 而不是重新传一遍。
+ *
+ * `private` 是必须的：同源里还有普通用户，图形本身不敏感，但这条路由挂着
+ * `requireAdmin`，缓存语义不该暗示它可以被共享代理留存。
+ *
+ * 未知平台不会出现在 `allIds()` 里，因此这里无需额外的白名单判断。
+ */
+router.get('/payment/logos', requireAdmin, (req, res) => {
+  const logos = {};
+  for (const id of allIds()) logos[id] = paymentLogos.logo(id, { size: 'sm' });
+  res.setHeader('Cache-Control', 'private, max-age=604800');
+  res.json({ logos });
+});
+
+/**
  * 读取全部平台的表单定义 + 已保存的配置（一次请求拿全，避免前端按平台轮询）
  */
 router.get('/payment/config', requireAdmin, (req, res) => {
@@ -301,6 +325,53 @@ router.post('/payment/config/:platform/validate', requireAdmin, (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
+
+/**
+ * 凭据自检（R92）：拿**当前填写的**凭据真的去向网关发一次**只读**请求。
+ *
+ * 与上面的「校验」是两件事，刻意分成两个端点、两个按钮：
+ *  · `validate` 只做本地格式校验（长度 / 正则 / 枚举），**不出网**，答案永远确定；
+ *  · `selftest` 真的出网，回答的是「这套凭据网关到底认不认」——
+ *    公钥填错（填成应用公钥）、云闪付 `signMethod` 与入网不一致、微信私钥与证书
+ *    序列号不是一对、PayPal secret 已重置，这四类错在本地**全部合法**，只会在
+ *    真实付款那一刻炸，而那时钱已经出账。
+ *
+ * 入参是**表单当前值**（`applySave` 与已保存值合并），因此不必先保存再自检 ——
+ * 填完就能验；留空的敏感字段沿用旧值，与「校验」一致。
+ *
+ * 先过一遍 `validate()`：字段都不全就出网，只会拿到一堆无意义的网关错误码。
+ */
+router.post('/payment/config/:platform/selftest', requireAdmin, asyncHandler(async (req, res) => {
+  const id = req.params.platform;
+  if (!paymentProviders.isKnown(id)) {
+    return res.status(404).json({ error: `未知的支付平台：${id}` });
+  }
+  const stored = configStore.getPayment();
+  const prev = stored.platforms[id] || {};
+  // 与保存完全同一条合并路径（敏感字段留空 = 沿用旧值），否则「已配置但没改动」
+  // 会被当成必填缺失，自检根本发不出去
+  const merged = paymentProviders.applySave(id, prev, req.body || {});
+  const chk = paymentProviders.validate(id, merged);
+  if (!chk.ok) {
+    return res.status(400).json({ error: '凭据填写不完整或格式不正确，无法发起自检', errors: chk.errors });
+  }
+
+  const r = await paymentGateway.probeCharge(id, merged);
+  const p = paymentProviders.platform(id);
+  /**
+   * 审计只记「谁、哪个平台、什么结论、网关原话（截断）」——
+   * 自检本身不含资金操作，但它会携带商户凭据出网，留痕的价值在于
+   * 「出问题时能回答：这个凭据是哪天被谁验证过的」。
+   */
+  statsStore.addLog({
+    action: 'payment.selftest',
+    level: r.ok ? 'info' : 'warn',
+    detail: `管理员「${req.authUser.username}」对支付渠道「${p.name}」执行凭据自检：`
+      + `${r.ok ? '通过' : '未通过'}（${r.state}）`
+      + (r.detail ? `；网关答复：${String(r.detail).slice(0, 120)}` : ''),
+  });
+  res.json({ ok: r.ok, state: r.state, message: r.message, detail: r.detail });
+}));
 
 /** 保存某一平台的凭证（校验通过才落盘） */
 router.put('/payment/config/:platform', requireAdmin, (req, res) => {

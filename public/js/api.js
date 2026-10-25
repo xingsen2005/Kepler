@@ -499,6 +499,8 @@ export const API = {
 
   // 支付平台凭证（系统设置，仅管理员）
   paymentConfig: () => request('GET', '/api/payment/config'),
+  // R92：渠道图形单独取（长期可缓存）。配置接口只下发「会变的东西」
+  paymentLogos: () => request('GET', '/api/payment/logos'),
   paymentOrders: () => request('GET', '/api/payment/orders'),
   // 退款：本系统不代持资金，这只是把订单标记为「已退款」的人工记账动作
   refundOrder: (id) => request('POST', `/api/payment/orders/${encodeURIComponent(id)}/refund`),
@@ -508,6 +510,8 @@ export const API = {
   setPaymentEnabled: (enabled) => request('PUT', '/api/payment/enabled', { enabled }),
   setPaymentChannelEnabled: (platform, enabled) => request('PUT', `/api/payment/config/${encodeURIComponent(platform)}/enabled`, { enabled }),
   validatePayment: (platform, b) => request('POST', `/api/payment/config/${encodeURIComponent(platform)}/validate`, b),
+  // R92：凭据自检 —— 真的向网关发一次只读请求，回答「这套凭据网关认不认」
+  selftestPayment: (platform, b) => request('POST', `/api/payment/config/${encodeURIComponent(platform)}/selftest`, b),
   savePayment: (platform, b) => request('PUT', `/api/payment/config/${encodeURIComponent(platform)}`, b),
   clearPayment: (platform) => request('DELETE', `/api/payment/config/${encodeURIComponent(platform)}`),
 

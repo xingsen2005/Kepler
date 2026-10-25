@@ -53,6 +53,9 @@ const EXPECTED = [
   'PUT /payment/site-url', 'GET /payment/orders', 'POST /payment/orders/:id/refund',
   // R32-01：批量删除「支付失败」的订单（管理端「删除失效订单」按钮）
   'DELETE /payment/orders/failed',
+  // R92：渠道图形独立下发 + 凭据自检。两条都**必须** requireAdmin ——
+  // 图形虽不敏感，但自检会带着商户凭据真的出网。
+  'GET /payment/logos', 'POST /payment/config/:platform/selftest',
   'POST /webauthn/register/options', 'POST /webauthn/register/verify',
   'POST /webauthn/disable', 'POST /users/:id/webauthn/disable',
   'GET /config', 'PUT /config',
@@ -210,6 +213,11 @@ test('敏感接口均挂载 requireAdmin', () => {
     'POST /payment/orders/:id/refund',
     // R32-01：批量删除订单流水（不可逆），与退款同级 —— 同样是「一点就是一片」的写操作
     'DELETE /payment/orders/failed',
+    // R92：自检会带着已保存的商户凭据（或表单里刚填的）真的向支付网关出网，
+    // 结论里还包含「公钥/私钥是否匹配」这类凭据有效性信息 —— 普通用户不可用。
+    'POST /payment/config/:platform/selftest',
+    // R92：图形本身不敏感，但它挂在 requireAdmin 下，登记在此以防哪天被顺手放开
+    'GET /payment/logos',
     'GET /enc/settings', 'PUT /enc/settings',
     'GET /upload-excludes', 'PUT /upload-excludes',
     // R48：并发数决定服务端同时起多少个加密工作线程（整机 CPU / 内存占用），属系统级配置

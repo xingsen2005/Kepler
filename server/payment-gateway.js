@@ -608,15 +608,32 @@ function paypalCaptureAmount(orderJson) {
   return '';
 }
 
-async function paypalQuery(cfg, order) {
-  const id = order.tradeNo;
-  if (!id) return { paid: false, state: 'pending', tradeNo: '', failReason: '' };
+/**
+ * 只读取回 PayPal 订单（`GET /v2/checkout/orders/{id}`）—— **不含任何 capture**。
+ *
+ * R92：抽出来的唯一理由是「关单路径绝不允许扣款」。
+ *
+ * `paypalQuery()` 在 `status === 'APPROVED'` 时会**主动 POST /capture 把钱扣掉**，
+ * 这在「查单」语义下是对的（买家已经同意，我们该完成收款）。但同一个函数一旦被
+ * 关单流程复用（「先查一次看看这笔还在不在」是极自然的写法），关单就变成了扣款：
+ * 管理员换个支付渠道，旧单反被收了钱。两种语义必须有两个入口，不能靠调用方记得。
+ */
+async function paypalFetchOrder(cfg, id) {
   const token = await paypalToken(cfg);
   const r = await fetchWithTimeout(`${paypalHost(cfg.mode)}/v2/checkout/orders/${encodeURIComponent(id)}`, {
     method: 'GET',
     headers: { Authorization: `Bearer ${token}` },
   }, 'json');
-  const json = r.body;
+  return { r, json: r.body, token };
+}
+
+async function paypalQuery(cfg, order) {
+  const id = order.tradeNo;
+  if (!id) return { paid: false, state: 'pending', tradeNo: '', failReason: '' };
+  const got = await paypalFetchOrder(cfg, id);
+  const r = got.r;
+  const json = got.json;
+  const token = got.token; // 关单路径不会用到它（那里绝不 capture），但这里有
   if (!r.ok || !json) return { paid: false, state: 'error', tradeNo: id, failReason: 'PayPal 查询订单失败' };
   const status = json.status;
   if (status === 'COMPLETED') {
@@ -1044,7 +1061,7 @@ async function unionpayQuery(cfg, order) {
  * | `closed`     | 网关已关闭（幂等，重复关同样返回它）        | 继续建新单 |
  * | `not_found`  | 网关侧压根没有这笔（用户从未跳到收银台）    | 继续建新单 |
  * | `paid`       | 这笔**已经付掉了**                          | **绝不建新单**，去确认并交付那一笔 |
- * | `unsupported`| 网关不提供关单接口（PayPal）                | 继续建新单，但要留痕 |
+ * | `unsupported`| 网关不提供关单接口（PayPal / 云闪付）  | 继续建新单，但要留痕 |
  * | `error`      | 没关成、也不知道支付状态                    | **有疑问就不放行**，让用户稍后重试 |
  *
  * `paid` 单独成一档的原因：它是**唯一**一个「用户已经给过钱」的状态。把它和
@@ -1112,39 +1129,88 @@ async function wechatClose(cfg, order) {
 }
 
 /**
- * PayPal：**没有关单接口**。
+ * PayPal 关单：**没有关单接口，但有查单接口** —— 先查一次再回答。
  *
- * 查过官方 Orders v2 的七个端点（create / show / update / confirm-payment-source /
- * authorize / capture / track），其中**没有** cancel 或 void：`CREATED` / `APPROVED`
- * 状态的订单既不能取消也不能作废（官方论坛与 Stack Overflow 上同一结论，v1 的
- * `DELETE /v1/checkout/orders/{id}` 在 v2 已取消）。所以这里不编造端点，如实回
- * `unsupported`，由调用方**留痕后继续**，并把这个残余风险写进日志。
+ * ## 为什么不能直接回 `unsupported`（R92 修的就是这个）
+ *
+ * 旧实现不查单，无条件回 `unsupported`。于是 `closeCharge()` 五档里的 `paid`
+ * **在 PayPal 上永远不可能出现** —— 而 `paid` 恰恰是唯一一个「用户已经给过钱」的
+ * 档位，也是调用方唯一会因此**放弃建新单**的档位。结果是：
+ * 买家在旧收银台上真的付掉了，系统却认为旧单「关不掉而已」，照样建第二笔单，
+ * 于是同一件商品被付两次、需要人工退款。关单接口的缺失不该连带丢掉「这笔已经付了」
+ * 这一条**能查到**的事实。
+ *
+ * ## 边界（如实标注）
+ *
+ * `CREATED`（尚未跳收银台 / 跳了没批准）与 `APPROVED`（批准了但未扣款）确实关不掉：
+ * Orders v2 的七个端点（create / show / update / confirm-payment-source / authorize /
+ * capture / track）里没有 cancel 或 void，v1 的 `DELETE /v1/checkout/orders/{id}` 在 v2
+ * 已取消。这两种状态只能等其自然过期（PayPal 侧约 3 小时）。
+ * `APPROVED` 还多一层保护：**我们不主动 capture，就永远不会扣款**。
+ *
+ * ⚠️ 这里必须走 `paypalFetchOrder()`（只读），绝不能走 `paypalQuery()` ——
+ * 后者在 `APPROVED` 时会主动 capture，那等于「关单时把钱扣了」。
  */
-function paypalCloseUnsupported() {
+async function paypalClose(cfg, order) {
+  const id = order.tradeNo;
+  // 本地连网关单号都没有 ⇒ 用户从未跳到 PayPal 收银台，网关侧根本没有这笔
+  if (!id) return { ok: true, state: 'not_found' };
+  let got;
+  try {
+    got = await paypalFetchOrder(cfg, id);
+  } catch (e) {
+    return { ok: false, state: 'error', error: String((e && e.message) || e).slice(0, 300) };
+  }
+  const { r, json } = got;
+  // 404 / INVALID_RESOURCE_ID ⇒ 网关侧没有这笔，等价于已关闭
+  if (r.status === 404 || (json && json.name === 'INVALID_RESOURCE_ID')) return { ok: true, state: 'not_found' };
+  if (!r.ok || !json) return { ok: false, state: 'error', error: `PayPal 查询订单失败（HTTP ${r.status}）` };
+  const status = String(json.status || '');
+  if (status === 'COMPLETED') {
+    // I-5：先对账再认账。金额读不出来时按 `error`（有疑问就不放行），不按 `paid`
+    const amt = checkPaidAmount(order, fenFromYuan(paypalCaptureAmount(json)), paypalCaptureAmount(json));
+    if (!amt.ok) return { ok: false, state: 'error', error: amt.reason };
+    return { ok: false, state: 'paid', error: '该订单已完成支付' };
+  }
+  if (status === 'VOIDED') return { ok: true, state: 'closed' };
   return {
     ok: false, state: 'unsupported',
-    error: 'PayPal 订单不支持主动关闭（Orders v2 无 cancel/void 端点），'
-      + '被放弃的订单只能等其自然过期；若买家仍完成支付，需人工退款',
+    error: `PayPal 订单不支持主动关闭（Orders v2 无 cancel/void 端点），当前状态 ${status || '未知'}；`
+      + '被放弃的订单只能等其自然过期（约 3 小时），期间本系统不会对它发起扣款。'
+      + '若买家仍完成支付，需在 PayPal 后台人工退款',
   };
 }
 
 /**
- * 云闪付（银联全渠道）：**没有"关闭未支付订单"的接口**。
+ * 云闪付（银联全渠道）关单：**没有"关闭未支付订单"的接口，但有查单接口** —— 先查一次再回答。
  *
- * 查过全渠道的交易类型表：`31` 是消费撤销、`32/33` 是预授权撤销，三者都要求
- * `origQryId`（**原始交易的查询流水号**），而本系统走的是「跳转收银台」模式 ——
- * 那个 `queryId` 只出现在银联回给浏览器的同步应答里，服务端从未见过它。
- * 未支付订单本来就由 `payTimeout`（下单时送 30 分钟）自动失效，不存在"关不掉就
- * 永远能付"的问题。
+ * ## 为什么不能直接回 `unsupported`（R92 修的就是这个）
  *
- * 所以不编造端点，如实回 `unsupported`：调用方留痕后继续建新单。
- * 残余风险与 PayPal 同一个形状 —— 若用户在两个标签页里各付一次，需人工退款。
+ * 与 PayPal 同一条理由：无条件回 `unsupported` 会让 `paid` 档在云闪付上永远不可达，
+ * 而那是唯一能让调用方停下「建新单」的档位。旧单真的付掉了却照样建新单 = 双份付款。
+ *
+ * ## 为什么确实关不掉（边界）
+ *
+ * 全渠道的撤销类交易 `txnType=31`（消费撤销）/ `32`、`33`（预授权撤销）都要求
+ * `origQryId`（**原始交易的查询流水号**）。本系统走「跳转收银台」模式，那个 `queryId`
+ * 只在银联回给**浏览器**的前台通知里出现，服务端要到 `finalizeOrder()` 查单时才能拿到
+ * —— 那时交易已经成功了，撤销的语义是「退款」，不是「阻止付款」。
+ *
+ * 好消息是不至于束手无策：**未支付订单本来就会由 `payTimeout`（下单时送 30 分钟）自动失效**，
+ * 所以「关不掉」的真实含义只是「旧收银台在 30 分钟内仍然可付」，而不是「永远能付」。
  */
-function unionpayCloseUnsupported() {
+async function unionpayClose(cfg, order) {
+  const r = await unionpayQuery(cfg, order);
+  // 已付 ⇒ 必须让调用方看见（它是唯一「用户已经给过钱」的档位）
+  if (r.paid) return { ok: false, state: 'paid', error: '该订单已完成支付' };
+  // 查单没能给出结论（验签失败 / 网络 / 银联网关报错）⇒ 不知道死活就不放行
+  if (r.state === 'error') {
+    return { ok: false, state: 'error', error: `关单前查单未能确认支付状态：${r.failReason || '未知原因'}` };
+  }
   return {
     ok: false, state: 'unsupported',
-    error: '云闪付（银联全渠道）不提供关闭未支付订单的接口，被放弃的订单会由 payTimeout '
-      + '（下单时 30 分钟）自动失效；若用户仍完成支付，需人工退款',
+    error: '云闪付（银联全渠道）不提供关闭未支付订单的接口（撤销类交易需要已成功交易的 queryId），'
+      + '被放弃的订单会由 payTimeout（下单时 30 分钟）自动失效；若用户仍完成支付，需人工退款',
   };
 }
 
@@ -1302,12 +1368,188 @@ async function queryCharge(platform, cfg, order) {
  * @returns {Promise<{ok: boolean, state: 'closed'|'not_found'|'paid'|'unsupported'|'error', error?: string}>}
  */
 async function closeCharge(platform, cfg, order) {
-  const run = { alipay: alipayClose, wechat: wechatClose, unionpay: unionpayCloseUnsupported, paypal: paypalCloseUnsupported }[platform];
+  const run = { alipay: alipayClose, wechat: wechatClose, unionpay: unionpayClose, paypal: paypalClose }[platform];
   if (!run) return { ok: false, state: 'error', error: `未知的支付平台：${platform}` };
   try {
     return await run(cfg, order);
   } catch (e) {
     return { ok: false, state: 'error', error: String((e && e.message) || e).slice(0, 300) };
+  }
+}
+
+/* ============================ 凭据自检（R92） ============================ */
+
+/**
+ * 凭据自检：拿**当前填写的**凭据真的去向网关发一次只读请求，回答「这套凭据到底能不能用」。
+ *
+ * ## 为什么需要它
+ *
+ * 「校验」按钮（`/payment/config/:platform/validate`）只做**本地格式**校验：长度、正则、
+ * 枚举。它能看出「私钥不是 PEM」，看不出「支付宝公钥填成了应用公钥」「云闪付的
+ * signMethod 与入网约定不一致」「微信的私钥与证书序列号不是一对」「PayPal secret 已经
+ * 重置过」。这几类错误在本地永远合法，只会在**真实付款那一刻**炸 —— 而那时用户的钱
+ * 已经出账，我们却确认不了，只能人工介入。
+ *
+ * 自检把这些错误提前到「保存前」暴露：一次只读请求就能证明「网关收下了我们的签名」
+ * 或「响应能被我们的公钥验开」。
+ *
+ * ## 只用只读操作（绝不产生资金副作用）
+ *
+ *  · 支付宝 `alipay.trade.query`、微信 `GET /v3/pay/transactions/out-trade-no/{假单号}`、
+ *    银联 `txnType=00`（查询）、PayPal `POST /v1/oauth2/token`。
+ *  · 统一用一个**必然不存在**的订单号 `PROBE_ORDER_NO`（31 位纯大写字母数字，同时满足
+ *    银联「8~40 位字母数字」、微信「6~32 位」、支付宝「≤64 位」三家的格式限制），
+ *    因此网关的预期答复是「订单不存在」——**那正是成功信号**。假单号必须过格式校验，
+ *    否则会被网关当**入参错误**拒掉，看起来像「凭据有问题」，实际是自己填错了单号。
+ *
+ * ## 返回的四档语义
+ *
+ * | state    | 含义                                            | 管理员该做什么 |
+ * |----------|-------------------------------------------------|----------------|
+ * | `ok`     | 网关接受了我们的签名 / 令牌，答复「订单不存在」 | 凭据可用 |
+ * | `auth`   | 网关明确拒绝了凭据（验签失败 / 401 / 应用ID无效）| 检查公钥、私钥、序列号、client_id |
+ * | `net`    | 没拿到可用答复（超时 / 3xx / 内容无法识别）     | 检查网关地址与出口网络 |
+ * | `config` | 本地字段不全，连请求都发不出                    | 先把必填项填完 |
+ *
+ * ⚠️ 它**不能**证明什么：`certId` 是否必填、`signMethod` 到底该选 `01` 还是 `11`，
+ * 只能由入网材料确定。自检能**证伪**（选错会验签失败），不能**证成**。
+ */
+const PROBE_ORDER_NO = 'SELFTESTPROBE000000000000000000';
+const PROBE_STATES = ['ok', 'auth', 'net', 'config'];
+
+function probePass(message, detail) {
+  return { ok: true, state: 'ok', message, detail: detail || '' };
+}
+
+function probeFail(state, message, detail) {
+  return { ok: false, state: state, message, detail: detail || '' };
+}
+
+async function alipayProbe(cfg) {
+  if (!cfg.appId || !cfg.privateKey) return probeFail('config', '应用 ID 与应用私钥未填写，无法发起自检');
+  const params = {
+    app_id: cfg.appId,
+    method: 'alipay.trade.query',
+    format: 'JSON',
+    charset: 'utf-8',
+    sign_type: cfg.signType || 'RSA2',
+    timestamp: alipayTimestamp(),
+    version: '1.0',
+    biz_content: JSON.stringify({ out_trade_no: PROBE_ORDER_NO }),
+  };
+  const url = alipayBuildUrl(cfg.gateway || ALIPAY_GATEWAY, params, cfg.privateKey, cfg.signType);
+  const r = await fetchWithTimeout(url, undefined, 'text');
+  const raw = String(r.body == null ? '' : r.body);
+  let json = null;
+  try { json = raw ? JSON.parse(raw) : null; } catch (e) { json = null; }
+  const node = json && json.alipay_trade_query_response;
+  if (!node) {
+    return probeFail('net', '支付宝返回内容无法识别，请检查网关地址是否为 https://openapi.alipay.com/gateway.do',
+      raw.slice(0, 200));
+  }
+  // 验签在读业务字段之前 —— 与查单同一口径
+  if (!alipayVerifySync(raw, json, cfg)) {
+    return probeFail('auth', '支付宝响应签名校验失败：支付宝公钥不正确（应填开放平台上该应用的「支付宝公钥」，'
+      + '不是应用公钥、也不是应用私钥）', `${node.code || ''} ${node.sub_code || ''}`.trim());
+  }
+  if (node.sub_code === 'ACQ.TRADE_NOT_EXIST' || node.code === '10000') {
+    return probePass('凭据已通过支付宝验签，网关答复「交易不存在」（符合预期，说明应用 ID 与私钥也被接受）');
+  }
+  return probeFail('auth', `支付宝拒绝了本次调用：${node.sub_msg || node.msg || '未知原因'}`,
+    `${node.code || ''} ${node.sub_code || ''}`.trim());
+}
+
+async function wechatProbe(cfg) {
+  if (!cfg.mchId || !cfg.privateKey || !cfg.certSerialNo) {
+    return probeFail('config', '商户号 / 商户私钥 / 证书序列号未填写，无法发起自检');
+  }
+  const path = `/v3/pay/transactions/out-trade-no/${encodeURIComponent(PROBE_ORDER_NO)}`
+    + `?mchid=${encodeURIComponent(cfg.mchId)}`;
+  const r = await wechatRequestRaw('GET', path, cfg);
+  const code = String((r.json && r.json.code) || '');
+  if (code === 'ORDER_NOT_EXIST' || r.status === 404) {
+    return probePass('凭据已通过微信支付签名校验，网关答复「订单不存在」（符合预期，说明商户私钥与证书序列号是一对）');
+  }
+  if (r.ok) return probePass('凭据已通过微信支付签名校验（网关对本笔假订单返回了 2xx）');
+  if (r.status === 401 || code === 'SIGN_ERROR') {
+    return probeFail('auth', '微信支付签名校验未通过：商户私钥与证书序列号（serial_no）不是一对，或商户号有误',
+      `${r.status} ${code}`.trim());
+  }
+  return probeFail('net', `微信支付返回了非预期答复（HTTP ${r.status}${code ? '，' + code : ''}）`,
+    String(r.text || '').slice(0, 200));
+}
+
+async function unionpayProbe(cfg) {
+  if (!cfg.merId || !cfg.privateKey || !cfg.unionpayPublicKey) {
+    return probeFail('config', '商户号 / 商户私钥 / 银联验签公钥未填写，无法发起自检');
+  }
+  const probeOrder = { orderNo: PROBE_ORDER_NO, createdAt: new Date().toISOString() };
+  const params = Object.assign(unionpayCommonParams(cfg, '00', '00'), {
+    orderId: unionpayOrderId(probeOrder),
+    txnTime: unionpayTxnTime(probeOrder),
+  });
+  const url = unionpayBuildUrl(cfg.gateway, params, cfg);
+  const r = await fetchWithTimeout(url, undefined, 'text');
+  const body = unionpayParseForm(r.body);
+  if (!body.respCode) {
+    return probeFail('net', '银联返回内容无法识别，请检查网关地址是否为 https://gateway.95516.com/gateway/api/frontTransReq.do',
+      String(r.body || '').slice(0, 200));
+  }
+  if (!body.signature) {
+    return probeFail('net', `银联答复未带签名，无法判定凭据是否正确（respCode=${body.respCode}）`);
+  }
+  /**
+   * 验签通过 ⇒ **公钥正确、且 `signMethod` 与银联的签名实际使用的一致**。
+   * 这一条正是「本地永远查不出来」的那个错：`01`(RSA-SHA1) 与 `11`(RSA-SHA256) 选错时，
+   * 我们发出去的签名能过网关（网关按报文里的 signMethod 验），但**回来的应答我们验不开**，
+   * 表现为真实付款后订单永远停在「支付中」。
+   */
+  if (!unionpayVerify(body, cfg.unionpayPublicKey, cfg.signMethod)) {
+    return probeFail('auth', '银联响应验签未通过：验签公钥不正确，或签名方法（01 / 11）与入网约定不一致',
+      `respCode=${body.respCode}`);
+  }
+  if (body.respCode === '34') {
+    return probePass('凭据已通过银联验签，网关答复「原始交易不存在」（符合预期，说明商户号、私钥与签名方法均被接受）');
+  }
+  return probePass(`凭据已通过银联验签，网关答复：${body.respMsg || '—'}（respCode=${body.respCode}）`);
+}
+
+async function paypalProbe(cfg) {
+  if (!cfg.clientId || !cfg.clientSecret) return probeFail('config', 'Client ID / Secret 未填写，无法发起自检');
+  const r = await fetchWithTimeout(`${paypalHost(cfg.mode)}/v1/oauth2/token`, {
+    method: 'POST',
+    headers: { Authorization: paypalBasic(cfg), 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: 'grant_type=client_credentials',
+  }, 'json');
+  const json = r.body;
+  if (r.ok && json && json.access_token) {
+    return probePass(`已成功取得 PayPal 访问令牌（client_id / secret 正确，环境：${cfg.mode === 'live' ? '正式' : '沙箱'}）`);
+  }
+  const name = String((json && (json.error || json.name)) || '');
+  return probeFail('auth', `PayPal 令牌被拒：client_id 或 secret 不正确（HTTP ${r.status}${name ? '，' + name : ''}）`, name);
+}
+
+const PROBES = {
+  alipay: alipayProbe, wechat: wechatProbe, unionpay: unionpayProbe, paypal: paypalProbe,
+};
+
+/**
+ * @param {string} platform
+ * @param {object} cfg 已合并好待测的凭据（可含未保存的表单值）
+ * @returns {Promise<{ok:boolean, state:'ok'|'auth'|'net'|'config', message:string, detail:string}>}
+ */
+async function probeCharge(platform, cfg) {
+  const run = PROBES[platform];
+  if (!run) return probeFail('config', `未知的支付平台：${platform}`);
+  try {
+    return await run(cfg || {});
+  } catch (e) {
+    /**
+     * 走到这里只剩「请求本身没发出去或没拿到答复」：DNS、超时、网关返回 3xx
+     * （`fetchWithTimeout` 拒绝跟随重定向）、TLS 失败。这三种都是「地址/网络」问题，
+     * 不是凭据问题 —— 报成 `auth` 会把管理员引去反复改密钥。
+     */
+    return probeFail('net', `未能从网关取得可用答复：${String((e && e.message) || e).slice(0, 200)}`);
   }
 }
 
@@ -1332,4 +1574,7 @@ module.exports = {
   // R90（PAY-F1）：网关侧关单 —— 换渠道 / 换券时必须先关掉被放弃的那笔，
   // 否则旧收银台仍可付款，同一件商品会被付两次
   closeCharge,
+  // R92：凭据自检（只读）。`PROBE_ORDER_NO` / `PROBE_STATES` 导出是为了让行为测试
+  // 能直接断言「用的是必然不存在的假单号」「四档状态齐全」，而不是去匹配日志文案。
+  probeCharge, PROBE_ORDER_NO, PROBE_STATES,
 };

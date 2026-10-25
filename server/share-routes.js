@@ -92,6 +92,25 @@ router.use(express.json({ limit: '256kb' }));
 const SAFE_METHOD_SET = new Set(security.SAFE_METHODS || ['GET', 'HEAD', 'OPTIONS']);
 
 /**
+ * R92：支付完成回跳路径（`/s/:id/pay/return`）。
+ *
+ * 需要它是因为**银联全渠道的前台通知是浏览器 POST 表单**，不是 GET ——
+ * 用户点「返回商户」时，银联用一个自动提交的 `<form method="POST">` 把
+ * `respCode` / `queryId` 等参数送到 `frontUrl`。而这条路径原先只注册了 GET，
+ * 于是云闪付用户付完款会落到 404（或先被下面这道 CSRF 判成跨站而 403）——
+ * 表现是「付了钱，回来是一张报错页」。
+ *
+ * 放宽范围**只限这一条形状**（`/s/<一个路径段>/pay/return`，且只有 POST）：
+ * 不是整个 `/pay/*`，也不包括 `/s/:id/pay`（建单）与 `/s/:id/pay/check`（手动查单）
+ * —— 那两条仍然必须同源，放宽它们等于把「替任何人建单 / 刷网关查单配额」开放给任意站点。
+ *
+ * 这条路径放宽的代价可控：它只做「按本地订单去**查一次**网关，然后 303 回分享页」，
+ * 不采信请求体里的任何支付结果（判定永远来自服务端主动查单），且前面有
+ * `payCheckLimiter` 按 IP 限流。
+ */
+const PAY_RETURN_PATH_RE = /^\/s\/[^/]+\/pay\/return$/;
+
+/**
  * R80：跨站拒绝的**呈现形态**必须跟着调用方走。
  *
  * 旧实现对两种调用方一律 `res.status(403).json(...)`：
@@ -114,7 +133,10 @@ function rejectCrossSite(req, res, why) {
 
 router.use((req, res, next) => {
   if (SAFE_METHOD_SET.has(req.method)) return next();
-  if (String(req.path || '').indexOf('/pay/notify/') === 0) return next();
+  const p = String(req.path || '');
+  if (p.indexOf('/pay/notify/') === 0) return next();
+  // R92：银联前台通知是跨站 POST 表单 —— 只放行这一条形状，理由见 PAY_RETURN_PATH_RE
+  if (req.method === 'POST' && PAY_RETURN_PATH_RE.test(p)) return next();
 
   const origin = String(req.headers.origin || '').trim();
   //
@@ -2352,16 +2374,50 @@ function payCheckRateLimited(req, res, l) {
   return true;
 }
 
-/** 支付完成后的回跳（支付宝 return_url / PayPal return_url） */
-router.get('/s/:id/pay/return', asyncHandler(async (req, res) => {
+/**
+ * 回跳时定位订单：先认票据（GET 路径的常规情形），再退回按**本地订单号**认。
+ *
+ * 为什么需要第二条：支付票据 Cookie 是 `SameSite=Lax` 的，**跨站 POST 不携带** ——
+ * 而银联的前台通知正是一次跨站 POST 表单。只认票据的话，云闪付用户永远走不到
+ * `finalizeOrder()`，只能落到分享页再等页面轮询（能收敛，但要白等一轮，且浏览器
+ * 禁用脚本时彻底卡住）。
+ *
+ * 退回用的 `orderId` 来自请求体，**不可信**：它只用来「定位是哪一笔」，绝不用来
+ * 决定结果 —— 结果仍然只能由 `finalizeOrder()` 向网关查单得出。同时要求该订单确实
+ * 属于这条链接（与票据路径同一条约束），否则任何人拿一个别的链接的订单号，就能让
+ * 这里替他去查单。
+ */
+function orderFromReturnBody(l, req) {
+  const b = req.body && typeof req.body === 'object' ? req.body : null;
+  if (!b) return null;
+  const o = paymentOrders.findByOrderNo(String(b.orderId || ''));
+  return o && o.linkId === l.id ? o : null;
+}
+
+/** 支付完成后的回跳（支付宝 / PayPal 是 GET 同步跳转；云闪付是 POST 表单） */
+async function handlePayReturn(req, res) {
   const l = shareStore.get(req.params.id);
   if (!l) return statePage(res, 'notfound');
-  const order = paymentOrders.verifyToken(l.id, getCookie(req, payCookieName(l.id)));
+  const order = paymentOrders.verifyToken(l.id, getCookie(req, payCookieName(l.id)))
+    || orderFromReturnBody(l, req);
   if (!order || order.linkId !== l.id) return res.redirect(303, '/s/' + l.id);
   if (payCheckRateLimited(req, res, l)) return undefined; // R8-20
   await finalizeOrderThrottled(l, order);
   return res.redirect(303, '/s/' + l.id);
-}));
+}
+
+router.get('/s/:id/pay/return', asyncHandler(handlePayReturn));
+/**
+ * R92：银联全渠道的前台通知是**跨站 POST 表单**，必须有一条 POST 路由接住它。
+ *
+ * 响应 303 回 `/s/:id` 而不是 200：这是浏览器整页导航，若落在一个「什么都没有」的
+ * 200 页面上，用户只会以为付款没生效。303 让地址栏回到分享页，由页面如实显示已付 / 待付。
+ *
+ * 与 R83 的「表单 POST 之后不许跨域 3xx」不冲突：那条讲的是**我们的**页面发起的表单
+ * 被 3xx 到**别的站**（Chrome 会把 `form-action` 管到提交后的重定向上）。这里目标
+ * 始终是本机同一个源，而且这个 POST 根本不是我们自己的页面发的。
+ */
+router.post('/s/:id/pay/return', asyncHandler(handlePayReturn));
 
 /**
  * 手动触发一次查单（「我已完成支付」按钮）。
@@ -2577,8 +2633,20 @@ async function resolveNotifiedOrder(platform, req) {
     return no ? paymentOrders.get(no) : null;
   }
   if (platform === 'unionpay') {
+    /**
+     * R92：**必须按 `orderNo` 查，不能按 `id` 查**。
+     *
+     * 银联回显的是我们送给它的 `orderId`，而那个值是 `unionpayOrderId()` 算出来的
+     * `order.orderNo`（36 位纯 base62）—— 因为银联只收 8~40 位字母数字、不许含
+     * `-` 与 `_`，而记录主键 `order.id` 是 base64url，恰好会含这两个字符。
+     *
+     * 旧实现写的是 `paymentOrders.get(no)`（按 `id` 精确匹配），于是**云闪付的异步通知
+     * 永远定位不到订单**：验签通过、限流通过、然后静默返回 404 让银联重试，真实付款
+     * 只能靠页面轮询推进（关掉浏览器就卡在「支付中」）。R91 引入该渠道时留下的这一处，
+     * 与 `alipay`/`wechat`（它们的 `out_trade_no` 就是 `order.id`）形状不同，故未能沿用。
+     */
     const no = String(b.orderId || '');
-    return no ? paymentOrders.get(no) : null;
+    return no ? paymentOrders.findByOrderNo(no) : null;
   }
   if (platform === 'paypal') {
     const id = String((b.resource && b.resource.id) || b.id || '');

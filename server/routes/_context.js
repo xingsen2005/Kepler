@@ -12,6 +12,9 @@ module.exports = {
   paymentProviders: require('../payment-providers'),
   paymentRules: require('../payment-rules'),
   paymentOrders: require('../payment-orders'),
+  // R92：凭据自检（只读出网探针）与渠道图形都只在「支付设置」这一组路由里用到
+  paymentGateway: require('../payment-gateway'),
+  paymentLogos: require('../payment-logos'),
   security: require('../security'),
   configStore: require('../config-store'),
   statsStore: require('../stats-store'),

@@ -20,6 +20,52 @@ let updatedAt = '';
 let globalEnabled = false; // 支付功能总开关
 let availableChannels = []; // 当前真正可收款的渠道
 let siteUrl = ''; // 站点对外地址（网关回调 / 支付完成回跳的目标）
+/**
+ * R92：渠道图形 `{ [platformId]: '<span class="pv-logo …">…</span>' }`。
+ *
+ * 图**不再随配置接口下发**（那份响应因此从 ~25 KB 降到 **~10.8 KB**；比 R91 之前的
+ * ~9 KB 大，是因为多了一个渠道的字段，去掉图形已经是纯收益），改为
+ * `GET /api/payment/logos` 单独取一次，并缓存进 `sessionStorage` ——
+ * 它是代码内常量、一个字节都不会变，没必要每次打开设置页都重传。
+ *
+ * 取不到时 `logos` 保持空对象：标签退化为纯文字，**不影响任何操作**。
+ */
+let logos = {};
+
+const LOGO_CACHE_KEY = 'ke_pay_logos_v1';
+
+function readLogoCache() {
+  try {
+    const raw = window.sessionStorage.getItem(LOGO_CACHE_KEY);
+    if (!raw) return null;
+    const o = JSON.parse(raw);
+    return o && typeof o === 'object' ? o : null;
+  } catch (e) {
+    return null; // 隐私模式 / 配额满 / 缓存里是脏数据 —— 一律当作没有缓存
+  }
+}
+
+function writeLogoCache(o) {
+  try {
+    window.sessionStorage.setItem(LOGO_CACHE_KEY, JSON.stringify(o));
+  } catch (e) {
+    /* 写不进去就算了，只是下次再多取一次 */
+  }
+}
+
+async function loadLogos() {
+  const cached = readLogoCache();
+  if (cached) { logos = cached; return; }
+  try {
+    const r = await API.paymentLogos();
+    const got = r && r.logos && typeof r.logos === 'object' ? r.logos : {};
+    if (!Object.keys(got).length) return;
+    logos = got;
+    writeLogoCache(got);
+  } catch (e) {
+    /* 图形是装饰：取不到就不显示，不惊动用户、不阻断任何操作 */
+  }
+}
 
 /** 渲染期角色判断（真正的强制校验在服务端） */
 function isAdmin() {
@@ -60,6 +106,11 @@ export async function loadPayment() {
     renderForm();
     renderStatus();
     renderSiteUrl();
+    /**
+     * 图形异步补一次：先让标签以**纯文字**立刻可见（不因一个装饰性请求拖慢整页），
+     * 图形到了再重画。`renderTabs` 只重建标签条本身，表单与焦点不受影响。
+     */
+    loadLogos().then(() => renderTabs()).catch(() => {});
   } catch (e) {
     const el = $('payment-form');
     if (el) el.innerHTML = `<div class="hint">加载支付配置失败：${escapeHtml(e.message)}</div>`;
@@ -88,13 +139,14 @@ function renderTabs() {
       if (st.enabled && st.complete) { dot = 'on'; tip = '已启用 · 可用于收款'; }
       else if (st.enabled) { dot = 'part'; tip = '已启用 · 待补全凭证'; }
       /**
-       * `p.logo` 是服务端下发的一段内联 SVG 标记（出处只有 `server/payment-logos.js`），
-       * 与前台分享页渲染的是同一份字节 —— **不能**过 `escapeHtml`，否则 `<path` 会
-       * 变成文本。它是本模块唯一一段原样写入 innerHTML 的值（内容为代码内常量）。
-       * 老版本服务端不下发该字段时退化为纯文字标签，不至于整排标签空白。
+       * `logos[p.id]` 是从 `GET /api/payment/logos` 取回的内联 SVG 标记
+       * （出处只有 `server/payment-logos.js`），与前台分享页渲染的是同一份字节 ——
+       * **不能**过 `escapeHtml`，否则 `<path` 会变成文本。它是本模块唯一一段原样
+       * 写入 innerHTML 的值（内容为代码内常量，不含任何用户输入）。
+       * 图形尚未取到 / 老版本服务端未提供该接口时为空串，退化为纯文字标签。
        */
       return `<button type="button" class="pay-tab${p.id === currentId ? ' active' : ''}${st.enabled ? '' : ' off'}" data-id="${escapeHtml(p.id)}" title="${tip}">
-        ${p.logo || ''}
+        ${logos[p.id] || ''}
         <span>${escapeHtml(p.name)}</span>
         <i class="pay-dot ${dot}"></i>
       </button>`;
@@ -354,6 +406,47 @@ async function doValidate() {
   }
 }
 
+/**
+ * 凭据自检（R92）—— 与「校验」是两件事，界面上也分成两个按钮。
+ *
+ * 「校验」只回答格式对不对（本地、不出网、答案确定）；自检真的带凭据去网关上
+ * 走一圈，回答「这套凭据网关认不认」。后者才有机会发现「公钥填成应用公钥」
+ * 「signMethod 与入网不一致」「私钥与证书序列号不是一对」这类本地永远合法、
+ * 只在真实付款那一刻才炸的错。
+ *
+ * 按钮在请求期间必须禁用：一次自检就是一次真实出网，连点会连打网关。
+ */
+async function doSelftest() {
+  if (!currentId) return;
+  const p = currentPlatform();
+  const btn = $('btn-payment-selftest');
+  if (btn) btn.disabled = true;
+  setMsg('正在向支付网关发起自检（只读查询，不会创建订单也不会产生任何扣款）…', 'info');
+  try {
+    const r = await API.selftestPayment(currentId, collectValues());
+    if (r.ok) {
+      setMsg(`自检通过：${r.message || '凭据可用'}`, 'ok');
+      toast(`${p ? p.name : ''}凭据自检通过`, { type: 'success' });
+    } else {
+      const label = r.state === 'auth' ? '网关拒绝了这套凭据'
+        : r.state === 'net' ? '没能从网关取得答复'
+          : r.state === 'config' ? '凭据不完整' : '未通过';
+      setMsg(`自检未通过（${label}）：${r.message || ''}`, 'bad');
+      toast(`自检未通过：${r.message || '未知原因'}`, { type: 'error', duration: 8000 });
+    }
+  } catch (e) {
+    // 字段不全时服务端回 400 + errors，直接标到对应输入框上
+    if (Array.isArray(e.errors)) {
+      const n = applyErrors(e.errors);
+      setMsg(`自检未执行：${e.message}（共 ${n} 处需先修正）`, 'bad');
+    } else {
+      setMsg('自检失败：' + e.message, 'bad');
+    }
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
 async function doSave() {
   if (!currentId) return;
   const p = currentPlatform();
@@ -470,6 +563,7 @@ function wire() {
   const btnV = $('btn-payment-validate');
   const btnS = $('btn-payment-save');
   const btnC = $('btn-payment-clear');
+  const btnT = $('btn-payment-selftest');
   if (!tabs || !btnV || !btnS || !btnC) return;
 
   tabs.addEventListener('click', (e) => {
@@ -488,6 +582,8 @@ function wire() {
   const cSwitch = $('payment-channel-on');
   if (cSwitch) cSwitch.addEventListener('change', () => toggleChannel(cSwitch.checked));
   btnV.addEventListener('click', doValidate);
+  // R92：自检按钮允许缺席（老页面缓存里没有它时不该整块交互失效）
+  if (btnT) btnT.addEventListener('click', doSelftest);
   btnS.addEventListener('click', doSave);
   btnC.addEventListener('click', doClear);
   const btnU = $('btn-payment-site-url');

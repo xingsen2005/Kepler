@@ -858,10 +858,12 @@
               <div id="payment-msg" class="form-msg"></div>
               <div class="form-item" style="margin-top:4px">
                 <button id="btn-payment-validate" class="mini-btn" type="button">校验</button>
+                <button id="btn-payment-selftest" class="mini-btn" type="button">凭据自检</button>
                 <button id="btn-payment-save" class="mini-btn primary" type="button">保存设置</button>
                 <button id="btn-payment-clear" class="mini-btn danger" type="button">清除本平台</button>
                 <span id="payment-hint" class="hint" style="margin-left:10px"></span>
               </div>
+              <div class="hint" style="margin-top:-2px"><b>校验</b>只检查填写格式（本地完成，不出网）；<b>凭据自检</b>会带这套凭据真的向支付网关发一次<b>只读</b>查询（不会建单、不会扣款），用来确认「公钥 / 私钥 / 证书序列号 / client_id 这些网关到底认不认」——这几类错误在本地格式上永远合法，只会在真实付款那一刻才暴露。</div>
               <div class="hr"></div>
               <div class="form-item">
                 <label for="payment-site-url">站点对外地址</label>
@@ -940,7 +942,7 @@
             <div class="dash-card wide sysset-card">
               <h3 class="sysset-h3"><span class="sysset-tag about">关于</span>关于</h3>
               <div class="about-body">
-                <p><b>Kepler 对象存储管理系统</b> Build 1.9.26</p>
+                <p><b>Kepler 对象存储管理系统</b> Build 1.9.27</p>
                 <ul class="about-list">
                   <li>开发者：邢森</li>
                   <li>项目地址：<a href="https://github.com/xingsen2005/Kepler" target="_blank" rel="noopener noreferrer">https://github.com/xingsen2005/Kepler</a></li>

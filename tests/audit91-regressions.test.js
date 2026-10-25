@@ -16,12 +16,13 @@
  *
  * ## 分层（每条判据都落在**实际被执行的那一层**）
  *
- *  · 注册表层：`ORDER` / `list()` / `clientSchema()` 的顺序与 `logo` 字段
+ *  · 注册表层：`ORDER` / `list()` / `clientSchema()` 的顺序与「图形不再随配置下发」
  *  · 渲染层：`__payOptionHtml()` —— 图标**在名称左侧**只能靠驱动它来证明
  *  · 网关层：`createCharge('unionpay')` 出的 URL 要素 + 签名可被公钥验过
  *  · 查单层：真 `queryCharge` + fetch 桩，走「验签在业务字段之前」与三档状态
  *  · 通知层：真 express + 真 HTTP，验签不过 403、过了 200
- *  · 关单层：`unsupported`（不谎报 `closed`，否则 R90 的"先关后建"会被绕过）
+ *  · 关单层：**先只读查单**再回答（R92 起）—— 未付才 `unsupported`，已付必须回 `paid`，
+ *    以及「验签口径 / 通知定位」这两处判据本身
  */
 const fs = require('fs');
 const path = require('path');
@@ -152,16 +153,31 @@ test('R91-01 · 云闪付排在微信支付与 PayPal 之间，且前后台共�
  * R91-02 · 图形：唯一实现点，前后台同源
  * ================================================================== */
 
-test('R91-02 · clientSchema 下发的渠道图形与前台渲染的是**同一份字节**', () => {
+test('R91-02 · 渠道图形只有一个实现点，且不再随配置接口下发（R92 改口径）', () => {
   const schema = providers.clientSchema();
   assertEqual(schema.length, 4, '四个渠道都要下发');
 
+  /**
+   * ⚠️ R92 改掉了这一条的判据方向。
+   *
+   * 上一轮断言的是「`clientSchema()` 必须带 `logo`」，理由是同源。但那份 logo 让
+   * `GET /api/payment/config` 从 ~9 KB 涨到 ~25 KB，而图形是**代码内常量**、
+   * 一个字节都不会变，却跟着「每次打开支付设置」重传。现在图形走
+   * `GET /api/payment/logos`（长缓存），这里改成断言**它不许回来**。
+   *
+   * 同源这件事没有丢：前后台仍然只有 `payment-logos.js` 一个实现点，
+   * 后台经那条接口取、前台在服务端渲染时内联，见下面的逐字节断言与 R91-04。
+   */
   for (const p of schema) {
-    assert(typeof p.logo === 'string' && p.logo.length > 0, `${p.id} 必须下发 logo`);
-    assert(p.logo.indexOf('<svg') > 0, `${p.id} 的 logo 必须是真的内联 SVG`);
-    assert(p.logo.indexOf('pv-logo--sm') > 0, `${p.id} 的 logo 必须带尺寸类（与后台标签一致）`);
-    // 同源：与前台用的是同一个函数、同一份数据
-    assertEqual(p.logo, logos.logo(p.id, { size: 'sm' }), `${p.id} 前后台图形必须逐字节相同`);
+    assert(!('logo' in p),
+      `${p.id} 不得再随配置接口下发 logo —— 那会让 GET /api/payment/config 重回 ~25 KB（R92）`);
+  }
+
+  // 唯一实现点仍然产出合法图形，且尺寸类与后台标签一致
+  for (const id of providers.ORDER) {
+    const svg = logos.logo(id, { size: 'sm' });
+    assert(svg.indexOf('<svg') > 0, `${id} 的图形必须是真的内联 SVG`);
+    assert(svg.indexOf('pv-logo--sm') > 0, `${id} 的图形必须带尺寸类（与后台标签一致）`);
   }
 
   // 云闪付的图形确实来自图标源文件（红色主块 + 底部三色条）
@@ -182,7 +198,9 @@ test('R91-03 · 图形只有一个实现点：前端副本已删除且不再被 
 
   const pay = readSrc('public/js/paysettings.js');
   assert(!/from '\.\/payment-logos\.js'/.test(pay), 'paysettings.js 不得再 import 已删除的模块');
-  assert(/p\.logo \|\| ''/.test(pay), '后台标签必须渲染服务端下发的 p.logo');
+  // R92：图形改为从独立接口取一次并缓存，标签渲染读缓存里的那份
+  assert(/API\.paymentLogos\(\)/.test(pay), '必须从 GET /api/payment/logos 取图形（配置接口已不再下发）');
+  assert(/logos\[p\.id\]/.test(pay), '后台标签必须渲染取回并缓存的那份图形');
 });
 
 /* ================================================================== *
@@ -356,11 +374,81 @@ test('R91-10 · 查单三档：已支付 / 未支付 / 金额不符', async () =
  * R91-11 · 关单：unsupported（不谎报 closed）
  * ================================================================== */
 
-test('R91-11 · 云闪付关单如实回 unsupported，绝不谎报 closed', async () => {
-  const r = await gateway.closeCharge('unionpay', UP_CFG, UP_ORDER);
-  assertEqual(r.ok, false, 'unsupported 不得伪装成成功');
-  assertEqual(r.state, 'unsupported', 'R90 的「先关后建」靠这一档决定「留痕后继续」');
-  assert(/payTimeout|失效/.test(r.error), '必须说清未付订单靠什么失效');
+test('R91-11 · 云闪付关单：先只读查单 —— 未付才 unsupported，已付必须回 paid', async () => {
+  /**
+   * R92 改了这条的**判据方向**，因为旧实现有一个真缺陷。
+   *
+   * 旧版无条件回 `unsupported`（「银联没有关闭未支付订单的接口」是事实），代价是
+   * R90 五档里的 `paid` 在云闪付上**永远不可达** —— 而 `paid` 是唯一一个「用户已经
+   * 给过钱」的档位，也是调用方唯一会因此**放弃建新单**的档位。于是「旧单其实已经
+   * 付掉了」时系统照样建第二笔单 = 双份付款，正是这一轮要消掉的残余风险。
+   *
+   * 现在的口径：关单前先查一次（只读），答案是
+   *  · 未支付 ⇒ `unsupported`（靠 payTimeout 失效）
+   *  · 已支付 ⇒ `paid`（绝不建新单）
+   *  · 查单本身失败 ⇒ `error`（有疑问就不放行）
+   */
+  const unpaid = await withFetchStub(
+    () => fakeResponse(200, upResponse({ respCode: '34', respMsg: '原始交易不存在' })),
+    () => gateway.closeCharge('unionpay', UP_CFG, UP_ORDER),
+  );
+  assertEqual(unpaid.ok, false, 'unsupported 不得伪装成成功');
+  assertEqual(unpaid.state, 'unsupported', 'R90 的「先关后建」靠这一档决定「留痕后继续」');
+  assert(/payTimeout|失效/.test(unpaid.error), '必须说清未付订单靠什么失效');
+
+  const paid = await withFetchStub(
+    () => fakeResponse(200, upResponse({ respCode: '00', respMsg: '成功', origRespCode: '00', txnAmt: '500', queryId: 'Q9' })),
+    () => gateway.closeCharge('unionpay', UP_CFG, UP_ORDER),
+  );
+  assertEqual(paid.state, 'paid', '旧单已经付掉了 —— 这一档必须能出现，否则会被引导去付第二次');
+  assertEqual(paid.ok, false, 'paid 不是「关成功了」，调用方要据此改走交付');
+
+  const broken = await withFetchStub(
+    () => fakeResponse(200, upResponse({ respCode: '00', origRespCode: '00', txnAmt: '1', queryId: 'Q8' })),
+    () => gateway.closeCharge('unionpay', UP_CFG, UP_ORDER),
+  );
+  assertEqual(broken.state, 'error', '金额对不上时不能判 paid，也不能判 unsupported（有疑问就不放行）');
+
+  const down = await withFetchStub(
+    () => fakeResponse(500, 'boom'),
+    () => gateway.closeCharge('unionpay', UP_CFG, UP_ORDER),
+  );
+  assertEqual(down.state, 'error', '查单没成功时不知道旧单死活 —— 必须 error，不能默默建新单');
+});
+
+test('R91-11b · PayPal 关单绝不走会扣款的查单路径', async () => {
+  /**
+   * `paypalQuery()` 在 `APPROVED` 时会**主动 capture 扣款**。关单若复用它，
+   * 「换个支付渠道」就会把旧单的钱收掉 —— 这是抽 `paypalFetchOrder()` 的唯一理由。
+   *
+   * 判据落在**实际发出去的请求**上：关单只允许有一个 `GET .../orders/{id}`，
+   * 绝不能出现 `POST .../capture`。
+   */
+  const PP_CFG = { clientId: 'cid', clientSecret: 'sec', mode: 'sandbox' };
+  const calls = await withFetchStub(
+    (url) => {
+      if (url.indexOf('/v1/oauth2/token') >= 0) return fakeResponse(200, JSON.stringify({ access_token: 'tok' }));
+      if (url.indexOf('/capture') >= 0) return fakeResponse(200, JSON.stringify({ id: 'X', status: 'COMPLETED' }));
+      return fakeResponse(200, JSON.stringify({ id: 'ORD-1', status: 'APPROVED' }));
+    },
+    (c) => gateway.closeCharge('paypal', PP_CFG, { id: 'x', amountFen: 500, tradeNo: 'ORD-1' }).then((r) => ({ r, calls: c })),
+  );
+  assertEqual(calls.r.state, 'unsupported', 'APPROVED 状态的订单关不掉，如实回 unsupported');
+  assert(!calls.calls.some((c) => c.url.indexOf('/capture') >= 0),
+    '关单路径**绝不允许**出现 /capture —— 那会把「换个渠道」变成「把钱扣了」');
+
+  // 已经付掉的旧单必须被认出来（否则照样会建第二笔）
+  const done = await withFetchStub(
+    (url) => {
+      if (url.indexOf('/v1/oauth2/token') >= 0) return fakeResponse(200, JSON.stringify({ access_token: 'tok' }));
+      return fakeResponse(200, JSON.stringify({
+        id: 'ORD-2', status: 'COMPLETED',
+        purchase_units: [{ payments: { captures: [{ amount: { value: '5.00' } }] } }],
+      }));
+    },
+    () => gateway.closeCharge('paypal', PP_CFG, { id: 'x', amountFen: 500, tradeNo: 'ORD-2' }),
+  );
+  assertEqual(done.state, 'paid', 'PayPal 关不掉单，但「这笔已经付了」是查得到的 —— 必须回 paid');
 });
 
 /* ================================================================== *
@@ -403,12 +491,28 @@ test('R91-12 · 云闪付后台通知：没签名 403、签名错 403、签名�
  * R91-13 · 回调定位：按 orderId（= orderNo）找订单
  * ================================================================== */
 
-test('R91-13 · 通知按 orderId 定位订单（而不是记录 id）', () => {
+test('R91-13 · 通知按 orderId（= orderNo）定位订单，而不是按记录 id', () => {
   const src = readSrc('server/share-routes.js');
-  const at = src.indexOf("if (platform === 'unionpay') {\n    const no = String(b.orderId");
-  assert(at > 0, '必须在 resolveNotifiedOrder 里按 orderId 定位');
+  /**
+   * ⚠️ R92 修正了这条断言 —— 它上一轮把**错误的口径**固化成了护栏。
+   *
+   * 旧版断言的是 `paymentOrders.get(no)`（按记录 `id` 精确匹配），而银联回显的
+   * `orderId` 是我们送出去的 `order.orderNo`（36 位纯 base62）—— 因为银联只收
+   * 8~40 位字母数字、不许含 `-` 与 `_`，而记录主键是 base64url，恰好会含这两个字符。
+   * 于是云闪付的异步通知**永远定位不到订单**：验签通过、限流通过、然后静默 404
+   * 让银联反复重投，真实付款只能靠页面轮询推进。
+   *
+   * 护栏写对了形状（「按 orderId 定位」）却写错了实现，比没有护栏更贵：它让后来的人
+   * 以为这里被保护着。所以这次把判据落在「用的是哪个函数」上。
+   */
+  const key = "const no = String(b.orderId || '');";
+  const at = src.indexOf(key);
+  assert(at > 0, 'resolveNotifiedOrder 必须有云闪付分支');
   const block = src.slice(at, at + 200);
-  assert(/paymentOrders\.get\(no\)/.test(block), 'orderId 就是 orderNo，直接走 paymentOrders.get()');
+  assert(/paymentOrders\.findByOrderNo\(no\)/.test(block),
+    'orderId 就是 orderNo，必须走 findByOrderNo —— 按记录 id 查会恒定查不到');
+  assert(!/paymentOrders\.get\(no\)/.test(block),
+    '不得再按记录 id 查银联订单（R91 的缺陷：get() 只认 o.id）');
 
   // 验签分支必须复用网关那一个实现，不得另写一份判据
   const vAt = src.indexOf("if (platform === 'unionpay') {");

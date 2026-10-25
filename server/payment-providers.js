@@ -17,8 +17,8 @@
 const { assertSafeEndpoint } = require('./endpoint-guard');
 // 密钥结构判定（PEM / 裸 Base64 / PKCS#1 / PKCS#8）的**唯一实现点**，签名侧共用
 const pemKey = require('./pem-key');
-// 渠道品牌图形的**唯一实现点**：后台（接口下发）与前台分享页（服务端渲染）共用
-const paymentLogos = require('./payment-logos');
+// ⚠️ 渠道图形（`payment-logos.js`）**不再由本模块引用**：R92 起它只经
+// `GET /api/payment/logos` 下发（见 `clientSchema()` 的注释），前台分享页则直接内联。
 
 /* ============================ 字段级校验器 ============================ */
 
@@ -386,11 +386,17 @@ function field(platformId, key) {
  * 可序列化的平台定义（下发前端用于渲染表单）
  * 与服务端用的是同一份数据，pattern 因此天然同步；前端做即时提示，服务端做最终裁定。
  *
- * `logo` 是**渠道品牌图形的内联 SVG 字符串**（含 `<span class="pv-logo">` 外层容器），
- * 出处只有 `payment-logos.js` 一处，与前台分享页渲染的是同一份字节。
- * 它是本接口唯一一段「可以原样写进 innerHTML」的值 —— 内容来自代码内的常量，
- * 不含任何用户输入，因此在 `paysettings.js` 里直接插入而不做转义
- * （转义会把 `<path` 变成文本）。其余字段一律照旧 `escapeHtml`。
+ * ⚠️ R92：**渠道图形不在这里下发**。
+ *
+ * 这里曾经带一个 `logo` 字段（`payment-logos.js` 产出的内联 SVG），好处是前端一次
+ * 请求就能连图标一起画出来。代价是这个接口从 ~9 KB 涨到 ~25 KB —— 而图形是**代码内
+ * 常量**，一个字节都不会变，却跟着「每次打开支付设置」的配置一起重传。
+ *
+ * 现在图形走 `GET /api/payment/logos`（`Cache-Control: private, max-age=604800`），
+ * 前端取一次、缓进 `sessionStorage`；本函数只负责**会变的东西**。
+ *
+ * 顺带说明：图形仍然是 `payment-logos.js` 这一个实现点产出的，前台分享页
+ * （服务端渲染，直接内联同一份字节）与后台（走上面那条接口）不会分叉。
  */
 function clientSchema() {
   return list().map((p) => ({
@@ -398,7 +404,6 @@ function clientSchema() {
     name: p.name,
     shortName: p.shortName,
     doc: p.doc,
-    logo: paymentLogos.logo(p.id, { size: 'sm' }),
     fields: p.fields.map((f) => ({
       key: f.key,
       official: f.official,
