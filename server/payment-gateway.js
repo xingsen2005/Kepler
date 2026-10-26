@@ -2,10 +2,15 @@
  * 真实支付网关适配器（零依赖，基于 Node 内置 crypto + 全局 fetch）
  *
  * 支持四个渠道，各自选用**最适合 PC 浏览器场景**的下单方式：
- *   alipay   电脑网站支付 alipay.trade.page.pay → 跳转支付宝收银台（无需二维码）
+ *   alipay   ① 电脑网站支付 alipay.trade.page.pay → 跳转支付宝收银台（`mode: 'page'`）
+ *            ② 当面付 alipay.trade.precreate → 返回 qr_code，本站绘制二维码（`mode: 'face'`，R93）
  *   wechat   Native 支付 APIv3 → 返回 code_url，由自研 qrcode.js 渲染二维码
  *   unionpay 银联全渠道网关支付 frontTransReq.do → 跳转银联收银台（可在其中选云闪付）
  *   paypal   Orders v2 → 跳转 PayPal 审批页，回调后再 capture 收款
+ *
+ * 「能不能在本站画二维码」= 该渠道是否返回 `kind: 'qrcode'`：目前只有微信与
+ * 支付宝当面付。另外三家是 `kind: 'redirect'`，必须跳转（PayPal 的线上收单
+ * 根本没有「商户展示二维码」这个形态，不是实现取舍）。
  *
  * ┌──────────────────────────────────────────────────────────────────────┐
  * │ 关键设计：支付结果一律以「服务端主动查单」为准，不采信异步通知的内容。      │
@@ -224,7 +229,23 @@ function alipayTimestamp() {
     + `${p(d.getUTCHours())}:${p(d.getUTCMinutes())}:${p(d.getUTCSeconds())}`;
 }
 
-async function alipayCreate(cfg, { order, subject, returnUrl, notifyUrl }) {
+async function alipayCreate(cfg, { order, subject, returnUrl, notifyUrl }, deadline) {
+  /**
+   * R93：`mode` 决定走哪条产品线。
+   *
+   * 当面付（`precreate`）与网站应用（`page.pay`）在开放平台是**两个独立签约的产品**，
+   * 报文与返回值形状都不一样：前者同步返回一个 `qr_code`（我们本地渲染成二维码，
+   * 用户不离开本站），后者返回一串收银台 URL（跳过去）。
+   *
+   * 取值兜底到 `page`：R93 之前的配置没有 `mode` 键，必须当「网站应用」处理，
+   * 否则老用户升级后支付宝直接不可用。
+   *
+   * 位置放在签名算法归一化**之前**：那条分支自己会做同一次归一化
+   * （`alipayPrecreate()` 首行），两者互不依赖；放前面还能让「网站应用」这条主路径
+   * 的代码保持原样 —— `signType` 与 `params` 仍然紧挨着。
+   */
+  if (String(cfg.mode || '') === 'face') return alipayPrecreate(cfg, { order, subject, notifyUrl }, deadline);
+
   // 先归一化签名算法：非 RSA2/RSA 在这里就抛，页面会显示「创建支付订单失败：…」，
   // 而不是带着一个必然被网关拒绝的 sign_type 跳过去（见 alipaySignType）。
   const signType = alipaySignType(cfg.signType);
@@ -249,6 +270,88 @@ async function alipayCreate(cfg, { order, subject, returnUrl, notifyUrl }) {
   if (cfg.rootCertSn) params.alipay_root_cert_sn = cfg.rootCertSn;
   const url = alipayBuildUrl(cfg.gateway, params, cfg.privateKey, signType);
   return { kind: 'redirect', url, tradeNo: '' };
+}
+
+/**
+ * 支付宝当面付（`alipay.trade.precreate`）—— R93。
+ *
+ * 与 `page.pay` 的三处差别：
+ *   ① **是服务端出站调用**（`page.pay` 是纯本地签名拼 URL，一次网络都不发）。
+ *      所以它必须带截止时刻，否则会和 R81 的 12 秒前端看门狗打架。
+ *   ② 同步响应里带 `qr_code`，我们**本地**用 `qrcode.js` 渲染成 SVG，
+ *      用户根本不离开本站（这正是本次改造要的形态）。
+ *   ③ **同步响应必须验签**（与查单同一口径：验签在读业务字段之前）。
+ *      `page.pay` 没有响应内容可验（它是个 302），这里多了一道真实风险面。
+ *
+ * ⚠️ `product_code` 取 `FACE_TO_FACE_PAYMENT`（当面付）。
+ *    另一种 `QR_CODE_OFFLINE` 是「订单码支付」，与当面付接口流程相同但产品不同、
+ *    限额也不同。这里固定用当面付 —— 与配置页文案里的限额（单笔 2000 / 单日 20000）
+ *    是同一套口径，两处不能各说一套。
+ *
+ * ⚠️ **不返回 `returnUrl`**：当面付没有「付完跳回商户页」这一环（用户在手机支付宝里
+ *    扫码付款，浏览器根本没离开本站）。传 `return_url` 只会让人误以为有回跳。
+ *    支付结果靠 `pay-poll.js` 轮询 `/pay/status` → 服务端主动查单，这条路 R84（M-2）
+ *    已经对所有渠道打通，不需要为支付宝加分支。
+ */
+async function alipayPrecreate(cfg, { order, subject, notifyUrl }, deadline) {
+  const signType = alipaySignType(cfg.signType);
+  const params = {
+    app_id: cfg.appId,
+    method: 'alipay.trade.precreate',
+    format: 'JSON',
+    charset: 'utf-8',
+    sign_type: signType,
+    timestamp: alipayTimestamp(),
+    version: '1.0',
+    notify_url: notifyUrl,
+    biz_content: JSON.stringify({
+      out_trade_no: order.id,
+      total_amount: (order.amountFen / 100).toFixed(2),
+      subject: subject,
+      product_code: 'FACE_TO_FACE_PAYMENT',
+    }),
+  };
+  if (cfg.appCertSn) params.app_cert_sn = cfg.appCertSn;
+  if (cfg.rootCertSn) params.alipay_root_cert_sn = cfg.rootCertSn;
+  /**
+   * `POST` 而不是 `page.pay` 那种拼查询串的 GET：当面付的响应是**业务数据**
+   * （qr_code / sub_code），必须能可靠地拿到响应体并验签。
+   */
+  const body = new URLSearchParams(params).toString();
+  const r = await fetchWithTimeout(cfg.gateway || ALIPAY_GATEWAY, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded;charset=utf-8' },
+    body,
+  }, 'text', deadline);
+  const raw = String(r.body == null ? '' : r.body);
+  let json = null;
+  try { json = raw ? JSON.parse(raw) : null; } catch (e) { json = null; }
+  const node = json && json.alipay_trade_precreate_response;
+  if (!node) {
+    throw new Error(`支付宝当面付返回内容无法识别（HTTP ${r.status}）`);
+  }
+  /**
+   * 验签在**读业务字段之前** —— 与 `alipayQuery` 同一条铁律。
+   * 否则一个中间人（或填错网关地址指向的假站点）返回 `{"code":"10000",
+   * "qr_code":"https://evil/…"}` 就能把我们变成钓鱼页的引流入口。
+   */
+  if (!alipayVerifySync(raw, json, cfg, 'alipay_trade_precreate_response')) {
+    throw new Error('支付宝当面付响应签名校验失败：请检查「支付设置 → 支付宝」里的支付宝公钥是否正确');
+  }
+  if (node.code !== '10000' || !node.qr_code) {
+    const reason = [node.sub_msg, node.msg].filter(Boolean).join(' ') || '未知原因';
+    const sub = node.sub_code ? `（${node.sub_code}）` : '';
+    throw new Error(`支付宝当面付下单失败：${reason}${sub}`);
+  }
+  const qrPayload = String(node.qr_code);
+  /**
+   * ⚠️ 二维码内容长度受本地编码器限制（实测 213 字节以上 `toSvg()` 返回空串，
+   * **不报错**）。当面付的 `qr_code` 通常是 `https://qr.alipay.com/...`（约 50~80 字节），
+   * 远在安全区内；但真超了必须**当场抛错**，而不是画一个空白框让用户对着它扫。
+   */
+  const svg = qrcode.toSvg(qrPayload, { scale: 6, margin: 3 });
+  if (!svg) throw new Error('二维码生成失败：内容过长，请检查支付宝返回的 qr_code');
+  return { kind: 'qrcode', url: '', codeUrl: qrPayload, svg, tradeNo: '' };
 }
 
 /**
@@ -1360,6 +1463,48 @@ async function queryCharge(platform, cfg, order) {
 }
 
 /**
+ * R93：该渠道**是否会返回可本地渲染的二维码**（`kind: 'qrcode'`）。
+ *
+ * ## 为什么需要这个函数，而不是「试一次看 kind」
+ *
+ * 前端要在**下单之前**决定「显示『立即支付』按钮，还是直接显示二维码」——
+ * 那时还没有 `charge`。而这件事完全由**渠道 + 配置**决定，是静态可判的：
+ *
+ *  | 渠道       | 条件                  | 形态     |
+ *  |-----------|----------------------|---------|
+ *  | 微信支付   | 恒为 Native + code_url | qrcode  |
+ *  | 支付宝     | `mode === 'face'`（当面付） | qrcode |
+ *  | 支付宝     | `mode === 'page'`（网站应用） | redirect |
+ *  | 云闪付     | 恒为网关支付跳转        | redirect |
+ *  | PayPal    | 恒为审批页跳转          | redirect |
+ *
+ * ## 这是**唯一实现点**
+ *
+ * 「哪些渠道免跳转」这个判断会同时被三处需要：付费页决定摆按钮还是摆码、
+ * 下单后决定走 `qrPayPage` 还是 `jumpPage`、以及测试断言。三处各写一份
+ * `if (id === 'wechat' || (id === 'alipay' && mode === 'face'))` 必然漂移 ——
+ * 而漂移的后果是「页面给了二维码，服务端却返回了跳转地址」，用户点了个空。
+ *
+ * ⚠️ 判据必须吃 `cfg` 而不只是 `platform`：支付宝靠 `mode` 分叉。
+ * 这也是本函数不写成常量表的原因。
+ *
+ * @param {string} platform 渠道 id
+ * @param {object} cfg 该渠道的配置（支付宝要看 `mode`）
+ */
+function supportsQr(platform, cfg) {
+  const id = String(platform || '');
+  if (id === 'wechat') return true;
+  /**
+   * 支付宝只看 `mode`，**默认按 `page` 处理**：R93 之前的配置没有这个键，
+   * 必须与 `alipayCreate()` 里的 `String(cfg.mode || '') === 'face'` 完全同构 ——
+   * 两处口径不一致会出现「页面说二维码、下单却给出跳转地址」。
+   */
+  if (id === 'alipay') return String((cfg && cfg.mode) || '') === 'face';
+  // 云闪付 / PayPal：收银台都在别处，本地没有可扫的码
+  return false;
+}
+
+/**
  * 关闭网关侧订单（PAY-F1）
  *
  * 与 `queryCharge` 的区别：这里**绝不**把「没能确认」当成成功。关单失败时
@@ -1571,6 +1716,8 @@ module.exports = {
   // R84（L-4）：事件类型白名单 + 时间新鲜度判定 —— 导出以便直接驱动这三条分支
   paypalEventCheck, PAYPAL_EVENT_TYPES, PAYPAL_TRANSMISSION_SKEW_MS,
   createCharge, queryCharge,
+  // R93：该渠道能否在本地画二维码（付费页 / 下单后 / 测试共用这一处判定）
+  supportsQr,
   // R90（PAY-F1）：网关侧关单 —— 换渠道 / 换券时必须先关掉被放弃的那笔，
   // 否则旧收银台仍可付款，同一件商品会被付两次
   closeCharge,

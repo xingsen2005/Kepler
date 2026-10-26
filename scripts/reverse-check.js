@@ -10672,8 +10672,9 @@ const CASES = [
        */
       name: 'R80-09a · pay-poll 不再接管支付表单（提交后依旧毫无反馈）',
       file: 'public/js/pay-poll.js',
-      anchor: "  const form = document.querySelector ? document.querySelector('form[data-pay-submit]') : null;\n  if (!form) return;",
-      replacement: '  const form = null; // R80 反向变异：不接管表单\n  if (!form) return;',
+      // R93：`if (!form) return;` 已被删除（第三部分要独立于看门狗），锚点改到这一行本身
+      anchor: "  const form = document.querySelector ? document.querySelector('form[data-pay-submit]') : null;",
+      replacement: '  const form = null; // R80 反向变异：不接管表单',
       testFile: 'audit80-regressions.test.js',
       minFail: 1,
     },
@@ -10973,8 +10974,8 @@ const CASES = [
        */
       name: 'R83-06a · 丢掉二维码分支（微信 Native 也被当中转页处理）',
       file: 'server/share-routes.js',
-      anchor: "  if (charge.kind === 'qrcode' && (charge.svg || charge.codeUrl)) return qrPayPage(res, l, order, charge);",
-      replacement: "  if (charge.kind === 'qrcode' && (charge.svg || charge.codeUrl)) void 0; // R83 反向变异：丢掉二维码分支",
+      anchor: "  if (charge.kind === 'qrcode' && charge.codeUrl) {",
+      replacement: "  if (false) { // R83 反向变异：丢掉二维码分支",
       testFile: 'audit83-regressions.test.js',
       minFail: 1,
     },
@@ -11835,6 +11836,120 @@ const CASES = [
       anchor: '    loadLogos().then(() => renderTabs()).catch(() => {});',
       replacement: '    loadLogos();',
       testFile: 'audit92-regressions.test.js',
+      minFail: 1,
+    },
+    /* ================= R93：付款二维码就地绘制 ================= */
+    {
+      /**
+       * 「码只活在一次响应里」的老形态：不写 `order.qrPayload`。
+       * 表现极其隐蔽 —— 用户当场付款一切正常，只有**刷新**或**从支付页回来**时
+       * 那张码凭空消失，用户除了重开一笔别无他法（而重开又用同一个
+       * `out_trade_no`，微信会回 `OUT_TRADE_NO_USED`）。
+       */
+      name: 'R93-01a · 二维码不落库（F5 之后码凭空消失）',
+      file: 'server/share-routes.js',
+      anchor: "  if (charge.kind === 'qrcode' && charge.codeUrl) paymentOrders.setQr(order.id, charge.codeUrl);",
+      replacement: "  if (charge.kind === 'qrcode' && charge.codeUrl) void 0; // R93 反向变异：码不落库",
+      testFile: 'audit93-regressions.test.js',
+      minFail: 2,
+    },
+    {
+      /**
+       * 复用分支不短路 ⇒ 同一个 `out_trade_no` 被第二次 POST 下单接口。
+       * 微信 v3 对这种重入有 `OUT_TRADE_NO_USED`，本项目无法在本地证实它是否放行，
+       * 所以只能靠「不许发这次请求」来保证。
+       */
+      name: 'R93-04a · 复用路径不短路（同一个商户单号二次下单）',
+      file: 'server/share-routes.js',
+      anchor: '  if (order.qrPayload) {',
+      replacement: '  if (false) { // R93 反向变异：复用路径也去打网关',
+      testFile: 'audit93-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * 扫码态金额取**链接标价**而不是订单金额。用了券两者就分叉：
+       * 页面写 ¥12、扫码进去收 ¥7 —— 金额对不上的收银台是这个项目最不能出现的形态。
+       */
+      name: 'R93-05a · 扫码态金额取链接标价（页面价与扫码价分叉）',
+      file: 'server/share-routes.js',
+      anchor: "` : ''}\n      <div class=\"pay-amount\">¥${paymentRules.formatAmount(order.amountFen)}</div>",
+      replacement: "` : ''}\n      <div class=\"pay-amount\">¥${paymentRules.formatAmount(ps.amountFen)}</div>",
+      testFile: 'audit93-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * 「只加码、忘了收按钮」：码画出来了，下面还摆着一个「立即支付」。
+       * 用户点它只会再下一单（R90 的三步原子整圈重跑），而页面上已经有码了。
+       */
+      name: 'R93-01b · 已经有码时仍摆「立即支付」按钮',
+      file: 'server/share-routes.js',
+      anchor: "        ${qr ? '' : '<button class=\"btn primary\" type=\"submit\">立即支付</button>'}",
+      replacement: '        <button class="btn primary" type="submit">立即支付</button>',
+      testFile: 'audit93-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * `data-qr` 恒为 1 ⇒ 前端把「支付宝（网站应用）」也当成扫码渠道自动提交，
+       * 提交回来发现没有码，用户白等一次建单（而且旧单已被关掉）。
+       */
+      name: 'R93-06a · data-qr 恒为 1（跳转渠道也被当成扫码渠道）',
+      file: 'server/share-routes.js',
+      anchor: 'data-qr="${qrable ? \'1\' : \'0\'}"',
+      replacement: 'data-qr="1"',
+      testFile: 'audit93-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * 判据退化成「只看平台不看配置」：支付宝恒可扫码 ⇒ 选了「网站应用」也会
+       * 被要求出码，而那一路根本不返回 `qr_code`。
+       */
+      name: 'R93-08a · supportsQr 不看 mode（网站应用也被当扫码渠道）',
+      file: 'server/payment-gateway.js',
+      anchor: "  if (id === 'alipay') return String((cfg && cfg.mode) || '') === 'face';",
+      replacement: "  if (id === 'alipay') return true; // R93 反向变异：支付宝不看 mode",
+      testFile: 'audit93-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * 把「选中扫码渠道才提交」写成「加载即提交」：任何一次页面浏览都会建一笔订单
+       * （爬虫、链接预览都算），且每笔都要真出网调一次网关下单接口 ——
+       * 既是 R14-03 灌单的复现路径，也会白烧网关配额。
+       */
+      name: 'R93-07a · 付费页加载即自动提交（每次浏览都建单）',
+      file: 'public/js/pay-poll.js',
+      anchor: '  if (!form) return;',
+      replacement: '  if (!form) return;\n  if (form.requestSubmit) form.requestSubmit(); // R93 反向变异：加载即提交',
+      testFile: 'audit93-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * `mode` 设成必填 ⇒ 升级前的支付宝配置（没有这个键）被判「配置不完整」，
+       * `availableChannels()` 把支付宝整个移出可用渠道 —— **已付费链接当场失效**，
+       * 而管理页看起来一切正常。
+       */
+      name: 'R93-09a · mode 设成必填（老配置被打成「未配置」，付费链接失效）',
+      file: 'server/payment-providers.js',
+      anchor: "        key: 'mode', official: 'product', label: '接入的产品', input: 'select', required: false, default: 'page',",
+      replacement: "        key: 'mode', official: 'product', label: '接入的产品', input: 'select', required: true, default: 'page',",
+      testFile: 'audit93-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * `publicView()` 不回填默认值 ⇒ 前端 `<select>` 一个选项都命不中 `selected`，
+       * 界面上是个**空白下拉框**（用户以为配置坏了），而后端实际取的是 `page`。
+       */
+      name: 'R93-09b · 配置回显不回填默认值（界面空白下拉框）',
+      file: 'server/payment-providers.js',
+      anchor: "    const v = stored0 || (f.backfillDefault && !f.secret && f.default !== undefined ? String(f.default) : '');",
+      replacement: '    const v = stored0; // R93 反向变异：不回填默认值',
+      testFile: 'audit93-regressions.test.js',
       minFail: 1,
     },
   ];

@@ -308,7 +308,15 @@ test('R83-06 · 二维码渠道不受影响：仍然渲染同源二维码页，�
 
     assertEqual(r.status, 200, `二维码页应是 200，实际 ${r.status}`);
     assert(!r.headers.location, '二维码页不该有 location');
-    assert(r.raw.indexOf('id="fakeqr"') >= 0, '必须渲染二维码 SVG');
+    /**
+     * R93：码**从内容重绘**（`qrBoxHtml(payload)` → `qrcode.toSvg()`），不再把网关
+     * 返回的 SVG 字符串原样内联 —— 订单里存的是码的内容而不是几十 KB 的图形，
+     * 刷新/回访时才能凭 `order.qrPayload` 重建同一张图。所以桩里的 `svg`
+     * 不该出现在页面上，要断言的是「有一个画着 SVG 的 .qr-box」。
+     */
+    assert(r.raw.indexOf('class="qr-box"') >= 0, '必须渲染二维码容器');
+    assert(/<div class="qr-box"[^>]*>\s*<svg/i.test(r.raw), '二维码容器里必须有内联 SVG');
+    assert(r.raw.indexOf('立即支付') < 0, '已经有码时不该再摆「立即支付」按钮');
     assert(!/http-equiv="refresh"/.test(r.raw), '二维码页不该自动跳走（用户要扫码）');
     assertEqual(lastOrder().status, 'pending', '二维码页对应的是在途订单');
   } finally {

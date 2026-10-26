@@ -220,6 +220,8 @@ function masterKey() {
  */
 function create({
   linkId, platform, amountFen, currency, payerIp, fileName, fileKey, bucket, tradeNo,
+  // R93：二维码内容（微信 code_url / 支付宝当面付 qr_code），见字段旁的说明
+  qrPayload,
   // R62：优惠券相关的**快照**。券可能事后被删除 / 改配置，订单必须自己记住
   // 「原价多少、优惠多少、用的是哪张券」，否则历史订单的对账信息会随券一起消失。
   originalFen, discountFen, couponCode, couponId, couponType,
@@ -291,6 +293,20 @@ function create({
     bucket: String(bucket || ''),
     // 网关侧的订单号（支付宝 trade_no / 微信 transaction_id / PayPal order id）
     tradeNo: String(tradeNo || ''),
+    /**
+     * R93：二维码内容（`weixin://…` / `https://qr.alipay.com/…`）。
+     *
+     * 为什么要落库而不是「建单时画一次、页面带着走」：二维码页的**每一次刷新**
+     * 要么重发 `POST /s/:id/pay`（用同一个 `out_trade_no` 二次调下单接口，
+     * 微信会回 `OUT_TRADE_NO_USED`、支付宝可能直接报错），要么走 `GET /s/:id`
+     * 命中 `pending` 分支 —— 而那条分支渲染的 `payingPage()` 里**没有二维码**。
+     * 两条路都拿不到可扫的码，表现就是「刚看到的二维码，退回来就没了」。
+     *
+     * 落库之后，GET 也能重绘**同一张**码，且**不产生任何新的网关请求**。
+     * 空串表示该订单没有二维码（跳转型渠道，或其他渠道）。
+     */
+    qrPayload: String(qrPayload || ''),
+    qrAt: qrPayload ? now : null,
   };
   orders.push(o);
   /**
@@ -770,6 +786,28 @@ function setTradeNo(id, tradeNo) {
 }
 
 /**
+ * R93：记录二维码内容（`weixin://…` / `https://qr.alipay.com/…`）。
+ *
+ * 与 `setTradeNo` 同构：建单时还不知道码（要先调网关），拿到之后回填。
+ * 有了它，`GET /s/:id` 的 `pending` 分支才能**重绘同一张码**而不必重新下单 ——
+ * 这是「二维码不再是一次性的」的全部依据。
+ *
+ * 只写一次（已存在就跳过）：同一笔订单的码不该被后来的值覆盖。理论上
+ * `out_trade_no` 固定，重下单拿到的码对同一笔交易是等价的，但「不覆盖」
+ * 让对账时看到的始终是买家**最早可能扫过**的那张码。
+ */
+function setQr(id, qrPayload) {
+  const o = get(id);
+  if (!o || !qrPayload) return null;
+  if (o.qrPayload) return o;
+  o.qrPayload = String(qrPayload);
+  o.qrAt = new Date().toISOString();
+  o.updatedAt = o.qrAt;
+  persist();
+  return o;
+}
+
+/**
  * 标记「已下载」—— 幂等，只记首次。
  *
  * 在**放行下载之后**调用（而不是之前）：下载可能因网络中断而失败，
@@ -912,6 +950,7 @@ module.exports = {
   flush, // R14-09：去抖落盘的强制刷写（优雅停机 / 测试）
   isDegraded, // R84（M-3）：订单存储读不出来时为 true —— 上游据此拒绝收款 / 显示告警
   markPaid, markFailed, markRefunded, markDownloaded, setTradeNo,
+  setQr, // R93：二维码内容落库（GET 重绘同一张码的唯一依据，见字段旁的说明）
   setCloseState, // R90（PAY-F1）：网关侧关单结果的记账（与 status 正交）
   orderToken, verifyToken, payerState, view,
   bucketOf, // R48：来源桶（快照优先、回退到现存链接）—— 收入统计按桶归集的唯一实现点

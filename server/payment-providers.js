@@ -183,6 +183,38 @@ const PLATFORMS = {
         placeholder: '证书模式：例如 687b5919..._02941eef...',
         hint: '仅「公钥证书」加签模式需要；普通公钥模式可留空。',
       },
+      /**
+       * R93：**支付宝的两个产品线**，二选一。
+       *
+       * 为什么是一个字段而不是两个开关：`alipay.trade.page.pay`（电脑网站支付）与
+       * `alipay.trade.precreate`（当面付）在开放平台是**两个独立签约的产品**，
+       * 各自有独立的接口权限与限额。商户号实际只签了其中一个，而这一点**本地无法探测** ——
+       * 自检走的 `alipay.trade.query` 是通用查询接口，两个产品都能调通。
+       * 所以只能由管理员**声明**，而「声明」的语义天然是单选：同时勾两个，等于
+       * 声称自己两个都签了，而实际多半不是 —— 那正是 R91 那个「配置能保存、
+       * 付款那一刻才炸」的坑。用单选把这个歧义彻底消掉。
+       *
+       * 默认 `page`（网站应用）**是刻意的**：R93 之前保存的配置里没有这个键，
+       * `defaults()` / `applySave()` 会把它补成 `page`，于是老配置的行为
+       * **一字不变**——不会因为升级就从「可用」变成「未配置完整」而让付费链接失效。
+       *
+       * `required: false` 也是为了这一条：若设成必填，`isConfigured()` 会在老配置上
+       * 判 false（键不存在），`availableChannels()` 随即把支付宝移出可用渠道。
+       * 取值完整性由下面 `mode` 的枚举校验保证（空值走 `defaults` 补齐）。
+       */
+      {
+        key: 'mode', official: 'product', label: '接入的产品', input: 'select', required: false, default: 'page',
+        backfillDefault: true,
+        options: [
+          { value: 'face', label: '支付宝（当面付）— 推荐' },
+          { value: 'page', label: '支付宝（网站应用）' },
+        ],
+        hint: '支付宝当面付可直接在订单页面绘制付款二维码而无需跳转。'
+          + '单笔最高限额 2000 元，单日最高限额 20000 元。'
+          + '若需要更高额度，请使用「支付宝（网站应用）」。'
+          + '⚠️ 这两个在开放平台是**独立签约**的产品，请按实际签约情况二选一：'
+          + '选了未签约的那个，配置能保存成功，但用户点支付时会失败。',
+      },
     ],
   },
 
@@ -417,6 +449,7 @@ function clientSchema() {
       patternHint: f.patternHint || '',
       maxLength: f.maxLength || 0,
       default: f.default === undefined ? '' : f.default,
+      backfillDefault: !!f.backfillDefault,
       options: f.options ? f.options.slice() : null,
     })),
   }));
@@ -550,13 +583,26 @@ function publicView(platformId, stored) {
   if (!p) return { values, configured };
   const s = stored && typeof stored === 'object' ? stored : {};
   for (const f of p.fields) {
-    const v = asValue(s[f.key]);
+    const stored0 = asValue(s[f.key]);
+    /**
+     * R93：带 `backfillDefault: true` 的枚举字段，存的是空值时**回填 `default`**。
+     *
+     * 只在**显式声明**的字段上做，不做成通用行为：通用回填会连带影响 `gateway`
+     * 这类「空值本身就是合法状态」的字段（`alipayCreate` 用 `cfg.gateway || ALIPAY_GATEWAY`
+     * 兜底，空值从来不表示出错），把默认值显示出来会让"没填"看起来像"填了"。
+     *
+     * 起因是支付宝的 `mode`：R93 之前保存的配置里没有这个键，若原样下发空串，
+     * 前端 `<select>` 一个选项都命不中 `selected`，界面显示成**空白下拉框** ——
+     * 用户会以为配置坏了。回填后显示为「支付宝（网站应用）」，与后端
+     * `defaults()` / `applySave()` 的实际取值一致。
+     */
+    const v = stored0 || (f.backfillDefault && !f.secret && f.default !== undefined ? String(f.default) : '');
     if (f.secret) {
       values[f.key] = '';
       configured[f.key] = Boolean(v);
     } else {
       values[f.key] = v;
-      configured[f.key] = Boolean(v);
+      configured[f.key] = Boolean(stored0);
     }
   }
   return { values, configured };
@@ -577,9 +623,17 @@ function applySave(platformId, prev, patch) {
   const merged = {};
   for (const f of p.fields) {
     const has = Object.prototype.hasOwnProperty.call(src, f.key);
+    /**
+     * R93：`backfillDefault` 字段在「既没提交、旧配置也没有」时补上 `default`。
+     *
+     * 这一步让老配置**第一次保存**就把 `mode` 落成 `page`（而不是永远缺这个键，
+     * 每次都靠 `publicView` / 下单侧兜底）。语义上等价于「升级到 R93 时按原行为
+     * 迁移一次」，但不需要写迁移脚本，也不会在读取时改文件。
+     */
+    const fallback = f.backfillDefault && !f.secret && f.default !== undefined ? String(f.default) : '';
     if (!has) {
       // 未提交：敏感字段保持原值，其余也保持原值（补丁语义）
-      const keep = asValue(old[f.key]);
+      const keep = asValue(old[f.key]) || fallback;
       if (keep) merged[f.key] = keep;
       continue;
     }

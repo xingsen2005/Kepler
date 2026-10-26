@@ -40,6 +40,11 @@ const paymentOrders = require('./payment-orders');
 const paymentGateway = require('./payment-gateway');
 // R91：渠道品牌图形的**唯一实现点**（与后台「支付设置」经 `clientSchema()` 下发的是同一份）
 const paymentLogos = require('./payment-logos');
+// R93：付款二维码由本服务**本地**渲染（零依赖、零外部请求）。与
+// `payment-gateway.wechatCreate` 引用的是同一个模块 —— 图形只有一处实现点，
+// 换成第三方二维码服务会让「码长什么样」多一个外部依赖与泄露面（码本身就含有
+// 可支付的凭据内容）。
+const qrcode = require('./qrcode');
 // R62：优惠券 —— 校验 / 核销 / 退款回退的唯一实现点在 coupon-store
 const couponStore = require('./coupon-store');
 // R62：分享页也要能认出「已登录的人」—— 只有这样「限特定用户」与「每人一次」才成立
@@ -278,6 +283,22 @@ function paySnapshot() {
     ));
   } catch (e) {
     return { enabled: false, states: {}, configuredMap: {}, available: [] };
+  }
+}
+
+/**
+ * R93：某渠道的**当前配置**（只读）。
+ *
+ * 「支付宝要不要画二维码」取决于它的 `mode`（当面付 / 网站应用），而 `mode` 住在
+ * 渠道配置里 —— 所以凡是想问「这个渠道会不会返回二维码」的地方，都必须能拿到
+ * 这份配置。读不到就给空对象：与 `paySnapshot()` 的降级口径一致（支付读不出来时
+ * 宁可判「不支持扫码」，也不要让整页抛错）。
+ */
+function channelCfg(id) {
+  try {
+    return (configStore.getPayment().platforms || {})[String(id)] || {};
+  } catch (e) {
+    return {};
   }
 }
 
@@ -753,6 +774,9 @@ ${refresh ? `<meta http-equiv="refresh" content="0;url=${esc(refresh)}">` : ''}
   .btn.ghost:hover { background: #f6f8fb; }
   .qr-box { display: flex; justify-content: center; margin: 16px 0 4px; }
   .qr-box svg { width: 208px; height: 208px; border: 1px solid #e5e8ec; border-radius: 10px; padding: 6px; background: #fff; }
+  /* R93：拿不到码 / 码内容过长时的兜底说明（绝不能留一个空框让人对着扫） */
+  .qr-box--empty { display: block; padding: 18px 14px; border: 1px dashed #d5dbe3; border-radius: 10px;
+    color: #8a8f98; font-size: 13px; line-height: 1.7; text-align: center; }
   /* ---------- R51：多文件 / 文件夹分享的列表页 ---------- */
   .sl-bar { display: flex; align-items: center; gap: 10px; margin: 16px 0 8px; flex-wrap: wrap; }
   .sl-bar .btn { display: inline-block; width: auto; margin: 0; padding: 7px 12px; font-size: 13px; border-radius: 7px; }
@@ -1002,11 +1026,15 @@ function payNoticeFromQuery(q) {
  *
  * `paymentProviders.platform(id)` 为空时退回渠道 id 的文字：旧实现直接取 `p.name`，
  * 一个已下线的渠道 id 会让整张付费页变成 500。
+ *
+ * R93：第三参 `qrable` 把这个渠道**会不会返回可本地渲染的二维码**写成 `data-qr`，
+ * 由 `public/js/pay-poll.js` 读取 —— 用户切到扫码渠道时它直接提交、省掉一次点击。
+ * 「谁支持扫码」的判据仍只在 `paymentGateway.supportsQr()` 一处，这里只是把它落成属性。
  */
-function payOptionHtml(id, checked) {
+function payOptionHtml(id, checked, qrable) {
   const p = paymentProviders.platform(id);
   return `<label class="pay-opt"><input type="radio" name="platform" value="${esc(id)}"`
-    + `${checked ? ' checked' : ''}> `
+    + `${checked ? ' checked' : ''} data-qr="${qrable ? '1' : '0'}"> `
     + `${paymentLogos.logo(id, { size: 'sm' })}<span>${esc(p ? p.name : String(id))}</span></label>`;
 }
 
@@ -1020,21 +1048,64 @@ function payOptionHtml(id, checked) {
  *
  * ⚠️ 必须是**内联** SVG：分享页是服务端渲染的独立文档，没有 `index.html` 那套雪碧，
  * `<use href="#…">` 在这里只会画出空白（与 `fileIcons.inlineSvg()` 同一条理由）。
+ *
+ * ## R93：这一页同时负责「扫码态」—— 画码、并**隐藏**「立即支付」
+ *
+ * 需求原话是「当用户选择支持二维码绘制的渠道时，就在卡片下方画出二维码并隐藏『立即支付』
+ * 按钮」。难点在于**「选择」发生在浏览器里，而这一页是服务端渲染的**（分享页 CSP 为
+ * `script-src 'self'`，不许内联脚本），所以有三种可能做法：
+ *
+ *  · A. 每次切换都 POST 一次重新渲染 ⇒ 会**建订单**。单选钮一碰就下单，等于把「浏览
+ *    渠道」变成「下单」，还会连带触发退券 / 关旧单（R82/R90）；不可接受。
+ *  · B. 加一个「获取二维码」按钮 ⇒ 多一次点击，且与「立即支付」并存时用户不知道该点哪个。
+ *  · C. ⑤ 选中的渠道支持扫码 ⇒ 由 `pay-poll.js` 自动提交表单（它就是那个「立即支付」
+ *    动作，只是省掉了点击）；页面本身则在**已经画出码之后**不再渲染那个按钮。
+ *
+ * 落到本函数的形态：一旦手里有 `qr`（本页已经在展示二维码），就不渲染 `<button>`；
+ * 拿到码之前那一瞬间按钮照旧在（**渐进增强**：脚本被拦掉时仍是「选渠道 → 点立即支付」，
+ * 只是多一次点击，功能不坏）。
+ *
+ * ⚠️ 「码生成失败」不另设变量：`qrBoxHtml()` 在内容超长时返回的是**一段说明块**
+ * （`.qr-box--empty`），它同样是「有东西要摆在那儿」，所以 `qr` 非空、按钮照样隐藏 ——
+ * 那时摆按钮只会让用户按下去拿到同一个超长码，然后又回到这一页。
+ *
+ * @param {object} qrState `{ qr: '<div class="qr-box">…', order }` —— 已经有码要展示
  */
-function payPage(res, l, ps, available, err, note = '', coupon = null) {
-  const opts = available.map((id, i) => payOptionHtml(id, i === 0)).join('');
+function payPage(res, l, ps, available, err, note = '', coupon = null, qrState = null) {
+  const opts = available.map((id, i) => payOptionHtml(id, i === 0, paymentGateway.supportsQr(id, channelCfg(id)))).join('');
   const c = coupon || null;
   const applied = Boolean(c && c.ok);
+  /**
+   * 已经拿到码 ⇒ 这一页的主动作是「扫码」，不是「再下一单」。
+   * `qrState.qr` 非空即渲染码块（它已含 `.qr-box` 外壳，空值时也是一句可照做的说明）。
+   */
+  const qr = qrState && qrState.qr ? String(qrState.qr) : '';
+  /**
+   * R93：扫码态下**金额以订单为准**，不是以链接配置为准。
+   *
+   * 两个数通常是同一个，但只要用了券就会分叉：`ps.amountFen` 是链接标价，
+   * `order.amountFen` 是这张订单在网关侧真正要收的钱（券已核销进去）。二维码画的
+   * 是**后者的收款单**，页面却写前者，用户会看到「页面 ¥10、扫码进去 ¥5」——
+   * 金额对不上的收银台是这个项目最不能出现的形态（R62 的整轮都在修这个）。
+   */
+  const order = qr ? (qrState.order || null) : null;
+  const qrName = order ? ((paymentProviders.platform(order.platform) || {}).name || order.platform) : '';
   /**
    * R62 需求 5：用了券就「原价划线变灰 + 优惠后价格突出」。
    * 没用券时保持原样（只有一个大金额）—— 凭空显示一个「原价」划线价会让
    * 免费/未用券的用户误以为自己错过了折扣。
    */
-  const priceHtml = applied
-    ? `<div class="pay-orig">¥${paymentRules.formatAmount(c.originalFen)}</div>
+  const priceHtml = order
+    ? `${order.discountFen > 0
+      ? `<div class="pay-orig">¥${paymentRules.formatAmount(order.originalFen)}</div>` : ''}
+      <div class="pay-amount">¥${paymentRules.formatAmount(order.amountFen)}</div>
+      <div class="pay-cap">人民币（CNY）${order.discountFen > 0
+    ? `，已使用优惠券 <code>${esc(order.couponCode)}</code>，优惠 ¥${paymentRules.formatAmount(order.discountFen)}` : ''}</div>`
+    : applied
+      ? `<div class="pay-orig">¥${paymentRules.formatAmount(c.originalFen)}</div>
       <div class="pay-amount">¥${paymentRules.formatAmount(c.payableFen)}</div>
       <div class="pay-cap">已使用优惠券 <code>${esc(c.code)}</code>，优惠 ¥${paymentRules.formatAmount(c.discountFen)}</div>`
-    : `<div class="pay-amount">¥${paymentRules.formatAmount(ps.amountFen)}</div>
+      : `<div class="pay-amount">¥${paymentRules.formatAmount(ps.amountFen)}</div>
       <div class="pay-cap">人民币（CNY）</div>`;
   // R62 需求 6：券无效时就地给出对应提示（未开始 / 已过期 / 已用尽 / 不适用 / 已用过…）
   const couponWarn = c && !c.ok ? `<div class="warn">${esc(c.message || '优惠券无效')}</div>` : '';
@@ -1059,12 +1130,30 @@ function payPage(res, l, ps, available, err, note = '', coupon = null) {
           ${applied ? '<button class="btn ghost" type="submit" name="clear" value="1">不使用</button>' : ''}
         </form>
       </details>`;
+  /**
+   * R93：扫码态的**尾巴** —— 支付状态 / 订单摘要 / 订单号 / 「放弃并重新发起」。
+   *
+   * 这几块原先住在**独立的扫码页**里（R93 把那页合并进本页）。合并后它们仍然必要：
+   *  · `#pay-state` 是 `pay-poll.js` 轮询的**唯一开关**（没有它，码画出来了也
+   *    不会自动放行，用户付完钱得自己刷新 —— R8-07 修过一次同类问题）；
+   *  · 订单号是 R64/R85 的硬要求（取回下载权限、去网关后台对账都要用它）；
+   *  · 「放弃并重新发起」是用户换渠道 / 码过期时的唯一出路。
+   */
+  const qrTail = order
+    ? `<div class="meta">
+        ${orderMetaRows(order, '<div><span>支付状态</span><b id="pay-state">等待扫码…</b></div>')}
+      </div>
+      <div class="pay-note">二维码由本服务本地生成，有效期以${esc(qrName || '支付渠道')}为准；若二维码已过期，请点下方「重新发起支付」。</div>
+      <a class="btn ghost" href="/s/${esc(l.id)}?restart=1" style="display:block;text-align:center;text-decoration:none">重新发起支付</a>
+      ${orderNoBox(order)}`
+    : '';
   renderPage(res, err ? 400 : 200, {
     title: '付费下载',
     head: `<div class="center-head">
-    
       <h1>${note ? '订单已退款，需重新支付' : '分享者要求该文件必须付费才可下载'}</h1>
-      <p class="sub">${note ? '退款后的订单不再作为下载凭证，重新支付即可继续下载。' : '完成支付后即可下载，支付结果仅对该链接与当前浏览器有效。'}</p>
+      <p class="sub">${note ? '退款后的订单不再作为下载凭证，重新支付即可继续下载。'
+    : (qr ? '请使用手机扫描下方二维码完成支付，支付成功后本页会自动放行。'
+      : '完成支付后即可下载，支付结果仅对该链接与当前浏览器有效。')}</p>
       </div>`,
     body: `
       ${err ? `<div class="warn">${esc(err)}</div>` : ''}
@@ -1073,11 +1162,14 @@ function payPage(res, l, ps, available, err, note = '', coupon = null) {
       <form method="POST" action="/s/${esc(l.id)}/pay" data-pay-submit="1">
         ${applied ? `<input type="hidden" name="coupon" value="${esc(c.code)}">` : ''}
         <div class="pay-opts">${opts}</div>
-        <button class="btn primary" type="submit">立即支付</button>
+        ${qr}
+        ${qr ? '' : '<button class="btn primary" type="submit">立即支付</button>'}
       </form>
       <div id="pay-submit-note" class="warn" role="status" hidden></div>
+      ${qrTail}
       ${couponBox}
-      <script src="/js/pay-poll.js" data-link-id="${esc(l.id)}" defer></script>`,
+      <script src="/js/pay-poll.js" data-link-id="${esc(l.id)}" defer></script>
+      ${order ? orderNoScript() : ''}`,
     below: paidBelowHtml(l, res),
   });
 }
@@ -1091,7 +1183,7 @@ function refundNote() {
   return '该笔订单已被分享者标记为已退款，原支付凭证已失效。请重新支付后再下载。';
 }
 
-/** 订单摘要（支付中 / 二维码两页共用） */
+/** 订单摘要（付费页扫码态 / 支付中等待页共用 —— R93 起两者是同一套组件） */
 function orderMetaRows(order, extra) {
   const p = paymentProviders.platform(order.platform);
   return `
@@ -1220,19 +1312,41 @@ function jumpPage(res, l, order, url) {
 
 function payingPage(res, l, order, checked) {
   const p = paymentProviders.platform(order.platform);
+  const name = p ? p.name : order.platform;
   const notice = payCheckNotice(checked, order);
+  /**
+   * R93：订单上存了二维码 ⇒ 这一页**就地画出它**，而不是让用户去猜「码在哪」。
+   *
+   * 这一页正是用户「付了一半，回来/刷新/换个标签页」时命中的分支（`GET /s/:id`
+   * 的 `pending` 分支）。此前它只有一句「请在微信完成支付」和一个查询按钮 ——
+   * 而**码已经不在页面上了**，用户除了从头再点一次「立即支付」别无他法，
+   * 那又会用同一个 `out_trade_no` 二次调下单接口。
+   *
+   * 现在码来自订单快照（`qrPayload`），**不产生任何新的网关请求**。
+   *
+   * ⚠️ 判据是「订单里有没有码」，**不是**「当前配置的渠道支不支持扫码」。后者会在
+   * 管理员事后切换支付宝 `mode`（face ↔ page）时变脸：一张当面付订单会被判成
+   * 「不支持扫码」而把已经存在的码藏起来 —— 用户手上那张收了钱的通知却还在。
+   * 订单快照一旦写就不可变，用它判定才与「这单当时是怎么建的」一致。
+   */
+  const qr = order.qrPayload ? qrBoxHtml(order.qrPayload, name) : '';
   renderPage(res, 200, {
     title: '等待支付结果',
     head: `<div class="center-head">
       <div class="icon-big" style="background:#e8f1fb;color:#0067c0;font-size:20px">⏳</div>
       <h1>等待支付结果</h1>
-      <p class="sub">订单已创建，请在<b>${esc(p ? p.name : order.platform)}</b>完成支付后返回本页。</p>
+      <p class="sub">订单已创建，请在<b>${esc(name)}</b>完成支付后返回本页。</p>
       </div>`,
     body: `
+      ${qr ? `<div class="pay-amount">¥${paymentRules.formatAmount(order.amountFen)}</div>
+      <div class="pay-cap">人民币（CNY）</div>
+      ${qr}` : ''}
       <div class="meta">
         ${orderMetaRows(order, '<div><span>支付状态</span><b id="pay-state">支付中…</b></div>')}
       </div>
-      <div class="pay-note">请在<b>${esc(p ? p.name : order.platform)}</b>完成支付。支付成功后本页会自动放行，无需其他操作。</div>
+      <div class="pay-note">${qr
+    ? `请使用<b>${esc(name)}</b>扫描上方二维码完成支付。支付成功后本页会自动放行，无需其他操作。`
+    : `请在<b>${esc(name)}</b>完成支付。支付成功后本页会自动放行，无需其他操作。`}</div>
       ${notice ? `<div class="${notice.kind}" style="margin-top:12px">${esc(notice.text)}</div>` : ''}
       <form method="POST" action="/s/${esc(l.id)}/pay/check">
         <button class="btn primary" type="submit">我已完成支付，立即查询</button>
@@ -1245,30 +1359,39 @@ function payingPage(res, l, order, checked) {
   });
 }
 
-/** 微信支付 Native：展示二维码并轮询支付结果 */
-function qrPayPage(res, l, order, charge) {
-  const p = paymentProviders.platform(order.platform);
-  renderPage(res, 200, {
-    title: '扫码支付',
-    head: `<div class="center-head">
-      <div class="icon-big" style="background:#e8f1fb;color:#0067c0;font-size:20px">⏳</div>
-      <h1>请使用${esc(p ? p.name : '微信')}扫码支付</h1>
-      <p class="sub">支付完成后本页会自动放行，无需刷新。</p>
-      </div>`,
-    body: `
-      <div class="pay-amount">¥${paymentRules.formatAmount(order.amountFen)}</div>
-      <div class="pay-cap">人民币（CNY）</div>
-      <div class="qr-box">${charge.svg || ''}</div>
-      <div class="meta">
-        ${orderMetaRows(order, '<div><span>支付状态</span><b id="pay-state">等待扫码…</b></div>')}
-      </div>
-      <div class="pay-note">二维码由本服务本地生成，有效期以${esc(p ? p.name : '微信支付')}为准；若二维码过期，请返回上一步重新发起支付。</div>
-      <a class="btn ghost" href="/s/${esc(l.id)}?restart=1" style="text-align:center;text-decoration:none">放弃并重新发起</a>
-      ${orderNoBox(order)}
-      <script src="/js/pay-poll.js" data-link-id="${esc(l.id)}" defer></script>
-      ${orderNoScript()}`,
-    below: paidBelowHtml(l, res),
-  });
+/**
+ * R93：二维码块的**唯一渲染点**（付费页内嵌 与 单独的扫码页 共用）。
+ *
+ * ## 为什么内联服务端生成的 SVG
+ *
+ * 分享页是服务端渲染的独立文档、CSP 为 `script-src 'self'`：既不能引第三方
+ * 二维码库，也没有 `index.html` 那套雪碧可 `<use>`。`server/qrcode.js` 产出
+ * 的是**纯 SVG 字符串**，内联进 HTML 即可，零脚本、零外部请求。
+ *
+ * ## 为什么传 `payload` 而不直接传 `svg`
+ *
+ * 码要能从**订单快照**重绘（`order.qrPayload`），而订单里存的是码的**内容**、
+ * 不是那几十 KB 的 SVG 文本 —— 存 SVG 会让 `payments.json` 迅速膨胀，
+ * 且图形本该由「内容 + 渲染参数」确定性推导，存中间结果只会引入
+ * 「存的图和参数不一致」这类无从排查的错。
+ *
+ * ## 为什么超长时会显式报错而不是留白
+ *
+ * 本地编码器实测超过 213 字节时 `toSvg()` **返回空串且不抛错**。若直接内联，
+ * 用户看到的是一个漂亮的空边框，扫不出东西也不知道为什么。这里兜到一句
+ * 可照做的说明，并保留重新发起的入口。
+ */
+function qrBoxHtml(payload, name) {
+  const text = String(payload || '');
+  if (!text) {
+    return '<div class="qr-box qr-box--empty">暂时拿不到二维码，请点击下方「重新发起支付」。</div>';
+  }
+  const svg = qrcode.toSvg(text, { scale: 6, margin: 3 });
+  if (!svg) {
+    return `<div class="qr-box qr-box--empty">二维码内容过长，无法在本地生成图形（${text.length} 字符）。`
+      + `请改用其他支付方式，或联系分享者。</div>`;
+  }
+  return `<div class="qr-box" role="img" aria-label="使用${esc(name)}扫码支付的二维码">${svg}</div>`;
 }
 
 /** 支付失败：给出原因并允许重新发起 */
@@ -2222,6 +2345,27 @@ router.post('/s/:id/pay', asyncHandler(async (req, res) => {
     return payPage(res, l, ps, available, '原支付方式已停用，请重新发起支付', '', couponStateFor(l, req));
   }
 
+  /**
+   * R93：这条在途订单**已经拿到过二维码** ⇒ 直接把那张码重绘出来，**不再打网关**。
+   *
+   * 这是「F5 / 从支付页退回来 / 又点了一次立即支付」的主路径。不短路的代价分两层：
+   *  · 微信 Native 对同一个 `out_trade_no` 二次下单会回 `OUT_TRADE_NO_USED`
+   *    （是否放行取决于微信侧的重入判定，本项目在本地无从证实）⇒ 用户可能拿到
+   *    一句「创建支付订单失败」，而钱其实还能正常付；
+   *  · 即便网关幂等放行，多一次出网请求也是白花的时间与配额。
+   *
+   * 判据只看「订单里有没有码」：`setQr()` 只写一次、永不覆盖，所以重绘出来的必然
+   * 与买家当初看到的是同一张。金额同理取 `order.amountFen`（见 `payPage()` 中
+   * 「扫码态下金额以订单为准」）。位置放在 `available` 复检**之后**，与跳转式订单
+   * 遇到「渠道已停用」时的处置保持一致。
+   */
+  if (order.qrPayload) {
+    return payPage(res, l, ps, available, '', '', couponStateFor(l, req), {
+      qr: qrBoxHtml(order.qrPayload, (paymentProviders.platform(order.platform) || {}).name || order.platform),
+      order,
+    });
+  }
+
   const cfg = (configStore.getPayment().platforms || {})[chargePlatform] || {};
   const base = siteUrlFor(req);
   /**
@@ -2261,8 +2405,37 @@ router.post('/s/:id/pay', asyncHandler(async (req, res) => {
     return payPage(res, l, ps, available, `创建支付订单失败：${charge.error || '未知原因'}`, '', couponStateFor(l, req));
   }
   if (charge.tradeNo) paymentOrders.setTradeNo(order.id, charge.tradeNo);
+  /**
+   * R93：二维码**立刻落库**，且在建任何分支之前 —— `payingPage` 与付费页回退
+   * `payingPage` / 付费页回退都要靠它重绘。
+   *
+   * 顺序刻意放在 `markFailed` 之前：即使后面判定「没有可用收银台」而把订单标失败，
+   * 这张码对应的交易在网关侧**可能仍然可付**（例如 url 协议不合规被我们拒跳），
+   * 留着它，对账时能回答「这个 pending 订单当时给了买家什么码」。
+   */
+  if (charge.kind === 'qrcode' && charge.codeUrl) paymentOrders.setQr(order.id, charge.codeUrl);
 
-  if (charge.kind === 'qrcode' && (charge.svg || charge.codeUrl)) return qrPayPage(res, l, order, charge);
+  /**
+   * R93：扫码渠道（微信 Native / 支付宝当面付）⇒ 留在**本页**画码，不跳转。
+   *
+   * 旧实现另开一张 `qrPayPage()`，与付费页是两份模板：码画出来了，但「换渠道」
+   * 「用券」「重新发起」全都不在那张页上，用户想换个方式付钱就只能后退 —— 而后退
+   * 回到的付费页已经不知道该渠道刚下过单。合并成一页后，**同一个模板既负责选渠道
+   * 也负责展示码**，`qrState` 就是那个开关。
+   *
+   * 传 `charge.codeUrl` 而不是 `charge.svg`：图形永远从**内容**重绘
+   * （见 `qrBoxHtml()` 的说明），网关返回的 SVG 只当「有没有拿到码」的信号用。
+   */
+  if (charge.kind === 'qrcode' && charge.codeUrl) {
+    return payPage(res, l, ps, available, '', '', couponStateFor(l, req), {
+      qr: qrBoxHtml(charge.codeUrl, (paymentProviders.platform(order.platform) || {}).name || order.platform),
+      order,
+    });
+  }
+  /**
+   * 走到这里说明网关说「成功了」，却没给出任何能付款的入口（扫码渠道连 `codeUrl`
+   * 都没有）—— 交给下面 R80 的统一处置，绝不让用户落到一个「什么也做不了」的等待页。
+   */
   /**
    * R83：收银台跳转**不能**由这次表单 POST 的 3xx 完成 —— 见 `jumpPage()` 的说明。
    * 同时做协议白名单：`charge.url` 来自网关，`javascript:` / `data:` 一旦进了

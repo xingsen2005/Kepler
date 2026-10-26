@@ -1,8 +1,9 @@
 /**
- * 分享页「支付」相关的两段行为 —— 独立静态脚本（**非** ES Module，也**非**内联脚本）
+ * 分享页「支付」相关的三段行为 —— 独立静态脚本（**非** ES Module，也**非**内联脚本）
  *
- * ① **支付结果轮询**（等待支付页 / 二维码页，靠 `#pay-state` 判定是否启用）
- * ② **付费页「立即支付」的提交反馈**（R80，靠 `form[data-pay-submit]` 判定是否启用）
+ * ① **支付结果轮询**（等待支付页 / 扫码页，靠 `#pay-state` 判定是否启用）
+ * ② **选中扫码渠道即出码**（R93，靠单选钮上的 `data-qr="1"` 判定是否启用）
+ * ③ **付费页「立即支付」的提交反馈**（R80，靠 `form[data-pay-submit]` 判定是否启用）
  *
  * ## 为什么必须是独立文件（R8-07）
  *
@@ -20,14 +21,14 @@
  * 因此这里刻意使用普通脚本 + `data-link-id` 属性。
  *
  * 用法（由 `share-routes.js` 渲染）：
- *   <script src="/js/pay-poll.js" data-link-id="<链接 id>" defer></script>     // 等待页 / 二维码页
+ *   <script src="/js/pay-poll.js" data-link-id="<链接 id>" defer></script>     // 等待页 / 扫码页
  *   <script src="/js/pay-poll.js" data-link-id="<链接 id>" defer></script>     // 付费页（表单带 data-pay-submit）
  *
  * ## 安全
  *  · 链接 id 先经 `encodeURIComponent` 再拼进 URL，不会造成路径注入；
  *  · 只做 `fetch` 轮询与 DOM 状态切换，不读写 localStorage，不引入任何外部资源；
  *  · 状态页是幂等的只读接口（`/pay/status` 内部自带 3 秒查询节流）；
- *  · 两段行为都以「页面上有没有对应元素」为开关，互不干扰，也不改变禁用脚本时的功能。
+ *  · 三段行为都以「页面上有没有对应元素」为开关，互不干扰，也不改变禁用脚本时的功能。
  */
 (function () {
   'use strict';
@@ -140,11 +141,14 @@
    * ================================================================ */
   const SUBMIT_TIMEOUT_MS = 12000;
 
+  /**
+   * ⚠️ 这里**不再提前 return**（R93）：第三部分（选中扫码渠道即出码）只用到 `form`，
+   * 与下面的看门狗彼此独立。保持「没有表单就整段退出」会让那一段永远跑不到。
+   */
   const form = document.querySelector ? document.querySelector('form[data-pay-submit]') : null;
-  if (!form) return;
 
   const note = document.getElementById('pay-submit-note');
-  const btn = form.querySelector('button[type=submit]');
+  const btn = form ? form.querySelector('button[type=submit]') : null;
   const btnText = btn ? btn.textContent : '';
   let submitTimer = null;
 
@@ -205,7 +209,7 @@
     });
   }
 
-  form.addEventListener('submit', function (ev) {
+  if (form) form.addEventListener('submit', function (ev) {
     if (btn && btn.disabled) {
       // 第二次点击：直接吞掉，不产生第二笔订单（`disabled` 在部分浏览器上不拦回车，这里补一道）
       if (ev && ev.preventDefault) ev.preventDefault();
@@ -219,4 +223,46 @@
 
   // 从 bfcache 返回（用户按了「后退」）时，按钮可能仍是禁用状态 —— 复位
   window.addEventListener('pageshow', function () { reset(); });
+
+  /* ================================================================
+   * 第三部分：选中「能画二维码」的渠道 ⇒ 立刻出码（R93）
+   *
+   * 需求是「选了微信 / 支付宝当面付，就在本页画出付款二维码，并且不再显示
+   * 『立即支付』」。难点在于**这一页是服务端渲染的**（CSP 不允许内联脚本，也引不了
+   * 第三方二维码库），浏览器这边凭空画不出码 —— 码只能由服务端在**建单之后**给出。
+   * 所以「切换渠道」这个动作必须变成一次提交；本段就是省掉那次点击的粘合剂：
+   * 它提交的正是「立即支付」那张表单，**语义完全相同**，只是不需要用户再点一下。
+   *
+   * ## 为什么首次加载不自动提交
+   *
+   * 服务端会把第一个可用渠道预选中。若加载即提交，就等于**任何一次页面浏览都会
+   * 建一笔订单** —— 爬虫、链接预览、用户单纯点开看看，全都会建单；而每笔订单还要
+   * 真出网调一次网关下单接口（微信 Native / 支付宝当面付都是 POST 出网）。这既是
+   * R14-03「灌单挤出在途订单」（`MAX_ORDERS_PER_LINK = 50`，超窗的 pending 会被裁掉）
+   * 的复现路径，也会白烧网关配额。
+   *
+   * 所以只在 `change` 上挂：**用户明确换了渠道**才提交。没换渠道时页面上那个
+   * 「立即支付」按钮照旧可用，与改造前完全一致。
+   *
+   * ## 为什么用 `data-qr` 而不是在前端写一份渠道名单
+   *
+   * 「谁能扫码」的唯一判定在服务端（`paymentGateway.supportsQr()`：微信恒为真，
+   * 支付宝还要看后台选的 `mode`）。前端再抄一份名单，一旦后台改了模式就会两边打架 ——
+   * 页面按旧名单提交，回来发现没有码。`data-qr` 是服务端那份判定的投影，不会漂。
+   * ================================================================ */
+  if (!form) return;
+
+  form.addEventListener('change', function (ev) {
+    const t = ev && ev.target;
+    if (!t || t.name !== 'platform' || !t.checked) return;
+    if (t.getAttribute('data-qr') !== '1') return;
+    /**
+     * 提交中（按钮已被上面的看门狗禁用）就不再触发：一次提交对应一笔订单，
+     * 连着切换会连着建单、连着关旧单（R90 的三步原子要整圈重跑），没有必要。
+     */
+    if (btn && btn.disabled) return;
+    // `requestSubmit()` 会真的派发 submit 事件 ⇒ 上面的看门狗照常生效。
+    if (typeof form.requestSubmit === 'function') form.requestSubmit();
+    else form.submit(); // 极老的浏览器：不派发事件，但至少能提交
+  });
 })();
