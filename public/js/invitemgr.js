@@ -345,13 +345,23 @@ function inviteFieldsHtml(p, v) {
    * 而不是「这件事不归我管」。
    */
   const canGrantAdmin = Boolean(App.state.user && App.state.user.role === 'root');
+  /**
+   * R94（审核 M02-03）：编辑一枚**根用户发放的 admin 码**时，非根管理员的下拉里没有
+   * admin 档 ⇒ `readInviteFields()` 读到恒为 `'user'`，保存时随 `maxUses` / `expiresAt`
+   * 一起提交；而服务端 `assertCanGrantRole` 只拦「改成 admin」，改回 user 一律放行 ——
+   * 于是这枚码被**静默降权**，界面上没有任何提示（同一次操作，根用户做毫无问题）。
+   *
+   * 现在的处理：把该下拉置为 `disabled` **如实显示**当前身份，并让 `readInviteFields()`
+   * 在禁用时**不提交 role 字段**（服务端 `buildPatch` 见不到 role ⇒ 保持原值）。
+   */
+  const lockedRole = !canGrantAdmin && role === 'admin';
   const hasExp = Boolean(val.expiresAt);
   const uses = Number(val.maxUses) > 0 ? Number(val.maxUses) : 0;
   return `
     <div class="form-row">
       <div class="form-item">
         <label>注册后的身份</label>
-        <select id="${p}-role" class="full">
+        <select id="${p}-role" class="full"${lockedRole ? ' disabled' : ''}>
           <option value="user"${role === 'user' ? ' selected' : ''}>普通用户</option>
           ${canGrantAdmin
             ? `<option value="admin"${role === 'admin' ? ' selected' : ''}>管理员</option>`
@@ -359,7 +369,9 @@ function inviteFieldsHtml(p, v) {
         </select>
         <div class="hint">用这枚邀请码注册出来的账户<b>直接获得</b>该身份。${canGrantAdmin
           ? '「管理员」仅根用户可发放。'
-          : '「管理员」身份只有根用户可发放，如需管理员账户请联系根用户。'}</div>
+          : lockedRole
+            ? '这枚码由根用户发放，其身份不可由你改动（只能改次数与有效期）。'
+            : '「管理员」身份只有根用户可发放，如需管理员账户请联系根用户。'}</div>
       </div>
       <div class="form-item">
         <label>使用次数上限</label>
@@ -407,7 +419,15 @@ function bindExpiryToggle(root, p) {
  */
 function readInviteFields(root, p) {
   const out = {};
-  out.role = root.querySelector(`#${p}-role`).value;
+  /**
+   * R94（审核 M02-03）：**禁用的下拉不参与提交**。
+   *
+   * 编辑一枚根用户发放的 admin 码时，非根管理员看到的下拉是 disabled 的「管理员」——
+   * 若照旧读 `.value` 并提交，就等于把"我读到的值"当成"用户想改成的值"，
+   * 服务端只拦「改成 admin」，于是这枚码会被静默降权。
+   */
+  const roleSel = root.querySelector(`#${p}-role`);
+  if (roleSel && !roleSel.disabled) out.role = roleSel.value;
   const usesRaw = String(root.querySelector(`#${p}-uses`).value || '').trim();
   const uses = Number(usesRaw === '' ? 0 : usesRaw);
   if (!Number.isInteger(uses) || uses < 0) return { ok: false, error: '使用次数上限须为不小于 0 的整数（0 表示不限制）' };

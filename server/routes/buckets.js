@@ -104,17 +104,25 @@ router.post('/buckets/local', requireAdmin, async (req, res) => {
     if (b.credentialId) {
       const full = configStore.load();
       const cred = full && (full.credentials || []).find((c) => c.id === String(b.credentialId));
-      if (cred) {
-        provider = cred.provider;
-        // 探测必须用**这条被指定的密钥**，否则会用当前桶的密钥去验别人的桶，
-        // 得到"A 密钥访问 B 桶被拒"这种与真实配置无关的误判。
-        credOverride = {
-          provider: cred.provider,
-          secretId: cred.secretId,
-          secretKey: cred.secretKey,
-          endpoint: cred.endpoint || '',
-        };
-      }
+      /**
+       * R94（审核 M05-06）：**找不到就直接 400**，不许静默回退。
+       *
+       * 旧实现这里 `if (cred)` 不成立就继续往下走：`provider` 保持 undefined ⇒
+       * `addBucket()` 回退默认厂商（腾讯云）⇒ 桶被保存成「腾讯云 + 悬空 credentialId」，
+       * 而 `activeCredential()` 找不到那个 id 就按 provider 找同厂商的另一把密钥 ⇒
+       * 管理员以为桶挂在 A 账号，实际用的是 B 账号（同名桶存在时数据就写错了账号）。
+       * 这类「静默兜底代替显式失败」正是 FUN-09 明确禁止的形态。
+       */
+      if (!cred) return res.status(400).json({ error: '所选密钥不存在，请刷新后重试' });
+      provider = cred.provider;
+      // 探测必须用**这条被指定的密钥**，否则会用当前桶的密钥去验别人的桶，
+      // 得到"A 密钥访问 B 桶被拒"这种与真实配置无关的误判。
+      credOverride = {
+        provider: cred.provider,
+        secretId: cred.secretId,
+        secretKey: cred.secretKey,
+        endpoint: cred.endpoint || '',
+      };
     }
     /**
      * 地域是否必填**取决于厂商**（又拍云 / GCS / R2 / MinIO 都不需要）—— 与
@@ -335,13 +343,18 @@ router.delete('/buckets/local/:id', requireAdmin, (req, res) => {
 /**
  * 判定桶 ACL 权限级别：private | public-read | public-read-write
  * 只看授权给"所有人"（AllUsers）的权限，授权给指定账号的不算公开。
+ *
+ * ⚠️ R94（审核 M05-04）：URI 判据从 `includes('global/AllUsers')` 改成**锚定结尾**的
+ * 正则 —— 旧写法会把 `…/global/AllUsersX` 这类并不存在的授权也算成「授权给所有人」。
  */
+const ALL_USERS_URI_RE = /(^|\/)global\/AllUsers$/;
+
 function evalBucketAcl(aclData) {
   const grants = (aclData && aclData.Grants) || [];
   let allRead = false, allWrite = false;
   for (const g of grants) {
     const uri = (g && g.Grantee && g.Grantee.URI) || '';
-    if (!uri.includes('global/AllUsers')) continue;
+    if (!ALL_USERS_URI_RE.test(uri)) continue;
     const perm = String(g.Permission || '').toUpperCase();
     if (perm === 'FULL_CONTROL' || perm === 'WRITE') { allWrite = true; allRead = true; }
     else if (perm === 'READ') allRead = true;
@@ -353,6 +366,41 @@ function evalBucketAcl(aclData) {
   if (canned.includes('public-read-write')) return 'public-read-write';
   if (canned.includes('public-read')) return 'public-read';
   return 'private';
+}
+
+/**
+ * 判定**桶策略**是否等于「对所有人开放」（R94 · 审核 M05-04）。
+ *
+ * ACL 与桶策略是**两条独立**的公开通道，只看 ACL 会漏掉后一条：
+ * AWS 2023-04 之后新建桶默认 `BucketOwnerEnforced`（ACL 关闭），公开访问的常规做法
+ * 就是桶策略 + Block Public Access —— 此时 `?acl` 仍返回 200、只含 owner 的
+ * `FULL_CONTROL`，只看 ACL 的实现会把**实际公开可读**的桶报成 `private`。
+ *
+ * 判据只认「`Effect: Allow` + `Principal` 为 `*` + `Action` 含 GetObject / PutObject」。
+ * ⚠️ 已知残余：`Condition`（如限制来源 IP）不做求值 —— 保守起见按「可能公开」上报，
+ * 宁可多报一条让管理员核对，也不在这里做假阴性。
+ *
+ * @returns {''|'public-read'|'public-read-write'} 空串表示「策略不构成公开访问」
+ */
+function evalBucketPolicy(policy) {
+  if (!policy || typeof policy !== 'object') return '';
+  const sts = Array.isArray(policy.Statement) ? policy.Statement : [policy.Statement];
+  let read = false, write = false;
+  for (const st of sts) {
+    if (!st || String(st.Effect || '').toLowerCase() !== 'allow') continue;
+    const p = st.Principal;
+    const anyone = p === '*'
+      || (p && typeof p === 'object' && (p.AWS === '*' || (Array.isArray(p.AWS) && p.AWS.includes('*'))));
+    if (!anyone) continue;
+    const actions = [].concat(st.Action || []).map((a) => String(a).toLowerCase());
+    const hasRead = actions.some((a) => a === '*' || a === 's3:*' || a === 's3:getobject' || a === 's3:getobjectversion');
+    const hasWrite = actions.some((a) => a === '*' || a === 's3:*' || a === 's3:putobject' || a === 's3:deleteobject');
+    if (hasRead) read = true;
+    if (hasWrite) write = true;
+  }
+  if (write) return 'public-read-write';
+  if (read) return 'public-read';
+  return '';
 }
 
 // 检查全部本地绑定桶的 ACL（单个桶失败不影响其他桶）（**仅管理员**）
@@ -376,7 +424,24 @@ router.get('/acl-check', requireAdmin, async (req, res) => {
     try {
       const client = getClient(cfg);
       const acl = await p(client, 'getBucketAcl', { Bucket: b.bucket, Region: cfg.region });
-      results.push({ bucket: b.bucket, region: cfg.region, remark: b.remark, acl: evalBucketAcl(acl) });
+      let level = evalBucketAcl(acl);
+      /**
+       * R94（审核 M05-04）：ACL 说「私有」**不等于**桶是私有的 —— 另一条公开通道是
+       * 桶策略。只在 ACL 判私有时才补查策略（ACL 已经判公开的无需再查），
+       * 且策略查询失败一律当作「没有策略」处理（厂商不支持 / 无权限读取都不该
+       * 让整个检查变成 unexpected）。
+       */
+      if (level === 'private') {
+        let policy = null;
+        try {
+          policy = await p(client, 'getBucketPolicy', { Bucket: b.bucket, Region: cfg.region });
+        } catch (e) {
+          policy = null;
+        }
+        const fromPolicy = evalBucketPolicy(policy);
+        if (fromPolicy) level = fromPolicy;
+      }
+      results.push({ bucket: b.bucket, region: cfg.region, remark: b.remark, acl: level });
     } catch (e) {
       const err = e.status ? e : translateError(e);
       results.push({ bucket: b.bucket, region: cfg.region, remark: b.remark, acl: 'unknown', error: err.message });

@@ -212,15 +212,15 @@ test('R53-3 · 加密方式缺省跟随端口：仅改端口（PATCH）时保持
 });
 
 /* ================================================================== *
- * ④ 安全视图：safeView 的两处返回都必须含 smtp 且不含明文
+ * ④ 安全视图：safeView 的 smtp 段**只给管理员**，且任何分支都不含口令明文
  * ================================================================== */
 
-test('R53-4 · safeView：两处返回都带 smtp，且两处都不含口令明文', () => {
+test('R53-4 · safeView：smtp 段只下发给管理员，且任何分支都不含口令明文', () => {
   configStore.saveSmtp({ host: 'view.example.com', port: 465, user: 'u@x.com', password: 'SECRET-PW', from: 'a@b.com', fromName: 'Kepler' });
 
   // 正常分支（有配置）
   const admin = configStore.safeView('admin');
-  assert(admin.smtp, 'safeView（正常分支）必须下发 smtp 段');
+  assert(admin.smtp, 'safeView（管理员）必须下发 smtp 段 —— 发信设置卡片要用');
   assertNoSecret(admin.smtp, 'safeView 正常分支');
   assertEqual(admin.smtp.host, 'view.example.com');
   assertEqual(admin.smtp.port, 465);
@@ -230,9 +230,17 @@ test('R53-4 · safeView：两处返回都带 smtp，且两处都不含口令明�
   // 整个响应体里也不能出现口令
   assert(!/SECRET-PW/.test(JSON.stringify(admin)), 'safeView 整体序列化结果里不得出现口令');
 
+  /**
+   * ⚠️ R94（审核 M03-03）**改了这条判据的方向**：本用例原先断言「普通用户同样必须带
+   * smtp 段」，那正是缺陷本身 —— `GET /api/config` 只要求「有会话」，于是任意已登录
+   * 用户都能读到 SMTP 主机 / 端口 / 加密方式 / 登录用户名 / 发件人地址（基础设施拓扑）。
+   * 设置页走的是独立的 `/api/smtp/config`（`requireAdmin`），前端 `public/js/` 从不读
+   * `config.smtp`，所以裁掉不会影响任何界面。
+   */
   const user = configStore.safeView('user');
-  assert(user.smtp, 'safeView（普通用户）同样必须带 smtp 段');
-  assertNoSecret(user.smtp, 'safeView 普通用户分支');
+  assertEqual(user.smtp, null, '普通用户不得拿到 smtp 段（发信拓扑只给管理员）');
+  assert(!/SECRET-PW/.test(JSON.stringify(user)), 'safeView 整体序列化结果里不得出现口令');
+  assert(!/view\.example\.com/.test(JSON.stringify(user)), '普通用户的响应体里不得出现 SMTP 主机名');
 });
 
 test('R53-4 · smtpView：未配置时给出「关闭 + 默认端口」而不是 undefined', () => {

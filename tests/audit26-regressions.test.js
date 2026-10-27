@@ -321,9 +321,12 @@ test('R26-06 · 「只改备注」的一次保存不得把密钥的厂商与端�
     'R26-06：未显式提交端点时必须保持原端点（旧实现会把它清空 / 重算，且不可逆）');
 
   // 反向对照：显式提交时必须真的写入（证明上面不是「压根不写」）
-  configStore.addCredential({ secretId: 'AKIDr2', secretKey: '', endpoint: '9z8y' });
+  // ⚠️ R94（审核 M05-02）起 R2 的账户 ID 要过 `accountPattern`（8–64 位小写字母数字），
+  // 这里原来用的 `9z8y`（4 位）会被判非法 —— 换成真实形态的 32 位十六进制 ID。
+  const R2_ID = '1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d';
+  configStore.addCredential({ secretId: 'AKIDr2', secretKey: '', endpoint: R2_ID });
   assertEqual(configStore.load().credentials.find((x) => x.id === 'c-r2').endpoint,
-    'https://9z8y.r2.cloudflarestorage.com', 'R26-06：显式提交端点时应按厂商规则组装并写入');
+    'https://' + R2_ID + '.r2.cloudflarestorage.com', 'R26-06：显式提交端点时应按厂商规则组装并写入');
 
   /**
    * 要求端点的厂商（R2 / MinIO）缺失端点时必须当场拒绝 ——
@@ -341,7 +344,7 @@ test('R26-06 · 「只改备注」的一次保存不得把密钥的厂商与端�
     'R26-06：把 R2 的端点清空时必须抛错');
   assertEqual(e2.status, 400, 'R26-06：清空必需端点应为 400');
   assertEqual(configStore.load().credentials.find((x) => x.id === 'c-r2').endpoint,
-    'https://9z8y.r2.cloudflarestorage.com', 'R26-06：被拒的更新不得改动既有端点');
+    'https://' + R2_ID + '.r2.cloudflarestorage.com', 'R26-06：被拒的更新不得改动既有端点');
 });
 
 /* ==================================================================== */

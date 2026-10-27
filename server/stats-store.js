@@ -251,6 +251,30 @@ function sanitizeField(v, max) {
   return s;
 }
 
+/**
+ * R94（审核 M08-07）：日志里引用**凭据类 id** 时的脱敏写法。
+ *
+ * 无口令的分享链接，其访问凭据就是链接 id 本身（`/s/<id>`）。原先把完整 id
+ * 写进**明文**的 `data/logs.jsonl`，而承载同一批链接的 `data/links.json` 走
+ * `secure-store` 的 AES-256-GCM 落盘 —— 同一个秘密一处加密、一处明文。
+ *
+ * `data/` 属既定威胁模型里的可信边界（能读它的人本来就能拿到 `secret.key`），
+ * 所以这本身不构成漏洞；但「日志被顺手打包进备份 / 贴进工单 / 被监控采集」
+ * 是现实事故场景，那时日志就不再"只是日志"，而是一串**可直接使用的访问凭据**
+ * （README 第 188 行已声明"分享下载不记录来源 IP"，本函数是同一口径的延伸）。
+ *
+ * 只保留前 `len/3` 个字符（上限 6）：现代 22 字符 id 留 6 位、历史 12 / 8 字符
+ * 的 id 分别留 4 / 2 位。运维仍能凭前缀在链接列表里对上号，但剩下的熵
+ * （22 字符 id 剩 96 位）配合 `shareViewLimiter` 不可枚举。
+ */
+function logRef(id) {
+  const s = String(id == null ? '' : id);
+  if (!s) return '-';
+  const keep = Math.min(6, Math.max(2, Math.floor(s.length / 3)));
+  if (s.length <= keep) return '…';
+  return s.slice(0, keep) + '…';
+}
+
 function addLog(entry) {
   try {
     LOG_BUFFER.push(JSON.stringify({
@@ -344,7 +368,7 @@ async function getLogs({ limit = 200, level = '', action = '' } = {}) {
 }
 
 module.exports = {
-  track, series, summary, addLog, getLogs, todayKey, sampleTraffic, speed,
+  track, series, summary, addLog, logRef, getLogs, todayKey, sampleTraffic, speed,
   trackBucket, bucketStats, resetBucketStats,
   flushLogs, flushLogsSync, rotateLogs, flushStatsSync,
   isLoadFailed: () => loadFailed, // FUN-06：供测试与运维观察统计是否已降级

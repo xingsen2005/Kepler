@@ -546,7 +546,9 @@ function verifyAuthentication({
   if (!verifyEs256(spki, signedData, fromBase64url(signature))) {
     return { ok: false, reason: 'signature_invalid' };
   }
-  return { ok: true, signCount: next };
+  // R94（审核 M01-05）：把签发挑战时记下的「记住登录状态」带回给调用方 ——
+  // 服务端自己的决定，不让第二次请求的参数覆盖它。
+  return { ok: true, signCount: next, remember: Boolean(consumed.meta && consumed.meta.remember) };
 }
 
 /* ============================ 面向用户的文案 ============================ */

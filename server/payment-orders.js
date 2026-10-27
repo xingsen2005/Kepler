@@ -379,10 +379,10 @@ function prune(linkId) {
   for (let i = all.length - 1; i >= 0; i--) {
     if (all[i].linkId === linkId && !keep.has(all[i].id)) all.splice(i, 1);
   }
-  if (dropped > 0) warnPruned(`链接 ${linkId}`, dropped);
+  if (dropped > 0) warnPruned(`链接 ${statsStore.logRef(linkId)}`, dropped);
   else if (frozen.size >= MAX_ORDERS_PER_LINK) {
     // 上限被受保护订单占满 —— 多半是有人在灌单，必须可见（否则运维只会看到文件变大）
-    warnPruned(`链接 ${linkId}`, 0, `上限 ${MAX_ORDERS_PER_LINK} 已被受保护订单占满，无法裁剪`);
+    warnPruned(`链接 ${statsStore.logRef(linkId)}`, 0, `上限 ${MAX_ORDERS_PER_LINK} 已被受保护订单占满，无法裁剪`);
   }
 }
 

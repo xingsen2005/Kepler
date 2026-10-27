@@ -183,10 +183,22 @@ fakeClient.getObject = (opts, cb) => {
 };
 
 s3.getClient = () => fakeClient;
-// 路由层：解构绑定的 `p` → 替换导出对象上的属性即可
+/**
+ * 路由层：解构绑定的 `p` → 替换导出对象上的属性即可。
+ *
+ * ⚠️ R94（审核 M06-03）：桩必须**尊重 `params.Output`**。
+ * 读路径（`fs-gateway.readObject` / `download-stream`）现在统一走 `s3.p()`，
+ * 而它们取数据靠的是 `params.Output` 这条流 —— 返回 `{ Body }` 却往 `Output` 里
+ * 什么也不写的桩，会让调用方永远等一条不会结束的流：表现为「WebDAV GET 挂住」，
+ * 而不是一条看得懂的失败。桩与真实适配器的语义必须一致，否则测的就不是同一件事。
+ */
 s3.p = async (client, method, params) => {
   const r = handleCloud(method, params || {});
   if (r.error) throw r.error;
+  if (method === 'getObject' && params && params.Output) {
+    params.Output.end(r.result && r.result.Body);
+    streamReads += 1;
+  }
   return r.result;
 };
 

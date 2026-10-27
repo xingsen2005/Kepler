@@ -22,6 +22,15 @@ const LOCK_FILE = path.join(DATA_DIR, '.instance.lock');
 
 let held = false;
 
+/**
+ * 本进程的启动时刻（毫秒）。用于区分「同一个 pid 的两条不同生命期」。
+ *
+ * `process.uptime()` 返回的是本进程已运行的秒数 ⇒ 反推启动时刻。精度只到秒的
+ * 小数部分，且受 `Date.now()` 单调性的影响，因此下面的比较留了一点余量
+ * （见 `samePidLeftover()`），不追求亚毫秒级。
+ */
+const PROC_START_MS = Date.now() - Math.round(process.uptime() * 1000);
+
 /** 判断某 pid 是否仍存活（Windows / POSIX 通用：signal 0 探测） */
 function pidAlive(pid) {
   if (!pid) return false;
@@ -32,6 +41,31 @@ function pidAlive(pid) {
     // ESRCH = 不存在；EPERM = 存在但无权限（视为存活）
     return e && e.code === 'EPERM';
   }
+}
+
+/**
+ * 锁里记录的持有者，是不是**上一个进程**留下的残影 —— 且那个进程的 pid 恰好等于本次。
+ *
+ * R94（审核 M04-03）：原先只看 pid 是否相等，于是容器部署（tini 作 PID 1、
+ * `node server/index.js` 恒为 PID 2）下「非优雅退出 → 残留锁」永远无法接管：
+ * `pidAlive(2)` 为真（就是自己），既不接管也不放行 ⇒ 实例**永久起不来**，
+ * 而报错还说「检测到另一个实例正在运行（PID 2）」—— 那个 PID 就是它自己。
+ *
+ * 但反过来「同 pid 一律接管」也是错的：它会把「本进程生命期内被写下的锁」也当成残影，
+ * 而那种情形（手工放了锁文件 / 上一位持有者异常）恰恰应该先问清楚。
+ * 两者的可观测区别只有一个：**锁是哪个生命期写下的**。
+ *  - 上一个进程写的 ⇒ 它的启动时刻必然早于本进程启动；
+ *  - 本进程写的 ⇒ 必然晚于（或等于）本进程启动。
+ *
+ * 老格式的锁没有 `procStartAt`，退回到 `startedAt`（创建锁的时刻 ≥ 该进程启动时刻，
+ * 因此「上一轮写的锁」在本判据下同样成立；方向一致，不会误判成残影）。
+ * 两个时间都读不出来时**保守地按「活锁」处理**（宁可让运维手工删锁，也不接管别人的锁）。
+ */
+function samePidLeftover(cur) {
+  if (!cur || !cur.pid || cur.pid !== process.pid) return false;
+  const t = Date.parse(String(cur.procStartAt || cur.startedAt || ''));
+  if (!Number.isFinite(t)) return false;
+  return t < PROC_START_MS;
 }
 
 function readLock() {
@@ -117,7 +151,13 @@ function acquire({ force = false } = {}) {
     fs.mkdirSync(DATA_DIR, { recursive: true });
   } catch (e) { /* 目录已存在 */ }
 
-  const payload = JSON.stringify({ pid: process.pid, startedAt: new Date().toISOString() });
+  const payload = JSON.stringify({
+    pid: process.pid,
+    startedAt: new Date().toISOString(),
+    // R94（审核 M04-03）：记下**本进程的启动时刻**，供下次启动区分「同 pid 的另一条
+    // 生命期」（见 samePidLeftover()）。只记 pid 无法分辨这两者。
+    procStartAt: new Date(PROC_START_MS).toISOString(),
+  });
 
   // 先探测已有锁
   const existing = readLock();
@@ -138,7 +178,14 @@ function acquire({ force = false } = {}) {
       if (!cur && !force && lockAgeMs() < LOCK_SHAPE_GRACE_MS) {
         return { ok: false, stale: false, pid: null };
       }
-      if (!cur || !cur.pid || !pidAlive(cur.pid) || force) {
+      /**
+       * R94（审核 M04-03）：判据从「pid 相等」改成「**上一个生命期**的 pid 相等」。
+       *
+       * 同一个 pid 并不能说明「同一个进程」：容器里 node 恒为 PID 2，于是每次重启
+       * 的 pid 都一样。能说明问题的是**生命期** —— 判据见 `samePidLeftover()`。
+       */
+      const samePidLeftoverNow = samePidLeftover(cur);
+      if (!cur || !cur.pid || samePidLeftoverNow || !pidAlive(cur.pid) || force) {
         /**
          * R27-21 + R28-05：接管陈旧锁。
          *

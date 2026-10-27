@@ -43,6 +43,8 @@ const STATS_FLUSH_MS = 1000;
 function createTrafficMeter({ bucket, traffic, intervalMs = STATS_FLUSH_MS } = {}) {
   let pendingBytes = 0;
   let lastFlushAt = Date.now();
+  /** R94（审核 M12-05）：收尾只做一次 —— `flush()` 与 `close` 两条路径互斥 */
+  let settled = false;
 
   function flushTraffic(n) {
     if (!n) return;
@@ -50,7 +52,14 @@ function createTrafficMeter({ bucket, traffic, intervalMs = STATS_FLUSH_MS } = {
     statsStore.trackBucket(bucket, { down: n });
   }
 
-  return new Transform({
+  function settle() {
+    if (settled) return;
+    settled = true;
+    flushTraffic(pendingBytes);
+    pendingBytes = 0;
+  }
+
+  const t = new Transform({
     transform(chunk, _enc, cb) {
       pendingBytes += chunk.length;
       if (traffic) traffic.bytesDown += chunk.length; // 供调用方在结束后读取总数
@@ -64,11 +73,27 @@ function createTrafficMeter({ bucket, traffic, intervalMs = STATS_FLUSH_MS } = {
       cb();
     },
     flush(cb) {
-      flushTraffic(pendingBytes); // 收尾：清算残余计数，避免尾部字节丢失
-      pendingBytes = 0;
+      settle(); // 收尾：清算残余计数，避免尾部字节丢失
       cb();
     },
   });
+
+  /**
+   * R94（审核 M12-05）：**中断路径也要结算**。
+   *
+   * `_flush` 只在正常 `end()` 路径上被调用；下载被客户端中途掐断（关页面 / 弱网超时 /
+   * `AbortController`）时，`pipeline(...)` 会 `destroy()` 整条管线，`meter` 随之被销毁 ——
+   * `pendingBytes`（最多一个汇总间隔的量）**永远不会上报**。而 `traffic.bytesDown`
+   * 是逐 chunk 累加的、始终准确，于是本模块声明的「两者逐字节相等」这条不变量在
+   * 中断路径上不成立：统计页的「今日下行」会比审计日志（按 `bytesDown` 记）少一截；
+   * 被限速的下载更是把偏差放大 —— 低速下 1 秒的额度可能就是几 MB。
+   *
+   * `close` 是流被销毁后**必定**触发的事件（正常结束时也会触发，故用 `settled` 互斥，
+   * 不会重复上报）。
+   */
+  t.on('close', settle);
+
+  return t;
 }
 
 module.exports = { createTrafficMeter, STATS_FLUSH_MS };

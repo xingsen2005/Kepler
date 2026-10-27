@@ -53,6 +53,32 @@ const MAX_ENCRYPT_READERS = 3;
  * 内存再加一道闸门只会凭空排队；WebDAV PUT 才是那条「用一个 128MB 上限保护无界并发」的路径。
  */
 const MAX_WRITE_STREAMS = 2;
+/**
+ * R94（审核 M06-08）：**可当文档执行**的 Content-Type，写入时一律归一为
+ * `application/octet-stream`。
+ *
+ * `/fs/thumb` 的 R69 护栏（`THUMB_UNSAFE_RE`）按**扩展名**拒绝给这类对象签直链，
+ * 理由是直链落在存储厂商域名上、由存储侧按**对象自带的 Content-Type** 下发，
+ * 不经过本进程的 `Content-Disposition` / `nosniff`。但它判的是文件名，真正决定
+ * 「能不能当文档跑」的是存储里的 Content-Type —— 而 WebDAV PUT 会把请求头原样
+ * 写进对象元数据（`webdav/app.js`：`req.headers['content-type'] || guessContentType(key)`）。
+ * 于是「任意后缀 + `Content-Type: text/html`」即可让护栏失效。
+ *
+ * 为什么在**写入**这一层收口，而不是在签直链前 HEAD 一次：
+ *  - 缩略图是网格视图里最热的请求，为它逐张 HEAD 的代价远大于收益；
+ *  - 写入是**唯一**的源头，收在这里一处即可同时覆盖网页上传、WebDAV PUT 与未来的新入口
+ *    （与 `THUMB_UNSAFE_RE` 那一串扩展名是同一份判定，两层从此同口径）。
+ * 合法用途不受影响：`/fs/download` 本来就带 `Content-Disposition: attachment`，
+ * 渲染与否从来不由对象上的 Content-Type 决定。
+ */
+const ACTIVE_CONTENT_TYPE_RE = /^(?:text\/html|application\/xhtml\+xml|image\/svg\+xml|text\/xml|application\/xml|application\/javascript|text\/javascript|application\/ecmascript|text\/css)\b/i;
+
+function normalizeContentType(ct) {
+  // 顺带清掉 CR/LF/NUL：Content-Type 直接来自 WebDAV 请求头，SDK 拼签名时不该见到它们
+  const s = String(ct == null ? '' : ct).replace(/[\r\n\u0000]/g, '').trim();
+  if (!s) return 'application/octet-stream';
+  return ACTIVE_CONTENT_TYPE_RE.test(s) ? 'application/octet-stream' : s;
+}
 // R45：单次 PUT Copy 的上限是**厂商相关**的（UCloud US3 只有 100MB），判据收在
 // `providers.copyNeedsSlice()` 一处 —— 此前这里与 routes/fs.js 各持一份 5GB 常量。
 let activeEncryptReaders = 0; // 当前正在进行的加密文件读取数
@@ -261,9 +287,10 @@ async function readObject(bucket, key, opts = {}) {
         const maxRange = MAX_RANGE_BUFFER;
         const pass = new PassThrough();
         const s3Stream = new PassThrough();
-        s3.getObject({ Bucket: cfg.bucket, Region: cfg.region, Key: k, Output: s3Stream }, (err) => {
-          if (err) { s3Stream.destroy(err); pass.destroy(err); }
-        });
+        // R94（审核 M06-03）：读路径一律走 `p()` —— 否则 `assertScoped()` 这条
+        // 越权兜底在真正的内容读取上不生效，按桶请求统计也漏计（详见 download-stream.js）
+        p(s3, 'getObject', { Bucket: cfg.bucket, Region: cfg.region, Key: k, Output: s3Stream })
+          .catch((err) => { if (err) { s3Stream.destroy(err); pass.destroy(err); } });
         const decryptor = encStore.decryptTransform(encMeta);
         pipeline(s3Stream, decryptor, pass, (pipeErr) => {
           if (pipeErr) pass.destroy(pipeErr);
@@ -288,9 +315,9 @@ async function readObject(bucket, key, opts = {}) {
     // 无 Range，或明文超过内存上限（退化为全量流式解密，忽略 Range）
     try {
       const s3Stream = new PassThrough();
-      s3.getObject({ Bucket: cfg.bucket, Region: cfg.region, Key: k, Output: s3Stream }, (err) => {
-        if (err) { s3Stream.destroy(err); }
-      });
+      // R94（审核 M06-03）：同上层，读路径统一走 `p()`（越权兜底 + 按桶计数）
+      p(s3, 'getObject', { Bucket: cfg.bucket, Region: cfg.region, Key: k, Output: s3Stream })
+        .catch((err) => { if (err) s3Stream.destroy(err); });
       const decryptor = encStore.decryptTransform(encMeta);
       const out = new PassThrough();
       pipeline(s3Stream, decryptor, out, (pipeErr) => {
@@ -347,7 +374,8 @@ async function readObject(bucket, key, opts = {}) {
   const s3Stream = new PassThrough();
   const s3Opts = { Bucket: cfg.bucket, Region: cfg.region, Key: k, Output: s3Stream };
   if (cloudRange) s3Opts.Range = cloudRange;
-  s3.getObject(s3Opts, (err) => {
+  // R94（审核 M06-03）：明文分支同样走 `p()`（越权兜底 + 按桶请求计数）
+  p(s3, 'getObject', s3Opts).catch((err) => {
     if (err && !s3Stream.destroyed) s3Stream.destroy(err);
   });
   return {
@@ -448,7 +476,8 @@ async function writeObjectInner(bucket, key, data, contentType, auditAction, aud
     ContentLength: body.length,
     // R36：WebDAV 上传同样记录上传者（属性面板与网页上传看到的是同一份数据）。
     Headers: Object.assign(
-      { 'Content-Type': contentType || 'application/octet-stream' },
+      // R94（审核 M06-08）：写入的唯一收口点 —— 可执行类型一律降级为二进制
+      { 'Content-Type': normalizeContentType(contentType) },
       uploaderMeta(uploader),
     ),
   });
@@ -668,6 +697,24 @@ async function deletePrefix(bucket, prefix, auditAction, auditPrefix) {
 /* ============================ 复制 / 移动 ============================ */
 
 /**
+ * R94（审核 M11-01）：单对象的 copy / move **永远**不许写进集合占位对象。
+ *
+ * 在对象存储的物理模型里，一个「目录」就是一个以 `/` 结尾的 0 字节占位对象。
+ * 目标键以 `/` 结尾时，写入不是"放进那个文件夹"，而是**把占位对象的内容换成文件内容** ——
+ * 之后该键会被列举/遍历逻辑一律当成目录（`GET` 回 405），原来的集合语义被毁掉，
+ * 而且用户拿到的往往还是 201。WebDAV 侧已在 `moveCopy()` 里按 RFC 4918 §9.8.3
+ * 把「Destination 指向集合」翻译成 `<集合>/<源名>`；这里是**纵深防御**：
+ * 任何调用方（含将来的新路由）都不该有能力制造这种键。
+ */
+function assertFileDst(key, verb) {
+  if (String(key || '').endsWith('/')) {
+    const e = new Error(`${verb}目标不能是集合（${key}）—— 文件内容不得写入集合占位对象`);
+    e.status = 409;
+    throw e;
+  }
+}
+
+/**
  * 云端复制对象 + 加密元数据复制（FUN-07）
  *
  * 服务端 PUT Copy 单次上限为 5GB。`routes/fs.js` 的 `copyOne()` 会根据对象大小切换
@@ -678,6 +725,7 @@ async function deletePrefix(bucket, prefix, auditAction, auditPrefix) {
 async function copyObject(bucket, srcKey, dstKey, auditAction, auditPrefix, knownSize) {
   const srcK = normalizeKey(srcKey);
   const dstK = normalizeKey(dstKey);
+  assertFileDst(dstK, '复制');
   const { cfg, s3 } = requireS3();
 
   // CopySource 统一由 s3.js 生成（R49 起**全厂商**都是 /bucket/key）——
@@ -760,9 +808,13 @@ async function copyObject(bucket, srcKey, dstKey, auditAction, auditPrefix, know
  * 覆盖、不可还原 —— 这时再删目标就是把用户既有数据也一并毁掉，绝不许做。
  */
 async function moveObject(bucket, srcKey, dstKey, auditAction, auditPrefix) {
+  // R94（审核 M11-01）：与 `copyObject()` 同一道纵深防御 —— MOVE 更狠，
+  // 它写坏集合占位对象之后还会把源删掉（copy → delete），属不可自愈的数据丢失。
+  // 判据放在 `requireS3()` **之前**：这是纯参数校验，不该依赖云端配置是否可用。
+  const toKey = normalizeKey(dstKey);
+  assertFileDst(toKey, '移动');
   const { cfg, s3 } = requireS3();
   const fromKey = normalizeKey(srcKey);
-  const toKey = normalizeKey(dstKey);
 
   // 复制前探测目标是否已存在。探测本身失败时按「存在」处理（fail-closed）：
   // 宁可留下可重试的半成品，也不能误删复制前就有的用户对象（不可逆）。
@@ -1058,9 +1110,14 @@ async function movePrefix(bucket, srcPrefix, dstPrefix, auditAction, auditPrefix
    * 目标位置已是新密文、凭据却还没落盘 → 目标目录全部文件永久不可解。
    * R11-02 修好了顺序（迁移早于删源），但 SEC-08 的"先落盘再动云端"这一段没闭合。
    *
-   * `flushMetaSync()` 在无待写内容时是空操作，成本为零。
+   * `flushMeta()` 在无待写内容时是空操作，成本为零。
+   *
+   * R94（审核 M09-06）：这里原先调的是 `flushMetaSync()` —— 那是**退出路径**的语义
+   * （「只写不建」：数据目录不存在就静默跳过）。业务路径上用它等于把「目录恰好不在
+   * ⇒ 一个字节都没写」记成「已落盘」，而紧接着就是批量删源。改用在线版
+   * `flushMeta()`：同一条同步写，但允许按需创建目录，语义与调用时机一致。
    */
-  encStore.flushMetaSync();
+  encStore.flushMeta();
 
   /**
    * R27-17：**空目录必须在目标侧补建目录标记**。
@@ -1191,6 +1248,8 @@ module.exports = {
   parseRange,
   // R10-07：HEAD 与 GET 必须共用「该对象能否服务 Range」的判定
   rangeServable,
+  // R94（审核 M06-08）：写入时的 Content-Type 归一化（可执行类型 → 二进制）
+  normalizeContentType,
   // 仅供测试：暴露加密读取信号量，用于验证「错误销毁不会把计数减成负数」(FUN-02)
   __test__: {
     // R87：上传流缓冲的提前关闭判据（写信号量槽位泄漏的根因所在）

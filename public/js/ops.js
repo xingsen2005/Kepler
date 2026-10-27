@@ -406,6 +406,8 @@ export const ops = {
             if (pwOn.checked) {
               const pw = pwInput.value;
               if (!pw) return toast('已启用密码保护，请填写访问密码', { type: 'error' });
+              // R94（审核 M08-05）：下界与服务端同日提到 6（单字符口令等于没有保护）
+              if (pw.length < 6) return toast('访问密码至少 6 个字符', { type: 'error' });
               if (pw.length > 64) return toast('密码长度不能超过 64 个字符', { type: 'error' });
               body.password = pw;
             }

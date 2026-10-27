@@ -82,6 +82,16 @@ function readJson(file, fallback) {
     if (!fs.existsSync(file)) return fallback;
     raw = fs.readFileSync(file, 'utf8');
   } catch (e) {
+    /**
+     * R94（审核 M04-05）：`existsSync` 与 `readFileSync` 之间文件被删掉（容器卷重挂、
+     * 运维清理、`data/` 整体重建）时抛的是 `ENOENT` —— 那是「**已经不存在**」，
+     * 与 SEC-09 要防的「**存在但读不出来**」恰好相反：此时写入是安全的、也是必要的。
+     * 旧实现把它归进 `corruptFiles`，于是该文件在**本进程内永久拒写**
+     * （`assertWritable`），而错误文案还声称「已改名为 .corrupt-* 备份」—— 其实一个
+     * 备份都没有（`backupCorrupt()` 因为文件已不在，什么也没复制）。
+     * 对 `enc-meta.json` 而言这意味着新密文的元数据写不进去 ⇒ 那些密文不可解。
+     */
+    if (e && e.code === 'ENOENT') return fallback;
     throw corruptError(file, `读取失败（${e.message}）`);
   }
   let j;
@@ -138,10 +148,45 @@ function exitPathWritable(dir) {
 }
 
 /**
+ * 同步写入（**失败即抛错**）；用于「写失败就等于数据丢失」的调用方。
+ *
+ * R94（审核 M09-01）：`writeJson()` 把写盘异常**吞掉**并正常返回（只记
+ * `lastWriteError` 给 `/api/health` 看）。对「尽力而为」的调用方这是对的 —— 一次
+ * 统计写失败不该让请求 500。但对 `enc-meta.json`（解密唯一凭据）与
+ * `enc-settings.json` 这类**必须知道有没有真的写下去**的文件，吞错就是灾难：
+ * `flushMeta()` 拿到「正常返回」⇒ 推进 `metaSavedSeq` ⇒ `metaDirty()` 变 false
+ * ⇒ 退出钩子不再补写 ⇒ 云端已有密文、本地没有 IV/TAG ⇒ 文件永久不可解。
+ *
+ * 于是把「写失败必须让调用方看见」做成一个**独立入口**，而不是改 `writeJson()`
+ * 的返回语义（那会悄悄改变 `coalesce` 等把返回值当「成功/失败」用的地方）。
+ *
+ * @returns {true}
+ * @throws 写入失败时抛错（同时记入 `lastWriteError`，/api/health 仍能看到）
+ */
+function writeJsonStrict(file, obj) {
+  assertWritable(file);
+  try {
+    atomic.writeAtomicSync(file, serialize(obj));
+    lastWriteError = null;
+    return true;
+  } catch (e) {
+    lastWriteError = { file, message: e.message, at: new Date().toISOString() };
+    const err = new Error(`写入 ${path.basename(file)} 失败（${e.message}）`);
+    err.status = 500;
+    err.writeFailed = true;
+    err.cause = e;
+    throw err;
+  }
+}
+
+/**
  * 同步写入（加密 + 原子替换）；用于低频但关键的数据，确保调用返回时已落盘。
  *
  * SEC-09：写入失败不再静默 —— 记录 `lastWriteError`（经 /api/health 暴露）
  * 并打印错误；同时拒绝写入处于损坏状态的文件。
+ *
+ * ⚠️ 本函数**吞掉写盘异常**（返回值恒为 `obj`）。需要「写失败必须让调用方知道」的
+ * 场景请用 {@link writeJsonStrict}（R94 / 审核 M09-01）。
  */
 function writeJson(file, obj) {
   assertWritable(file);
@@ -232,7 +277,8 @@ function upgrade(file) {
 }
 
 module.exports = {
-  readJson, writeJson, writeJsonAsync, flush, upgrade,
+  readJson, writeJson, writeJsonStrict, writeJsonAsync, flush, upgrade,
+  // R94：写入失败必须让调用方看见的入口（enc-meta / enc-settings 这类"写丢就等于数据丢"的文件用）
   // R11-07：退出路径「只写不建」的共用判据（upload-sessions / enc-store / config-store）
   exitPathWritable,
   getLastWriteError, corruptList, clearCorrupt,

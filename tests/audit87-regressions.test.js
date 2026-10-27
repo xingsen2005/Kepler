@@ -556,11 +556,21 @@ test('R87-14 · 徽章 label、桶列表 data-id、IP 规则方法单元格都�
 
 test('R87-15 · `/api/health` 的 secureWriteError 只下发文件名', () => {
   const lines = codeLines(read('server/routes/stats.js'));
-  const assign = lines.find((l) => /out\.secureWriteError = Object\.assign\(\{\}, secureErr/.test(l));
-  assert(assign,
+  /**
+   * R94（审核 M13-01）之后这里变成**显式白名单**（`{ file, message, at }`），
+   * 比原先的 `Object.assign({}, secureErr, { file: basename })` 更严 ——
+   * 后者会把 `getLastWriteError()` 上的任何新增字段（包括原样的 fs 报错文本，
+   * 里面带绝对路径）一起漏出去。判据因此改成「白名单 + 三字段各自收敛」，不再钉
+   * 某个具体的 `Object.assign` 写法。
+   */
+  const start = lines.findIndex((l) => /out\.secureWriteError = \{/.test(l));
+  assert(start >= 0,
     'R87-15：`getLastWriteError()` 原样带着绝对路径，而 `/health` 只要求登录 —— '
     + '任何普通用户都能读到本实例的磁盘布局与数据目录');
-  const tail = lines.slice(lines.indexOf(assign), lines.indexOf(assign) + 3).join('\n');
-  assert(/basename/.test(tail), 'R87-15：必须取 `path.basename()`（与 secure-store 自己打日志的口径一致）');
+  const block = lines.slice(start, start + 6).join('\n');
+  assert(/basename\(/.test(block), 'R87-15：file 必须取 `path.basename()`（与 secure-store 自己打日志的口径一致）');
+  assert(/message:\s*'[^']*'/.test(block), 'R87-15：message 必须是写死的文案，不得由 secureErr 的报错文本拼出');
+  assert(!/\.\.\.secureErr/.test(block), 'R87-15：不得用展开运算符把整个对象带出去 —— 新增字段会静默变成新的泄露口');
+  assert(!/secureErr\.(message|errno|path|stack)/.test(block), 'R87-15：fs 的原始报错字段一个都不许直传');
   assert(!lines.some((l) => /out\.secureWriteError = secureErr;/.test(l)), 'R87-15：不得再直传整对象');
 });

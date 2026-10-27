@@ -80,7 +80,18 @@ function parseLinkParams(b) {
       out.password = null; // 未启用 / 清除密码
     } else {
       const pw = String(b.password);
-      if (pw.length < 1 || pw.length > 64) throw badRequest('访问密码长度须为 1-64 个字符');
+      /**
+       * R94（审核 M08-05）：长度下界从 **1** 提到 **6**。
+       *
+       * 下界 1 在协议上是合法的，但实际上等于没保护：口令校验入口是**匿名可达**的，
+       * 而爆破预算只有 `shareLimiter`（20 次/10 分钟/(IP+链接)）与 `shareLock`
+       * （5 次失败冻结 30 分钟/(IP+链接)）—— 都是**按 IP** 计的，分布式来源下
+       * 没有任何总量约束。于是 4 位数字 PIN 在 50 个 IP 并行下约 10 小时可穷举，
+       * 而单字符口令几十秒就完了。下界提到 6（与 `config-store.assertPasswordPolicy`
+       * 的取向一致）让"猜"重新变得不划算；已有短口令的链接**照常工作**
+       * （只在创建 / 改密时校验），用户下次改密码时会被要求补足长度。
+       */
+      if (pw.length < 6 || pw.length > 64) throw badRequest('访问密码长度须为 6-64 个字符');
       out.password = pw;
     }
   }
@@ -282,7 +293,7 @@ router.post('/links', async (req, res) => {
     });
     statsStore.addLog({
       action: 'share.create',
-      detail: `创建分享链接 ${link.id}（${snap.summary}）${snap.truncated ? `，条目超过 ${shareStore.SNAPSHOT_MAX} 已截断` : ''}${link.paid && link.paid.required ? `，需付费 ${paymentRules.formatAmount(link.paid.amountFen)} 元` : ''}`,
+      detail: `创建分享链接 ${statsStore.logRef(link.id)}（${snap.summary}）${snap.truncated ? `，条目超过 ${shareStore.SNAPSHOT_MAX} 已截断` : ''}${link.paid && link.paid.required ? `，需付费 ${paymentRules.formatAmount(link.paid.amountFen)} 元` : ''}`,
     });
     res.json(Object.assign(
       { ok: true }, link,
@@ -311,7 +322,7 @@ router.put('/links/:id', async (req, res) => {
     }));
     statsStore.addLog({
       action: 'share.update',
-      detail: `修改分享链接 ${req.params.id}${params.paid ? `，付费下载：${link.paid && link.paid.required ? `需付 ${paymentRules.formatAmount(link.paid.amountFen)} 元` : '关闭'}` : ''}`,
+      detail: `修改分享链接 ${statsStore.logRef(req.params.id)}${params.paid ? `，付费下载：${link.paid && link.paid.required ? `需付 ${paymentRules.formatAmount(link.paid.amountFen)} 元` : '关闭'}` : ''}`,
     });
     res.json(Object.assign({ ok: true }, link, { warn: paidWarning(link.paid) }));
   } catch (e) {
@@ -353,7 +364,7 @@ router.delete('/links/:id', (req, res) => {
     return res.status(403).json({ error: '无权删除该分享链接' });
   }
   if (!shareStore.remove(req.params.id)) return res.status(404).json({ error: '链接不存在' });
-  statsStore.addLog({ action: 'share.delete', detail: '删除分享链接 ' + req.params.id, level: 'warn' });
+  statsStore.addLog({ action: 'share.delete', detail: '删除分享链接 ' + statsStore.logRef(req.params.id), level: 'warn' });
   res.json({ ok: true });
 });
 

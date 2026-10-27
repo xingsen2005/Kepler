@@ -18,6 +18,24 @@ const EXPIRE_MS = 7 * 86400 * 1000;
 /** 会话数上限（M8）：超出时按 updatedAt 从最旧开始淘汰，避免大量中断上传累积导致
  *  文件膨胀与 prune 时的长时间遍历阻塞。正常场景远达不到该量级。 */
 const MAX_SESSIONS = 2000;
+/**
+ * R94（审核 M07-03）：**单个用户**的未完成会话上限。
+ *
+ * `MAX_SESSIONS` 是全局上限，且只在 `prune()`（每小时一次）里事后纠正 —— 于是
+ * 「登录 → 循环 `POST /fs/upload/init`」能把全局会话数顶过 2000，而下一次 prune
+ * 按 `updatedAt` 升序淘汰时，被中止的必然是**别人**更早的真实上传（远端
+ * `multipartAbort`，已传分片全部作废）。攻击者自己的会话都是新的，永远排在后面。
+ *
+ * 按人设上限之后，一个人最多占 32 个名额，够不到全局线；撞到自己的上限时**拒绝**
+ * 而不是淘汰 —— 他可以去「上传任务」里取消不再需要的任务（`/fs/sessions` + `/fs/upload/abort`），
+ * 而淘汰别人的会话他做不到。
+ */
+const MAX_SESSIONS_PER_USER = 32;
+/**
+ * R94（审核 M07-03）：数量上限淘汰时的「活跃窗口」—— 一小时内有过分片写入的会话
+ * 不进淘汰名单（见 `prune()` 第 2 步）。
+ */
+const ACTIVE_MS = 60 * 60 * 1000;
 
 let sessions = null;
 let saveTimer = null;
@@ -115,8 +133,41 @@ function flushSync() {
 }
 process.on('exit', () => { try { flushSync(); } catch (e) { /* 退出阶段尽力而为 */ } });
 
+/**
+ * R94（审核 M07-03）：数某个用户名下的未完成会话（`ownerId` 优先，历史会话按 `createdBy` 兜底）。
+ */
+function countMine(s, ownerId, createdBy) {
+  const me = String(ownerId || '');
+  const meName = String(createdBy || '');
+  if (!me && !meName) return 0;
+  return Object.values(s).filter((o) => (me
+    ? String(o.ownerId || '') === me
+    : String(o.createdBy || '') === meName)).length;
+}
+
+/**
+ * R94（审核 M07-03）：**建会话之前**先判自己的名额，超限抛 429。
+ *
+ * 之所以必须在 `multipartInit` **之前**调用：会话登记失败时远端 UploadId 会悬挂
+ * （见 `routes/fs.js` 里 `create()` 的 catch）。路由先问一句，就不会白建一个云端任务。
+ */
+function assertCapacity({ ownerId, createdBy } = {}) {
+  const mine = countMine(ensure(), ownerId, createdBy);
+  if (mine >= MAX_SESSIONS_PER_USER) {
+    const e = new Error(
+      `你还有 ${mine} 个未完成的上传任务（上限 ${MAX_SESSIONS_PER_USER} 个）。`
+      + '请先在「上传任务」中取消不再需要的任务，再重新上传。'
+    );
+    e.status = 429;
+    e.code = 'UPLOAD_SESSIONS_FULL';
+    throw e;
+  }
+}
+
 function create({ uploadId, key, bucket, region, size, chunkSize, provider, createdBy, ownerId }) {
   const s = ensure();
+  // R94（审核 M07-03）：名额校验的唯一实现点（路由在 multipartInit 之前也会先问一次）
+  assertCapacity({ ownerId, createdBy });
   const id = require('crypto').randomBytes(12).toString('hex');
   const pid = provider || providers.DEFAULT_PROVIDER_ID;
   // SEC-07：记录创建者，使 /fs/sessions 能按用户过滤（避免泄露他人会话的桶名与对象键）
@@ -173,7 +224,18 @@ function findByTarget(key, size, filter = {}) {
   let best = null;
   for (const o of Object.values(s)) {
     if (o.key !== key || o.size !== size) continue;
-    if (filter.createdBy !== undefined && o.createdBy !== filter.createdBy) continue;
+    /**
+     * R94（审核 M07-06）：**用户 id 优先**，用户名只作历史会话的兜底。
+     *
+     * R89 给会话加了不可变的 `ownerId`，但这条「断点续传找会话」的判据还按
+     * `createdBy`（用户名）匹配 —— 于是「改个名字，正在续传的任务全部无权操作」
+     * （正是 R89 要修的症状）在这一处仍然成立，且旧会话会一直残留成孤儿。
+     * 新会话一律有 `ownerId`；只有 R89 之前落盘的老会话才回落到用户名比对。
+     */
+    if (filter.ownerId) {
+      const oid = String(o.ownerId || '');
+      if (oid ? oid !== filter.ownerId : (filter.createdBy !== undefined && o.createdBy !== filter.createdBy)) continue;
+    } else if (filter.createdBy !== undefined && o.createdBy !== filter.createdBy) continue;
     if (filter.bucket !== undefined && o.bucket !== filter.bucket) continue;
     if (filter.region !== undefined && o.region !== filter.region) continue;
     if (!best || o.updatedAt > best.updatedAt) best = o;
@@ -263,11 +325,24 @@ function prune(getClientForSession) {
   if (rest.length > MAX_SESSIONS) {
     rest.sort((a, b) => (a.updatedAt || 0) - (b.updatedAt || 0));
     for (const o of rest.slice(0, rest.length - MAX_SESSIONS)) {
+      /**
+       * R94（审核 M07-03）：**仍在活跃窗口内的会话不淘汰**。
+       *
+       * 旧实现按 `updatedAt` 升序无条件淘汰。被淘汰者的代价是不可逆的：远端
+       * `multipartAbort` 之后已传分片全部作废，用户必须整份重传；而暂时多留几条
+       * 闲置会话只是在内存里多几个小对象。既然两者代价差着量级，判据就该往
+       * 「宁可不删」偏 —— 真正过期的会话由上面第 1 步（7 天）回收。
+       */
+      if (now - (o.updatedAt || 0) < ACTIVE_MS) continue;
       // R7-12：与过期分支**同一口径** —— 中止失败就保留会话，等下一轮再试。
       // 旧实现无条件 `abortRemote(); delete s[o.id];`，中止一失败就把本地会话删掉，
       // 云端分片的 UploadId 句柄随之丢失：用户既无法中止、也无法续传，分片持续计费。
       if (!abortRemote(o)) continue;
       delete s[o.id];
+    }
+    if (Object.keys(s).length > MAX_SESSIONS) {
+      console.warn('[upload-sessions] 会话数（%d）仍高于上限（%d），但多为一小时内活跃的会话，'
+        + '本轮不淘汰（中断进行中的上传不可逆）', Object.keys(s).length, MAX_SESSIONS);
     }
   }
 
@@ -276,5 +351,7 @@ function prune(getClientForSession) {
 
 module.exports = {
   create, get, findByTarget, setPart, touch, remove, list, prune, flush, flushSync,
+  assertCapacity, // R94：会话名额（路由在 multipartInit 之前先问一次）
   MAX_SESSIONS, // 供测试与运维观察会话上限
+  MAX_SESSIONS_PER_USER, // R94：单用户上限
 };

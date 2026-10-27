@@ -30,6 +30,7 @@
  */
 const crypto = require('crypto');
 const configStore = require('./config-store');
+const statsStore = require('./stats-store');
 const smtp = require('./smtp');
 const {
   EMAIL_CODE_LEN, EMAIL_CODE_TTL_MS, EMAIL_CODE_MAX_ATTEMPTS, EMAIL_CODE_RESEND_MS,
@@ -297,14 +298,101 @@ async function probeMailer() {
   const { cfg, gate } = mailerState();
   if (gate) return { ok: false, status: gate.status, error: gate.error };
   try {
-    await smtp.verify({
+    const v = await smtp.verify({
       host: cfg.host, port: cfg.port, secure: cfg.secure,
       user: cfg.user, password: cfg.password, from: cfg.from,
     });
-    return { ok: true };
+    // R94（审核 M03-05）：把「本次连接到底加没加密」透出去 —— 原先这里丢弃 `encrypted`，
+    // 于是全程明文的站点探针照样报「正常」，管理员与用户两头都拿不到信号。
+    return { ok: true, encrypted: Boolean(v && v.encrypted) };
   } catch (e) {
-    return { ok: false, status: 503, error: `系统发信当前不可用：${e.message}` };
+    return {
+      ok: false,
+      status: 503,
+      // 详情版：含主机:端口 / TLS 协商结果 / 服务端原文。只给管理员与日志用。
+      error: `系统发信当前不可用：${e.message}`,
+      // R94（审核 M03-02）：**匿名端点必须用这一份**。见 publicMailReason() 的注释。
+      publicError: publicMailReason(e),
+    };
   }
+}
+
+/**
+ * 把发信失败的底层错误压成**固定词表**的一句话（R94 · 审核 M03-02）。
+ *
+ * ## 为什么不能直接把 `e.message` 回给匿名调用方
+ *
+ * `/auth/forgot` 在 `PUBLIC_API` 匿名白名单里，且它在读取标识**之前**就对任意标识跑一次
+ * 本探针（那是防枚举的必要顺序，见 R57）。于是「原样回 `e.message`」等于给未认证调用方
+ * 开了一条可反复触发的内部服务指纹：
+ *  - 内部 SMTP 主机名与端口（`smtp.js` 的 `where = host:port`）—— 自建中继时可能是
+ *    `mail.internal.corp:587` 这类本不该出网的拓扑；
+ *  - TLS 协商结果与证书错误码（哪一步失败 = 该端口是不是 465）；
+ *  - 认证用户名与认证被拒与否；
+ *  - ⚠️ **最多 300 字符的 SMTP 服务端原文**（`_assertCode()` 的 `detail`）——这段文本
+ *    **完全由对端控制**，恶意 / 被入侵的发信服务器可以借此把任意内容回显给匿名访客。
+ *
+ * 但 R57 的收益（「配置全对却一封也收不到」时用户能立刻看到病灶）不能丢，所以这里不是
+ * 一律吞掉，而是**保留可执行的类别、去掉可定位的细节**：看的人知道「去查登录口令 / 去查
+ * 网络与端口 / 去查证书」，但拿不到主机、端口、账号与服务端原文。
+ *
+ * 详情版仍在 `probeMailer().error` 里，供 `routes/smtp.js` 的管理员测试邮件与内部调用方使用。
+ *
+ * @param {Error} e `smtp.verify()` 抛出的错误
+ * @returns {string} 一句话（不含任何主机 / 端口 / 账号 / 服务端原文）
+ */
+function publicMailReason(e) {
+  const msg = String((e && e.message) || '');
+  const tail = '请管理员检查「系统设置 → 发信设置」。';
+  if (e && e.isTimeout) return `系统发信当前不可用：连接发信服务器超时。${tail}`;
+  if (/服务器拒绝了「登录/.test(msg) || (e && e.smtpCode && !/^(2)/.test(String(e.smtpCode)))) {
+    return `系统发信当前不可用：发信服务器拒绝登录（口令 / 授权码可能已变更）。${tail}`;
+  }
+  if (/服务器拒绝了「/.test(msg)) {
+    return `系统发信当前不可用：发信服务器拒绝了本次投递。${tail}`;
+  }
+  if (/STARTTLS/.test(msg)) {
+    return `系统发信当前不可用：发信服务器不支持所需的加密方式。${tail}`;
+  }
+  if (/连接 SMTP 服务器/.test(msg)) {
+    return `系统发信当前不可用：无法连接发信服务器（网络 / 端口 / 证书）。${tail}`;
+  }
+  return `系统发信当前不可用：连接或认证失败。${tail}`;
+}
+
+/**
+ * 明文投递的**管理员可见告警**（R94 · 审核 M03-05，只告警不拦截）。
+ *
+ * ## 缺口是什么
+ *
+ * `smtp.js` 有一条保密纪律：**未加密的连接一律不发口令**（`auth()` 里明文即抛错）。
+ * 但那条纪律只护着「SMTP 账号口令」，**没护住正文里的验证码**。三条同时成立时：
+ * ① `secure: false`；② 服务器 EHLO 不宣告 `STARTTLS`；③ **没配登录用户名**
+ * （`smtpConfigured()` 明确允许「无认证内网中继」这一合法配置）——
+ * 口令闸门根本不会被调用，`send()` 照常投递，正文里的 6 位重置码以 base64（=明文）
+ * 跨过整条链路。而 `probeMailer()` 拿到了 `verify().encrypted` 却丢弃，
+ * 站点级健康探针在全程明文时依然报「正常」—— 管理员与用户都拿不到任何信号。
+ *
+ * ## 为什么不直接拒发
+ *
+ * 拒发会让**现有**这类部署在升级后一封验证码也发不出去（属破坏性变更），而
+ * 「内网无认证明文中继」在自建场景里是常见且被显式允许的配置。取舍是：
+ * **保留发送能力，但把「未加密」这件事变成管理员可查的一条告警**，并在下面
+ * 注释里写明它与口令闸门的强度差（原来的问题一半是「没人知道」）。
+ *
+ * 去重：按「主机:端口:账号」记一份已告警集合，否则每封验证码都会多一条日志。
+ */
+const plaintextWarned = new Set();
+function notePlaintextDelivery(cfg) {
+  const key = `${cfg.host}:${cfg.port}:${cfg.user || '(无认证)'}`;
+  if (plaintextWarned.has(key)) return;
+  plaintextWarned.add(key);
+  statsStore.addLog({
+    action: 'smtp.plaintext',
+    level: 'warn',
+    detail: `验证码邮件以**未加密**连接投递（${key}）—— 该服务器未宣告 STARTTLS 且未启用隐式 TLS，`
+      + '验证码在链路上可被读取。请改用 465 端口（隐式 TLS），或在发信服务器上开启 STARTTLS。',
+  });
 }
 
 /** 发一封带验证码的邮件（**唯一实现点**：SMTP 配置、站点名称、文案都只在这里拼一次） */
@@ -333,7 +421,7 @@ async function sendCodeMail({ purpose, email, username, code }) {
     `—— ${siteName}`,
     '',
   ].join('\n');
-  await smtp.sendMail({
+  const sent = await smtp.sendMail({
     host: cfg.host, port: cfg.port, secure: cfg.secure,
     user: cfg.user, password: cfg.password,
     from: cfg.from,
@@ -342,6 +430,9 @@ async function sendCodeMail({ purpose, email, username, code }) {
     subject,
     text,
   });
+  // R94（审核 M03-05）：投递成功但**没加密**时留一条管理员可见告警（去重，不拦截）
+  if (sent && sent.encrypted === false) notePlaintextDelivery(cfg);
+  return { encrypted: Boolean(sent && sent.encrypted) };
 }
 
 /**

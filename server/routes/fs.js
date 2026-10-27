@@ -162,7 +162,15 @@ router.get('/fs/list', apiHandler(async (req, res) => {
     const client = getClient(cfg);
     // R89：客户端传的是**相对** key，进收口点时加空间根；出来时统一剥根
     const prefix = absKey(cfg, normalizeKey(String(req.query.prefix || '')));
-    const marker = String(req.query.marker || '') ? absKey(cfg, String(req.query.marker)) : '';
+    /**
+     * R94（审核 M06-07）：`marker` 是唯一没过 `normalizeKey` 的路径参数。
+     *
+     * 它直接进 `listCache.keyOf()`，而 `list-cache` 在生成缓存键时会把 NUL 剥掉 ——
+     * 于是 `a\u0000b` 与 `ab` 得到**同一个缓存键**，一次列举会命中另一次的结果。
+     * 加根之前先规范化，与其它所有 key 入参同一口径（也会顺带挡掉 `..` 段）。
+     */
+    const markerRel = normalizeKey(String(req.query.marker || ''));
+    const marker = markerRel ? absKey(cfg, markerRel) : '';
     // LOW-28：单页上限取自 limits.js（旧实现在此硬编码 1000）
     const maxKeys = Math.min(LIMITS.LIST_PAGE, Math.max(1, Number(req.query.maxKeys) || 100));
     const delimiter = req.query.delimiter === '' ? '' : '/';
@@ -530,7 +538,17 @@ router.put('/fs/upload/simple', uploadGate.gate(), express.raw({ type: () => tru
   try {
     const cfg = requireConfig();
     const client = getClient(cfg);
-    const key = absKey(cfg, normalizeKey(String(req.query.path || '')));
+    /**
+     * R94（审核 M06-05）：空路径必须先挡掉。
+     *
+     * `userSpace.toAbs(root, '')` 在 root 非空（普通用户）时返回的是 **root 本身**
+     * （`u/<uid>/`），不是空串 —— `/fs/mkdir` 的注释早就警告过这个坑，其他 5 个入口
+     * 都加了「相对入参为空 ⇒ 400」，唯独两条上传路径漏了。于是空 `path` 会把用户
+     * 上传的内容写到**空间根那个 key** 上，把目录标记对象覆盖成「内容是文件、却叫目录」。
+     */
+    const relIn = normalizeKey(String(req.query.path || ''));
+    if (!relIn) throw badRequest('路径不能为空');
+    const key = absKey(cfg, relIn);
     if (!req.body || !req.body.length) throw badRequest('请求体为空');
     // 上传排除规则校验（.DS_Store / Thumbs.db，服务端兜底）
     //
@@ -583,6 +601,19 @@ router.put('/fs/upload/simple', uploadGate.gate(), express.raw({ type: () => tru
 // 分片上传：初始化（返回 sessionId / chunkSize / 已传分片，实现断点续传）
 router.post('/fs/upload/init', async (req, res) => {
   try {
+    /**
+     * R94（审核 M07-03）：按用户限速 —— 每次成功调用都会真的打一次云端
+     * `multipartInit` 并新增一条会话，旧实现毫无约束（见 security.uploadInitLimiter）。
+     */
+    const rlUserId = 'u:' + String((req.authUser && req.authUser.id) || '');
+    const rl = security.uploadInitLimiter(rlUserId);
+    if (!rl.ok) {
+      res.setHeader('Retry-After', String(rl.retryAfter));
+      return res.status(429).json({
+        error: `新建上传任务过于频繁，请 ${rl.retryAfter} 秒后重试`,
+        code: 'UPLOAD_INIT_RATE_LIMITED',
+      });
+    }
     const cfg = requireConfig();
     const client = getClient(cfg);
     /**
@@ -593,6 +624,8 @@ router.post('/fs/upload/init', async (req, res) => {
      * `assertNotExcluded` 与所有回包，保持「用户看到的世界」不变。
      */
     const rel = normalizeKey(String((req.body || {}).key || ''));
+    // R94（审核 M06-05）：同上 —— 空 key 加根后等于空间根，会让分片会话落在空间根 key 上
+    if (!rel) throw badRequest('路径不能为空');
     const key = absKey(cfg, rel);
     const size = Number((req.body || {}).size || 0);
     if (!key || !Number.isFinite(size) || size < 0) throw badRequest('参数错误');
@@ -664,7 +697,11 @@ router.post('/fs/upload/init', async (req, res) => {
     // getClientForSession(sess)，init 这条路径之前漏了，管理员切桶后会误判
     // 「uploadId 已失效」并重建会话，已传分片全部作废（还产生存储费用）。
     const who = (req.authUser && req.authUser.username) || '';
-    let sess = uploadSessions.findByTarget(key, size, { createdBy: who, bucket: cfg.bucket, region: cfg.region });
+    // R94（审核 M07-06）：带上不可变的 ownerId（R89 的判据），createdBy 仅作旧会话兜底
+    const whoId = (req.authUser && req.authUser.id) || '';
+    let sess = uploadSessions.findByTarget(key, size, {
+      ownerId: whoId, createdBy: who, bucket: cfg.bucket, region: cfg.region,
+    });
     let uploadedParts = [];
     if (sess) {
       try {
@@ -695,6 +732,9 @@ router.post('/fs/upload/init', async (req, res) => {
       await assertBucketQuota(client, cfg, { addBytes: netAdd }); // R28-02：单桶上限（同一净增量口径）
     }
     if (!sess) {
+      // R94（审核 M07-03）：先判自己的会话名额，**再**去建云端 UploadId ——
+      // 反过来会在超限时白建一个悬挂的云端分片任务（既不能合并也不能中止）
+      uploadSessions.assertCapacity({ ownerId: whoId, createdBy: who });
       // R36：分片上传的「上传者」只能在此刻写入 —— S3 / COS 的对象元数据
       // 只在创建 uploadId 时生效，合并（complete）时再传是被忽略的。
       const init = await p(client, 'multipartInit', {
@@ -745,14 +785,28 @@ router.post('/fs/upload/init', async (req, res) => {
       // 于是 getClientForSession() 认为「会话厂商 ≠ 桶的厂商」，用 COS SDK 去打阿里云/其它厂商
       // 的 Endpoint —— 非腾讯云厂商 >8MB 的分片上传从第二个分片起必然失败，
       // 且已创建的 UploadId 既不能合并也不能中止（中止也用错客户端），云端分片持续计费。
-      sess = uploadSessions.create({
-        uploadId: init.UploadId, key, bucket: cfg.bucket, region: cfg.region, size, chunkSize,
-        provider: cfg.provider, // R7-01
-        createdBy: (req.authUser && req.authUser.username) || '', // SEC-07：记录创建者供 /fs/sessions 过滤
-        // R89：用户名可被管理员改写，改写后「文件还在、人找不到」⇒ 归属判据用不可变的 id。
-        // createdBy 保留只为兼容**升级前**落盘的老会话（它们没有 ownerId）。
-        ownerId: (req.authUser && req.authUser.id) || '',
-      });
+      try {
+        sess = uploadSessions.create({
+          uploadId: init.UploadId, key, bucket: cfg.bucket, region: cfg.region, size, chunkSize,
+          provider: cfg.provider, // R7-01
+          createdBy: (req.authUser && req.authUser.username) || '', // SEC-07：记录创建者供 /fs/sessions 过滤
+          // R89：用户名可被管理员改写，改写后「文件还在、人找不到」⇒ 归属判据用不可变的 id。
+          // createdBy 保留只为兼容**升级前**落盘的老会话（它们没有 ownerId）。
+          ownerId: (req.authUser && req.authUser.id) || '',
+        });
+      } catch (err) {
+        /**
+         * R94（审核 M07-03）：会话**没能登记**时，远端那个 UploadId 不能就这么悬挂 ——
+         * 它既不在会话表里（无人能中止 / 续传 / 被 prune 回收），又会一直按分片计费。
+         * 尽力中止后把原错误抛出去（429 = 自己的会话名额满了）。
+         */
+        try {
+          await p(client, 'multipartAbort', {
+            Bucket: cfg.bucket, Region: cfg.region, Key: key, UploadId: init.UploadId,
+          });
+        } catch (e2) { /* 中止失败只能留给管理员手工清理，不能让报错覆盖真正的原因 */ }
+        throw err;
+      }
     } else if (encStore.currentMode() === 'magic' && sess.chunkSize > magicChunkCap(sess.provider)) {
       /**
        * R9-09 残留口：会话**续传**时不重新计算 `chunkSize`。
@@ -898,6 +952,34 @@ router.put('/fs/upload/chunk', uploadGate.gate(), express.raw({ type: () => true
       throw e;
     }
 
+    /**
+     * R94（审核 M07-02）：**分片入口是真正的写入出口，必须自己过配额闸门**。
+     *
+     * 旧实现的配额只在 `init` 判一次，而且判的是客户端**声明**的 `size`；`chunk`
+     * （真正把字节写进云端）与 `complete`（真正把它们合并成对象）一次判定都没有。
+     * 而额度是按「桶内**已落地**对象」统计的 —— 未合并的分片不计入 `usedBytes`。
+     * 两者叠加的结果是：只要 `init` 那一刻额度还够，之后写多少都能落云。实测把桶
+     * 灌到配额上限后，仍能再合并进一个 9MB 对象（README 明写「判定在所有写入出口
+     * 生效」，chunk/complete 恰恰是出口）。
+     *
+     * 口径与 init 对齐：`addBytes` = **本会话已传明文字节 + 本次分片**。分片不能
+     * 简单按单片判 —— 单片 8MB 永远小于任何合理额度，但 2000 片加起来不是。
+     * 重传同一片时不重复计（先剔掉该片号的旧尺寸）。
+     */
+    {
+      const sizesNow = (sess.partSizes && typeof sess.partSizes === 'object') ? sess.partSizes : {};
+      let sessionPlain = 0;
+      for (const n of Object.keys(sizesNow)) {
+        if (Number(n) === partNumber) continue; // 重传同一片：不把旧值算两遍
+        const v = Number(sizesNow[n]);
+        if (Number.isFinite(v) && v > 0) sessionPlain += v;
+      }
+      const willWrite = sessionPlain + req.body.length;
+      const quotaCfg = configForSession(sess);
+      await assertCredentialQuota(quotaCfg.credentialId, { addBytes: willWrite });
+      await assertBucketQuota(getClientForSession(sess), quotaCfg, { addBytes: willWrite });
+    }
+
     // 加密一致性：会话已按其他模式加密、或此前已有明文分片 → 拒绝（避免产出混合密文/明文文件）
     if (mode !== 'none') {
       if (sess.enc && sess.enc.mode !== mode) {
@@ -911,9 +993,24 @@ router.put('/fs/upload/chunk', uploadGate.gate(), express.raw({ type: () => true
     }
 
     let body = req.body;
+    let partMetaSnapshot = null;
     if (mode !== 'none') {
       // R48：多线程入口（同一实现，只是 CPU 密集那一步交给工作线程池）
       body = await encStore.encryptPartAsync(sess, partNumber, req.body);
+      /**
+       * R94（审核 M09-03）：**记下本片密文对应的加密元数据**。
+       *
+       * crypto 模式下每片是独立 GCM 段，它的 IV 只存在两处：本地
+       * `sess.enc.parts[n].iv` 与云端分片头 12 字节。这两处的写入时刻不同：
+       * 加密时写本地、上传成功后写 etag。同一分片号被**并发或重传**时（客户端重试、
+       * 用户重开标签页续传），后到的请求会在加密阶段用新 IV 覆盖本地，
+       * 而云端最后落定的密文可能是先到的那个 —— 于是「云端密文 A + 本地 IV B」，
+       * 该对象**永久不可解**（R24-03 的逐段 IV 比对会直接报错）。
+       *
+       * 修法：把「加密那一刻的元数据」快照下来，上传成功后与 etag 在**同一同步片段**
+       * 内一起写回。最后一个落定的请求同时决定密文与 IV，两者永远成对。
+       */
+      partMetaSnapshot = (sess.enc && sess.enc.parts) ? sess.enc.parts[partNumber] : null;
       uploadSessions.touch(sess.id); // 立即持久化 IV/TAG/盐，防响应丢失后无法解密
     }
 
@@ -923,6 +1020,10 @@ router.put('/fs/upload/chunk', uploadGate.gate(), express.raw({ type: () => true
       Body: body, ContentLength: body.length,
     });
     const etag = String(data.ETag || '').replace(/"/g, '');
+    // R94（审核 M09-03）：先把**本次上传的密文**对应的元数据写回，再登记 etag ——
+    // 两行在同一个同步片段里，中间没有 await，任何其它请求都无法插进来，
+    // 因此「云端密文」与「本地 IV/TAG」永远指向同一份数据。
+    if (partMetaSnapshot && sess.enc && sess.enc.parts) sess.enc.parts[partNumber] = partMetaSnapshot;
     // R27-04：记下**明文**字节数（本片的实际大小），供 complete 核对与按真实字节记账
     uploadSessions.setPart(sess.id, partNumber, etag, req.body.length);
     res.json({ ok: true, partNumber, etag });
@@ -1012,6 +1113,19 @@ router.post('/fs/upload/complete', async (req, res) => {
     }
     // 记账用**真实**字节：全部已知时就是实际总量，否则退回声明值（至少不比旧行为更差）
     const actualBytes = knownParts.length === parts.length ? knownBytes : size;
+
+    /**
+     * R94（审核 M07-02）：**合并前按实际字节再过一次配额**。
+     *
+     * 这是最后一个能把「已写好的一堆分片」变成「正式占用空间的对象」的时机：
+     *  - 单个会话中途额度被别的写入占满时，chunk 那道闸门会挡住后续分片，但已传完的
+     *    这一份仍能合进去 —— 合并前复查才是真正的收口；
+     *  - 两个用户并发上传时有 TOCTOU：双方各自的 chunk 判定都看到「云端还没有这些
+     *    字节」，合并后总量才超限。合并点复查把窗口压到「两次校验之间」的量级。
+     * 被拒时会话**保留**（不 abort、不删），用户清理空间后仍可重新合并。
+     */
+    await assertCredentialQuota(sessCfg.credentialId, { addBytes: actualBytes });
+    await assertBucketQuota(client, sessCfg, { addBytes: actualBytes });
 
     const encMeta = encStore.buildFinalMeta(sess); // 加密任务：校验并生成元数据（不完整则拒绝合并）
     await p(client, 'multipartComplete', {
@@ -1194,7 +1308,24 @@ router.get('/fs/download', async (req, res) => {
         userId: (req.authUser && req.authUser.id) || '',
       }),
     });
-    statsStore.addLog({ action: 'fs.download', detail: `下载 ${key}（${traffic.bytesDown} 字节${encLogSuffix(cfg.bucket, key)}）` });
+    /**
+     * R94（审核 M06-02）：字节数必须等**传输结束后**再读。
+     *
+     * `streamDownload()` 的 `await` 等的是 `s3.getObject` 的**回调**，而那个回调在
+     * 「响应头到达、body 还没开始传输」时就触发了；真正累加字节的是管线里
+     * `traffic-meter` 那个 Transform。于是旧写法在传输刚开始时就读
+     * `traffic.bytesDown` ⇒ 每条 `fs.download` 日志恒为「（0 字节）」，
+     * 而这恰恰是追溯「谁下载了多少」的那条记录。
+     *
+     * 改成挂 `res` 的 `close`/`finish`：响应收尾（正常完成或客户端断开）后再读。
+     * 不能在这里 `await` 整个传输 —— 那会拖住 handler，也挡不住断开的情况。
+     */
+    const logDownload = () => statsStore.addLog({
+      action: 'fs.download',
+      detail: `下载 ${key}（${traffic.bytesDown} 字节${encLogSuffix(cfg.bucket, key)}）`,
+    });
+    if (res.writableEnded || res.destroyed) logDownload();
+    else res.once('close', logDownload);
   } catch (e) {
     const err = e.status ? e : translateError(e);
     if (!res.headersSent) res.status(err.status || 500).json(Object.assign({ error: err.message }, e.needUnlock ? { needUnlock: true } : null));
@@ -1208,9 +1339,15 @@ router.get('/fs/download', async (req, res) => {
  *
  * `/fs/thumb` 的回应是 302 到对象存储的预签名 URL，命中后由存储侧按对象**自带的**
  * `Content-Type` 下发（没有 `Content-Disposition`、也不经过本进程的 `nosniff`）。
- * 上传侧对 Content-Type 是放行的（WebDAV PUT 直接取请求头），于是一个 `text/html`
- * 对象在这条链路上就是一个**同源文档**。图片类不受影响（`<img>` 上下文不执行脚本），
- * 因此这里只拦"能当文档跑"的类型：给一个占位图标，让用户走下载。
+ * 图片类不受影响（`<img>` 上下文不执行脚本），因此这里只拦"能当文档跑"的类型：
+ * 给一个占位图标，让用户走下载。
+ *
+ * R94（审核 M06-08）：这条护栏判的是**文件名**，而真正决定「能不能当文档跑」的是
+ * 对象存储里存的 `Content-Type` —— 一个 `note.txt` + `Content-Type: text/html`
+ * 的对象曾经能绕过去。现在写入侧（`fs-gateway.writeObject` 的
+ * `normalizeContentType()`）把这类可执行类型统一降级为 `application/octet-stream`，
+ * 两层同口径：**扩展名拦"看起来像"，写入侧拦"真的是"**。本判据保留不动 ——
+ * 它同时覆盖本次改动之前就已存在的历史对象（那些对象的 Content-Type 已经落定了）。
  */
 const THUMB_UNSAFE_RE = /\.(?:html?|xhtml|shtml|svg|xml|xsl|xslt|js|mjs|css|pdf)$/i;
 
@@ -1432,6 +1569,50 @@ async function copyOne(client, cfg, fromKey, toKey, size) {
 }
 
 /**
+ * 单对象「移动 / 重命名」的**唯一实现点**（R94 · 审核 M06-01）。
+ *
+ * ## 旧顺序为什么会造成不可逆丢失
+ *
+ * 原实现是「复制密文 → `renameMeta`（**搬走**解密凭据）→ 删除源对象」。
+ * `encStore.renameMeta()` 的语义是 `files[to] = files[from]; delete files[from];`
+ * —— 源 key 的元数据在删除云端对象**之前**就已经被抹掉。于是第三步失败时：
+ *  - 源对象仍留在云端（密文），但 `getMeta()` 已是 undefined ⇒ 下载侧按「明文」处理
+ *    ⇒ 用户拿到一段无法解读的乱码；
+ *  - 加密凭据（IV / GCM tag / magic 模式的盐与文件头）**只存在于元数据里**，
+ *    丢了没有任何恢复途径（`enc-store` 只有「有元数据没对象」的孤儿回收，
+ *    没有反向修复）；
+ *  - 目标 newKey 已存在 ⇒ 用户重试会先撞 `assertNoConflict()` 的「目标名称已存在」
+ *    ⇒ **永远无法通过重试完成这次改名**。
+ *
+ * ## 现在的顺序（任一步失败都可回到干净起点）
+ *
+ * 复制密文 → **把凭据复制到目标**（`reconcileAfterWrite`，源条目保留）→ 删源
+ * → 删源成功后才 `renameMeta`（此时源确实不在了，搬走是幂等的收尾）。
+ * 删源失败时撤掉目标副本与目标凭据，回到「源在、目标不在」，用户可以原样重试。
+ *
+ * WebDAV 侧的 `fs-gateway.moveObject()` 早就是这个语义 —— 本函数把管理端的
+ * 第二份实现收敛到同一条路。
+ */
+async function moveOneObject(client, cfg, key, newKey, size) {
+  await copyOne(client, cfg, key, newKey, Number(size) || 0);
+  const meta = encStore.getMeta(cfg.bucket, key) || null;
+  if (meta) encStore.reconcileAfterWrite(cfg.bucket, newKey, meta); // 复制凭据，源条目保留
+  try {
+    await p(client, 'deleteObject', { Bucket: cfg.bucket, Region: cfg.region, Key: key });
+  } catch (e) {
+    // 删源失败 ⇒ 撤销目标副本与目标凭据，恢复「源在、目标不在」的干净起点
+    try {
+      await p(client, 'deleteObject', { Bucket: cfg.bucket, Region: cfg.region, Key: newKey });
+    } catch (e2) { /* 撤销副本失败也不该盖掉原始错误 */ }
+    encStore.removeMetaBatch(cfg.bucket, [newKey]);
+    throw e;
+  }
+  // 源已确认删除：此刻把凭据从源搬走（目标是同内容的副本，覆盖幂等）
+  encStore.renameMeta(cfg.bucket, key, newKey);
+  shareStore.markMissingByKeys(cfg.bucket, [key]);
+}
+
+/**
  * 批量复制：受控并发 + **失败即停 + 自动回滚**（FUN-05）
  *
  * 旧实现用固定 5 路 worker 遍历共享游标，任一 `copyOne` 抛错只让 `Promise.all` 拒绝，
@@ -1600,15 +1781,9 @@ router.post('/fs/rename', async (req, res) => {
         throw err;
       }
     } else {
-      await copyOne(client, cfg, key, newKey, Number((req.body || {}).size) || 0);
-      // FUN-11：元数据迁移必须在**删除源对象之前**完成（与上面文件夹分支同序）。
-      // 旧实现先 deleteObject 再 renameMeta：两步之间任何一次失败（进程退出、
-      // 网络中断、renameMeta 抛错）都会让密文留在 newKey 而元数据仍挂在旧 key 上，
-      // 该对象从此无法解密 —— 数据还在，但等于永久丢失。反过来最多是残留一条
-      // 无人引用的元数据，可安全清理。
-      encStore.renameMeta(cfg.bucket, key, newKey); // 加密元数据随迁（密文复制后参数不变）
-      await p(client, 'deleteObject', { Bucket: cfg.bucket, Region: cfg.region, Key: key });
-      shareStore.markMissingByKeys(cfg.bucket, [key]);
+      // R94（审核 M06-01）：三步骤全部收进 moveOneObject() —— 删源失败会撤销目标副本
+      // 与目标凭据，源文件保持可解，用户可以原样重试（旧顺序会让源永久不可解）。
+      await moveOneObject(client, cfg, key, newKey, Number((req.body || {}).size) || 0);
       copied = 1;
     }
     res.json({ ok: true, newKey: relKey(cfg.spaceRoot, newKey), copied });
@@ -1706,11 +1881,8 @@ router.post('/fs/move', async (req, res) => {
             throw err;
           }
         } else {
-          await copyOne(client, cfg, key, newKey, 0);
-          // FUN-11：同 rename —— 先迁元数据，再删源（顺序颠倒会丢解密能力）
-          encStore.renameMeta(cfg.bucket, key, newKey); // 加密元数据随迁
-          await p(client, 'deleteObject', { Bucket: cfg.bucket, Region: cfg.region, Key: key });
-          shareStore.markMissingByKeys(cfg.bucket, [key]);
+          // R94（审核 M06-01）：同 rename —— 与 moveOneObject 共用同一条安全顺序
+          await moveOneObject(client, cfg, key, newKey, 0);
         }
         return { path: key, ok: true, newKey };
       } catch (e) {
@@ -1851,13 +2023,23 @@ router.post('/fs/copy', apiHandler(async (req, res) => {
     const runnable = [];
     for (const p of plans) {
       if (!p.occupied) { runnable.push(p); continue; }
-      const d = decisions ? decisions[p.key] : null;
+      /**
+       * R94（审核 M06-04）：「进出一律相对」。
+       *
+       * 这里的键以前是**绝对 key**（`u/<uid>/dest/x.txt`），前端把 `path` 原样渲染进
+       * 冲突弹窗 ⇒ 普通用户界面上出现内部用户 id 命名空间；`decisions` 也按绝对键回传，
+       * 与「客户端只提交相对 key」的约定不一致（将来有人把它当相对键用就会拼出
+       * `u/<uid>/u/<uid>/...`）。`/fs/move`、`/fs/delete` 早已统一走 `relResults`，
+       * 这里对齐同一口径。前端回显服务端给的 `path`，因此两边自动一致。
+       */
+      const rel = relKey(cfg.spaceRoot, p.key);
+      const d = decisions ? decisions[rel] : null;
       if (d === 'overwrite') runnable.push(p);
-      else if (d === 'skip') rootResult[p.i] = { path: p.key, ok: true, skipped: true, reason: '用户选择跳过同名项' };
+      else if (d === 'skip') rootResult[p.i] = { path: rel, ok: true, skipped: true, reason: '用户选择跳过同名项' };
       else {
         ask.push({
-          path: p.key,
-          target: p.newKey,
+          path: rel,
+          target: relKey(cfg.spaceRoot, p.newKey),
           kind: p.isFolder ? 'folder' : 'file',
           // 文件夹的冲突对象数要完整列举才数得准 —— 那正是本设计要省掉的开销，
           // 因此给 null，前端按「目标已存在同名文件夹」措辞，不去编一个数字。

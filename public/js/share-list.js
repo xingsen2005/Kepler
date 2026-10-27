@@ -20,7 +20,9 @@
  * 仍是一次普通的带 `k` / `mode` 参数的 GET（表示形式见下方 `form.addEventListener('submit')`）。
  *
  * 不做：**不构造下载 URL、不自己发请求**。下载一定走页面里那个原生
- * `<form method="GET">`，因为下载响应是 `Content-Disposition: attachment`，
+ * `<form method="POST">`（R94 / 审核 M08-02 从 GET 改成 POST：勾选项塞进查询串时
+ * Node 的 16KB 请求行上限会让"勾一半"这种中间区间直接 431，连服务端都进不来），
+ * 因为下载响应是 `Content-Disposition: attachment`，
  * 交给浏览器导航才能拿到进度、取消与"另存为"，用 fetch 反而要把整个包读进内存。
  * 这也意味着**脚本没加载时页面仍然可用**（服务端已把本页渲染成全选，只能勾本页），
  * 是渐进增强而非硬依赖。

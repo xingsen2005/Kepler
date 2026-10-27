@@ -41,6 +41,15 @@ const dataDir = require(SERVER('data-dir.js'));
 const authRoutes = require(SERVER('routes', 'auth.js'));
 const userRoutes = require(SERVER('routes', 'users.js'));
 
+/**
+ * R94（审核 M01-02）：`setupTokenMatches()` 改成**只读不生成**（原先它会调
+ * `ensureSetupToken()`，于是初始化完成后任何一次匿名 `POST /auth/init` 都能让
+ * `data/setup-token.txt` 复活并再打印一次）。生成点于是只剩生产启动路径
+ * `server/index.js` 里那句 `primeSetupToken()`；本文件是直接挂路由的，必须自己
+ * 补上这一步，否则临时数据目录里永远没有令牌文件。
+ */
+authRoutes.primeSetupToken();
+
 const PASSWORD = 'Unit!2026abc';
 
 /* ================================================================== *

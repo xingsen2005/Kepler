@@ -82,12 +82,42 @@ router.post('/webauthn/register/options', async (req, res) => {
 
 /**
  * 注册验证：校验 attestation，保存公钥并启用。
+ *
+ * R94（审核 M01-01）：**口令校验必须落在这一层**，不能只落在 `register/options`。
+ *
+ * 旧实现把「需当前密码」加在 `register/options`（只签发挑战、**不写库**）上，
+ * 而真正把公钥落库的本端点一次口令都不问。于是「持被盗会话但不能出示口令」的
+ * 一方，可以拿受害者几分钟前通过口令校验、随后放弃的那枚待用挑战，提交**自己**
+ * 验证器的证明 —— `setUserWebauthn()` 是无条件覆盖，受害者已启用的凭据被静默顶替，
+ * 攻击者随后用「账户口令 + 自己的验证器」完成两步登录。二次验证要防的正是
+ * 「口令已泄露」，这条路径把它整条绕开。
+ *
+ * 两处都校验（而不是把 options 那处删掉）是刻意的：options 那处挡的是「反复触发
+ * 口令哈希」，这里挡的是「凭据被替换」—— 两件事，两个落点。
  */
-router.post('/webauthn/register/verify', (req, res) => {
+router.post('/webauthn/register/verify', async (req, res) => {
   try {
     const me = currentUser(req);
     if (!me) return res.status(401).json({ error: '请先登录' });
     const b = req.body || {};
+
+    // 与 `register/options` 同一条限流（同为口令哈希入口），避免这里变成新的爆破面
+    const ip = security.clientIp(req) || 'unknown';
+    const rl = security.passwordLimiter('webauthn:' + ip);
+    if (!rl.ok) {
+      res.setHeader('Retry-After', String(rl.retryAfter));
+      return res.status(429).json({ error: `操作过于频繁，请 ${rl.retryAfter} 秒后重试` });
+    }
+    const pwd = String(b.password || '');
+    if (!(await configStore.verifyUserPassword(me.id, pwd))) {
+      statsStore.addLog({
+        action: 'webauthn.register.fail', level: 'warn',
+        detail: `用户「${me.username}」提交 Windows Hello 注册结果时密码校验失败`,
+      });
+      // 403 而不是 401：会话完全有效，只是当前密码不对（同 R8-12 的口径）
+      return res.status(403).json({ error: '密码不正确，无法开启 Windows Hello' });
+    }
+
     const ctx = webauthnContext(req);
 
     const r = webauthn.verifyRegistration({
@@ -113,6 +143,15 @@ router.post('/webauthn/register/verify', (req, res) => {
       return res.status(400).json({ error: webauthn.publicReason(r.reason), reason: r.reason });
     }
 
+    /**
+     * R94：区分「首次注册」与「替换已有凭据」。
+     *
+     * 审计日志原先只有一句「已启用 Windows Hello」—— 被顶替过的账户在日志里
+     * 看不出任何异常（第 1 次和第 N 次写得一模一样）。改一条日志文案，就能让
+     * 事后排查看出「这台账户的二次因子被换过」。
+     */
+    const before = configStore.findUserRawById(me.id);
+    const replacing = Boolean(before && before.webauthn && before.webauthn.enabled);
     const user = configStore.setUserWebauthn(me.id, {
       credentialId: r.credentialId,
       publicKey: r.publicKey,
@@ -120,8 +159,13 @@ router.post('/webauthn/register/verify', (req, res) => {
       aaguid: r.aaguid,
       fmt: r.fmt,
     });
-    statsStore.addLog({ action: 'webauthn.register', detail: `用户「${me.username}」已启用 Windows Hello 登录验证` });
-    res.json({ ok: true, user });
+    statsStore.addLog({
+      action: 'webauthn.register',
+      detail: replacing
+        ? `用户「${me.username}」已**替换** Windows Hello 凭据（原凭据被覆盖，若非本人操作请立即关闭二次验证并改密）`
+        : `用户「${me.username}」已启用 Windows Hello 登录验证`,
+    });
+    res.json({ ok: true, user, replaced: replacing });
   } catch (e) {
     sendError(res, e);
   }

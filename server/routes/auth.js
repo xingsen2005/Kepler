@@ -34,6 +34,25 @@ const crypto = require('crypto');
 const router = express.Router();
 
 /**
+ * R94（审核 M03-04）：本站允许的域名集合 —— 供人机验证核对服务商应答里的 `hostname`。
+ *
+ * 取两处并集：本次请求的 `Host`（用户实际访问的域名）与 `SITE_DOMAIN`（部署脚本写入的
+ * 对外域名）。两者都属 `security.isOwnSiteHost()` 认的「本站」，故任一命中即放行；
+ * 而一枚在**别的域名**上解出的 token 两处都不匹配 —— 那正是要拦下的情况
+ * （同一枚 sitekey 被多个站点共用是服务商官方支持的常见做法）。
+ */
+function captchaHosts(req) {
+  const out = [];
+  const add = (v) => {
+    const s = security.normalizeHost(v);
+    if (s && out.indexOf(s) < 0) out.push(s);
+  };
+  add(req && req.headers && req.headers.host);
+  add(security.SITE_DOMAIN);
+  return out;
+}
+
+/**
  * 登录失败锁定的键（SEC-02 / R27-08）
  *
  * 旧实现**只按用户名**锁定：任何人只要知道管理员的用户名，连着输错 5 次密码
@@ -110,7 +129,11 @@ router.post('/auth/login', async (req, res) => {
 
     // 人机验证（服务端回源校验；关闭时直接放行，不引入任何额外校验/依赖）
     // token 从 body.captchaToken 取（前端由 reCAPTCHA/Turnstile 组件产出），不信任前端自带的结果。
-    const cap = await captcha.verify({ token: b.captchaToken, remoteip: pre.ip }, configStore);
+    // R94（审核 M03-04）：带上「本站允许的域名」，让 captcha.verify 核对服务商应答里的
+    // `hostname` —— 否则同一枚 sitekey 在别的域名上解出的 token 也能过本站的人机验证。
+    const cap = await captcha.verify({
+      token: b.captchaToken, remoteip: pre.ip, expectedHosts: captchaHosts(req),
+    }, configStore);
     if (!cap.passed) {
       statsStore.addLog({ action: 'auth.fail', level: 'warn', detail: `登录被人机验证拦截（原因：${cap.reason}，用户名：${username || '(空)'}）` });
       return res.status(403).json({ error: captcha.publicReason(cap.reason) });
@@ -166,7 +189,14 @@ router.post('/auth/login', async (req, res) => {
     //    从而静默绕过整个 Windows Hello 二次验证 —— 这是一个高危的失效开放（fail-open）。
     if (configStore.isWebauthnEnabled(raw)) {
       const ctx = webauthnContext(req);
-      const challenge = webauthn.issueChallenge('login', { userId: user.id, username: user.username });
+      /**
+       * R94（审核 M01-05）：「记住登录状态」必须**由服务端记住**。
+       *
+       * 旧实现把它随响应回给前端、第二步再让前端原样回传 —— 服务端对这个用户可见的
+       * 安全选项没有任何约束力，脚本可以静默把会话续到 30 天。现在随挑战一起存进
+       * 服务端（挑战一次性、5 分钟过期、带归属用户），第二步只认这一份。
+       */
+      const challenge = webauthn.issueChallenge('login', { userId: user.id, username: user.username, remember: Boolean(b.remember) });
       statsStore.addLog({ action: 'auth.login.webauthn', detail: `用户「${user.username}」密码校验通过，等待 Windows Hello 验证` });
       return res.json({
         ok: false,
@@ -182,6 +212,7 @@ router.post('/auth/login', async (req, res) => {
       });
     }
 
+    // 未启用二次验证：直接签发会话（remember 取本请求提交的值）
     return completeLogin(res, user, Boolean(b.remember), pre.ip);
   } catch (e) {
     res.status(e.status || 500).json({ error: e.message });
@@ -292,7 +323,8 @@ router.post('/auth/login/webauthn', async (req, res) => {
     // 验签通过：更新签名计数（单调递增，供克隆检测）并签发会话
     const user = configStore.touchWebauthn(raw.id, r.signCount);
     statsStore.addLog({ action: 'auth.login.webauthn.ok', detail: `用户「${username}」Windows Hello 验证通过` });
-    return completeLogin(res, user, Boolean(b.remember), pre.ip);
+    // R94（审核 M01-05）：用**挑战里记下的** remember，不再采信第二步请求体里的值
+    return completeLogin(res, user, Boolean(r.remember), pre.ip);
   } catch (e) {
     res.status(e.status || 500).json({ error: e.message });
   }
@@ -458,8 +490,29 @@ function primeSetupToken() {
   return ensureSetupToken();
 }
 
+/**
+ * **只读地**取当前安装令牌：**绝不生成、绝不打印**。
+ *
+ * R94（审核 M01-02）：`setupTokenMatches()` 原先直接调 `ensureSetupToken()`，
+ * 而后者在「缓存空 + 文件读不到」时会**重新生成一枚并落盘 + 打印**。于是初始化
+ * 完成之后，任何匿名请求打一次 `POST /auth/init`（不带令牌）就会让
+ * `data/setup-token.txt` 复活、并在容器日志里再打一遍「首次初始化令牌」——
+ * 与「它的全部生命周期就是第一次初始化之前」的口径直接矛盾，也与
+ * `primeSetupToken()`（已初始化则**不**生成）相反。
+ *
+ * 比对只该读：读不到就是「没有令牌」，按不匹配处理。
+ */
+function readSetupToken() {
+  if (setupTokenCache) return setupTokenCache;
+  try {
+    return String(fs.readFileSync(setupTokenFile(), 'utf8') || '').trim();
+  } catch (e) {
+    return '';
+  }
+}
+
 function setupTokenMatches(given) {
-  const want = ensureSetupToken();
+  const want = readSetupToken();
   const a = Buffer.from(String(given || ''), 'utf8');
   const b = Buffer.from(want, 'utf8');
   if (!a.length || a.length !== b.length) return false;
@@ -621,7 +674,9 @@ router.post('/auth/register', async (req, res) => {
 
     // ③ 人机验证：与登录同源。开启时注册同样是脚本撞的第一道门 —— 而且它比登录更"贵"：
     // 每一次成功注册都要落一个账户并算一次 scrypt。
-    const cap = await captcha.verify({ token: b.captchaToken, remoteip: ip }, configStore);
+    const cap = await captcha.verify({
+      token: b.captchaToken, remoteip: ip, expectedHosts: captchaHosts(req),
+    }, configStore);
     if (!cap.passed) {
       statsStore.addLog({ action: 'auth.register', level: 'warn', detail: `注册被人机验证拦截（原因：${cap.reason}；IP：${ip}）` });
       return res.status(403).json({ error: captcha.publicReason(cap.reason) });
@@ -742,7 +797,11 @@ router.post('/auth/forgot', async (req, res) => {
      * 这条匿名端点立刻变回一条账户存在性 oracle。
      */
     const gate = await emailCode.probeMailer();
-    if (!gate.ok) return res.status(gate.status || 503).json({ error: gate.error });
+    if (!gate.ok) {
+      // R94（审核 M03-02）：匿名端点只回**类别**（`publicError`），不回 `error` 里的
+      // 主机:端口 / TLS 结果 / 服务端原文 —— 详情版只留在服务端日志与管理员接口。
+      return res.status(gate.status || 503).json({ error: gate.publicError || gate.error });
+    }
 
     const b = req.body || {};
     const identifier = String(b.identifier == null ? '' : b.identifier).trim();
@@ -884,6 +943,18 @@ router.post('/auth/email/code', async (req, res) => {
     if (!rl.ok) {
       res.setHeader('Retry-After', String(rl.retryAfter));
       return res.status(429).json({ error: `请求过于频繁，请 ${rl.retryAfter} 秒后重试` });
+    }
+    /**
+     * R94（审核 M03-06）：按 IP 那一层挡不住「换一批地址」——`email-code.js` 的
+     * 冷却按 `purpose|邮箱` 记，换个地址就是新配额。再按**用户**计一条日配额，
+     * 否则本站会用管理员的 SMTP 账号往任意第三方地址发信（骚扰 + 烧发信配额）。
+     */
+    const url = security.emailCodeUserLimiter('u:' + me.id);
+    if (!url.ok) {
+      res.setHeader('Retry-After', String(url.retryAfter));
+      return res.status(429).json({
+        error: `该账户近期请求的邮箱验证码过多，请 ${url.retryAfter} 秒后重试`,
+      });
     }
 
     const b = req.body || {};

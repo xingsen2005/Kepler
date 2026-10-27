@@ -50,6 +50,8 @@ const configStore = require('./config-store');
 const ipGuard = require('./ip-guard');
 // R87：导入落库前的端点校验必须与正常保存路径**同一实现**（含 DNS 解析级复核）
 const { assertSafeEndpointResolved } = require('./endpoint-guard');
+// R94（审核 M05-01）：桶名字符集判据的唯一实现点（与 addBucket 同源）
+const providers = require('./providers');
 
 /** 明文实时码的抬头（便于肉眼识别与版本演进） */
 const CODE_HEAD = 'KEPLER-CONFIG-V1';
@@ -145,7 +147,23 @@ function sanitizeBucket(b) {
     bucket: String((b && b.bucket) || ''),
     region: String((b && b.region) || ''),
     remark: String((b && b.remark) || ''),
-    endpoint: String((b && b.endpoint) || ''),
+    /**
+     * ⚠️ **桶级端点一律丢弃**（R94 · 审核 M04-01）。
+     *
+     * 全库**没有任何 API 能设置桶级端点**：`addBucket()` / `updateBucket()` 的入参里
+     * 都没有 `endpoint`，`bucketView()` 也不返回它 —— 也就是说这个字段在正常路径下
+     * 永远是空串，唯一的写入入口就是「导入一份别人给的导出码」。
+     *
+     * 而 `effective()` 的取值优先级是 `凭据端点 || 桶端点 || 厂商默认端点`：管理员
+     * 之后在界面上重填自己的真实 AK/SK（表单不带端点栏 ⇒ 凭据端点为空），
+     * 生效的就是这个被植入的桶端点 ⇒ **真实密钥的签名请求全部发往攻击者主机**，
+     * 且界面上看不到、也没有 API 能清除（只能删桶重建）。R87 那道
+     * `assertSafeEndpointResolved` 只回答「是不是内网」，挡不住「公网但属于攻击者」。
+     *
+     * 所以这里不是「校验端点」，而是**不接受这个字段**：导出不带、导入不认。
+     * 凭据级端点保留 —— 它是 S3 兼容厂商的正常配置项，界面上可见可改。
+     */
+    endpoint: '',
     quotaBytes: numOr0(b && b.quotaBytes),
     speedLimit: numOr0(b && b.speedLimit),
     credentialId: String((b && b.credentialId) || ''),
@@ -270,6 +288,15 @@ function collect() {
       appName: String(full.appName || ''),
       username: String(full.username || ''),
       password: String(full.password || ''),
+      /**
+       * R94（审核 M04-04）：**必须带上空间绑定**。
+       *
+       * R89 给 WebDAV 账户加了最小权限模型：`ownerUserId` 非空 ⇒ 只能看 `u/<id>/`；
+       * 空串 ⇒ **管理权限 = 整个激活桶**。旧实现两头都不搬这个字段，于是「把配置从
+       * A 实例搬到 B」这一正常运维动作会把**被刻意收窄**的账户**静默升级成整桶账户**
+       * —— 一个已经发给第三方设备的凭据，导入后拿到整桶读写权。
+       */
+      ownerUserId: String(full.ownerUserId || ''),
     };
   });
 
@@ -294,7 +321,10 @@ function collect() {
     webdav: { enabled: boolOf(wd.enabled), accounts: webdavAccounts },
     payment: {
       enabled: boolOf(pay.enabled),
-      platforms: clone(pay.platforms || {}),
+// R94（审核 M04-06）：只搬注册表内的已知平台 —— 与 `sanitizeCredential` /
+      // `sanitizeBucket` 同一条纪律（「只带当前已知的字段」）：导出码里塞进来的未知
+      // 平台 id / 任意字段不会被原样写进 config.enc（界面看不到，也没有代码消费它）。
+      platforms: configStore.sanitizePaymentPlatforms(pay.platforms),
       siteUrl: String(pay.siteUrl || ''),
     },
     buckets: {
@@ -549,6 +579,21 @@ async function apply(data) {
   const bk = data.buckets || {};
   const buckets = (Array.isArray(bk.buckets) ? bk.buckets : []).map(sanitizeBucket);
   const activeBucketId = String(bk.activeBucketId || '');
+  /**
+   * R94（审核 M05-01）：桶名同样要在**落库前**判掉。
+   *
+   * 端点通道堵住了不等于安全：`s3-client._request()` 把桶名拼进 Host 头 / 请求路径，
+   * 而这条路**不经过 `endpoint-guard`**。一份构造好的导出码只要把
+   * `data.buckets.buckets[0].bucket` 写成 `169.254.169.254/x`（endpoint 留空，
+   * 是合法值），导入后该桶的任何一次操作都会带着真实 AK 的 SigV4 签名发往该主机。
+   * 判据与 `addBucket()` 同源（`providers.isValidBucketName`），这里整批判：
+   * 导入是整体覆盖，留半份配置比直接拒绝更糟。
+   */
+  const badBucket = buckets.find((b) => !providers.isValidBucketName(b.bucket));
+  if (badBucket) {
+    throw badCode(`备份里的存储桶名称不合法：${String(badBucket.bucket).slice(0, 40)}`
+      + '（只允许字母、数字、点、下划线与连字符，1–63 位）');
+  }
 
   /**
    * R87：**落库之前**逐条过端点安全校验 —— 与「API Key / 存储桶」正常保存路径同源。
@@ -567,6 +612,11 @@ async function apply(data) {
    * 放在这里（解析完、写之前）而不是写完之后：导入是**整体覆盖**，写到一半再拒
    * 只会留下半份配置。解析失败（离线 / 内网 DNS 不可达）时该函数本身放行，
    * 与正常保存路径的语义一致。
+   *
+   * ⚠️ R94（审核 M04-01）之后，这一圈剩下的只有**凭据级**端点：
+   * `sanitizeBucket()` 已经不再搬运桶级 `endpoint`（见那里的注释 —— 正常路径根本
+   * 写不出它，导入是唯一入口，而它能跨密钥轮换存活并把真实 AK/SK 送去任意主机）。
+   * 凭据端点保留是因为它是 S3 兼容厂商的正常配置项、界面上可见可改，仍在此复核。
    */
   for (const ent of credentials.concat(buckets)) {
     if (ent.endpoint) await assertSafeEndpointResolved(ent.endpoint);
@@ -607,7 +657,10 @@ async function apply(data) {
   configStore.save({
     payment: {
       enabled: boolOf(pay.enabled),
-      platforms: clone(pay.platforms || {}),
+// R94（审核 M04-06）：只搬注册表内的已知平台 —— 与 `sanitizeCredential` /
+      // `sanitizeBucket` 同一条纪律（「只带当前已知的字段」）：导出码里塞进来的未知
+      // 平台 id / 任意字段不会被原样写进 config.enc（界面看不到，也没有代码消费它）。
+      platforms: configStore.sanitizePaymentPlatforms(pay.platforms),
       siteUrl: String(pay.siteUrl || ''),
       updatedAt: new Date().toISOString(),
     },
@@ -617,12 +670,28 @@ async function apply(data) {
   const wd = data.webdav || {};
   const existing = (configStore.getWebdav().accounts || []);
   for (const a of existing) configStore.removeWebdavAccount(a.id);
+  /**
+   * R94（审核 M04-04）：还原**空间绑定**，绑不到用户就**不导入**这个账户。
+   *
+   * 用户列表不在备份范围内（见本文件头部 SCOPES 说明），所以「源实例上绑到 alice」
+   * 这件事在目标实例上结构性地无法还原。三种选择里：
+   *  - 落成「未绑定」= 把最小权限账户**静默升级**成整桶权限 —— 不可接受；
+   *  - 落成「未启用」= 仍然存在一个能读整桶的账户，只是默认关着 —— 半修；
+   *  - **跳过并如实回报** = 管理员知道「这个账户没过来、原因是什么」，可以手工重建。
+   * 取第三种，并把被跳过的账号名放进摘要（`webdavSkipped`），不让它静默消失。
+   */
+  const skippedWebdav = [];
   for (const a of (Array.isArray(wd.accounts) ? wd.accounts : [])) {
     const appName = String(a.appName || '').trim();
     const username = String(a.username || '').trim();
     if (!appName || !username) continue; // 缺关键字段的账户跳过，不让整次导入失败
+    const ownerUserId = String(a.ownerUserId || '');
+    if (ownerUserId && !configStore.findUserRawById(ownerUserId)) {
+      skippedWebdav.push(username); // 绑定的用户在目标实例上不存在 ⇒ 不导入（见上）
+      continue;
+    }
     try {
-      configStore.addWebdavAccount({ appName, username, password: String(a.password || '') });
+      configStore.addWebdavAccount({ appName, username, ownerUserId, password: String(a.password || '') });
     } catch (e) { /* 单条账户不合法（如口令为空）不影响其余配置还原 */ }
   }
   configStore.setWebdavEnabled(boolOf(wd.enabled));
@@ -663,7 +732,11 @@ async function apply(data) {
    * 导入是一次**整体覆盖**，它必须是「要么全都在盘上、要么明确报错」。
    */
   await configStore.flush();
-  return summarize(collect());
+  const sum = summarize(collect());
+  // R94（审核 M04-04）：把「因绑定用户在目标实例不存在而未导入」的 WebDAV 账户
+  // 如实回报，避免它们静默消失（也就不会有人误以为它们被导入了）。
+  if (skippedWebdav.length) sum.webdavSkipped = skippedWebdav;
+  return sum;
 }
 
 /** 导入 / 导出后回给界面的摘要（只给计数，不回传任何密钥内容） */

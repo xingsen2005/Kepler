@@ -5,7 +5,7 @@
  *   FUN-06  stats.json 损坏护栏（区分「不存在」与「损坏」，损坏即备份 + 拒绝落盘）
  *   FUN-07  IP 守卫按**会话**桶判定（不再读全局 activeBucketId）
  *   FUN-08  新增本地桶前的云端存在性探测（确定性失败才拒绝）
- *   FUN-11  rename / move 先迁加密元数据、再删源对象
+ *   FUN-11  rename / move 复制 →（成功后）删源 → 再迁加密元数据（顺序 R94 起反转）
  *   SEC-02  登录失败锁定键含来源 IP（防针对已知账户的锁定 DoS）
  *   SEC-03  支付回调限流 + 支付宝 RSA 验签
  *   PERF-01 分片列举短缓存（命中 + 分片写操作失效）
@@ -312,7 +312,7 @@ let renameClient = null;
 s3.getClient = () => renameClient; // 在 require fs.js 之前换成重命名用的假客户端
 const fsRoutes = require(path.join(ROOT, 'server', 'routes', 'fs.js'));
 
-test('FUN-11 · 重命名文件：元数据迁移**先于**删除源对象', async () => {
+test('FUN-11 · 重命名文件：源对象删除成功**之后**才迁移元数据', async () => {
   renameEvents.length = 0;
   const notFound = () => { const e = new Error('NotFound'); e.statusCode = 404; return e; };
   renameClient = {
@@ -352,13 +352,21 @@ test('FUN-11 · 重命名文件：元数据迁移**先于**删除源对象', asy
     });
     assertEqual(res.status, 200, `重命名应成功，实际：${res.raw}`);
 
-    // 顺序是本条护栏的核心：先删源再迁元数据的话，两步之间任何失败都会让密文
-    // 永久失去元数据（数据还在但解不开），等于不可逆丢失。
+    // ### 顺序判据（R94 / M06-01 起方向反转）
+    //
+    // 本用例原本断言「元数据迁移**先于**删源」，理由是「先删源再迁元数据，两步之间
+    // 失败会让密文（在源 key 上）失去元数据」。R94 复核发现那条顺序恰好造出更坏的
+    // 终态：`renameMeta` 成功、`deleteObject` 失败时，**元数据已经搬去新 key，源对象
+    // 却还在旧 key 上且已无元数据** —— 列表里看得见、点开解不开、重试也无从下手，
+    // 属于不可逆丢失；而反过来（先删源、后迁元数据）失败时源 key 的「对象 + 元数据」
+    // 仍然成对，重试即可，删除失败时还会撤掉目标副本。
+    //
+    // 所以现在的正确序列是 copy → reconcile → delete(源) → meta，断言也随之反转。
     assert(renameEvents.indexOf('copy') >= 0, '应发生一次复制');
     assert(renameEvents.indexOf('meta:a.txt->b.txt') > renameEvents.indexOf('copy'),
       '元数据迁移应在复制之后');
-    assert(renameEvents.indexOf('meta:a.txt->b.txt') < renameEvents.indexOf('delete:a.txt'),
-      `元数据迁移必须**早于**删除源对象，实际序列：${JSON.stringify(renameEvents)}`);
+    assert(renameEvents.indexOf('meta:a.txt->b.txt') > renameEvents.indexOf('delete:a.txt'),
+      `元数据迁移必须**晚于**删除源对象，实际序列：${JSON.stringify(renameEvents)}`);
   } finally {
     await new Promise((r) => server.close(r));
     encStore.renameMeta = origRenameMeta;

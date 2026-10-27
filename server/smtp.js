@@ -461,9 +461,23 @@ class SmtpSession {
     raw.removeAllListeners('timeout');
     raw.removeAllListeners('error');
     raw.removeAllListeners('close');
+    /**
+     * R94（审核 M03-01）：**证书身份校验的对象必须与配置的 host 一致**。
+     *
+     * 旧实现在目标是 IP 时把 `servername` 置为 undefined —— 而 Node 的默认身份校验
+     * 取的是「servername / host」，两者都为空就等于拿 `undefined` 去比证书 SAN，
+     * 必然失败。于是「管理员把 SMTP 主机直接填成 IP」这条完全合法的配置，
+     * 会让整条发信链路恒定报「证书校验失败」。
+     *
+     * SNI 不能塞 IP 字面量（RFC 6066），所以这里保留 `servername: undefined`，
+     * 但显式把校验对象改回 `o.host`：证书里带 iPAddress SAN 时正常通过，
+     * 不带时仍然报错（这一点不能放宽 —— 跳过校验等于把 StartTLS 的收益丢掉）。
+     */
+    const isIpHost = net.isIP(o.host) > 0;
     const secure = tls.connect({
       socket: raw,
-      servername: net.isIP(o.host) ? undefined : o.host,
+      servername: isIpHost ? undefined : o.host,
+      checkServerIdentity: isIpHost ? (hostname, cert) => tls.checkServerIdentity(o.host, cert) : undefined,
     });
     secure.setEncoding('utf8');
     secure.on('data', (chunk) => this._onData(chunk));

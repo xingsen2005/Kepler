@@ -4,6 +4,8 @@
  */
 const { express, configStore, statsStore, ipGuard } = require('./_context');
 const { requireAdmin } = require('./_shared');
+// R94（审核 M12-01）：限速入参判据的唯一实现点（与 buckets / config / links / users 同源）
+const { parseSpeedLimitInput } = require('../limits');
 // R65：订单取回的自动封禁（只作用于取回端点；管理端在这里展示与解封）
 const restoreGuard = require('../restore-guard');
 
@@ -65,10 +67,28 @@ router.post('/ipguard/restore-bans/unban', requireAdmin, (req, res) => {
   res.json({ ok: true, ip, removed, restoreBans: restoreGuard.listBans() });
 });
 
+/**
+ * R94（审核 M12-01）：限速值必须过 `limits.parseSpeedLimitInput()` —— 与 API Key /
+ * 存储桶 / 用户 / 分享链接**四处实体级写入入口同一判据**。
+ *
+ * 本接口是全库唯一绕过它的限速写入点：`ip-guard.coerceSpeedLimit()` 只做「粗存」，
+ * 任何非正数一律归 `0`，而 `0` 的语义是「**不限速**」。于是 `-1` / `null` / `"abc"`
+ * 都会建出一条「启用中、但完全不限速」的规则 —— 正好与用户的意图相反
+ * （`limits.js` 里那段注释讲的就是这个坑）。
+ */
+function speedLimitOf(b) {
+  // `null` 视同「未传」：`Number(null) === 0` 会被判成合法的「不限速」，
+  // 那正是本条缺陷在修改路径上的触发形态（JSON 中间层把 undefined 变成 null）。
+  if (b.speedLimit === undefined || b.speedLimit === null) return { ok: true, skip: true };
+  return parseSpeedLimitInput(b.speedLimit);
+}
+
 router.post('/ipguard/rules', requireAdmin, (req, res) => {
   try {
     const b = req.body || {};
-    const rule = ipGuard.addRule({ target: b.target, remark: b.remark, methods: b.methods, bucketIds: b.bucketIds, kind: b.kind, speedLimit: b.speedLimit });
+    const sp = speedLimitOf(b);
+    if (!sp.ok) return res.status(400).json({ error: sp.error });
+    const rule = ipGuard.addRule({ target: b.target, remark: b.remark, methods: b.methods, bucketIds: b.bucketIds, kind: b.kind, speedLimit: sp.skip ? undefined : sp.value });
     const scope = (rule.bucketIds && rule.bucketIds.length) ? '桶级' : '全局';
     const what = rule.kind === 'speed' ? `IP 限速规则 ${rule.target}（${Math.round(rule.speedLimit / 1024 / 1024 * 10) / 10} MB/s）` : `IP 屏蔽规则 ${rule.target}`;
     statsStore.addLog({ action: 'ipguard.add', detail: `新增${scope} ${what}${rule.kind === 'speed' ? '' : (rule.methods.length ? '（' + rule.methods.join('/') + '）' : '（全部方法）')}` });
@@ -79,7 +99,16 @@ router.post('/ipguard/rules', requireAdmin, (req, res) => {
 router.put('/ipguard/rules/:id', requireAdmin, (req, res) => {
   try {
     const b = req.body || {};
-    const rule = ipGuard.updateRule(req.params.id, { target: b.target, remark: b.remark, methods: b.methods, bucketIds: b.bucketIds, kind: b.kind, speedLimit: b.speedLimit });
+    /**
+     * R94（审核 M12-01）：修改路径上**尤其**要拦 —— `updateRule` 的判据是
+     * `speedLimit !== undefined`，所以请求体里只要带了这个键（哪怕值是 `null`，
+     * 这在表单序列化 / `undefined → null` 的中间层里极其常见），一条正在生效的
+     * IP 限速就会被 `coerceSpeedLimit(null)` 静默改成 0，而 `enabled` 仍是 true。
+     * 这里把 `null` 视同「未传」（保持原值），非法值 400。
+     */
+    const sp = speedLimitOf(b);
+    if (!sp.ok) return res.status(400).json({ error: sp.error });
+    const rule = ipGuard.updateRule(req.params.id, { target: b.target, remark: b.remark, methods: b.methods, bucketIds: b.bucketIds, kind: b.kind, speedLimit: sp.skip ? undefined : sp.value });
     statsStore.addLog({ action: 'ipguard.update', detail: `修改 ${rule.kind === 'speed' ? 'IP 限速' : 'IP 屏蔽'}规则 ${rule.target}` });
     res.json({ ok: true, rule });
   } catch (e) { res.status(e.status || 500).json({ error: e.message }); }
@@ -139,7 +168,14 @@ router.get('/ipguard/test', requireAdmin, (req, res) => {
   const sp = ipGuard.speedLimitFor(ip, method, bucketId || null);
   res.json({
     ok: true, ip, method, bucketId: bucketId || null,
-    allowed: v.ok, reason: v.reason || null, matchedRule: v.rule || null,
+    allowed: v.ok, reason: v.reason || null,
+    /**
+     * R94（审核 M12-06）：派生缓存 `_parsed` **不得出接口**（R28-01 已定的口径）。
+     * `evaluate()` 返回的是规则对象本体，解析结果以 `_parsed` 挂在它上面；
+     * 直接回传会把实现细节漏给前端（IPv6 规则是 16 字节 `Buffer`），也让
+     * 「同一份规则两个形状」的差异扩散出去。剥壳走 `publicRule()` 这**唯一实现点**。
+     */
+    matchedRule: v.rule ? ipGuard.publicRule(v.rule) : null,
     speedRule: sp ? { target: sp.target, bytesPerSec: sp.bytesPerSec } : null,
   });
 });

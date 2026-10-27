@@ -21,6 +21,8 @@
 const crypto = require('crypto');
 const { URL } = require('url');
 const { Readable, Transform, pipeline } = require('stream');
+// R94（审核 M05-01）：桶名字符集判据的唯一实现点（与 addBucket / 备份导入同源）
+const providers = require('./providers');
 
 /**
  * R21-12：出站请求**禁止自动跟随重定向**（`fetch` 默认是 `follow`）。
@@ -460,6 +462,22 @@ class S3Client {
     const key = spec.key || '';
     const query = spec.query || {};
     const headers = Object.assign({}, spec.headers || {});
+
+    /**
+     * R94（审核 M05-01）· 纵深防御：桶名是**唯一**会被拼进 Host 头 / 请求路径
+     * 却又不经过 `endpoint-guard` 的输入（对象键至少走了 `encodeKeyPath()`）。
+     * 含 `/` 的桶名会让 URL 解析器把主机名切成 `/` 之前的部分 ⇒ 请求连同
+     * `Authorization: AWS4-HMAC-SHA256 Credential=<AK>/…` 一起被送去任意主机。
+     *
+     * 落库侧（`addBucket` / 备份导入）已经拦了，这里再断言一次：`config.enc` 里
+     * 可能还留着**旧版本写进去**的坏桶名，而这条通道的代价是凭据外发。
+     */
+    if (bucket && !providers.isValidBucketName(bucket)) {
+      const err = new Error(`存储桶名称不合法（${String(bucket).slice(0, 40)}）：`
+        + '只允许字母、数字、点、下划线与连字符，且不得以符号开头');
+      err.status = 400;
+      throw err;
+    }
 
     const hostHeader = bucket && this._virtualHosted()
       ? `${bucket}.${this.host}`          // 虚拟主机风格（S3 默认）
@@ -1231,6 +1249,36 @@ class S3Client {
         };
       });
       return { Grants: grants, Owner: {} };
+    });
+  }
+
+  /**
+   * 查询**桶策略**（`GetBucketPolicy`，`GET /<bucket>?policy`）—— R94（审核 M05-04）。
+   *
+   * ## 为什么 ACL 检查需要它
+   *
+   * AWS 自 2023-04 起新建桶默认 `BucketOwnerEnforced`（**ACL 已关闭**），公开访问的
+   * 常规做法变成「桶策略 + Block Public Access」。此时 `GET /<bucket>?acl` 照样返回
+   * 200、但只含 owner 的 `FULL_CONTROL` 授权 ⇒ 只看 ACL 的实现会把一个**实际公开
+   * 可读**的桶报成 `private`。这是「安全检查的假阴性」，比不做检查更危险 ——
+   * 管理员据此认为没有公有读风险。
+   *
+   * @returns {Promise<object|null>} 策略 JSON；**没有策略**（`NoSuchBucketPolicy` /
+   *   404 / 厂商不支持 / 无权限读取）一律返回 null（不抛），让调用方退回 ACL 结论。
+   */
+  getBucketPolicy(params, cb) {
+    return this._do(cb, async () => {
+      const { bucket } = this._ctx(params);
+      try {
+        const body = await this._send({ method: 'GET', bucket, query: { policy: '' } });
+        return JSON.parse(String(body || '').trim() || 'null');
+      } catch (e) {
+        const code = String((e && e.code) || '');
+        if (e && (e.statusCode === 404 || /NoSuchBucketPolicy|NotImplemented|AccessDenied|MethodNotAllowed/i.test(code))) {
+          return null; // 没有策略 = 正常情况，不是错误
+        }
+        throw e;
+      }
     });
   }
 

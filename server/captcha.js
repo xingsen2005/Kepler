@@ -170,6 +170,7 @@ function postVerify(endpoint, params, timeoutMs) {
  * @param {object} args
  * @param {string} args.token          前端提交的验证码 token（reCAPTCHA: g-recaptcha-response；Turnstile: cf-turnstile-response）
  * @param {string} [args.remoteip]     可选客户端 IP（服务商支持时一并提交）
+ * @param {string[]} [args.expectedHosts] 本站允许的域名列表（用于核对服务商应答里的 `hostname`）
  * @param {object} configStore         配置存储模块
  * @returns {Promise<{passed:boolean, reason?:string, degraded?:boolean}>}
  *   - passed=true   允许登录流程继续
@@ -180,7 +181,7 @@ function postVerify(endpoint, params, timeoutMs) {
  *  - enabled=false 时直接 passed=true（零网络依赖、零副作用）。
  *  - 任何异常/超时都不会抛错，而是转为 passed=false 或 degraded，绝不挂死登录接口。
  */
-async function verify({ token, remoteip }, configStore) {
+async function verify({ token, remoteip, expectedHosts }, configStore) {
   let c;
   try { c = resolveConfig(configStore); } catch (e) { c = Object.assign({}, DEFAULTS); }
 
@@ -212,7 +213,23 @@ async function verify({ token, remoteip }, configStore) {
     result = { success: false, error: 'unexpected' };
   }
 
-  if (result.success) return { passed: true, reason: 'ok' };
+  if (result.success) {
+    /**
+     * R94（审核 M03-04）：采信 `success` 之前必须核对「这枚 token 是在**本站**解出的」。
+     *
+     * 服务商回源应答里带着 `hostname`（Google 官方文档明确要求核验）与 `action`，
+     * 而旧实现只读 `success` 一个字段 —— 于是**同一枚 sitekey 被多个域名共用**时
+     * （Google 官方支持的常见做法），在别的域名上解出的合法 token 会被本站判为通过。
+     * 拿到一枚这样的 token 就能过登录 / 注册的人机验证。
+     *
+     * 判据取「不匹配就拒」而不是「没给就拒」：Turnstile 等实现在少数场景下不返回
+     * `hostname`，把它当失败会凭空拦掉正常用户；而**给了却不对**是明确的异常。
+     */
+    if (!hostnameAllowed(result.raw && result.raw.hostname, expectedHosts)) {
+      return { passed: false, reason: 'captcha_host_mismatch' };
+    }
+    return { passed: true, reason: 'ok' };
+  }
 
   // 5) 校验失败 / 超时 / 网络异常
   if (c.onError === 'degrade') {
@@ -221,6 +238,37 @@ async function verify({ token, remoteip }, configStore) {
     if (netErr) return { passed: true, reason: 'verify_error_degraded', degraded: true };
   }
   return { passed: false, reason: result.error || 'captcha_failed' };
+}
+
+/**
+ * 域名归一化（R94 / 审核 M03-04）：小写、去端口、去尾点。
+ *
+ * 服务商回的 `hostname` 大小写与尾点都不保证一致（`Example.COM.` 与 `example.com`
+ * 是同一台主机），而 `Host` 头可能带端口 —— 不归一化就会把正常用户判成"域名不符"。
+ */
+/**
+ * 「服务商应答里的 hostname 是否属于本站」（R94 / 审核 M03-04 的判据本体）。
+ *
+ * **抽成独立纯函数**是为了让护栏能驱动真正的判据，而不是只断言源码里出现过某个字符串：
+ * 这条判据一旦被改回"只看 success"，行为差异必须能被一条断言抓住。
+ *
+ * @param {string} rawHost 服务商应答的 `hostname`
+ * @param {string[]} expectedHosts 本站允许的域名
+ * @returns {boolean} 未给 hostname / 未给允许集 ⇒ true（不因此拒绝）；给了却不匹配 ⇒ false
+ */
+function hostnameAllowed(rawHost, expectedHosts) {
+  const got = normHost(rawHost);
+  const allow = (Array.isArray(expectedHosts) ? expectedHosts : []).map(normHost).filter(Boolean);
+  if (!got || !allow.length) return true;
+  return allow.indexOf(got) >= 0;
+}
+
+function normHost(v) {
+  let s = String(v == null ? '' : v).trim().toLowerCase();
+  if (!s) return '';
+  s = s.replace(/:\d+$/, '');
+  s = s.replace(/\.+$/, '');
+  return s;
 }
 
 /**
@@ -234,7 +282,11 @@ function publicReason(reason) {
   if (r === 'timeout') return '人机验证超时，请重新验证后重试';
   if (r.indexOf('network') === 0 || r === 'request_failed' || r === 'write_failed' || r === 'bad_endpoint') return '人机验证服务暂不可用，请稍后重试';
   if (r === 'bad_response' || r === 'unexpected') return '人机验证服务响应异常，请重试';
+  if (r === 'captcha_host_mismatch') return '人机验证的签发域名与本站不一致，请在本站重新完成验证';
   return '人机验证未通过，请重新验证';
 }
 
-module.exports = { resolveConfig, publicConfig, verify, publicReason, DEFAULTS, VERIFY_ENDPOINTS };
+module.exports = {
+  resolveConfig, publicConfig, verify, publicReason, hostnameAllowed, normHost,
+  DEFAULTS, VERIFY_ENDPOINTS,
+};

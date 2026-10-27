@@ -411,7 +411,18 @@ test('R14-10 · 探测失败必须留下 warn 日志，且页面仍按 fail-open
     '非 404 的探测失败必须写一条 share.probe 日志 —— 旧实现被外层 `catch` 完全吞掉、零日志，'
     + '凭据失效 / 桶被删 / 端点不可达对运维完全不可见');
   assertEqual(probes[0].level, 'warn', '这是故障信号，必须是 warn 级');
-  assert(String(probes[0].detail).includes(l.id), '日志里必须能定位到是哪条链接');
+  /**
+   * R94（审核 M08-07）：日志里引用分享链接时只写**脱敏前缀**（`statsStore.logRef()`）——
+   * 无口令分享的访问凭据就是链接 id 本身，完整写进明文的 `logs.jsonl` 等于把
+   * 一串可直接使用的凭据落到「被备份 / 贴工单 / 被监控采集」的位置。
+   * 所以判据是「能靠前缀对上号」，而不是「出现完整 id」。
+   */
+  const ref = statsStore.logRef(l.id);
+  assert(ref && ref !== '…' && ref !== '-',
+    '自证：logRef 必须给出可辨识的前缀（否则下面的断言是空转）');
+  assert(String(probes[0].detail).includes(ref), '日志里必须能定位到是哪条链接（脱敏前缀即可）');
+  assert(!String(probes[0].detail).includes(l.id),
+    '日志里不得出现**完整**链接 id —— 它就是无口令分享的访问凭据');
   assertEqual(r.status, 200,
     '「非 404 一律 fail-open」的取舍**不变**：只有明确的 404 才算文件没了，'
     + '否则一次临时抖动会把所有分享页打成错误页');

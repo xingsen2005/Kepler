@@ -14,6 +14,9 @@
 /** 现阶段仅支持人民币 */
 const CURRENCY = 'CNY';
 
+// R94（审核 M10-04）：元 → 分的唯一实现点
+const { yuanToFen } = require('./limits');
+
 /** 最低 0.01 元（1 分）；金额一律以「分」为整数存储，杜绝浮点误差 */
 const MIN_AMOUNT_FEN = 1;
 /** 上限 100000 元，防止误填天价金额 */
@@ -33,7 +36,9 @@ function normalizeAmount(v) {
   if (!Number.isFinite(n)) return { ok: false, fen: 0, message: '付费金额必须是数字' };
   if (n < 0) return { ok: false, fen: 0, message: '付费金额不能为负数' };
   // 先按元四舍五入到分，再转整数分 —— 避免 0.1+0.2 这类二进制浮点误差
-  const fen = Math.round(n * 100);
+  // R94（审核 M10-04）：改用 limits.yuanToFen()，否则 1.005 元会被算成 1.00
+  // （`1.005 * 100 === 100.49999999999999`，Math.round 只做就近取整）。
+  const fen = yuanToFen(n);
   if (fen < MIN_AMOUNT_FEN) {
     return { ok: false, fen: 0, message: `付费金额最低 ${formatAmount(MIN_AMOUNT_FEN)} 元` };
   }

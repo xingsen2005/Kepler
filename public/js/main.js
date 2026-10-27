@@ -2187,6 +2187,8 @@ export async function updateStatusbar() {
 export async function refreshMiniStats() {
   // 已登出（状态栏不在）→ 立刻停止轮询，而不是"请求照发、只在渲染时 return"
   if (!document.getElementById('status-traffic')) { stopStatsTimer(); return; }
+  // R94（审核 M13-07）：`/api/stats/summary` 管理员专属（全实例聚合，非个人用量）
+  if (!isStaffRole(App.state.user && App.state.user.role)) { stopStatsTimer(); return; }
   try {
     const s = await API.summary();
     App.state.statsSummary = s;
@@ -2203,6 +2205,12 @@ export async function refreshMiniStats() {
 /** R7-09：统计摘要定时器 —— 句柄保存 + 先停后启，登出时由 forceLogout 停止 */
 function startStatsTimer() {
   stopStatsTimer();
+  /**
+   * R94（审核 M13-07）：`/api/stats/summary` 已改为管理员专属（它报的是**全实例**
+   * 的 7 天流量，不是"自己那一部分"）。普通用户连定时器都不建，避免每分钟一次
+   * 注定 403 的请求 —— 请求频率本身也是一种噪音与日志污染。
+   */
+  if (!isStaffRole(App.state.user && App.state.user.role)) return;
   App._statsTimer = setInterval(refreshMiniStats, 60000);
 }
 function stopStatsTimer() {
@@ -2221,6 +2229,18 @@ let speedTimer = null;
 function startSpeedPolling() {
   stopSpeedPolling();
   const el = () => document.getElementById('status-traffic');
+  /**
+   * R94（审核 M13-07）：只给管理员轮询，普通用户连那一格都隐藏。
+   *
+   * `/api/stats/speed` 报的是**全实例**近 10 秒吞吐（`sampleTraffic()` 不带用户维度），
+   * 对单个用户没有意义，且与「普通用户仅见自己可见资源」的约定相悖 —— 于是接口加了
+   * `requireAdmin`。前端若照旧每 2 秒打一次，普通用户会立刻撞 403（下面的 catch 会
+   * 停掉轮询，但开局那一次仍是白挨），状态栏还会留着一个永远「↑— ↓—」的格子。
+   */
+  const staff = isStaffRole(App.state.user && App.state.user.role);
+  const node = el();
+  if (node) node.hidden = !staff;
+  if (!staff) return;
   async function tick() {
     if (!el()) { stopSpeedPolling(); return; } // 状态栏不在 → 已登出，立即停
     try {

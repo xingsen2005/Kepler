@@ -5,6 +5,7 @@ const { express, configStore, statsStore } = require('./_context');
 // R71：`/health` 的运维字段按「是否管理层」分档 —— 根用户必须与管理员同级
 const roles = require('../roles');
 const secureStore = require('../secure-store');
+const encPool = require('../enc-pool'); // R94（审核 M09-07）：健康检查报加密线程池降级状态
 const updateCheck = require('../update-check');
 const { LIMITS } = require('../limits');
 const { getClient, translateError, listAll } = require('../s3');
@@ -98,7 +99,12 @@ function adjustStorageCache(delta, cfg) {
 }
 
 // 实时上传/下载速率（近 10 秒平均）
-router.get('/stats/speed', (req, res) => {
+//
+// R94（审核 M13-07）：**仅管理员**。`statsStore.speed()` 统计的是**全实例**吞吐
+// （`sampleTraffic()` 不带用户维度），普通用户拿到的不是"自己那一部分"，而是所有
+// 用户加总的实时速率 —— 与 R89 为 `/stats/storage` 做的那次收敛（按 `spaceRoot`
+// 只统计自己那一段）是同一条产品约定，这里是当时漏掉的一处。
+router.get('/stats/speed', requireAdmin, (req, res) => {
   res.json(statsStore.speed());
 });
 
@@ -156,7 +162,13 @@ router.get('/stats/storage', async (req, res) => {
 });
 
 // 汇总统计：容量 + 流量 + 请求（7 天）
-router.get('/stats/summary', async (req, res) => {
+//
+// R94（审核 M13-07）：**仅管理员** —— 与 `/stats/logs`（SEC-07）与 `/stats/storage`
+// （R89 按 `spaceRoot` 收敛）同一口径。`statsStore.summary()` 里的 7 天流量、按请求
+// 类型聚合、以及 `quotaBytes`（取自**全实例**配置）都不带用户维度；对普通用户开放
+// 等于把「全站此刻有多少人传了多少东西」摊给每个人看，单用户规模下甚至能反推
+// 他人的活动时间与体量。
+router.get('/stats/summary', requireAdmin, async (req, res) => {
   try {
     const cfg = configStore.get();
     const quotaBytes = cfg ? cfg.quotaBytes : 0; // 0 = 无限制
@@ -204,6 +216,21 @@ router.get('/health', (req, res) => {
   if (req.authUser && roles.isStaff(req.authUser.role)) {
     out.bucketCount = cfg && Array.isArray(cfg.buckets) ? cfg.buckets.length : 0;
     out.lastWriteAt = (cfg && cfg.updatedAt) || '';
+    /**
+     * R94（审核 M09-07）：把加密线程池的降级状态报出来。
+     *
+     * 降级后 magic 模式一个 48MB 分片要在主线程同步异或约 3 秒、期间全站零响应，
+     * 而管理界面的「线程并发」卡片看不出任何区别 —— 运维只会觉得「这台机器最近
+     * 怎么这么慢」。只给管理层看（与 `bucketCount` 同档），普通用户不需要。
+     */
+    const pool = encPool.stats();
+    out.encPool = {
+      degraded: Boolean(pool.degraded),
+      cooling: Boolean(pool.cooling),
+      workers: pool.workers,
+      queued: pool.queued,
+      degradeCount: pool.degradeCount,
+    };
   }
   const secureErr = secureStore.getLastWriteError();
   /**
@@ -216,9 +243,24 @@ router.get('/health', (req, res) => {
    */
   if (secureErr) {
     out.ok = false;
-    out.secureWriteError = Object.assign({}, secureErr, {
+    /**
+     * R94（审核 M13-01）：`message` 同样要脱敏，不能只换 `file`。
+     *
+     * R87 把 `file` 换成了 basename，却用 `Object.assign({}, secureErr, …)`
+     * 把其余字段原样带出 —— 而 `message` 就是 `atomic.writeAtomicSync()` 抛出的
+     * **原始 fs 错误文案**，Node 的 fs 错误里带**绝对路径**：
+     * `EACCES: permission denied, open '/opt/kepler/data/links.json.1234.a1b2.tmp'`
+     * （Windows 上是 `C://Users//<登录名>//…`）。本端点只要求登录、不挂 requireAdmin
+     * ⇒ 任何普通用户在磁盘写满 / 只读挂载的那一刻都能读到数据目录布局与系统用户名。
+     *
+     * 改成**白名单重建**（而不是在旧对象上覆盖）：只留 filename + 固定文案 + 时刻，
+     * 原始 message 仅进服务端日志（`secure-store` 的 console.error 已经打过）。
+     */
+    out.secureWriteError = {
       file: require('path').basename(String(secureErr.file || '')),
-    });
+      message: '敏感数据文件写入失败（详见服务端日志）',
+      at: secureErr.at,
+    };
   }
   const corruptFiles = secureStore.corruptList();
   if (corruptFiles.length) { out.ok = false; out.corruptFiles = corruptFiles; }

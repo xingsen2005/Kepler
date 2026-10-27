@@ -33,7 +33,20 @@ const DATA_DIR = require('./data-dir').dataDir();
 const GUARD_FILE = path.join(DATA_DIR, 'ipguard.json');
 const CHINA_LIST_FILE = path.join(__dirname, 'china-ips.txt');
 
-const ALLOWED_METHODS = ['GET', 'POST', 'PUT', 'DELETE', 'HEAD'];
+/**
+ * 规则可限定的 HTTP 方法词表（R94 · 审核 M12-02）。
+ *
+ * ⚠️ **必须含 WebDAV 动词**：本服务同时挂着 WebDAV 端口，`PROPFIND` / `MOVE` /
+ * `COPY` / `MKCOL` / `PROPPUT` 等是**真正读写数据**的方法。旧词表只有 5 个 REST
+ * 动词，于是「只屏蔽读 / 只屏蔽写」这类规则在 WebDAV 端口上被完全绕过
+ * （下载走 `GET` 被限了，同一份文件用 `PROPFIND` + WebDAV `GET` 走另一条路径）。
+ * 词表同时是前端复选框的来源（`GET /ipguard/methods`），加在这里即可两边一致。
+ */
+const ALLOWED_METHODS = [
+  'GET', 'POST', 'PUT', 'DELETE', 'HEAD', 'PATCH',
+  // WebDAV
+  'OPTIONS', 'PROPFIND', 'PROPPATCH', 'MKCOL', 'COPY', 'MOVE', 'LOCK', 'UNLOCK',
+];
 
 /* ------------------------- IP 解析与 CIDR 匹配（IPv4） ------------------------- */
 
@@ -415,6 +428,21 @@ let guard = null; // { rules: [], updatedAt }
 let loadDegraded = false;
 
 /**
+ * R94（审核 M12-03）：「本机回环永久放行」正在生效的时刻（0 = 从未生效）。
+ *
+ * 那条豁免的判据是「socket 对端是回环」，而**反向代理部署里 socket 对端恰恰就是
+ * 本机反代**（`proxy_pass http://127.0.0.1:$APP_PORT`）。只要本次请求没被识别为
+ * 「来自可信代理的转发头」，IP 守卫就把整站请求都当成 `127.0.0.1`，于是
+ * **管理员配的全部屏蔽规则与「屏蔽海外 IP」一次性失效**，而界面上没有任何信号
+ * （规则卡片照旧显示「生效中」，命中数恒 0 也会被误读成"还没人撞上来"）。
+ *
+ * 触发路径都不需要攻击者：`TRUST_PROXY` 未设、`TRUST_PROXY_FROM` 写错、或反代
+ * 不转发 `X-Forwarded-For`。这里只做**可观测性**（与 R78 的 `loadDegraded` 同款）：
+ * 记录豁免的最近生效时刻，`view()` 带出去，界面据此提示。
+ */
+let loopbackExemptAt = 0;
+
+/**
  * 单条规则的归一化 —— **唯一实现点**（读盘 / 导入共用）。
  *
  * 三件事缺一不可，且历史上每一条都各自踩过坑：
@@ -503,6 +531,23 @@ function load() {
 }
 
 /**
+ * 「剥掉派生缓存 `_parsed`」的**唯一实现点**（R28-01 定的口径，R94 / 审核 M12-06 收口）。
+ *
+ * `_parsed` 是 `parseTarget()` 的预解析结果，纯属性能缓存，**既不落盘也不出接口**。
+ * 这条口径原先在**四处**各写了一遍（`persistView()` / `listRules()` / `view()` /
+ * `GET /api/ipguard/test`），于是每新增一条读路径就会漏一处：预检接口正是这样
+ * 把一条 IPv6 规则的 16 字节 `Buffer`（乃至历史坏缓存里的
+ * `{type:'Buffer',data:[…]}`）原样回显给前端的。收敛到一处之后，
+ * 「还有没有漏」这个问题的答案变成「有没有走这个函数」，而不是「数了几遍」。
+ */
+function publicRule(r) {
+  if (!r || typeof r !== 'object') return r;
+  const c = Object.assign({}, r);
+  delete c._parsed;
+  return c;
+}
+
+/**
  * R28-01：落盘视图 —— **剥掉派生缓存 `_parsed`**。
  *
  * `_parsed` 是 `parseTarget()` 的预解析结果，纯属性能缓存，**不该被持久化**：
@@ -515,13 +560,7 @@ function load() {
  * `load()` 里的类型校验负责把**已经**带着坏缓存的历史文件纠正过来。
  */
 function persistView(g) {
-  return Object.assign({}, g, {
-    rules: (g.rules || []).map((r) => {
-      const copy = Object.assign({}, r);
-      delete copy._parsed;
-      return copy;
-    }),
-  });
+  return Object.assign({}, g, { rules: (g.rules || []).map(publicRule) });
 }
 
 function persist() {
@@ -568,7 +607,7 @@ function newId() {
  * R28-01：它没有任何界面用途，却会把 IPv6 规则的 16 字节数组（乃至坏缓存里的
  * `{type:'Buffer',data:[…]}`）一并回显给前端。
  */
-function listRules() { return load().rules.map((r) => { const c = { ...r }; delete c._parsed; return c; }); }
+function listRules() { return load().rules.map(publicRule); }
 
 /**
  * 校验并规范化作用范围（多桶）：返回去重后的桶 id 数组；空数组 = 全局。
@@ -966,9 +1005,20 @@ function evaluate(ip, method, bucketId, opts) {
   const m = String(method || 'GET').toUpperCase();
   const g = load();
   const fromForwarded = Boolean(opts && opts.fromForwarded);
+  /**
+   * R94（审核 M12-03）：「带过任何 `X-Forwarded-*` 头」的请求**不再享有回环豁免**。
+   *
+   * 反代没被识别为可信（`TRUST_PROXY` 未设 / `TRUST_PROXY_FROM` 写错）时，
+   * `clientIpInfo()` 会退回 socket 对端 —— 在反代部署下那就是 `127.0.0.1`，
+   * 于是「本机永远放行」把**全部**屏蔽规则一次吞掉。而真正的本机直连（管理界面、
+   * 命令行探针）不会带 `X-Forwarded-*`：用「有没有转发头」这一条把两者分开，
+   * 既不牺牲既有的「本机回环永久放行」特性，也不让反代流量继续混进豁免里。
+   */
+  const hasForwarded = Boolean(opts && opts.hasForwarded);
 
-  if (!fromForwarded && (ip === '127.0.0.1' || ip === '::1')) {
-    return { ok: true, ip, bucketId: bucketId || null }; // 本机永远放行（仅 socket 对端）
+  if (!fromForwarded && !hasForwarded && (ip === '127.0.0.1' || ip === '::1')) {
+    // 本机永远放行（仅 socket 对端，且请求不带任何转发头）
+    return { ok: true, ip, bucketId: bucketId || null, loopbackExempt: true };
   }
 
   const info = parseIpInfo(ip); // IPv4 / IPv6 统一结构（S10）
@@ -1073,8 +1123,16 @@ setInterval(flushHits, 3000).unref();
  */
 function guardRequest(req) {
   const info = security.clientIpInfo(req);
-  const v = evaluate(info.ip, req.method, resolveBucketId(req), { fromForwarded: info.fromForwarded });
-  if (!v.ok) {
+  const v = evaluate(info.ip, req.method, resolveBucketId(req), {
+    fromForwarded: info.fromForwarded,
+    // R94（审核 M12-03）：见 `evaluate()` —— 带转发头的回环请求不再豁免
+    hasForwarded: security.hasForwardedHeader(req),
+  });
+  if (v.ok) {
+    if (v.loopbackExempt) loopbackExemptAt = Date.now();
+    return v;
+  }
+  {
     // R27-07：只有「规则命中」与「海外命中」各自计数；`unparsable` 既不是规则命中
     // 也不是海外命中，混进 overseasHits 会让界面的命中统计说谎。
     if (v.reason === 'rule') markHit(v.rule.id);
@@ -1131,7 +1189,7 @@ function view() {
   const g = load();
   return {
     // R28-01：与 persistView()/listRules() 同一口径（不回传派生缓存）
-    rules: g.rules.map((r) => { const c = { ...r }; delete c._parsed; return c; }),
+    rules: g.rules.map(publicRule),
     chinaRangeCount: loadChinaList().length,
     overseasHits,
     updatedAt: g.updatedAt,
@@ -1143,6 +1201,16 @@ function view() {
      * 两者都是 `false` 才是正常态；只报"规则 0 条"会让管理员以为是自己没配。 */
     rulesLoadDegraded: loadDegraded,
     rulesPersistDegraded: persistDegraded,
+    /**
+     * R94（审核 M12-03）：「本机回环永久放行」是否最近实际生效过。
+     *
+     * 反代部署下若 `TRUST_PROXY` / `TRUST_PROXY_FROM` 没配对，整站请求在守卫眼里
+     * 都是 `127.0.0.1`，全部屏蔽规则**静默失效**。这两个字段让界面能把
+     * 「规则写了但根本没参与判定」这件事说出来 —— 只有当**确实配有规则**时才提示，
+     * 没配规则的人不该看到这条警告。
+     */
+    loopbackExempt: g.rules.length > 0 && loopbackExemptAt > 0,
+    loopbackExemptAt: loopbackExemptAt ? new Date(loopbackExemptAt).toISOString() : '',
     ipv6: {
       supported: true,
       // 提示前端：国内白名单仅覆盖 IPv4；某桶开启海外屏蔽时公网 IPv6 访问会被视为海外
@@ -1155,7 +1223,7 @@ module.exports = {
   middleware, guardRequest, clientIp, evaluate, view, resolveBucketId,
   // R28-06：拒绝原因 → 文案的唯一实现点（WebDAV 分支也用它，避免两处文案再次分叉）
   blockTip,
-  listRules, addRule, updateRule, removeRule, setRuleEnabled, setBucketOverseas, removeRulesForBucket,
+  listRules, publicRule, addRule, updateRule, removeRule, setRuleEnabled, setBucketOverseas, removeRulesForBucket,
   // R38：整批替换（配置备份导入）+ 单条归一化的唯一实现点
   replaceAllRules, normalizeRule,
   invalidateOverseasCache,

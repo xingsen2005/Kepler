@@ -16,7 +16,7 @@
  * 旧实现只有前者，于是「管理员」这个角色既表示「能进用户管理」，又隐含「能管任何人」——
  * 管理员之间可以互相删除的越权漏洞正是由此而来。
  */
-const { express, configStore, statsStore, authSession, emailCode, security } = require('./_context');
+const { express, configStore, statsStore, authSession, emailCode, security, shareStore } = require('./_context');
 /**
  * R71：**「谁能管谁」的唯一接口层判定点** —— R78 起实现搬到 `_shared.js`。
  *
@@ -371,7 +371,16 @@ router.put('/users/:id', requireAdmin, async (req, res) => {
     if (isSelf) {
       const changesPassword = b.password !== undefined && b.password !== '';
       const changesEmail = b.email !== undefined;
-      if (changesPassword || changesEmail) {
+      /**
+       * R94（审核 M02-01 / M01-04）：**改用户名同样要当前口令**。
+       *
+       * R90 把闸门补到了密码 / 邮箱，唯独漏了用户名 —— 而用户名是「我是谁」的
+       * 对外标识：会话被劫持后，攻击者只要对自己的 id 调一次本端点就能把名字改成
+       * 另一个人的，再配合「按用户名归属」的分享链接（见 M02-02）继承他人资产。
+       * `/users/me` 侧早已把用户名算进 `needsCurrent`，两边必须同源。
+       */
+      const changesUsername = b.username !== undefined && String(b.username) !== String(target.username);
+      if (changesPassword || changesEmail || changesUsername) {
         const ip = security.clientIp(req) || 'unknown';
         const rl = security.passwordLimiter('users-self-edit:' + ip);
         if (!rl.ok) {
@@ -563,10 +572,18 @@ router.delete('/users/:id', requireAdmin, (req, res) => {
     }
     if (denyIfCannotManage(req, res, target, '删除')) return;
     configStore.removeUser(req.params.id);
+    /**
+     * R94（审核 M02-02）：**连带解除该用户的分享链接归属**。
+     *
+     * 链接归属判据是 `createdBy`（用户名）。不处理的话，「删掉用户 + 建一个同名账号」
+     * 就等于把前者留下的全部分享链接（含付费链接的收款人身份）转交出去。
+     * 只清空归属、不删链接 —— 理由见 `shareStore.orphanByCreator()` 的说明。
+     */
+    const orphaned = shareStore.orphanByCreator(target.username);
     // SEC-02：账户已删除，其会话必须立即失效，否则被删除者仍能继续读写对象存储。
     const n = authSession.destroyUserSessions(target.id);
-    statsStore.addLog({ action: 'users.delete', level: 'warn', detail: `${roles.roleLabel(req.authUser.role)}「${req.authUser.username}」删除用户「${target.username}」（${n} 个会话已失效）` });
-    res.json({ ok: true, sessionsRevoked: n });
+    statsStore.addLog({ action: 'users.delete', level: 'warn', detail: `${roles.roleLabel(req.authUser.role)}「${req.authUser.username}」删除用户「${target.username}」（${n} 个会话已失效，${orphaned} 条分享链接已解除归属）` });
+    res.json({ ok: true, sessionsRevoked: n, linksOrphaned: orphaned });
   } catch (e) {
     sendError(res, e);
   }

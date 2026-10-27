@@ -266,7 +266,27 @@ class AzureBlobClient {
     const headers = Object.assign({}, spec.headers || {});
     let body = null;
     if (spec.body !== undefined && spec.body !== null) {
-      body = Buffer.isBuffer(spec.body) ? spec.body : Buffer.from(String(spec.body), 'utf8');
+      /**
+       * R94（审核 M05-07）：**流式请求体会被静默写成 `"[object Object]"`**。
+       *
+       * 旧实现只有 `Buffer.isBuffer(body) ? body : Buffer.from(String(body))` 一条路。
+       * S3 适配器另有一条 `spec.streamBody` 分支支持 Node 流，Azure 这边没有：
+       * 把流直接传进来时 `String(<Readable>)` 得到 `"[object Object]"`，
+       * `content-length` 也跟着变成它的长度 —— **云端返回 201 Created，看起来完全
+       * 成功**，实际写进去的是 15 字节垃圾。这种「只在某一家厂商上出现」的分裂
+       * 一旦被人按 S3 的写法使用就极难排查。
+       *
+       * 现在把流**读成 Buffer**（而不是让它变成字符串字面量）：语义上等价于 S3 侧
+       * 的 `streamBody`，只是这里不接受真正的流式上传（Azure Block Blob 的流式
+       * 需要分块协议，不在这里做）。
+       */
+      if (typeof spec.body.pipe === 'function' || typeof spec.body[Symbol.asyncIterator] === 'function') {
+        const chunks = [];
+        for await (const chunk of spec.body) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+        body = Buffer.concat(chunks);
+      } else {
+        body = Buffer.isBuffer(spec.body) ? spec.body : Buffer.from(String(spec.body), 'utf8');
+      }
       headers['content-length'] = String(body.length);
     }
     if (headers.host === undefined) headers.host = this.host;

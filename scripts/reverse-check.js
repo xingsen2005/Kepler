@@ -220,27 +220,8 @@ const CASES = [
       // 否则就变成「顺带把上传者元数据也丢了」的另一处变异，红的原因就不唯一了。
       name: 'R7-06 · fs-gateway 的 putObject 退回「直接回调式调用」（绕过 p()）',
       file: 'server/fs-gateway.js',
-      anchor: "  await p(s3, 'putObject', {\n"
-        + "    Bucket: cfg.bucket, Region: cfg.region, Key: k,\n"
-        + "    Body: body,\n"
-        + '    ContentLength: body.length,\n'
-        + '    // R36：WebDAV 上传同样记录上传者（属性面板与网页上传看到的是同一份数据）。\n'
-        + '    Headers: Object.assign(\n'
-        + "      { 'Content-Type': contentType || 'application/octet-stream' },\n"
-        + '      uploaderMeta(uploader),\n'
-        + '    ),\n'
-        + '  });',
-      replacement: '  await new Promise((resolve, reject) => {\n'
-        + '    s3.putObject({\n'
-        + '      Bucket: cfg.bucket, Region: cfg.region, Key: k,\n'
-        + '      Body: body,\n'
-        + '      ContentLength: body.length,\n'
-        + '      Headers: Object.assign(\n'
-        + "        { 'Content-Type': contentType || 'application/octet-stream' },\n"
-        + '        uploaderMeta(uploader),\n'
-        + '      ),\n'
-        + '    }, (err) => (err ? reject(err) : resolve()));\n'
-        + '  });',
+      anchor: "  await p(s3, 'putObject', {\n    Bucket: cfg.bucket, Region: cfg.region, Key: k,\n    Body: body,\n    ContentLength: body.length,\n    // R36：WebDAV 上传同样记录上传者（属性面板与网页上传看到的是同一份数据）。\n    Headers: Object.assign(\n      // R94（审核 M06-08）：写入的唯一收口点 —— 可执行类型一律降级为二进制\n      { 'Content-Type': normalizeContentType(contentType) },\n      uploaderMeta(uploader),\n    ),\n  });",
+      replacement: "  await new Promise((resolve, reject) => {\n    s3.putObject({\n      Bucket: cfg.bucket, Region: cfg.region, Key: k,\n      Body: body,\n      ContentLength: body.length,\n      Headers: Object.assign(\n        { 'Content-Type': normalizeContentType(contentType) },\n        uploaderMeta(uploader),\n      ),\n    }, (err) => (err ? reject(err) : resolve()));\n  });",
       testFile: 'audit7-regressions.test.js',
       minFail: 1,
     },
@@ -456,8 +437,10 @@ const CASES = [
     {
       name: 'R8-12 · 当前密码错误改回 401（前端会当成会话过期并强制登出）',
       file: 'server/routes/webauthn.js',
-      anchor: "      return res.status(403).json({ error: '密码不正确，无法开启 Windows Hello' });",
-      replacement: "      return res.status(401).json({ error: '密码不正确，无法开启 Windows Hello' });",
+      // R94 复核：两处 403 文案完全相同，唯一的区分依据是这段注释 + 同一行 addLog，
+      // 故 anchor 连同注释整段锚定（`stripComments()` 两侧同口径剥白，仍能逐字命中）。
+      anchor: "      statsStore.addLog({ action: 'webauthn.register.fail', level: 'warn', detail: `用户「${me.username}」开启 Windows Hello 时密码校验失败` });\n      // R8-12：这是**当前密码不正确**，会话完全有效，因此必须是 403 而不是 401。\n      // 前端 api.js 把任意 401 统一派发为 `auth-required`（「会话过期」）→ 用户\n      // 只是手误打错密码，却被踢回登录页、弹窗内容丢失、提示文案还是错的。\n      return res.status(403).json({ error: '密码不正确，无法开启 Windows Hello' });",
+      replacement: "      statsStore.addLog({ action: 'webauthn.register.fail', level: 'warn', detail: `用户「${me.username}」开启 Windows Hello 时密码校验失败` });\n      // R8-12：这是**当前密码不正确**，会话完全有效，因此必须是 403 而不是 401。\n      // 前端 api.js 把任意 401 统一派发为 `auth-required`（「会话过期」）→ 用户\n      // 只是手误打错密码，却被踢回登录页、弹窗内容丢失、提示文案还是错的。\n      return res.status(401).json({ error: '密码不正确，无法开启 Windows Hello' });",
       testFile: 'audit8-regressions.test.js',
       minFail: 1,
     },
@@ -819,7 +802,7 @@ const CASES = [
       // R12-03：`enc-store` 的内联判定也改调唯一实现点了
       name: 'R11-07 · 退出路径退回「无条件 mkdirSync」（删掉的 data 目录被退出钩子复活）',
       file: 'server/enc-store.js',
-      anchor: '  if (opts.exit && !secureStore.exitPathWritable(DATA_DIR)) return;\n',
+      anchor: '  if (opts.exit && !secureStore.exitPathWritable(DATA_DIR)) return false;\n',
       replacement: '',
       testFile: 'audit11-regressions.test.js',
       minFail: 1,
@@ -971,7 +954,7 @@ const CASES = [
        */
       name: 'R13-07 · 登记入口不再调用唯一实现点（旧 minCalls 计数代理照样放行）',
       file: 'server/enc-store.js',
-      anchor: '  if (opts.exit && !secureStore.exitPathWritable(DATA_DIR)) return;',
+      anchor: '  if (opts.exit && !secureStore.exitPathWritable(DATA_DIR)) return false;',
       replacement: '  // 变异：登记入口不再调用唯一实现点',
       testFile: 'invariants.test.js',
       minFail: 1,
@@ -1952,7 +1935,7 @@ const CASES = [
        */
       name: 'R17-01 · 「本机永远放行」退回无条件（一个 XFF: 127.0.0.1 即重获豁免）',
       file: 'server/ip-guard.js',
-      anchor: '  if (!fromForwarded && (ip === \'127.0.0.1\' || ip === \'::1\')) {',
+      anchor: '  if (!fromForwarded && !hasForwarded && (ip === \'127.0.0.1\' || ip === \'::1\')) {',
       replacement: "  if (ip === '127.0.0.1' || ip === '::1') {",
       testFile: 'audit17-regressions.test.js',
       minFail: 1,
@@ -2855,10 +2838,11 @@ const CASES = [
     {
       name: 'R25-07【WebDAV MKCOL】· 不再过配额闸门',
       file: 'server/webdav/app.js',
-      anchor: "      const dirKey = key.endsWith('/') ? key : key + '/';\n"
-        + '      // R25：新建集合是 0 字节对象 → `addBytes=0`\n'
-        + '      await bucketStats.assertCredentialQuota(cfg.credentialId, { addBytes: 0 });',
-      replacement: "      const dirKey = key.endsWith('/') ? key : key + '/';",
+      // R94（审核 M11-05）在 `dirKey` 与配额闸门之间插入了「父集合必须存在」的校验，
+      // 旧 anchor 的两行不再相邻。这里只锚**闸门本身**（6 空格缩进与 PUT·目录的 8 空格区分），
+      // 变异语义不变：把两处配额判据换成空语句。
+      anchor: "      // R25：新建集合是 0 字节对象 → `addBytes=0`\n      await bucketStats.assertCredentialQuota(cfg.credentialId, { addBytes: 0 });\n      await bucketStats.assertBucketQuota(s3, cfg, { addBytes: 0 }); // R28-02：单桶上限",
+      replacement: '      void 0;',
       testFile: 'audit25-regressions.test.js',
       minFail: 1,
     },
@@ -2971,16 +2955,18 @@ const CASES = [
     {
       name: 'R26-06a · 「只改备注」的保存把端点一并清空（旧实现的无条件写入）',
       file: 'server/config-store.js',
-      anchor: '      exist.endpoint = ep;',
-      replacement: '      void 0;',
+      anchor: '    if (endpoint !== undefined) exist.endpoint = ep;',
+      replacement: '    exist.endpoint = ep;',
       testFile: 'audit26-regressions.test.js',
       minFail: 1,
     },
     {
       name: 'R26-06b · 重新保存无条件改写厂商（R2 密钥被回落成腾讯云）',
       file: 'server/config-store.js',
-      anchor: '    if (explicitProvider) exist.provider = pid;',
-      replacement: '    exist.provider = pid;',
+      anchor: '    if (explicitProvider) exist.provider = nextProvider;',
+      // 旧行为：无条件把厂商写成「本次请求的厂商 / 默认厂商」，于是「只改备注」的
+      // 保存会把 R2 密钥的厂商回落成腾讯云（端点随之为空 → 连接全断）
+      replacement: '    exist.provider = pid || providers.DEFAULT_PROVIDER_ID;',
       testFile: 'audit26-regressions.test.js',
       minFail: 1,
     },
@@ -3003,7 +2989,7 @@ const CASES = [
     {
       name: 'R26-06e · 更新密钥时先落值后校验（被拒绝的更新把内存里的端点改坏）',
       file: 'server/config-store.js',
-      anchor: '    assertEndpointProvided(c.provider, nextEndpoint);',
+      anchor: '    if (endpoint !== undefined) assertEndpointProvided(nextProvider, ep);',
       replacement: '    // 变异：校验挪到落值之后',
       testFile: 'audit26-regressions.test.js',
       minFail: 1,
@@ -3171,8 +3157,8 @@ const CASES = [
     {
       name: 'R28-01 · 派生缓存 `_parsed` 重新被一并加密落盘（IPv6 规则重启后永不命中）',
       file: 'server/ip-guard.js',
-      anchor: '      delete copy._parsed;',
-      replacement: '      void 0;',
+      anchor: '  delete c._parsed;',
+      replacement: '  void 0;',
       testFile: 'audit28-regressions.test.js',
       minFail: 1,
     },
@@ -4694,8 +4680,8 @@ const CASES = [
       // 症状是「导入成功、WebDAV 却登录不上」，且界面上看不出任何异常。
       name: 'R38-02k · 备份里带上 passwordSealed（跨实例永远解不开）',
       file: 'server/backup.js',
-      anchor: "      password: String(full.password || ''),\n    };",
-      replacement: "      password: String(full.password || ''),\n      passwordSealed: String(a.passwordSealed || 'sealed'),\n    };",
+      anchor: "      password: String(full.password || ''),\n",
+      replacement: "      password: String(full.password || ''),\n      passwordSealed: String(a.passwordSealed || 'sealed'),\n",
       testFile: 'audit38-regressions.test.js',
       minFail: 1,
     },
@@ -4792,8 +4778,8 @@ const CASES = [
       // 没还原」，而是把系统导成**零管理员** —— 管理页打不开、也没有自助恢复通道。
       name: 'R38-02x · 导入顺手写了用户表（把系统导成零管理员 → 永久锁死）',
       file: 'server/backup.js',
-      anchor: '  await configStore.flush();\n  return summarize(collect());',
-      replacement: '  configStore.save({ users: Array.isArray(data.users) ? data.users : [] });\n  await configStore.flush();\n  return summarize(collect());',
+      anchor: '  await configStore.flush();\n  const sum = summarize(collect());',
+      replacement: '  configStore.save({ users: Array.isArray(data.users) ? data.users : [] });\n  await configStore.flush();\n  const sum = summarize(collect());',
       testFile: 'audit38-regressions.test.js',
       minFail: 1,
     },
@@ -7231,7 +7217,7 @@ const CASES = [
       // R52-03：「先问、再写」。云端覆盖不可撤销，冲突必须交给用户决策而不是默认覆盖。
       name: 'R52-03a · 复制遇到同名项不再先问，直接按覆盖写（云端覆盖不可撤销）',
       file: 'server/routes/fs.js',
-      anchor: '      const d = decisions ? decisions[p.key] : null;',
+      anchor: '      const d = decisions ? decisions[rel] : null;',
       replacement: '      const d = \'overwrite\';',
       testFile: 'audit52-regressions.test.js',
       minFail: 1,
@@ -7516,8 +7502,8 @@ const CASES = [
       // R54 同步：其后又插入了 `site: siteView(cfg),` 一行，anchor 一并带上。
       name: 'R53-04a · safeView 正常分支不再下发 smtp（卡片读不到已保存配置）',
       file: 'server/config-store.js',
-      anchor: '    smtp: smtpView(cfg), // R53：发信设置（口令只回 hasPassword 布尔值）\n    site: siteView(cfg), // R54：站点设置（站点名称 / 公开注册 / 新用户身份）\n    credentials: creds.credentials,',
-      replacement: '    site: siteView(cfg), // R54：站点设置（站点名称 / 公开注册 / 新用户身份）\n    credentials: creds.credentials,',
+      anchor: '    smtp: isAdmin ? smtpView(cfg) : null,\n    site: siteView(cfg),',
+      replacement: '    smtp: null,\n    site: siteView(cfg),',
       testFile: 'audit53-regressions.test.js',
       minFail: 1,
     },
@@ -8531,8 +8517,8 @@ const CASES = [
        */
       name: 'R54c-04e · 核销挪到人机验证之前（限流端点变成邀请码存在性 oracle）',
       file: 'server/routes/auth.js',
-      anchor: '    const cap = await captcha.verify({ token: b.captchaToken, remoteip: ip }, configStore);',
-      replacement: "    if (mode === 'invite') inviteStore.consume(inviteCode, String(b.username == null ? '' : b.username).trim());\n    const cap = await captcha.verify({ token: b.captchaToken, remoteip: ip }, configStore);",
+      anchor: '    const cap = await captcha.verify({\n      token: b.captchaToken, remoteip: ip, expectedHosts: captchaHosts(req),\n    }, configStore);',
+      replacement: "    if (mode === 'invite') inviteStore.consume(inviteCode, String(b.username == null ? '' : b.username).trim());\n    const cap = await captcha.verify({\n      token: b.captchaToken, remoteip: ip, expectedHosts: captchaHosts(req),\n    }, configStore);",
       testFile: 'audit54c-regressions.test.js',
       minFail: 1,
     },
@@ -8943,7 +8929,7 @@ const CASES = [
        */
       name: 'R57-01a · 发信探针被摘成恒真（认证被拒 / 连不上又变成静默失败）',
       file: 'server/email-code.js',
-      anchor: '    await smtp.verify({\n'
+      anchor: '    const v = await smtp.verify({\n'
         + '      host: cfg.host, port: cfg.port, secure: cfg.secure,\n'
         + '      user: cfg.user, password: cfg.password, from: cfg.from,\n'
         + '    });',
@@ -8965,9 +8951,9 @@ const CASES = [
       name: 'R57-02a · /auth/forgot 的站点级闸门被摘除（未配置也回「已发送」）',
       file: 'server/routes/auth.js',
       anchor: '    const gate = await emailCode.probeMailer();\n'
-        + '    if (!gate.ok) return res.status(gate.status || 503).json({ error: gate.error });',
+        + '    if (!gate.ok) {\n',
       replacement: '    const gate = { ok: true };\n'
-        + '    if (!gate.ok) return res.status(gate.status || 503).json({ error: gate.error });',
+        + '    if (!gate.ok) {\n',
       testFile: 'audit53-regressions.test.js',
       minFail: 3,
     },
@@ -11297,8 +11283,8 @@ const CASES = [
     {
       name: 'R87-06a · 编辑自己改密码不再校验当前密码',
       file: 'server/routes/users.js',
-      anchor: '      if (changesPassword || changesEmail) {',
-      replacement: '      if (false && (changesPassword || changesEmail)) {',
+      anchor: '      if (changesPassword || changesEmail || changesUsername) {',
+      replacement: '      if (false && (changesPassword || changesEmail || changesUsername)) {',
       testFile: 'audit87-regressions.test.js',
       minFail: 1,
     },
@@ -11371,9 +11357,8 @@ const CASES = [
     {
       name: 'R87-15a · /api/health 退回直传含绝对路径的写错误对象',
       file: 'server/routes/stats.js',
-      anchor: '    out.secureWriteError = Object.assign({}, secureErr, {\n'
-        + "      file: require('path').basename(String(secureErr.file || '')),\n"
-        + '    });',
+      anchor: '    out.secureWriteError = {\n'
+        + "      file: require('path').basename(String(secureErr.file || '')),\n",
       replacement: '    out.secureWriteError = secureErr;',
       testFile: 'audit87-regressions.test.js',
       minFail: 1,
@@ -11950,6 +11935,523 @@ const CASES = [
       anchor: "    const v = stored0 || (f.backfillDefault && !f.secret && f.default !== undefined ? String(f.default) : '');",
       replacement: '    const v = stored0; // R93 反向变异：不回填默认值',
       testFile: 'audit93-regressions.test.js',
+      minFail: 1,
+    },
+    /* ------------------------------------------------------------------ *
+     * R94 · 逐条复核《全模块安全与功能缺陷审计报告》
+     *
+     * 这一轮的护栏分两类：**行为层**（直接驱动纯函数 / 单模块，看后果）与
+     * **调用点层**（顺序本身就是判据，只能落在源码上 —— 但先把注释抹成等长空格）。
+     * 下面的变异都取「退回旧实现」的最小改动，判据落在**实际被执行的那一层**。
+     * ------------------------------------------------------------------ */
+    /* ---------- R94 前半段（M01~M13 已修 38 条）的逐条反向对照 ---------- */
+    {
+      name: 'R94-01a · M03-03：`safeView` 的 smtp 段对普通用户也下发（基础设施拓扑外泄）',
+      file: 'server/config-store.js',
+      anchor: '    smtp: isAdmin ? smtpView(cfg) : null,\n'
+        + '    site: siteView(cfg), // R54：站点设置（站点名称 / 公开注册 / 新用户身份）\n'
+        + '    credentials: creds.credentials,\n',
+      replacement: '    smtp: smtpView(cfg),\n'
+        + '    site: siteView(cfg), // R54：站点设置（站点名称 / 公开注册 / 新用户身份）\n'
+        + '    credentials: creds.credentials,\n',
+      testFile: 'audit94-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R94-02a · M03-02：匿名端点回显服务端原文（主机名 / 端口随探针失败外泄）',
+      file: 'server/email-code.js',
+      anchor: '      publicError: publicMailReason(e),',
+      replacement: "      publicError: '系统发信当前不可用：' + e.message,",
+      testFile: 'audit94-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R94-03a · M03-05：探针结果丢掉 `encrypted`（全程明文的站点照样报「正常」）',
+      file: 'server/email-code.js',
+      anchor: '    return { ok: true, encrypted: Boolean(v && v.encrypted) };',
+      replacement: '    return { ok: true };',
+      testFile: 'audit94-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R94-04a · M03-06：验证码只有按 IP 的配额（换一批收件地址即可无限发信）',
+      file: 'server/security.js',
+      anchor: "const emailCodeUserLimiter = createLimiter({ name: 'auth-email-code-user', windowMs: 24 * 60 * 60 * 1000, max: 20 });",
+      replacement: "const emailCodeUserLimiter = createLimiter({ name: 'auth-email-code-user', windowMs: 24 * 60 * 60 * 1000, max: 1000000 });",
+      testFile: 'audit94-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R94-05a · M04-01：备份码重新搬运桶级端点（导入别人导出码即可改出站目标）',
+      file: 'server/backup.js',
+      anchor: '    endpoint: \'\',',
+      replacement: "    endpoint: String((b && b.endpoint) || ''), // 变异：桶级端点又被搬进导出码",
+      testFile: 'audit94-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R94-06a · M04-02：默认配置退回模块级可变模板（删配置后旧账户复活）',
+      file: 'server/config-store.js',
+      anchor: 'const DEFAULT_CONFIG = deepFrozenCopy(defaultConfig());',
+      replacement: 'const DEFAULT_CONFIG = defaultConfig(); // 变异：不深拷贝也不冻结',
+      testFile: 'audit94-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R94-07a · M04-03：同 pid 的残留锁不再接管（容器里 pid 恒为 2 ⇒ 实例永久起不来）',
+      file: 'server/instance-lock.js',
+      anchor: '  return t < PROC_START_MS;',
+      replacement: '  return false; // 变异：退回「只看 pid 相等」',
+      testFile: 'audit94-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R94-08a · M04-04：WebDAV 账户绑不到用户也照样导入（最小权限账户变整桶权限）',
+      file: 'server/backup.js',
+      anchor: '    if (ownerUserId && !configStore.findUserRawById(ownerUserId)) {',
+      replacement: '    if (false) { // 变异：绑不到用户也不拒绝',
+      testFile: 'audit94-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R94-09a · M04-05：`ENOENT` 被当成「文件损坏」（该文件在本进程内永久拒写）',
+      file: 'server/secure-store.js',
+      anchor: "    if (e && e.code === 'ENOENT') return fallback;",
+      replacement: '    if (false) return fallback; // 变异：ENOENT 也归进 corruptFiles',
+      testFile: 'audit94-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R94-10a · M05-01：桶名字符集放宽（含 `/` 的桶名把出站请求引向任意主机）',
+      file: 'server/providers.js',
+      anchor: 'const BUCKET_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$/;',
+      replacement: 'const BUCKET_NAME_RE = /^[^\\s]{1,63}$/; // 变异：放行 / 与 ..',
+      testFile: 'audit94-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R94-11a · M05-02：模板分支不再校验账户标识（`evil.example/x` 改写端点主机）',
+      file: 'server/providers.js',
+      anchor: '    if (p.accountPattern) {\n      let ok = false;',
+      replacement: '    if (false) {\n      let ok = false;',
+      testFile: 'audit94-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R94-12a · M05-03：`provider` 在校验前就被改写（被拒的更新留下脏值，密钥被发往另一厂商）',
+      file: 'server/config-store.js',
+      anchor: '  const nextProvider = (patch.provider !== undefined && providers.get(patch.provider))\n'
+        + '    ? patch.provider : c.provider;',
+      replacement: '  if (patch.provider !== undefined) c.provider = patch.provider; // 变异：先落值再校验\n'
+        + '  const nextProvider = (patch.provider !== undefined && providers.get(patch.provider))\n'
+        + '    ? patch.provider : c.provider;',
+      testFile: 'audit94-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R94-13a · M05-06：悬空 credentialId 静默兜底（桶挂到同厂商的另一把密钥上）',
+      file: 'server/config-store.js',
+      anchor: '  if (wantCredId && !cfg.credentials.some((c) => c.id === wantCredId)) {',
+      replacement: '  if (false) { // 变异：找不到绑定的密钥就回退默认厂商',
+      testFile: 'audit94-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R94-14a · M06-01：删源之前就搬走解密凭据（删源失败 ⇒ 凭据没了、密文还在）',
+      file: 'server/routes/fs.js',
+      anchor: '  try {\n    await p(client, \'deleteObject\', { Bucket: cfg.bucket, Region: cfg.region, Key: key });\n  } catch (e) {',
+      replacement: '  encStore.renameMeta(cfg.bucket, key, newKey); // 变异：先搬凭据再删源\n'
+        + '  try {\n    await p(client, \'deleteObject\', { Bucket: cfg.bucket, Region: cfg.region, Key: key });\n  } catch (e) {',
+      testFile: 'audit94-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R94-15a · M06-02：下载审计在传输开始前就读字节（每条日志恒为「0 字节」）',
+      file: 'server/routes/fs.js',
+      anchor: "    if (res.writableEnded || res.destroyed) logDownload();\n    else res.once('close', logDownload);",
+      replacement: '    logDownload(); // 变异：body 还没开始传就读 bytesDown',
+      testFile: 'audit94-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R94-16a · M06-06：gzip 缓冲路径吞掉 `res.write` 的回调（调用方永远等不到）',
+      file: 'server/gzip.js',
+      anchor: '    if (cbFn && !passthrough) process.nextTick(cbFn);',
+      replacement: '    // 变异：缓冲路径不再回调（旧实现把 cb 整个丢掉）',
+      testFile: 'audit94-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R94-17a · M11-02：XML 1.0 非法控制字符不剥（一份 PROPFIND 直接非良构）',
+      file: 'server/webdav/util.js',
+      anchor: "    .replace(/[\\u0000-\\u0008\\u000B\\u000C\\u000E-\\u001F\\uFFFE\\uFFFF]/g, '')",
+      replacement: '    // 变异：不剥 XML 非法控制字符',
+      testFile: 'audit94-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R94-18a · M13-01：`/health` 回显原始 fs 错误（绝对路径与系统用户名外泄）',
+      file: 'server/routes/stats.js',
+      anchor: "      message: '敏感数据文件写入失败（详见服务端日志）',",
+      replacement: "      message: String((secureErr && secureErr.message) || ''), // 变异：原样回显",
+      testFile: 'audit94-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R94-19a · M12-01：`null` 不再视同「未传」（生效中的限速被静默归零）',
+      file: 'server/routes/ipguard.js',
+      anchor: '  if (b.speedLimit === undefined || b.speedLimit === null) return { ok: true, skip: true };',
+      replacement: '  if (b.speedLimit === undefined) return { ok: true, skip: true }; // 变异：null 落到 parse',
+      testFile: 'audit94-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R94-20a · M12-02：方法词表缺 WebDAV 动词（「只屏蔽读写」在 WebDAV 端口被绕过）',
+      file: 'server/ip-guard.js',
+      anchor: "  'OPTIONS', 'PROPFIND', 'PROPPATCH', 'MKCOL', 'COPY', 'MOVE', 'LOCK', 'UNLOCK',",
+      replacement: "  'OPTIONS', // 变异：WebDAV 动词缺失",
+      testFile: 'audit94-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R94-21a · M10-04：元 → 分退回裸浮点（三位小数少算 1 分）',
+      file: 'server/limits.js',
+      anchor: '  return Math.round(Number((v * 100).toFixed(6)));',
+      replacement: '  return Math.round(v * 100); // 变异：1.005*100 = 100.4999…',
+      testFile: 'audit94-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R94-22a · M07-06：续传按用户名找会话（改个名字，正在续传的任务全部无权操作）',
+      file: 'server/upload-sessions.js',
+      anchor: '    if (filter.ownerId) {\n'
+        + "      const oid = String(o.ownerId || '');\n"
+        + '      if (oid ? oid !== filter.ownerId : (filter.createdBy !== undefined && o.createdBy !== filter.createdBy)) continue;\n'
+        + '    } else if (filter.createdBy !== undefined && o.createdBy !== filter.createdBy) continue;',
+      replacement: '    if (filter.createdBy !== undefined && o.createdBy !== filter.createdBy) continue; // 变异：只按用户名',
+      testFile: 'audit94-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R94-23a · M08-07：日志写出**完整**链接 id（等于把无口令分享的访问凭据落到明文日志）',
+      file: 'server/stats-store.js',
+      anchor: "  return s.slice(0, keep) + '…';",
+      replacement: '  return s;',
+      testFile: 'audit94-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R94-24a · M09-07：线程池降级变成永久（一次瞬时抖动 → 全站主线程同步加密）',
+      file: 'server/enc-pool.js',
+      anchor: '    if (Date.now() - degradedAt < DEGRADE_COOLING_MS) return 0;\n    degraded = false;',
+      replacement: '    return 0; // 变异：冷却过后也不复位',
+      testFile: 'audit94-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R94-25a · M09-08：线程起不来时把同步异常抛上去（资源紧张时从「变慢」退化成 500）',
+      file: 'server/enc-pool.js',
+      anchor: '    degrade(e);\n    return null;\n  }',
+      replacement: '    degrade(e);\n    throw e;\n  }',
+      testFile: 'audit94-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R94-26a · M10-01：退款定位退回被截断的台账（早期订单的券不退、used 不减）',
+      file: 'server/coupon-store.js',
+      anchor: '    const idxInIdx = c.orderIdx && Object.prototype.hasOwnProperty.call(c.orderIdx, oid);',
+      replacement: '    const idxInIdx = false; // 变异：只读被截断到 200 条的 uses',
+      testFile: 'audit94-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R94-27a · M10-02：`consume()` 不再判状态（maxUses 失效 ⇒ 超发）',
+      file: 'server/coupon-store.js',
+      anchor: "  const st = status(c);\n  if (st !== 'active') return { ok: false, reason: st, coupon: view(c) };",
+      replacement: "  const st = 'active'; // 变异：核销不看状态\n"
+        + "  if (false) return { ok: false, reason: st, coupon: view(c) };",
+      testFile: 'audit94-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R94-28a · M11-01：复制 / 移动允许以 `/` 结尾（文件内容吃掉集合占位对象）',
+      file: 'server/fs-gateway.js',
+      anchor: "  if (String(key || '').endsWith('/')) {",
+      replacement: '  if (false) { // 变异：不再拦集合目标',
+      testFile: 'audit94-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R94-29a · M11-04：游标不前进静默收尾（调用方以为已复制完整，随后把源删掉）',
+      file: 'server/webdav/listing.js',
+      anchor: "      e.code = 'LIST_CURSOR_STUCK';\n      throw e;",
+      replacement: "      e.code = 'LIST_CURSOR_STUCK';\n      return;",
+      testFile: 'audit94-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R94-30a · M12-03：带转发头的回环请求仍享「本机永久放行」（全部屏蔽规则静默失效）',
+      file: 'server/ip-guard.js',
+      anchor: "  if (!fromForwarded && !hasForwarded && (ip === '127.0.0.1' || ip === '::1')) {",
+      replacement: "  if (!fromForwarded && (ip === '127.0.0.1' || ip === '::1')) { // 变异：不看转发头",
+      testFile: 'audit94-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R94-31a · M12-05：中断路径不结算（被限速时「今日下行」比审计日志少一截）',
+      file: 'server/traffic-meter.js',
+      anchor: "  t.on('close', settle);",
+      replacement: "  t.on('close', () => {}); // 变异：`destroy()` 后不再结算",
+      testFile: 'audit94-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R94-32a · M13-06：部署模式退回「只看 HOST 是否回环」（把 HOST 改回回环即静默拆掉 Secure）',
+      file: 'server/security.js',
+      anchor: 'const IS_DEPLOY = DEPLOY_MODE || !IS_LOOPBACK;',
+      replacement: 'const IS_DEPLOY = !IS_LOOPBACK; // 变异：忽略 DEPLOY_MODE',
+      testFile: 'audit94-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R94-33a · M13-08：`is_ip_addr()` 退回「含冒号即 IPv6」（域名校验被任意串绕过）',
+      file: 'deploy.sh',
+      anchor: '  if [[ "$s" =~ ^[0-9A-Fa-f:.]+$ ]]; then',
+      replacement: '  if [[ "$s" == *:* ]]; then return 0; fi\n'
+        + '  if [[ "$s" =~ ^[0-9A-Fa-f:.]+$ ]]; then',
+      testFile: 'audit94-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R94-34a · M13-07：实时速率 / 7 天流量对普通用户开放（全实例吞吐外泄）',
+      file: 'server/routes/stats.js',
+      anchor: "router.get('/stats/speed', requireAdmin, (req, res) => {",
+      replacement: "router.get('/stats/speed', (req, res) => {",
+      testFile: 'audit94-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R94-35a · M03-04：人机验证不核对服务商应答的 hostname（同一 sitekey 多域名共用即可复用 token）',
+      file: 'server/captcha.js',
+      anchor: '  if (!got || !allow.length) return true;\n  return allow.indexOf(got) >= 0;',
+      replacement: '  return true; // 变异：不看 hostname',
+      testFile: 'audit94-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R94-36a · M13-03：取不到 SHASUMS256.txt 又静默放行（未校验的 node 以 root 跑整套系统）',
+      file: 'deploy.sh',
+      anchor: '    _unverified_node_allow "无法取得 Node.js v${ver} 的 SHASUMS256.txt" "$ver" "$fallback_base"\n    return 0',
+      replacement: '    warn "无法取得 Node.js v${ver} 的 SHASUMS256.txt，跳过哈希校验（完整性问题请自行确认来源可信）。"\n    return 0',
+      testFile: 'audit94-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R94-37a · M13-11：EAB 密钥只能经 argv 传入（`ps -ef` 对同机任意用户可见）',
+      file: 'deploy.sh',
+      anchor: '  v="${KEPLER_EAB_HMAC_KEY:-}"\n  if [[ -n "$v" ]]; then EAB_HMAC_KEY="$v"; fi',
+      replacement: '  v="" # 变异：环境变量通道被拿掉',
+      testFile: 'audit94-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R94-38a · M13-04：安装目录仍归应用账号（改 deploy.sh ⇒ 管理员下次执行即 root 提权）',
+      file: 'deploy.sh',
+      anchor: '  chown root:root "$INSTALL_DIR" 2>/dev/null || true',
+      replacement: '  : # 变异：安装目录不收紧',
+      testFile: 'audit94-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R94-39a · M12-06：`publicRule()` 不再剥派生缓存 `_parsed`',
+      file: 'server/ip-guard.js',
+      anchor: '  delete c._parsed;',
+      replacement: '  /* mutated：不剥 _parsed */',
+      testFile: 'audit94-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R94-40a · M01-01：注册验证层不校验当前口令（持被盗会话即可替换凭据）',
+      file: 'server/routes/webauthn.js',
+      anchor: "    const pwd = String(b.password || '');\n    if (!(await configStore.verifyUserPassword(me.id, pwd))) {",
+      replacement: "    const pwd = String(b.password || '');\n    if (false) {",
+      testFile: 'audit94-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R94-41a · M01-03：账户级失败计数不衰减（零散输错 20 次后永远多等 1.5 秒）',
+      file: 'server/security.js',
+      anchor: '  const prev = rec && now - (rec.lastAt || 0) <= ACCOUNT_FAIL_WINDOW_MS ? rec.count : 0;',
+      replacement: '  const prev = rec ? rec.count : 0;',
+      testFile: 'audit94-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R94-42a · M01-05：第二步采信请求体的 remember（会话时长由前端决定）',
+      file: 'server/routes/auth.js',
+      anchor: '    return completeLogin(res, user, Boolean(r.remember), pre.ip);',
+      replacement: '    return completeLogin(res, user, Boolean(b.remember), pre.ip);',
+      testFile: 'audit94-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R94-43a · M02-01：改用户名不问当前口令（撞名即继承他人资产）',
+      file: 'server/routes/users.js',
+      anchor: "      const changesUsername = b.username !== undefined && String(b.username) !== String(target.username);",
+      replacement: '      const changesUsername = false;',
+      testFile: 'audit94-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R94-44a · M02-02：删用户不摘链接归属（同名新账号继承全部链接）',
+      file: 'server/share-store.js',
+      anchor: '    if (l.createdBy && l.createdBy === name) {',
+      replacement: '    if (false) {',
+      testFile: 'audit94-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R94-45a · M02-03：被禁用的角色下拉照样参与提交（界面锁住等于没锁）',
+      file: 'public/js/invitemgr.js',
+      anchor: '  if (roleSel && !roleSel.disabled) out.role = roleSel.value;',
+      replacement: '  if (roleSel) out.role = roleSel.value;',
+      testFile: 'audit94-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R94-46a · M03-01：SMTP 的证书身份校验对象丢失（IP 目标恒定报校验失败）',
+      file: 'server/smtp.js',
+      anchor: '      checkServerIdentity: isIpHost ? (hostname, cert) => tls.checkServerIdentity(o.host, cert) : undefined,',
+      replacement: '      checkServerIdentity: undefined,',
+      testFile: 'audit94-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R94-47a · M04-06：备份的支付平台不过滤注册表（陌生平台写进 config.enc）',
+      file: 'server/config-store.js',
+      anchor: 'function sanitizePaymentPlatforms(src) {',
+      replacement: 'function sanitizePaymentPlatforms(src) {\n  return src; // mutated',
+      testFile: 'audit94-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R94-48a · M05-04：AllUsers 的 URI 判据退回子串（AllUsersX 也算公开）',
+      file: 'server/routes/buckets.js',
+      anchor: 'const ALL_USERS_URI_RE = /(^|\\/)global\\/AllUsers$/;',
+      replacement: 'const ALL_USERS_URI_RE = /global\\/AllUsers/;',
+      testFile: 'audit94-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R94-49a · M06-05：两条上传路径不挡空 key（空间根被写成文件内容）',
+      file: 'server/routes/fs.js',
+      anchor: "    if (!relIn) throw badRequest('路径不能为空');",
+      replacement: '    /* mutated：不挡空路径 */',
+      testFile: 'audit94-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R94-50a · M06-08：可执行 Content-Type 不再降级（任意后缀 + text/html 即可 XSS）',
+      file: 'server/fs-gateway.js',
+      anchor: "  return ACTIVE_CONTENT_TYPE_RE.test(s) ? 'application/octet-stream' : s;",
+      replacement: '  return s;',
+      testFile: 'audit94-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R94-51a · M07-01：应用级内存闸门被拿掉（闸门对着已进内存的 64MB 判定）',
+      file: 'server/index.js',
+      anchor: "app.use(UPLOAD_RAW_PATHS, require('./upload-gate').gate());",
+      replacement: '/* mutated：不挂应用级闸门 */',
+      testFile: 'audit94-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R94-52a · M07-04：单人名额判据被短路（一个人占满全场）',
+      file: 'server/upload-gate.js',
+      anchor: '    if (entry.slot.count + 1 > userCount) {',
+      replacement: '    if (false) {',
+      testFile: 'audit94-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R94-53a · M07-05：失败态取消不回收云端碎片（界面说已取消，分片继续计费）',
+      file: 'public/js/upload.js',
+      anchor: "    if (['uploading', 'paused', 'waiting', 'failed'].includes(t.state)) t.state = 'canceled';",
+      replacement: "    if (['uploading', 'paused', 'waiting'].includes(t.state)) t.state = 'canceled';",
+      testFile: 'audit94-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R94-54a · M07-08：双向控制字符不再剥离（扩展名显示被反转）',
+      file: 'server/s3.js',
+      anchor: "  k = k.replace(/[\\u200E\\u200F\\u202A-\\u202E\\u2066-\\u2069]/g, '');",
+      replacement: '  /* mutated：不剥 bidi */',
+      testFile: 'audit94-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R94-55a · M08-01：多条目分享照样因单个对象缺失而整条失效',
+      file: 'server/share-store.js',
+      anchor: '    if (view(l).listView) continue;',
+      replacement: '    /* mutated：不对 listView 豁免 */',
+      testFile: 'audit94-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R94-56a · M08-03：链接表退回「每次都直接写」（下载风暴把进程卡住）',
+      file: 'server/share-store.js',
+      anchor: 'coalesce.debouncedPersist(FILE, () => cache || null, { debounceMs: 250, dataDir: DATA_DIR })',
+      replacement: 'coalesce.debouncedPersist(FILE, () => cache || null, { debounceMs: 0, dataDir: DATA_DIR })',
+      testFile: 'audit94-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R94-57a · M09-01：元数据落盘退回吞错的 `writeJson()`（写失败=假装成功）',
+      file: 'server/enc-store.js',
+      anchor: '  secureStore.writeJsonStrict(META_FILE, loadMeta());',
+      replacement: '  secureStore.writeJson(META_FILE, loadMeta());',
+      testFile: 'audit94-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R94-58a · M09-02：元数据损坏时照样把快照写出去',
+      file: 'server/enc-store.js',
+      anchor: '    if (metaCorrupt) return null;',
+      replacement: '    if (false) return null;',
+      testFile: 'audit94-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R94-59a · M09-03：分片元数据不回写（云端密文 A + 本地 IV B ⇒ 永久不可解）',
+      file: 'server/routes/fs.js',
+      anchor: '    if (partMetaSnapshot && sess.enc && sess.enc.parts) sess.enc.parts[partNumber] = partMetaSnapshot;',
+      replacement: '    /* mutated：不回写本片元数据 */',
+      testFile: 'audit94-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R94-60a · M11-03：`Destination` 退回无 base 解析（绝对路径 / 相对引用一律 400）',
+      file: 'server/webdav/app.js',
+      anchor: "        destUrl = new URL(destHeader, 'https://' + String(req.headers.host || 'localhost') + String(req.path || '/'));",
+      replacement: '        destUrl = new URL(destHeader);',
+      testFile: 'audit94-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R94-61a · M12-04：`unparsable` 落进读 `matchedRule` 的分支（TypeError 被吞成「检测失败」）',
+      file: 'public/js/ipmgr.js',
+      anchor: "  } else if (r.reason === 'unparsable') {",
+      replacement: '  } else if (false) {',
+      testFile: 'audit94-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R94-62a · M13-09：CI 的 action 退回浮动 tag（可被上游指向任意代码）',
+      file: '.github/workflows/ci.yml',
+      anchor: '        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262',
+      replacement: '        uses: actions/checkout@v4',
+      testFile: 'audit94-regressions.test.js',
       minFail: 1,
     },
   ];

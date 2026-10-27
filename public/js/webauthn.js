@@ -193,11 +193,19 @@ export async function registerWindowsHello(API, password) {
   if (!cred) throw new Error('Windows Hello 注册未返回凭据');
 
   const resp = cred.response;
+  /**
+   * R94（审核 M01-01）：**口令要随注册结果一起回传**。
+   *
+   * 服务端在 `register/verify`（真正落库的那一步）重新校验一次当前口令 ——
+   * 只在 `register/options` 校验挡不住「用受害者遗留的待用挑战提交攻击者自己的
+   * 验证器」。这里把同一个口令再送一次，`password` 不落任何存储、不写日志。
+   */
   return API.webauthnRegisterVerify({
     challenge: opt.challenge,
     rawId: bufToB64url(cred.rawId),
     clientDataJSON: bufToB64url(resp.clientDataJSON),
     attestationObject: bufToB64url(resp.attestationObject),
+    password,
   });
 }
 

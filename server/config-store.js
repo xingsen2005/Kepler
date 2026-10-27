@@ -218,7 +218,26 @@ function normalizeConcurrencyFiles(v) {
   return Math.min(Math.floor(n), CONCURRENCY_FILES_MAX);
 }
 
-const DEFAULT_CONFIG = {
+/**
+ * 默认配置的**工厂**（R94 · 审核 M04-02）。
+ *
+ * ⚠️ 这里必须是函数、不能是模块级常量对象。原先是一个 `const DEFAULT_CONFIG = {...}`，
+ * 而三处「用默认配置起步」的代码（`requireStore()` / `migrateV1()` / `normalize()`）
+ * 全都是 **浅拷贝** `Object.assign({}, DEFAULT_CONFIG, …)` —— 于是新配置与模板
+ * **共享同一批数组**（`users` / `credentials` / `buckets` / `webdav.accounts`）。
+ *
+ * 后果有两条，第二条比第一条更贵：
+ *  ① 运行期任何一次写入（`addUser` → `cfg.users.push(...)`）都会**直接写进模板**，
+ *     把根账户的口令哈希与云凭据的**明文 SecretKey** 复制进一个被 `module.exports`
+ *     导出的长生命周期常量里（第二份副本）；
+ *  ② **删掉 `data/config.enc` 不再等于清空**：下一次 `requireStore()` 走「首次运行」
+ *     分支，从被污染的模板起步 ⇒ 旧账户、旧凭据、旧桶原样复活并重新落盘，
+ *     运维以为已经重置的机器仍能被旧管理员口令登录。
+ *
+ * 改成工厂后每个调用点拿到的都是**全新对象**，共享引用从结构上不存在。
+ */
+function defaultConfig() {
+  return {
   credentials: [],
   activeCredentialId: '',
   buckets: [],
@@ -281,7 +300,28 @@ const DEFAULT_CONFIG = {
   payment: { platforms: {} }, // 支付平台凭证（仅基础配置与合法性校验，字段见 server/payment-providers.js）
   createdAt: '',
   updatedAt: '',
-};
+  };
+}
+
+/** 深拷贝 + 逐层冻结（`JSON` 往返足够：配置里全是 JSON 安全的标量 / 数组 / 对象） */
+function deepFrozenCopy(obj) {
+  const clone = JSON.parse(JSON.stringify(obj));
+  const walk = (o) => {
+    if (!o || typeof o !== 'object') return;
+    Object.getOwnPropertyNames(o).forEach((k) => walk(o[k]));
+    Object.freeze(o);
+  };
+  walk(clone);
+  return clone;
+}
+
+/**
+ * 只读快照（R94 · 审核 M04-02）。**冻结的深拷贝**，只供读取 / 断言 / 向后兼容导出；
+ * 任何「以默认配置起步」的写路径都必须调 `defaultConfig()`。
+ * 冻结的意义：万一有人又写回 `Object.assign({}, DEFAULT_CONFIG, …)` 并往里 push，
+ * 会在当场抛 TypeError，而不是悄悄把口令哈希搬进常量。
+ */
+const DEFAULT_CONFIG = deepFrozenCopy(defaultConfig());
 
 const DEFAULT_UPLOAD_EXCLUDES = { dsStore: false, thumbsDb: false, gitignore: false };
 
@@ -291,7 +331,7 @@ const DEFAULT_QUOTA = 50 * 1024 * 1024 * 1024;
 /** 旧版(v1)扁平配置 -> v2 多密钥多桶结构 */
 function migrateV1(raw) {
   const now = new Date().toISOString();
-  const cfg = Object.assign({}, DEFAULT_CONFIG, {
+  const cfg = Object.assign(defaultConfig(), {
     domains: raw.domains || { primary: '', backup: '' },
     createdAt: raw.createdAt || now,
     updatedAt: raw.updatedAt || now,
@@ -534,7 +574,9 @@ function normalize(raw) {
   if (!Array.isArray(raw.credentials) && (raw.secretId !== undefined || raw.bucket !== undefined)) {
     return migrateV1(raw);
   }
-  const cfg = Object.assign({}, DEFAULT_CONFIG, raw);
+  // R94（审核 M04-02）：从**工厂**起步，绝不从模块级常量浅拷贝 —— 否则磁盘配置
+  // 缺某个顶层键（历史版本没有该键）时，新配置会直接继承模板里的那个**同一个数组**。
+  const cfg = Object.assign(defaultConfig(), raw);
   if (!Array.isArray(cfg.credentials)) cfg.credentials = [];
   if (!Array.isArray(cfg.buckets)) cfg.buckets = [];
   // 密钥记录兜底：历史密钥无 provider 字段，统一视为腾讯云；endpoint 自定义端点（S3 兼容厂商可选）
@@ -1049,7 +1091,7 @@ function requireStore() {
       throw unwritableError(CONFIG_FILE, 'corrupt', '无法解密或解析（可能已被篡改或损坏）');
     }
     // 首次运行：尚无配置文件，初始化空配置
-    cfg = persist(Object.assign({}, DEFAULT_CONFIG, { createdAt: new Date().toISOString() }));
+    cfg = persist(Object.assign(defaultConfig(), { createdAt: new Date().toISOString() }));
   }
   return cfg;
 }
@@ -1184,18 +1226,24 @@ function addCredential({ provider, secretId, secretKey, remark, endpoint, quotaB
   // 避免把危险端点持久化后由后续任意请求触发。
   if (ep) assertSafeEndpoint(ep);
   if (exist) {
+    /**
+     * R94（审核 M05-03）· 同型风险收敛：这里的三处落值（`secretKey` / `provider` /
+     * `endpoint`）原先都排在 `assertEndpointProvided()` **之前**，于是「同时改厂商
+     * 与端点、而端点非法」的请求会返回 400 却已经把 `secretKey` 与 `provider`
+     * 改在内存对象上（`load()` 与 `persist()` 用的是同一个引用 ⇒ 去抖窗口里
+     * 任何一次其它写入都会把它带到磁盘）。现在把校验提到落值之前。
+     */
+    const nextProvider = explicitProvider ? pid : exist.provider;
+    // ⚠️ 顺序：**先校验、后落值**。反过来的话，一次被拒绝的更新已经在内存里把
+    // `c.endpoint` 改成了非法值（`persist` 虽未执行，但这份 cfg 对象继续被同批请求
+    // 读用），表现为「明明报了错，密钥却真的坏了」。
+    if (endpoint !== undefined) assertEndpointProvided(nextProvider, ep);
     exist.secretKey = secretKey || exist.secretKey;
-    if (explicitProvider) exist.provider = pid;
+    if (explicitProvider) exist.provider = nextProvider;
     // 端点**仅在显式提交时**改写（与 remark / quotaBytes 同款「未传即保持」约定）。
     // 历史实现无条件 `exist.endpoint = ep`，于是在未传 endpoint 的调用方
     // （如 `PUT /config` 的旧版扁平入参）手里，一次保存就会把已有自定义端点清空。
-    if (endpoint !== undefined) {
-      // ⚠️ 顺序：**先校验、后落值**。反过来的话，一次被拒绝的更新已经在内存里把
-      // `c.endpoint` 改成了非法值（`persist` 虽未执行，但这份 cfg 对象继续被同批请求
-      // 读用），表现为「明明报了错，密钥却真的坏了」。
-      assertEndpointProvided(exist.provider, ep);
-      exist.endpoint = ep;
-    }
+    if (endpoint !== undefined) exist.endpoint = ep;
     if (remark !== undefined) exist.remark = String(remark || '');
     if (quotaBytes !== undefined) exist.quotaBytes = normalizeQuotaBytes(quotaBytes); // R25
     if (speedLimit !== undefined) exist.speedLimit = normalizeSpeedLimit(speedLimit); // R37：未传即保持
@@ -1264,7 +1312,25 @@ function updateCredential(id, patch) {
   const cfg = requireStore();
   const c = cfg.credentials.find((x) => x.id === id);
   if (!c) return false;
-  if (patch.provider !== undefined && providers.get(patch.provider)) c.provider = patch.provider;
+  /**
+   * R94（审核 M05-03）：`provider` **绝不能在**校验之前改写。
+   *
+   * 这段注释原来自称「先校验后落值」，代码顺序却恰好相反：`c.provider = patch.provider`
+   * 排在端点校验之前。于是「同时改厂商 + 填了一个非法端点」的请求返回 400，
+   * 而内存里的那条记录已经是新厂商了 —— 又因为 `load()` 返回的就是**进程内缓存的
+   * 同一个对象**、`persist()` 写的也是同一个引用，这次脏值会被去抖窗口里
+   * **任何一次其它写入**一并带到磁盘。
+   *
+   * 后果不是「改错了再改回来」：SecretKey 没变、只是被贴上另一个厂商的标签，
+   * `activeCredential()` 又只看桶绑定的 credentialId、不看厂商是否匹配 ⇒ 管理员
+   * 之后为新厂商补一个端点，原来那把 AK/SK 就会被发往新厂商 —— 正是本文件
+   * FUN-09 警告过的「凭据外发」。
+   *
+   * 现在改成：先在**局部变量**上算出「改完之后的状态」并完成全部校验，
+   * 通过后才一次性写回。
+   */
+  const nextProvider = (patch.provider !== undefined && providers.get(patch.provider))
+    ? patch.provider : c.provider;
   /**
    * 厂商与端点两者**任一被改动**都要先算出「改完之后的状态」再校验，最后才落值：
    *  - 只改 `provider`（换成 MinIO）而端点仍是旧厂商的空值 → 会得到一条
@@ -1275,12 +1341,14 @@ function updateCredential(id, patch) {
   if (patch.endpoint !== undefined) {
     // 同 addCredential：端点必须先按厂商规则组装（R2 的账户 ID → 完整端点），
     // 再送安全校验 —— 顺序反了会把合法的账户 ID 当成非法 URL 拒掉。
-    nextEndpoint = providers.composeEndpoint(c.provider, patch.endpoint);
+    nextEndpoint = providers.composeEndpoint(nextProvider, patch.endpoint);
     if (nextEndpoint) assertSafeEndpoint(nextEndpoint); // SEC-03：同 addCredential
   }
   if (patch.provider !== undefined || patch.endpoint !== undefined) {
-    assertEndpointProvided(c.provider, nextEndpoint);
+    assertEndpointProvided(nextProvider, nextEndpoint);
   }
+  // 校验全部通过，现在才落值
+  if (patch.provider !== undefined && providers.get(patch.provider)) c.provider = nextProvider;
   if (patch.endpoint !== undefined) c.endpoint = nextEndpoint;
   if (patch.remark !== undefined) c.remark = String(patch.remark || '');
   // R25：凭据级配额（0 = 无限制）。与桶配额同款归一化，负数/非法值一律落回 0。
@@ -1313,6 +1381,15 @@ function bucketView(b) {
     enabled: b.enabled !== false, // 启用/停用（默认 true，历史桶向后兼容）
     blockOverseasIP: b.blockOverseasIP === true, // 仅屏蔽海外 IP（按桶生效，默认 false）
     speedLimit: normalizeSpeedLimit(b.speedLimit), // R37：桶级下载限速（0 = 不限）
+    /**
+     * R94（审核 M04-01）：把桶级端点**暴露出来**，只为「看得见」。
+     *
+     * 这个字段没有任何 API 能设置（`addBucket` / `updateBucket` 都没有该入参），
+     * 正常部署恒为空串；非空只可能来自「导入了一份别人给的导出码」。导入路径已经
+     * 不再搬运它（`backup.sanitizeBucket()`），这里补一条可见性是为了**已经落库的
+     * 历史数据**：管理员能看到异常，而不是只能靠删桶重建。
+     */
+    endpoint: b.endpoint || '',
     createdAt: b.createdAt || '',
   };
 }
@@ -1449,6 +1526,36 @@ function setBucketsVisibility(visibleIds) {
 function addBucket({ provider, bucket, region, remark, quotaBytes, credentialId, visibleToUsers, enabled, blockOverseasIP, speedLimit }) {
   const cfg = requireStore();
   const now = new Date().toISOString();
+  /**
+   * R94（审核 M05-01）：桶名是**落库前**必须收敛的不可信输入。
+   *
+   * 它会被 `s3-client._request()` 拼进 Host 头（虚拟主机风格）或请求路径（路径风格），
+   * 且**不经过 `endpoint-guard`**（那道守卫只看 endpoint 字符串）。含 `/` 的桶名
+   * （`169.254.169.254/x`）会让 URL 解析器把主机名切成 `/` 之前的部分 ⇒ 盲 SSRF
+   * ＋ 把带真实 AK 的 SigV4 签名送去任意主机。判据的唯一实现点在
+   * `providers.isValidBucketName()`（备份导入路径用的是同一个函数）。
+   */
+  const safeBucket = String(bucket == null ? '' : bucket).trim();
+  if (!providers.isValidBucketName(safeBucket)) {
+    const err = new Error('存储桶名称格式不正确（只允许字母、数字、点、下划线与连字符，1–63 位，且不得以符号开头）');
+    err.status = 400;
+    throw err;
+  }
+  /**
+   * R94（审核 M05-06）：`credentialId` 指向不存在的凭据时必须**显式失败**。
+   *
+   * 旧实现找不到就当作「没绑密钥」，接着回退默认厂商（腾讯云）并把那个悬空 id 原样
+   * 落库 —— 接口返回成功，桶却挂在了默认厂商的**另一把**密钥下（`activeCredential()`
+   * 找不到绑定的 id，就按桶的 provider 找同厂商的启用密钥）。管理员以为桶在 A 账号，
+   * 实际写到 B 账号，属于「静默兜底代替显式失败」，与本文件 FUN-09 的
+   * 「绝不跨厂商猜测密钥」口径相悖。
+   */
+  const wantCredId = String(credentialId == null ? '' : credentialId);
+  if (wantCredId && !cfg.credentials.some((c) => c.id === wantCredId)) {
+    const err = new Error('所选密钥不存在，请刷新后重试');
+    err.status = 400;
+    throw err;
+  }
   // 服务商推导：绑定密钥的 provider 优先（桶必须与密钥同厂商，否则用错 SDK）；
   // 未绑定时用入参 provider（须是已注册厂商），最后回退默认（腾讯云）。
   let pid = '';
@@ -1461,7 +1568,7 @@ function addBucket({ provider, bucket, region, remark, quotaBytes, credentialId,
   const explicitProvider = providers.get(provider) ? provider : '';
   if (!pid) pid = explicitProvider || providers.DEFAULT_PROVIDER_ID;
   // 同名桶视为更新
-  const exist = cfg.buckets.find((b) => b.bucket === bucket);
+  const exist = cfg.buckets.find((b) => b.bucket === safeBucket);
   if (exist) {
     // SEC-01：**仅当厂商被显式指定（或由绑定密钥推导）时才改写 provider**。
     // 旧实现在此无条件 `exist.provider = pid`，而未显式指定时 pid 会回退成默认厂商，
@@ -1490,7 +1597,7 @@ function addBucket({ provider, bucket, region, remark, quotaBytes, credentialId,
   const b = {
     id: newId(),
     provider: pid,
-    bucket,
+    bucket: safeBucket,
     region,
     remark: String(remark || ''),
     quotaBytes: Number(quotaBytes) || 0,
@@ -1628,7 +1735,9 @@ function safeView(role) {
       domains: { primary: '', backup: '' },
       uploadExcludes: getUploadExcludes(),
       concurrency: getConcurrency(),
-      smtp: smtpView(cfg), // R53：发信设置（口令只回 hasPassword 布尔值）
+      // R94（审核 M03-03）：发信设置含 SMTP 主机/端口/用户名/加密方式，属于基础设施拓扑，
+      // 只下发给管理员；普通用户拿 null，前端本就不读该字段（设置页走 /api/smtp/config）。
+      smtp: isAdmin ? smtpView(cfg) : null,
       site: siteView(cfg), // R54：站点设置（站点名称 / 公开注册 / 新用户身份）
       credentials: creds.credentials, activeCredentialId: creds.activeCredentialId,
       buckets, activeBucketId,
@@ -1667,7 +1776,8 @@ function safeView(role) {
     domains: cfg.domains,
     uploadExcludes: getUploadExcludes(),
     concurrency: getConcurrency(),
-    smtp: smtpView(cfg), // R53：发信设置（口令只回 hasPassword 布尔值）
+    // R94（审核 M03-03）：同上，SMTP 拓扑只给管理员
+    smtp: isAdmin ? smtpView(cfg) : null,
     site: siteView(cfg), // R54：站点设置（站点名称 / 公开注册 / 新用户身份）
     credentials: creds.credentials,
     activeCredentialId: creds.activeCredentialId,
@@ -2210,17 +2320,31 @@ function saveCaptcha(patch) {
  * 绝不会被路由直接回传前端 —— 对外由 paymentProviders.publicView() 裁剪为「值 + 是否已配置」。
  * @returns {{enabled: boolean, platforms: object, updatedAt: string}}
  */
-function getPayment() {
-  const cfg = load();
-  const p = (cfg && cfg.payment) || {};
-  const src = p.platforms && typeof p.platforms === 'object' ? p.platforms : {};
-  const platforms = {};
-  // 只保留注册表中已知平台，避免历史脏数据被一路带下去
+/**
+ * 只保留注册表内**已知平台**（R94 · 审核 M04-06）。
+ *
+ * `getPayment()` 原本内联了这段过滤，而配置**备份的导出与导入**两侧都绕过它
+ * （`clone(pay.platforms)`）：导出码里 `payment.platforms` 的一切都会原样写进
+ * `config.enc` —— 注册表里不存在的平台 id 与任意字段，界面上看不到（`publicView()`
+ * 只按注册表渲染），也不会被任何代码路径消费，纯属磁盘上的脏数据。
+ *
+ * 抽成**唯一实现点**之后，读取 / 导出 / 导入三条路只有一个判据。
+ */
+function sanitizePaymentPlatforms(src) {
+  const out = {};
+  if (!src || typeof src !== 'object') return out;
   for (const id of Object.keys(src)) {
     if (!paymentProviders.isKnown(id)) continue;
     if (!src[id] || typeof src[id] !== 'object') continue;
-    platforms[id] = Object.assign({}, src[id]);
+    out[id] = Object.assign({}, src[id]);
   }
+  return out;
+}
+
+function getPayment() {
+  const cfg = load();
+  const p = (cfg && cfg.payment) || {};
+  const platforms = sanitizePaymentPlatforms(p.platforms);
   return {
     enabled: p.enabled === true,
     platforms,
@@ -2940,9 +3064,16 @@ function getUserById(id) {
   return cfg.users.find((u) => u.id === id) || null;
 }
 
-/** 管理员数量统计（用于保护最后一个管理员） */
-function adminCount(cfg) {
-  return (cfg.users || []).filter((u) => u.role === 'admin').length;
+/**
+ * R94（审核 M02-05）：「还有人能管用户」的总量 = 管理员 + 根用户。
+ *
+ * 「至少保留一个管理员」的旧判据只数 `role === 'admin'`，**不数根用户** ——
+ * 于是「1 个根 + 1 个管理员」的系统里，那个管理员既删不掉也降不了，报错还说
+ * 「至少保留一个管理员账户」，而事实上根用户完全能管。判据应当落在
+ * 「这次操作之后还有没有人能进用户管理」，而不是某个角色的字面值。
+ */
+function adminishCount(cfg) {
+  return (cfg.users || []).filter((u) => u.role === 'admin' || roles.isRoot(u.role)).length;
 }
 
 /**
@@ -3057,7 +3188,7 @@ async function updateUser(id, patch) {
         new Error('根用户角色不可授予：它只属于系统创建的第一个账户'), { status: 403 },
       );
     }
-    if (user.role === 'admin' && next !== 'admin' && adminCount(cfg) <= 1) {
+    if (user.role === 'admin' && next !== 'admin' && adminishCount(cfg) <= 1) {
       throw Object.assign(new Error('至少保留一个管理员账户'), { status: 400 });
     }
     user.role = next;
@@ -3095,7 +3226,7 @@ function removeUser(id) {
   if (roles.isRoot(target.role) && rootCount(cfg) <= 1) {
     throw Object.assign(new Error('至少保留一个根用户账户'), { status: 400 });
   }
-  if (target.role === 'admin' && adminCount(cfg) <= 1) {
+  if (target.role === 'admin' && adminishCount(cfg) <= 1) {
     throw Object.assign(new Error('至少保留一个管理员账户'), { status: 400 });
   }
   cfg.users.splice(idx, 1);
@@ -3205,7 +3336,9 @@ module.exports = {
   effective, effectiveForBucket, safeView, selfTest, isCorrupted,
   encrypt, decrypt, // 供 secure-store 复用同一主密钥与格式（S4）
   unwritableError, // 供 enc-store 等复用「备份 + 拒绝覆盖」语义（FUN-03 / FUN-04）
-  DEFAULT_CONFIG, DEFAULT_QUOTA, normalizeQuotaBytes,
+  // R94（审核 M04-02）：`defaultConfig` 是对外**唯一**的「以默认配置起步」入口；
+  // `DEFAULT_CONFIG` 只保留为冻结只读快照（向后兼容 + 供护栏断言模板未被污染）。
+  defaultConfig, DEFAULT_CONFIG, DEFAULT_QUOTA, normalizeQuotaBytes,
   listCredentials, listCredentialsFor, addCredential, removeCredential, setActiveCredential, updateCredentialRemark, updateCredential, setCredentialsVisibility,
   listProviders,
   listBuckets, listBucketsFor, addBucket, updateBucket, removeBucket, setActiveBucket, setBucketsVisibility, bucketBlockOverseas, credentialIdForBucket,
@@ -3228,6 +3361,7 @@ module.exports = {
   getCaptcha, saveCaptcha,
   // 支付平台凭证（仅基础配置与合法性校验）
   getPayment, savePayment, clearPayment, setPaymentEnabled, setChannelEnabled, setPaymentSiteUrl,
+  sanitizePaymentPlatforms, // R94：备份导出 / 导入与读取侧共用的唯一过滤点
   getWebdav, setWebdavEnabled, addWebdavAccount, updateWebdavAccount, removeWebdavAccount,
   revealWebdavPassword, authenticateWebdav,
   listUsers, getUserById, userView, addUser, updateUser, removeUser, authenticateUser,

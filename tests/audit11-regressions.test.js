@@ -177,6 +177,20 @@ fakeClient.getObject = (opts, cb) => {
 
 s3.getClient = () => fakeClient;
 s3.p = async (client, method, params) => {
+  /**
+   * R94（审核 M06-03）：下载 / 读取链路改走 `p()`（`download-stream.js` 与
+   * `fs-gateway.readObject` 都不再直接调 `s3.getObject`）。
+   *
+   * 真实 `p()` 只是把 `params` 原样转交给 `client[method](params, cb)`，于是
+   * `Output` 流由底层 SDK 写入。桩必须复刻这一点 —— 否则 `Output` 永远收不到数据，
+   * 下载请求会一直挂着（不是断言失败，是**永挂**）。这里转交给同样带
+   * `Output` 支持的 `fakeClient.getObject`，保证两条路径语义一致。
+   */
+  if (method === 'getObject' && params && params.Output) {
+    return new Promise((resolve, reject) => {
+      fakeClient.getObject(params, (err) => (err ? reject(err) : resolve({})));
+    });
+  }
   const r = handleCloud(method, params || {});
   if (r.error) throw r.error;
   return r.result;
@@ -570,16 +584,26 @@ test('R11-07 · 退出路径不得重建已删除的数据目录（只写不建�
   const wrote = encStore.flushMetaSync(); // 退出路径（只写不建）
   const recreated = fs.existsSync(TMP);
 
-  assertEqual(wrote, true, '前置：退出路径确实尝试了落盘（否则本条断言是空转）');
+  /**
+   * R94（审核 M09-06）：退出路径「按纪律跳过未写」时**必须如实返回 false** ——
+   * 旧实现不管写没写都把 `metaSavedSeq` 推到 `metaSeq` 并返回 true，于是这次
+   * 「一个字节都没写」被记成「已落盘」，之后任何 flush 都会被
+   * `metaDirty() === false` 挡掉，`enc-meta.json`（解密的唯一凭据）就再也写不出去。
+   * 因此这里的判据是「返回值 + dirty 是否还在」两条，而不是原先的 `true`。
+   */
+  assertEqual(wrote, false,
+    'R11-07：目录已被删除时退出路径**没有写**，必须如实返回 false（不得谎报成功）');
+  assert(encStore.metaDirty(),
+    'R11-07：没写就不能推进序号 —— dirty 必须还在，否则凭据再也落不了盘');
   assert(!recreated,
     'R11-07：退出路径**绝不创建**数据目录 —— 只写、不建。目录被删掉说明是'
     + '测试收尾 / 运维清理，退出钩子把它复活就等于「清理被自己的钩子撤销」');
 
   // 正向对照：目录存在时，退出路径必须真的落盘（防止把守卫写成「什么都不做」）
   fs.mkdirSync(TMP, { recursive: true });
-  encStore.setMeta(BASE_CFG.bucket, 'exit/probe2.bin', encMetaOf(5));
   assertEqual(encStore.flushMetaSync(), true,
-    'R11-07 正向对照：目录存在时退出路径必须真的落盘（否则守卫退化成空操作）');
+    'R11-07 正向对照：目录存在时同一次未落盘的变更必须真的写下去（dirty 没被谎报掉）');
+  assert(!encStore.metaDirty(), 'R11-07 正向对照：写成功后才允许 dirty 归零');
   assert(fs.existsSync(path.join(TMP, 'enc-meta.json')),
     'R11-07 正向对照：enc-meta.json 必须已写出');
 });

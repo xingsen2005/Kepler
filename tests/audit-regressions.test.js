@@ -653,7 +653,13 @@ test('PERF-06 · 下载流按固定间隔汇总统计（行为验证：1000 chun
     // （旧实现/间隔为 0 时会是 1000 次；间隔汇总时只应有收尾的那 1 次）
     assert(sampleCalls <= 2,
       `统计写次数应被汇总（≤2），实际 ${sampleCalls} 次 —— 若等于 chunk 数说明又退回逐 chunk 统计`);
-    assert(trackCalls <= 2, `按桶统计次数应被汇总（≤2），实际 ${trackCalls} 次`);
+    /**
+     * R94（审核 M06-03）：`getObject` 现在也走 `s3.p()`（越权兜底 + 按桶请求计数），
+     * 于是每次下载比旧实现固定多 1 次 trackBucket（旧实现漏计了这次 getObject）。
+     * 判据保持「远小于 chunk 数」的本意，不钉死具体常数 —— 钉死会让每次
+     * 「多一个 S3 调用」都变成一次测试红灯，而那不是这条护栏要守的东西。
+     */
+    assert(trackCalls <= 4, `按桶统计次数应被汇总（≤4），实际 ${trackCalls} 次`);
     assert(sampleCalls >= 1, '至少要收尾清算一次，否则尾部字节会丢失');
   } finally {
     statsStore.sampleTraffic = origSample;

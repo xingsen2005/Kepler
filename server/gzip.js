@@ -98,10 +98,10 @@ function gzipMiddleware(req, res, next) {
 
   // 把 chunk 写入缓冲区；一旦累计超过 MAX_SIZE 立即切成透传并释放已缓冲内存。
   // 写入 flush 到 origWrite 时如实返回其布尔值，使背压信号不再丢失。
-  function writeBuf(chunk, enc) {
+  function writeBuf(chunk, enc, cb) {
     if (!chunk) return true;
     const buf = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk, enc || 'utf8');
-    if (passthrough) return origWrite.call(res, buf);
+    if (passthrough) return origWrite.call(res, buf, cb);
     chunks.push(buf);
     buffered += buf.length;
     if (buffered > MAX_SIZE) {
@@ -113,7 +113,25 @@ function gzipMiddleware(req, res, next) {
     return true; // 缓冲模式下数据已被我们接收，背压由后续的透传 write 如实体现
   }
 
-  res.write = function write(chunk, enc, cb) { return writeBuf(chunk, enc); };
+  /**
+   * R94（审核 M06-06 / M13-10）：**必须把回调透传下去**。
+   *
+   * Node 的 `Writable.write(chunk, enc, cb)` 契约是「chunk 处理完后调用 cb」，
+   * 背压相关的库（`stream.pipeline`、`on-finished`、部分压缩/加密中间件）都依赖它。
+   * 旧实现 `function write(chunk, enc, cb) { return writeBuf(chunk, enc); }`
+   * 直接把 `cb` 丢了：调用方等不到回调 ⇒ 该触发的下一段逻辑永远不执行，
+   * 而在「数据被我们缓冲」这条路径上连错误都看不到（静默挂起）。
+   *
+   * 缓冲模式下我们确实「接收」了这块数据，按契约用 `process.nextTick` 回调；
+   * 已透传时把 cb 交给真正的 `origWrite`，绝不重复调用。
+   */
+  res.write = function write(chunk, enc, cb) {
+    const cbFn = typeof enc === 'function' ? enc : (typeof cb === 'function' ? cb : null);
+    const encArg = typeof enc === 'function' ? undefined : enc;
+    const ok = writeBuf(chunk, encArg, cbFn);
+    if (cbFn && !passthrough) process.nextTick(cbFn);
+    return ok;
+  };
 
   res.end = function end(chunk, enc, cb) {
     if (chunk) {

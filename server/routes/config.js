@@ -283,7 +283,16 @@ router.post('/config/verify', requireAdmin, async (req, res) => {
       // 建客户端时的取法一致，避免「校验按 A 厂商、连接按 B 厂商」的口径分叉）。
       const epProvider = (b.provider && String(b.provider).trim())
         || stored.provider || providers.DEFAULT_PROVIDER_ID;
-      try { assertSafeEndpoint(providers.composeEndpoint(epProvider, b.endpoint)); } catch (e) {
+      /**
+       * R94（审核 M05-05）：这里必须用**解析级**复核（`assertSafeEndpointResolved`），
+       * 与保存路径（本文件 :94 / :174）、`backup.apply()` 同一口径。
+       *
+       * 同步版只判「IP 字面量 + 元数据主机名」，**不解析域名**（`endpoint-guard.js`
+       * 明说这是刻意的边界）。于是「保存时解析到公网、之后改指内网」的域名在保存路径
+       * 会被拒绝，在这个**会真的发出请求**的连接验证路径却能通过并被连上 ——
+       * 同一个判据两处实现、只堵了一处。请求里还带着 `Authorization` 的 AK 标识。
+       */
+      try { await assertSafeEndpointResolved(providers.composeEndpoint(epProvider, b.endpoint)); } catch (e) {
         return res.status(e.status || 400).json({ ok: false, error: e.message });
       }
     }
@@ -295,7 +304,7 @@ router.post('/config/verify', requireAdmin, async (req, res) => {
       if (cred.enabled === false) return res.status(400).json({ ok: false, error: '所选密钥已停用，请先启用或选择其他密钥' });
       // 密钥自带的自定义端点同样过守卫（请求体端点已在前面校验过）
       if (cred.endpoint) {
-        try { assertSafeEndpoint(cred.endpoint); } catch (e) {
+        try { await assertSafeEndpointResolved(cred.endpoint); } catch (e) {
           return res.status(e.status || 400).json({ ok: false, error: e.message });
         }
       }

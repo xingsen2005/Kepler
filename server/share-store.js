@@ -61,6 +61,13 @@ const { normalizeSpeedLimit } = require('./limits');
 // （此前缺失，用例只能写真实 data/links.json）
 const DATA_DIR = require('./data-dir').dataDir();
 const FILE = path.join(DATA_DIR, 'links.json');
+const coalesce = require('./coalesce');
+
+/**
+ * R94（审核 M08-03）：分享链接表的去抖合并写（见 `persist()`）。
+ * 快照取 `cache`：写盘内容永远是**落盘那一刻**的最新全表，中间态不会被写出去。
+ */
+const writer = coalesce.debouncedPersist(FILE, () => cache || null, { debounceMs: 250, dataDir: DATA_DIR });
 
 let cache = null;
 
@@ -88,9 +95,22 @@ function load() {
 
 function persist() {
   ensureDataDir();
-  // N5：异步串行写入（secure-store 内部按文件维度排队 + 原子写），
-  // 优雅关闭时由 index.js 的 secureStore.flush() 兜底不丢数据
-  secureStore.writeJsonAsync(FILE, cache);
+  /**
+   * R94（审核 M08-03）：改成**去抖合并写**（与 `payment-orders` / `download-log` /
+   * `restore-guard` 同款，原语来自 `coalesce.debouncedPersist`）。
+   *
+   * 旧实现每次都直接 `writeJsonAsync(FILE, cache)`，而它内部的序列化与加密是在
+   * 队列的微任务里**同步**跑的 —— 也就是每一次分享下载都在主线程上做一遍
+   * 「全表 JSON.stringify + 全表 AES-256-GCM + 原子写」。`links.json` 的体积随
+   * 「链接数 × 快照条目数（每条上限 2000）」线性增长：实测 50 条 × 2000 项
+   * （≈7.7MB）时单次 persist 约 0.33 秒，而 `GET /s/:id/dl` 是**匿名可达**的，
+   * 每命中一次就把整个进程卡住这么久（Node 单进程，WebDAV / 管理页 / 其它下载
+   * 一起卡），写队列还会随下载量单调增长。
+   *
+   * 去抖之后，同一次下载风暴只落一次盘；退出路径由 coalesce 注册的**唯一**退出
+   * 钩子做同步写（`flushSync` 语义保留在那边），不会丢最后一次变更。
+   */
+  writer.schedule();
 }
 
 /**
@@ -356,6 +376,34 @@ function get(id) {
   return load().links.find((l) => l.id === id) || null;
 }
 
+/**
+ * R94（审核 M02-02）：账户被删除时**解除其分享链接的归属**。
+ *
+ * 归属判据是 `createdBy`（**用户名**，不是 userId）。于是「删掉一个用户、再建一个
+ * 同名账号」就等于把前者留下的全部分享链接（含付费链接的收款人身份）转交出去 ——
+ * 建号权限在管理员手里，但「同名」这件事本身不该成为继承凭据的理由。
+ *
+ * 这里只清空归属，**不删除链接**：链接是无口令可访问的公开凭据，删掉会让已经发出去的
+ * 链接变成 404（对分享者是数据丢失）；清空后它变成「无主链接」——
+ *  `canManage()` 对普通用户恒 false，管理员仍可在链接管理里看到并清理它。
+ *
+ * 返回被处理的链接数，供审计日志留痕。
+ */
+function orphanByCreator(username) {
+  const name = String(username || '');
+  if (!name) return 0;
+  const st = load();
+  let n = 0;
+  for (const l of st.links) {
+    if (l.createdBy && l.createdBy === name) {
+      l.createdBy = '';
+      n += 1;
+    }
+  }
+  if (n) persist();
+  return n;
+}
+
 /* ------------------------- 增删改 ------------------------- */
 
 /**
@@ -578,6 +626,18 @@ function markMissingByKeys(bucket, keys) {
     // 有 bucket 且与本次删除的桶不同 → 跳过（跨桶同名 key 不能误伤）。
     // 无 bucket 的历史链接：该 key 已被云端明确确认删除，标记是事实 → 不跳过。
     if (l.bucket && bucket && l.bucket !== bucket) continue;
+    /**
+     * R94（审核 M08-01）：**多条目 / 文件夹分享不因少了某一个对象而整条失效**。
+     *
+     * 这条口径 R51 早就写进 `share-routes.js` 了（`probeObjectMissing` 对
+     * `listView` 直接短路、下载失败分支带 `!v.listView` 豁免），但本函数是**另一处**
+     * 判定点，当时漏了同一把尺子 —— 而多条目链接的 `l.key` 在建链时被写成
+     * **快照的第一项**，于是「删掉第一个文件」就让整条分享落上 `missingAt`：
+     * 分享页 410，且因为 `probeObjectMissing` 对 `listView` 不再探测，
+     * `clearMissing()` 永远不会被调用 —— **不可自愈**，已分发出去的 URL 直接报废。
+     * 判据复用 `view().listView`（唯一实现点），保证与页面/下载两侧同源。
+     */
+    if (view(l).listView) continue;
     l.missingAt = now;
     n += 1;
   }
@@ -704,16 +764,44 @@ function masterKey() {
  * 现在把 passwordHash 纳入签名输入：改密码 → 令牌自然失效，旧 Cookie 立即失效。
  * 使用 HMAC 而非明文比较，故哈希本身不会泄露给客户端。
  */
-function accessToken(link) {
+/**
+ * R94（审核 M08-04）：密码票据的**服务端有效期**。
+ *
+ * 旧票据是 `HMAC(key, 'share-pass:' + id + '|' + passwordHash)` —— 签名输入里
+ * **没有签发时间**，`verifyToken()` 也不看任何时效，于是它在链接有效期内**永远有效**。
+ * Cookie 上的 `maxAge: 7 天` 只是浏览器侧的自觉行为，抓到 Cookie 值的人可以无限重放。
+ * 全库唯一同类票据 `encStore.issueToken()` 明确带 30 分钟 TTL，这里是唯一的例外。
+ *
+ * 现在把签发时间放进票据并参与签名：`<iat36>.<hmac>`，验证时同时判「没被篡改」
+ * 与「没过期」。改密码仍会立即失效（`passwordHash` 依旧在签名输入里）。
+ * 旧格式（纯 64 位 hex）**不再接受** —— 它正是"永不过期"的那个东西；
+ * 代价只是升级后让已有访问者重新输一次密码。
+ */
+const SHARE_TOKEN_TTL_MS = 7 * 24 * 3600 * 1000; // 与 Cookie 的 7 天对齐
+
+function accessTokenAt(link, iat) {
   const l = typeof link === 'string' ? get(link) : link;
   const id = (l && l.id) || String(link || '');
   const bind = (l && l.passwordHash) || 'no-pass';
-  return crypto.createHmac('sha256', masterKey()).update('share-pass:' + id + '|' + bind).digest('hex');
+  const h = crypto.createHmac('sha256', masterKey())
+    .update('share-pass:' + id + '|' + bind + '|' + String(iat)).digest('hex');
+  return Number(iat).toString(36) + '.' + h;
+}
+
+function accessToken(link) {
+  return accessTokenAt(link, Date.now());
 }
 
 function verifyToken(link, token) {
-  if (typeof token !== 'string' || token.length !== 64) return false;
-  const expected = accessToken(link);
+  if (typeof token !== 'string') return false;
+  const dot = token.indexOf('.');
+  if (dot <= 0) return false;
+  const iat = Number.parseInt(token.slice(0, dot), 36);
+  if (!Number.isFinite(iat) || iat <= 0) return false;
+  const age = Date.now() - iat;
+  // 未来的签发时间同样拒绝（时钟被拨 / 手工构造都不该换来一张长期票据）
+  if (age < 0 || age > SHARE_TOKEN_TTL_MS) return false;
+  const expected = accessTokenAt(link, iat);
   try {
     return crypto.timingSafeEqual(Buffer.from(token), Buffer.from(expected));
   } catch (e) {
@@ -723,8 +811,15 @@ function verifyToken(link, token) {
 
 module.exports = {
   list, listFor, canManage, get, create, update, remove, status, view,
+  orphanByCreator, // R94：删用户时解除其链接归属（防同名新账号继承）
   removeDead, // R32-02：管理端「删除失效链接」（仅 deleted / expired，不含可逆的 exhausted）
   checkPassword, tryAcquire, release, accessToken, verifyToken,
+  // R94（审核 M08-03）：去抖写的立即落盘入口（测试收尾 / 优雅停机用）。
+  // ⚠️ 只有 `flush()`：同步落盘走 `coalesce.flushAllSync()`（那是「退出路径」的
+  // 唯一收口，且那儿有「数据目录不存在就不写」的守卫）——
+  // `debouncedPersist()` 的返回对象**没有** `flushSync`，早先这里写成
+  // `flushSync: () => writer.flushSync()` 是一个会当场 TypeError 的死接口。
+  flush: () => writer.flush(),
   markMissing, clearMissing, markMissingByKeys, markMissingByBucket,
   // R51：多文件 / 文件夹分享
   SNAPSHOT_MAX, itemList, itemName, itemStats, viewItems, normalizeItems, displayName,

@@ -40,6 +40,35 @@ function isAdmin() {
   return isStaffRole(App.state.user && App.state.user.role);
 }
 
+/**
+ * R94（审核 M12-03）：把「本机回环豁免正在吞掉全部规则」这件事**说出来**。
+ *
+ * 为什么这是一条**必须**的提示：豁免的判据是「socket 对端是回环」，而反代部署里
+ * socket 对端恰恰就是本机 Nginx（`proxy_pass http://127.0.0.1:$APP_PORT`）。只要
+ * 本次请求没被识别为「来自可信代理的转发头」（`TRUST_PROXY` 未设、
+ * `TRUST_PROXY_FROM` 写错、或反代不转发 `X-Forwarded-For`），守卫看到的整站流量
+ * 都是 `127.0.0.1`，屏蔽规则与「屏蔽海外 IP」**一条都不参与判定**。
+ * 而界面上的规则卡片照旧显示「生效中」、命中数恒 0 —— 后者会被读成「还没人撞上来」，
+ * 管理员于是得到一个完全错误的安全假设。
+ *
+ * @param {boolean} flag `/api/ipguard` 返回的 `loopbackExempt`（仅在有规则时为真）
+ * @param {string} at   最近一次豁免生效的时刻（ISO 字符串，可为空）
+ * @returns {string} 空串表示正常
+ */
+export function loopbackExemptBanner(flag, at) {
+  if (!flag) return '';
+  const when = at ? `<br>最近一次豁免生效：${escapeHtml(fmtTime(at))}。` : '';
+  return '<div role="alert" style="margin:0 0 10px;padding:10px 12px;border-left:4px solid #b45309;'
+    + 'background:#fffbeb;color:#78350f;border-radius:6px;font-size:13px;line-height:1.65">'
+    + '<b>「本机回环永久放行」正在生效：下面这些屏蔽规则目前没有参与判定。</b><br>'
+    + '本服务把来源判定成了 <code>127.0.0.1</code>（本机）。若你前面有反向代理，'
+    + '请检查 <code>TRUST_PROXY=1</code> 是否生效、<code>TRUST_PROXY_FROM</code> '
+    + '是否与实际对端网段一致、反代是否转发了 <code>X-Forwarded-For</code>。'
+    + '在这些配好之前，IP 屏蔽与「屏蔽海外 IP」都不会起作用。'
+    + when
+    + '</div>';
+}
+
 /* ============================== 页面级入口 ============================== */
 
 /** 切到本页时调用（main.js 的 switchMainView） */
@@ -194,10 +223,12 @@ async function refreshIpGuard() {
   if (spCount) spCount.textContent = speeds.length ? `（${speeds.length} 条规则）` : '';
 
   if (box) {
+    // R94（审核 M12-03）：规则写了但没参与判定 ⇒ 必须在规则表上方说清楚
+    const exemptWarn = loopbackExemptBanner(d.loopbackExempt, d.loopbackExemptAt);
     if (!blocks.length) {
-      box.innerHTML = '<div class="lk-empty">尚无屏蔽规则。点击右上角「＋ 添加屏蔽规则」。按桶屏蔽海外 IP 请在「存储桶管理」表格中勾选对应列。</div>';
+      box.innerHTML = exemptWarn + '<div class="lk-empty">尚无屏蔽规则。点击右上角「＋ 添加屏蔽规则」。按桶屏蔽海外 IP 请在「存储桶管理」表格中勾选对应列。</div>';
     } else {
-      box.innerHTML = ruleTableHtml(blocks, false);
+      box.innerHTML = exemptWarn + ruleTableHtml(blocks, false);
       bindRuleRowActions(box, blocks);
     }
   }
@@ -422,6 +453,19 @@ async function testIpBlocked() {
       out.className = r.speedRule ? 'ipg-test-warn' : 'ipg-test-ok';
     } else if (r.reason === 'overseas') {
       out.textContent = `✗ ${ip}（${r.method}）为海外 IP，被「仅放行国内 IP」模式屏蔽`;
+      out.className = 'ipg-test-bad';
+    } else if (r.reason === 'unparsable') {
+      /**
+       * R94（审核 M12-04）：`unparsable` 分支必须**单独**处理。
+       *
+       * 服务端对无法解析的地址返回 `{ ok:false, reason:'unparsable' }`，此时**没有**
+       * `rule` 字段（`matchedRule` 为 `null`）。旧代码让这种结果落进最后一个 else，
+       * 直接读 `m.bucketIds` ⇒ `TypeError: Cannot read properties of null`，被外层
+       * catch 吞成「检测失败：…」—— 管理员看到一句 JS 报错，真实原因只是「你输入的
+       * 不是合法 IP」，排障方向被整个带偏。
+       */
+      out.textContent = `✗ ${ip}（${r.method}）无法解析为合法 IP，按「拒绝」处理`
+        + '（服务端对无法识别的地址 fail-closed；请检查输入，或确认该值不是畸形转发头）';
       out.className = 'ipg-test-bad';
     } else {
       const m = r.matchedRule;

@@ -83,9 +83,16 @@ async function streamDownload({ s3, bucket, region, key, fileName, encMeta, req,
   req.setTimeout(timeoutMs);
   res.setTimeout(timeoutMs, () => teardown(null));
 
-  await new Promise((resolve, reject) => {
-    s3.getObject({ Bucket: bucket, Region: region, Key: key, Output: out }, (err) => (err ? reject(err) : resolve()));
-  });
+  /**
+   * R94（审核 M06-03）：这里原先是回调式直接调 `s3.getObject(...)`，绕过了
+   * `s3.p()` —— 而 `p()` 挂着两件事：`assertScoped()`（R89 的越权兜底判据）与
+   * 按桶请求计数。下载是**最敏感的数据通路**，恰恰成了唯一没有第二道防线的出口；
+   * 下载产生的 `getObject` 也从不计入按桶统计。同文件顶部已经用 `p()` 做 HEAD，
+   * 正文却绕开它，属于「同类调用两种写法」。
+   *
+   * `p()` 是把 `params` 原样交给 `s3[method]` 的，`Output` 流照传，语义不变。
+   */
+  await p(s3, 'getObject', { Bucket: bucket, Region: region, Key: key, Output: out });
 }
 
 module.exports = { streamDownload, DOWNLOAD_TIMEOUT_MS };

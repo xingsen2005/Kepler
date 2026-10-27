@@ -401,6 +401,21 @@ const PROVIDERS = [
     // 的一家。这里把已确定的域名部分写进 endpointTemplate，占位符保留在主机名最前，
     // 由 composeEndpoint() 把用户填写的账户 ID 拼进去（见该函数说明）。
     endpointTemplate: '{region}.r2.cloudflarestorage.com',
+    /**
+     * R94（审核 M05-02）：账户 ID 会被 `composeEndpoint()` **拼进主机名**
+     * （`https://<账户ID>.r2.cloudflarestorage.com`），是彻头彻尾的不可信输入。
+     *
+     * 之前这里没有字符集约束，而 `assertSafeEndpoint()` 只看「拼完之后的主机是不是
+     * 元数据 / 回环 / 私网字面量 + 协议是不是 https」—— 于是填 `evil.example/x`
+     * 会拼出 `https://evil.example/x.r2.cloudflarestorage.com`，URL 解析器把主机名
+     * 切成 `/` 之前的部分 ⇒ 主机变成 `evil.example`，守卫**照样放行**，此后该密钥的
+     * 每一次对象操作都把真实 AccessKey / SecretKey 的签名发往攻击者主机。
+     *
+     * 判据与 Azure 的 `accountPattern` 同款（同一套 `isValidAccount()` 实现），
+     * 但放宽到 8–64 位字母数字：CF 账户 ID 目前是 32 位十六进制，判据只负责
+     * 「不可能改变主机或路径」，不替厂商校验业务格式。
+     */
+    accountPattern: '^[a-z0-9]{8,64}$',
     defaultRegion: 'auto',
     regionRequired: false,
     regionPlaceholder: '例如 auto（可留空）',
@@ -542,6 +557,40 @@ function isValidAccount(id, account) {
   } catch (e) {
     return false;
   }
+}
+
+/**
+ * 存储桶名的字符集判据（R94 · 审核 M05-01）。
+ *
+ * ## 为什么桶名必须校验
+ *
+ * `endpoint-guard.js` 的全部禁令（云元数据、回环、私网 / 链路本地、明文 HTTP）都只作用在
+ * **endpoint 字符串**上，而出站请求的目标是由「端点 + 桶名 + 对象键」三者拼出来的：
+ * `s3-client._request()` 在虚拟主机风格下把桶名拼进 **Host 头**
+ * （`` `${bucket}.${host}` ``）、路径风格下拼进**请求路径**。桶名是三者里唯一
+ * 没有字符集约束的一个 —— 对象键至少走了 `encodeKeyPath()`。
+ *
+ * 于是一个名为 `169.254.169.254/x` 的桶就让 URL 解析器把主机名切成 `/` 之前的
+ * 任意字符串：盲 SSRF + 把 `Authorization: AWS4-HMAC-SHA256 Credential=<AK>/…`
+ * 送去任意主机（守卫明文写下的「防凭据外发」在这条通道上完全失效）。路径风格下
+ * `a/../../evil` 还会经 `normalizeDotSegments()` 把桶段整个抹掉，请求落到同账号的
+ * 另一个桶上（跨桶）。
+ *
+ * 对照物：Azure 存储账户名（同样会拼进主机名）早就收敛到 `accountPattern`，
+ * 而桶名一直没有等价处理；且备份**导入**路径此前只校验 `endpoint`，
+ * 桶名通道原样留着（项目自己已把「导入别人的导出码」认定为凭据外发攻击面）。
+ *
+ * ## 判据为什么取这么宽
+ *
+ * 各家桶名规则不同（S3：3–63 位小写字母数字与 `.-`；腾讯云 COS 带 `-<APPID>` 后缀；
+ * Azure 容器：3–63 位小写字母数字与 `-`）。这里的目的是**堵住注入面**而不是替厂商
+ * 判合法性：只要不含 `/ \ : @ ? # 空白` 就不可能改写主机名或路径，长度按最宽的一档给。
+ */
+const BUCKET_NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$/;
+
+/** 桶名是否合法（首字符必须是字母或数字 ⇒ 排除 `.` / `..` 这类相对路径段） */
+function isValidBucketName(name) {
+  return BUCKET_NAME_RE.test(String(name == null ? '' : name).trim());
 }
 
 /**
@@ -797,6 +846,25 @@ function composeEndpoint(id, input) {
     if (/^https?:\/\//i.test(raw)) return raw;
     const suffix = p.endpointTemplate.replace('{region}', '');
     if (suffix && raw.toLowerCase().endsWith(suffix.toLowerCase())) return 'https://' + raw;
+    /**
+     * R94（审核 M05-02）：模板分支把用户输入拼进**主机名最前**，必须收敛字符集。
+     *
+     * 这条与 `safeRegion()`（R21-12）是同一类缺陷的第二个入口：`{region}` 位置的
+     * 值若含 `/`、`?`、`#`，拼出来的端点主机就被改写了，而 `assertSafeEndpoint()`
+     * 只判「拼完之后」的字面量 —— `evil.example/x` → 主机 `evil.example`，
+     * 公网域名一律放行。厂商登记了 `accountPattern` 时按它校验，没登记的维持原样
+     * （历史行为不能悄悄改）。
+     */
+    if (p.accountPattern) {
+      let ok = false;
+      try { ok = new RegExp(p.accountPattern).test(raw.toLowerCase()); } catch (e) { ok = false; }
+      if (!ok) {
+        const err = new Error(`${p.endpointLabel || '账户标识'}格式不正确：${raw.slice(0, 40)}`
+          + '（只能包含小写字母与数字）');
+        err.status = 400;
+        throw err;
+      }
+    }
     return 'https://' + p.endpointTemplate.replace('{region}', raw);
   }
   return raw;
@@ -842,4 +910,5 @@ module.exports = {
   copyNeedsSlice,      // 复制是否必须改走 sliceCopyFile（三处复制路径共用）
   // R30：由账户名推导端点（Azure）—— 唯一实现点，含账户名字符集校验
   accountEndpointTemplate, isValidAccount, endpointForAccount,
+  isValidBucketName, BUCKET_NAME_RE, // R94：桶名字符集判据的唯一实现点
 };

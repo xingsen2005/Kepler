@@ -1585,7 +1585,7 @@ async function probeObjectMissing(l) {
     if (failed) {
       statsStore.addLog({
         action: 'share.probe', level: 'warn',
-        detail: `分享链接存在性探测失败（链接 ${l.id}，桶 ${l.bucket}）：`
+        detail: `分享链接存在性探测失败（链接 ${statsStore.logRef(l.id)}，桶 ${l.bucket}）：`
           + `${(failed && (failed.message || failed.code || failed.name)) || failed}`,
       });
     }
@@ -1874,7 +1874,7 @@ function listPage(res, l, v, opts = {}) {
         ${v.hasPassword ? '<div><span>密码保护</span><b>已启用</b></div>' : ''}
         ${extra}
       </div>
-      <form method="GET" action="/s/${esc(l.id)}/dl" id="sl-form">
+      <form method="POST" action="/s/${esc(l.id)}/dl" id="sl-form">
         <div class="sl-bar">
           <button class="btn ghost" type="button" id="sl-all">全选本页</button>
           <button class="btn ghost" type="button" id="sl-none">清空选择</button>
@@ -2005,7 +2005,7 @@ router.post('/s/:id/coupon', asyncHandler(async (req, res) => {
   res.cookie(couponCookieName(l.id), r.coupon.code, shareCookieOptions(l.id));
   // 日志只记券 id 与优惠额，**不记券码本身**（与邀请码同：审计日志是明文 JSONL）
   statsStore.addLog({
-    action: 'share.coupon', detail: `分享链接 ${l.id} 应用优惠券 ${r.coupon.id}`
+    action: 'share.coupon', detail: `分享链接 ${statsStore.logRef(l.id)} 应用优惠券 ${r.coupon.id}`
       + `（优惠 ¥${paymentRules.formatAmount(r.discountFen)}，应付 ¥${paymentRules.formatAmount(r.payableFen)}，IP：${ip}）`,
   });
   return res.redirect(303, '/s/' + l.id);
@@ -2028,7 +2028,7 @@ router.post('/s/:id/pay', asyncHandler(async (req, res) => {
   if (l.passwordHash && !shareStore.verifyToken(l, getCookie(req, cookieName(l.id)))) {
     statsStore.addLog({
       action: 'share.pay', level: 'warn',
-      detail: `已拒绝发起支付：未持有效访问密码票据（链接 ${l.id}，IP：${security.clientIp(req)}）`,
+      detail: `已拒绝发起支付：未持有效访问密码票据（链接 ${statsStore.logRef(l.id)}，IP：${security.clientIp(req)}）`,
     });
     return passwordPage(res, l, true,
       '访问密码的验证状态已失效（可能是浏览器清理了 Cookie，或换了浏览器/隐身窗口），请重新输入访问密码后再支付。');
@@ -2039,7 +2039,7 @@ router.post('/s/:id/pay', asyncHandler(async (req, res) => {
     // 已转免费 / 支付被停用 / 无可用渠道：不该建单，但必须说清楚
     statsStore.addLog({
       action: 'share.pay', level: 'warn',
-      detail: `已拒绝发起支付：付费当前不生效（链接 ${l.id}，原因：${ps.reason || 'unknown'}，IP：${security.clientIp(req)}）`,
+      detail: `已拒绝发起支付：付费当前不生效（链接 ${statsStore.logRef(l.id)}，原因：${ps.reason || 'unknown'}，IP：${security.clientIp(req)}）`,
     });
     return res.redirect(303, '/s/' + l.id + '?e=pay-off');
   }
@@ -2066,7 +2066,7 @@ router.post('/s/:id/pay', asyncHandler(async (req, res) => {
       : `你选择的支付方式（${platform}）当前不可用，可能是刚刚被停用，请刷新本页后重新选择。`;
     statsStore.addLog({
       action: 'share.pay', level: 'warn',
-      detail: `已拒绝发起支付：支付方式不可用（链接 ${l.id}，提交「${platform || '空'}」，可用：${available.join(',') || '无'}）`,
+      detail: `已拒绝发起支付：支付方式不可用（链接 ${statsStore.logRef(l.id)}，提交「${platform || '空'}」，可用：${available.join(',') || '无'}）`,
     });
     return payPage(res, l, ps, available, msg, '', couponStateFor(l, req));
   }
@@ -2086,7 +2086,7 @@ router.post('/s/:id/pay', asyncHandler(async (req, res) => {
   if (paymentOrders.isDegraded()) {
     statsStore.addLog({
       action: 'share.pay', level: 'error',
-      detail: `已拒绝发起支付：订单存储不可用（链接 ${l.id}，IP：${ip}）—— payments.json 读取失败，为避免「收了钱却查不到订单」暂停收款`,
+      detail: `已拒绝发起支付：订单存储不可用（链接 ${statsStore.logRef(l.id)}，IP：${ip}）—— payments.json 读取失败，为避免「收了钱却查不到订单」暂停收款`,
     });
     return payPage(res, l, ps, available,
       '订单存储暂不可用，已暂停收款：现在下单会出现「钱付了、系统里查不到订单」。'
@@ -2105,7 +2105,7 @@ router.post('/s/:id/pay', asyncHandler(async (req, res) => {
     // 已付即放行：不再建单，也不动票据。R80：带上原因码，让 `/s/:id` 说明「这次点击为什么没建单」
     statsStore.addLog({
       action: 'share.pay', level: 'warn',
-      detail: `已拒绝发起支付：该浏览器在本链接上已有已支付订单（链接 ${l.id}，订单 ${payer.order ? payer.order.id : '-'}）`,
+      detail: `已拒绝发起支付：该浏览器在本链接上已有已支付订单（链接 ${statsStore.logRef(l.id)}，订单 ${payer.order ? payer.order.id : '-'}）`,
     });
     return res.redirect(303, '/s/' + l.id + '?e=paid');
   }
@@ -2173,7 +2173,7 @@ router.post('/s/:id/pay', asyncHandler(async (req, res) => {
     res.cookie(payCookieName(l.id), paymentOrders.orderToken(twin), shareCookieOptions(l.id));
     statsStore.addLog({
       action: 'share.pay', level: 'warn',
-      detail: `分享链接 ${l.id} 疑似重复提交（${TWIN_WINDOW_MS / 1000} 秒内同 IP / 同渠道 / 同券 / 同价）：`
+      detail: `分享链接 ${statsStore.logRef(l.id)} 疑似重复提交（${TWIN_WINDOW_MS / 1000} 秒内同 IP / 同渠道 / 同券 / 同价）：`
         + `复用未成交订单 ${twin.id}，不再新建（IP：${ip}）`,
     });
   } else if (sameChannel) {
@@ -2253,7 +2253,7 @@ router.post('/s/:id/pay', asyncHandler(async (req, res) => {
         if (settled && settled.status === 'paid') {
           statsStore.addLog({
             action: 'share.pay', level: 'warn',
-            detail: `分享链接 ${l.id} 的订单 ${pendingOrder.id} 在换${byCoupon ? '券' : '渠道'}时发现**已完成支付**：`
+            detail: `分享链接 ${statsStore.logRef(l.id)} 的订单 ${pendingOrder.id} 在换${byCoupon ? '券' : '渠道'}时发现**已完成支付**：`
               + '已按该笔交付，本次不再建新单（IP：' + ip + '）',
           });
           return res.redirect(303, '/s/' + encodeURIComponent(l.id) + '?e=paid');
@@ -2262,7 +2262,7 @@ router.post('/s/:id/pay', asyncHandler(async (req, res) => {
       if (!closeRes.ok && closeRes.state !== 'unsupported') {
         statsStore.addLog({
           action: 'share.pay', level: 'error',
-          detail: `分享链接 ${l.id} ${switchText}失败：网关侧未能关闭在途订单 ${pendingOrder.id}`
+          detail: `分享链接 ${statsStore.logRef(l.id)} ${switchText}失败：网关侧未能关闭在途订单 ${pendingOrder.id}`
             + `（${closeRes.error || closeRes.state}），为避免双份付款，本次**不再建新单**（IP：${ip}）`,
         });
         return payPage(res, l, ps, available,
@@ -2274,7 +2274,7 @@ router.post('/s/:id/pay', asyncHandler(async (req, res) => {
       if (closeRes.state === 'unsupported') {
         statsStore.addLog({
           action: 'share.pay', level: 'warn',
-          detail: `分享链接 ${l.id} ${switchText}：旧订单 ${pendingOrder.id} 无法在网关侧关闭`
+          detail: `分享链接 ${statsStore.logRef(l.id)} ${switchText}：旧订单 ${pendingOrder.id} 无法在网关侧关闭`
             + `（${closeRes.error || '该渠道不支持'}）；若买家仍完成支付，需人工退款`,
         });
       }
@@ -2286,11 +2286,39 @@ router.post('/s/:id/pay', asyncHandler(async (req, res) => {
       statsStore.addLog({
         action: 'share.pay', level: 'warn',
         detail: byCoupon
-          ? `分享链接 ${l.id} 更换优惠券（${pendingCode || '无券'} → ${submittedCode || '无券'}）：`
+          ? `分享链接 ${statsStore.logRef(l.id)} 更换优惠券（${pendingCode || '无券'} → ${submittedCode || '无券'}）：`
             + `原在途订单 ${pendingOrder.id} 已作废并退券，本次另建新单（IP：${ip}）`
-          : `分享链接 ${l.id} 更换支付渠道（${pendingOrder.platform} → ${platform}）：`
+          : `分享链接 ${statsStore.logRef(l.id)} 更换支付渠道（${pendingOrder.platform} → ${platform}）：`
             + `原在途订单 ${pendingOrder.id} 已作废，本次另建新单（IP：${ip}）`,
       });
+    }
+    /**
+     * R94（审核 M10-02）：「校验 → 核销」之间隔着上面那次 `await`（关旧单要出网），
+     * 于是券的配额可能在**这段时间**里被别人用掉 —— 两个并发请求都通过了 `:2079`
+     * 的校验，各自醒来核销 ⇒ `used` 突破 `maxUses`（超发）。
+     *
+     * 修复分两层，缺一不可：
+     *  ① 写点铁律在 `couponStore.consume()` 里（单线程下「判据 + 计数」在同一同步
+     *    片段内天然原子，见那边的注释）；
+     *  ② 这里在**建单前**重校验一次（`couponStore.create` 之后紧接着 consume，
+     *    中间没有 await）。重校验失败时**不静默改价** —— 「页面显示 ¥5、实际扣 ¥10」
+     *    正是 R84（L-2）修掉的那个缺陷；改为把用户送回付费页让他重新确认。
+     */
+    if (applied) {
+      const who2 = visitorIdentity(req);
+      const recheck = couponStore.validateForUse({
+        code: applied.coupon.code, link: l, identity: who2.identity, userId: who2.userId,
+      });
+      if (!recheck.ok) {
+        statsStore.addLog({
+          action: 'share.pay', level: 'warn',
+          detail: `已拒绝发起支付：优惠券 ${applied.coupon.code} 在关单等待期间失效（链接 ${statsStore.logRef(l.id)}，`
+            + `原因：${recheck.reason}，IP：${ip}）—— 不静默改价，请用户重新确认`,
+        });
+        res.clearCookie(couponCookieName(l.id), { path: '/' });
+        return payPage(res, l, ps, available, recheck.message, '', { code: applied.coupon.code, ok: false, message: recheck.message });
+      }
+      applied = recheck;
     }
     const amountFen = applied ? applied.payableFen : ps.amountFen;
     // 文件名 / 对象键 / 存储桶一并快照进订单：链接删除后订单管理页仍要能回答
@@ -2312,20 +2340,32 @@ router.post('/s/:id/pay', asyncHandler(async (req, res) => {
       fileName: l.fileName, fileKey: l.key, bucket: l.bucket,
     });
     /**
-     * 核销与建单在**同一个同步片段**里（中间没有 await）⇒ 不存在「券在这两步之间
-     * 被别人用掉」的窗口。按 orderId 幂等，重复调用不会重复计数。
+     * 核销与建单在**同一个同步片段**里（中间没有 await），且建单前刚重校验过
+     * （见上文 R94 / M10-02 的两层修复）⇒ 不存在「券在这两步之间被别人用掉」的窗口。
+     * 按 orderId 幂等，重复调用不会重复计数。
+     *
+     * `consume()` 自身也会拒（写点的配额判据，见 `coupon-store.js`）—— 真被拒时
+     * 顺序已经不允许退单，只能**记账并告警**：至少让「券没用上却给了优惠」这件事
+     * 在审计日志里可见，而不是安静地少收一笔钱。
      */
     if (applied) {
-      couponStore.consume({
+      const consumed = couponStore.consume({
         couponId: applied.coupon.id,
         identity: visitorIdentity(req).identity,
         orderId: order.id,
       });
+      if (consumed && consumed.ok === false) {
+        statsStore.addLog({
+          action: 'coupon.consume-rejected', level: 'warn',
+          detail: `订单 ${order.id} 已按优惠价创建，但优惠券 ${applied.coupon.code} 核销被拒（${consumed.reason}）`
+            + `（链接 ${statsStore.logRef(l.id)}）：本单少收 ¥${paymentRules.formatAmount(applied.discountFen)}，需人工核对`,
+        });
+      }
     }
     res.cookie(payCookieName(l.id), paymentOrders.orderToken(order), shareCookieOptions(l.id));
     statsStore.addLog({
       action: 'share.pay',
-      detail: `分享链接 ${l.id} 创建支付订单 ${order.id}（${platform}，¥${paymentRules.formatAmount(order.amountFen)}`
+      detail: `分享链接 ${statsStore.logRef(l.id)} 创建支付订单 ${order.id}（${platform}，¥${paymentRules.formatAmount(order.amountFen)}`
         + `${applied ? `，原价 ¥${paymentRules.formatAmount(order.originalFen)}，优惠券 ${order.couponId}` : ''}，IP：${ip}）`,
     });
   }
@@ -2378,7 +2418,7 @@ router.post('/s/:id/pay', asyncHandler(async (req, res) => {
     releaseCouponForOrder(order); // R62：没成交就不该消耗一次券
     statsStore.addLog({
       action: 'share.pay', level: 'warn',
-      detail: `分享链接 ${l.id} 订单 ${order.id} 拒绝下单：站点对外地址未配置、且请求 Host 不属本站（R24-01）`,
+      detail: `分享链接 ${statsStore.logRef(l.id)} 订单 ${order.id} 拒绝下单：站点对外地址未配置、且请求 Host 不属本站（R24-01）`,
     });
     return payPage(res, l, ps, available,
       '无法确定本站对外地址：请管理员在「系统设置 → 支付设置」中填写站点对外地址后再试', '', couponStateFor(l, req));
@@ -2400,7 +2440,7 @@ router.post('/s/:id/pay', asyncHandler(async (req, res) => {
     releaseCouponForOrder(order); // R62：没成交就不该消耗一次券
     statsStore.addLog({
       action: 'share.pay', level: 'error',
-      detail: `分享链接 ${l.id} 订单 ${order.id} 下单失败（${chargePlatform}）：${charge.error || '未知原因'}`,
+      detail: `分享链接 ${statsStore.logRef(l.id)} 订单 ${order.id} 下单失败（${chargePlatform}）：${charge.error || '未知原因'}`,
     });
     return payPage(res, l, ps, available, `创建支付订单失败：${charge.error || '未知原因'}`, '', couponStateFor(l, req));
   }
@@ -2458,7 +2498,7 @@ router.post('/s/:id/pay', asyncHandler(async (req, res) => {
   releaseCouponForOrder(order);
   statsStore.addLog({
     action: 'share.pay', level: 'error',
-    detail: `分享链接 ${l.id} 订单 ${order.id} 下单异常：渠道 ${chargePlatform} 返回 kind=${charge.kind || '空'}，无可用收银台地址${badUrl}`,
+    detail: `分享链接 ${statsStore.logRef(l.id)} 订单 ${order.id} 下单异常：渠道 ${chargePlatform} 返回 kind=${charge.kind || '空'}，无可用收银台地址${badUrl}`,
   });
   return payPage(res, l, ps, available,
     `创建支付订单失败：支付渠道（${chargePlatform}）没有返回可用的收银台地址${badUrl}，请检查该渠道的网关地址配置后重试`,
@@ -2481,13 +2521,13 @@ async function finalizeOrder(l, order) {
     paymentOrders.markPaid(order.id);
     statsStore.addLog({
       action: 'share.pay',
-      detail: `分享链接 ${l.id} 订单 ${order.id} 支付成功（${order.platform}，¥${paymentRules.formatAmount(order.amountFen)}${r.tradeNo ? '，网关单号 ' + r.tradeNo : ''}）`,
+      detail: `分享链接 ${statsStore.logRef(l.id)} 订单 ${order.id} 支付成功（${order.platform}，¥${paymentRules.formatAmount(order.amountFen)}${r.tradeNo ? '，网关单号 ' + r.tradeNo : ''}）`,
     });
   } else if (r.state === 'failed') {
     paymentOrders.markFailed(order.id, r.failReason || '支付失败或被取消');
     statsStore.addLog({
       action: 'share.pay', level: 'warn',
-      detail: `分享链接 ${l.id} 订单 ${order.id} 支付失败（${order.platform}）：${r.failReason || '未知原因'}`,
+      detail: `分享链接 ${statsStore.logRef(l.id)} 订单 ${order.id} 支付失败（${order.platform}）：${r.failReason || '未知原因'}`,
     });
   }
   return paymentOrders.get(order.id);
@@ -2540,7 +2580,7 @@ function payCheckRateLimited(req, res, l) {
   res.setHeader('Retry-After', String(rl.retryAfter));
   statsStore.addLog({
     action: 'share.pay', level: 'warn',
-    detail: `手动查单被限流（链接 ${l ? l.id : '-'}，IP：${ip}）`,
+    detail: `手动查单被限流（链接 ${l ? statsStore.logRef(l.id) : '-'}，IP：${ip}）`,
   });
   statePage(res, 'limited', l ? shareStore.view(l) : null,
     `查询过于频繁，请 ${rl.retryAfter} 秒后重试。`);
@@ -2948,14 +2988,14 @@ router.post('/s/:id/unlock', asyncHandler(async (req, res) => {
   const pw = String((req.body && req.body.password) || '');
   if (!(await encStore.checkPassword(pw))) {
     const left = security.encUnlockLock.fail(ip);
-    statsStore.addLog({ action: 'enc.unlock', level: 'warn', detail: `分享页加密访问密码验证失败（链接 ${l.id}，IP：${ip}）` });
+    statsStore.addLog({ action: 'enc.unlock', level: 'warn', detail: `分享页加密访问密码验证失败（链接 ${statsStore.logRef(l.id)}，IP：${ip}）` });
     if (left > 0) return encUnlockPage(res, l, true, `失败次数过多，请 ${left} 秒后重试`);
     return encUnlockPage(res, l, true);
   }
   security.encUnlockLock.reset(ip);
   const t = encStore.issueToken();
   res.cookie(ENC_COOKIE, t.token, encCookieOptions());
-  statsStore.addLog({ action: 'enc.unlock', detail: `分享页加密访问密码验证通过（链接 ${l.id}，IP：${ip}，签发 30 分钟令牌）` });
+  statsStore.addLog({ action: 'enc.unlock', detail: `分享页加密访问密码验证通过（链接 ${statsStore.logRef(l.id)}，IP：${ip}，签发 30 分钟令牌）` });
   return res.redirect(303, '/s/' + l.id);
 }));
 
@@ -2973,7 +3013,7 @@ router.post('/s/:id', asyncHandler(async (req, res) => {
   // 就能让该链接对**所有**合法访问者冻结 30 分钟，换 IP 还能持续触发，
   // 等于一条随手可用的针对性 DoS。
   const ip = security.clientIp(req);
-  const scope = `${ip}:${l.id}`;
+  const scope = `${ip}:${statsStore.logRef(l.id)}`;
   const rl = security.shareLimiter(scope);
   if (!rl.ok) return passwordPage(res, l, true, `尝试过于频繁，请 ${rl.retryAfter} 秒后重试`);
   const frozenLeft = security.shareLock.locked(scope);
@@ -2987,7 +3027,7 @@ router.post('/s/:id', asyncHandler(async (req, res) => {
     return res.redirect(303, '/s/' + l.id);
   }
   const left = security.shareLock.fail(scope);
-  statsStore.addLog({ action: 'share.auth', detail: `分享链接 ${l.id} 密码验证失败（IP：${ip}）`, level: 'warn' });
+  statsStore.addLog({ action: 'share.auth', detail: `分享链接 ${statsStore.logRef(l.id)} 密码验证失败（IP：${ip}）`, level: 'warn' });
   if (left > 0) return passwordPage(res, l, true, `密码错误次数过多，该链接已临时冻结，请 ${left} 秒后重试`);
   return passwordPage(res, l, true);
 }));
@@ -3227,7 +3267,7 @@ router.post('/s/:id/restore', asyncHandler(async (req, res) => {
     if (g.justBanned) {
       statsStore.addLog({
         action: 'share.restore-block', level: 'warn',
-        detail: `IP ${ip} 连续输错订单号达 ${cfg.maxFails} 次，已限制「恢复购买」24 小时（链接 ${l.id}）`,
+        detail: `IP ${ip} 连续输错订单号达 ${cfg.maxFails} 次，已限制「恢复购买」24 小时（链接 ${statsStore.logRef(l.id)}）`,
       });
     }
     return restorePage(res, l, { error: '订单号格式不正确，请核对后重新输入。' });
@@ -3256,13 +3296,13 @@ router.post('/s/:id/restore', asyncHandler(async (req, res) => {
       if (g.justBanned) {
         statsStore.addLog({
           action: 'share.restore-block', level: 'warn',
-          detail: `IP ${ip} 连续输错订单号达 ${cfg.maxFails} 次，已限制「恢复购买」24 小时（链接 ${l.id}）`,
+          detail: `IP ${ip} 连续输错订单号达 ${cfg.maxFails} 次，已限制「恢复购买」24 小时（链接 ${statsStore.logRef(l.id)}）`,
         });
       }
     }
     statsStore.addLog({
       action: 'share.restore', level: 'warn',
-      detail: `分享页恢复购买失败（链接 ${l.id}，原因：${r.reason}，IP：${ip}）`,
+      detail: `分享页恢复购买失败（链接 ${statsStore.logRef(l.id)}，原因：${r.reason}，IP：${ip}）`,
     });
     return restorePage(res, l, {
       error: r.message,
@@ -3279,7 +3319,7 @@ router.post('/s/:id/restore', asyncHandler(async (req, res) => {
   res.cookie(payCookieName(l.id), paymentOrders.orderToken(r.order), shareCookieOptions(l.id));
   statsStore.addLog({
     action: 'share.restore',
-    detail: `分享页凭订单号恢复下载权限（链接 ${l.id}，订单 ${r.order.orderNo || r.order.id}，IP：${ip}）`,
+    detail: `分享页凭订单号恢复下载权限（链接 ${statsStore.logRef(l.id)}，订单 ${r.order.orderNo || r.order.id}，IP：${ip}）`,
   });
   return res.redirect(303, '/s/' + l.id);
 }));
@@ -3508,7 +3548,21 @@ function parseSelection(query, v) {
   return { files, dirs, unknown, all: false };
 }
 
-router.get('/s/:id/dl', async (req, res) => {
+/**
+ * R94（审核 M08-02）：下载入口同时接受 **GET 与 POST**。
+ *
+ * 大分享的「下载选中」把勾选项塞进查询串，而 Node 的 `--max-http-header-size`
+ * 默认 16KB **包含请求行** —— 约 500 个 30 字符的 key 就顶满了。R52 的
+ * `mode=all / mode=exclude` 只解决了"全选 / 全不选"两端，**中间区间**（勾一半）
+ * 仍然会撑爆：请求在 Node 的 HTTP 层直接被拒（431），连 Express 都进不来，
+ * 服务端一条日志都不会留下，用户只看到浏览器的"请求头过大"。
+ *
+ * 修法：表单改成 POST，勾选项放请求体（`express.urlencoded` 限 2MB）。
+ * 解析逻辑一行都不用改 —— 下面的 `parseSelection(Object.assign({}, req.query, req.body))`
+ * 本来就是按"查询串 + 表单体合并"写的（表单体优先）。GET 继续保留：
+ * 手写 URL、分页链接、单文件直链都还在用它。
+ */
+async function downloadHandler(req, res) {
   const l = shareStore.get(req.params.id);
   if (!l) return statePage(res, 'notfound');
   const st = shareStore.status(l);
@@ -3535,7 +3589,7 @@ router.get('/s/:id/dl', async (req, res) => {
     if (payer.state !== 'paid') {
       statsStore.addLog({
         action: 'share.download', level: 'warn',
-        detail: `已拦截未完成的付费下载（链接 ${l.id}，状态：${payer.state}）`,
+        detail: `已拦截未完成的付费下载（链接 ${statsStore.logRef(l.id)}，状态：${payer.state}）`,
       });
       return payBlockedPage(res, l, ps, payer);
     }
@@ -3556,7 +3610,7 @@ router.get('/s/:id/dl', async (req, res) => {
   if (sel.unknown.length) {
     statsStore.addLog({
       action: 'share.download', level: 'warn',
-      detail: `已拒绝不属于该分享的下载选项（链接 ${l.id}，${sel.unknown.length} 项，例如 ${String(sel.unknown[0]).slice(0, 120)}）`,
+      detail: `已拒绝不属于该分享的下载选项（链接 ${statsStore.logRef(l.id)}，${sel.unknown.length} 项，例如 ${String(sel.unknown[0]).slice(0, 120)}）`,
     });
     return renderPage(res, 400, {
       title: '选择无效',
@@ -3610,7 +3664,7 @@ router.get('/s/:id/dl', async (req, res) => {
   if (!src.allow) {
     statsStore.addLog({
       action: 'share.download', level: 'warn',
-      detail: `已拦截来源不受信任的分享下载（链接 ${l.id}，IP：${ip}，原因：${src.reason}，referer=${String(req.headers.referer || '').slice(0, 120)}）`,
+      detail: `已拦截来源不受信任的分享下载（链接 ${statsStore.logRef(l.id)}，IP：${ip}，原因：${src.reason}，referer=${String(req.headers.referer || '').slice(0, 120)}）`,
     });
     return statePage(res, 'crosssite', shareStore.view(l),
       '该下载请求来自其它站点，已被拒绝。请在分享页面内点击下载。');
@@ -3619,7 +3673,7 @@ router.get('/s/:id/dl', async (req, res) => {
     // 直连客户端（curl / wget）：保留可用性，但落审计便于追溯
     statsStore.addLog({
       action: 'share.download', level: 'warn',
-      detail: `分享下载缺少来源标识（链接 ${l.id}，IP：${ip}）—— 疑似脚本直连，已放行但仅依赖限流保护`,
+      detail: `分享下载缺少来源标识（链接 ${statsStore.logRef(l.id)}，IP：${ip}）—— 疑似脚本直连，已放行但仅依赖限流保护`,
     });
   }
 
@@ -3685,7 +3739,7 @@ router.get('/s/:id/dl', async (req, res) => {
           if (isNotFound(e)) {
             statsStore.addLog({
               action: 'share.download', level: 'warn',
-              detail: `打包下载跳过已不存在的对象 ${key}（链接 ${l.id}）`,
+              detail: `打包下载跳过已不存在的对象 ${key}（链接 ${statsStore.logRef(l.id)}）`,
             });
             return null;
           }
@@ -3708,7 +3762,7 @@ router.get('/s/:id/dl', async (req, res) => {
       }
       statsStore.addLog({
         action: 'share.download',
-        detail: `分享打包下载 ${l.id}：${bundleStats.files} 个文件`
+        detail: `分享打包下载 ${statsStore.logRef(l.id)}：${bundleStats.files} 个文件`
           + `${bundleStats.dirs ? ` / ${bundleStats.dirs} 个目录` : ''}`
           + `${bundleStats.skipped ? `，跳过 ${bundleStats.skipped} 个已不存在的对象` : ''}`
           + `（${traffic.bytesDown} 字节）`,
@@ -3733,10 +3787,10 @@ router.get('/s/:id/dl', async (req, res) => {
       if (paidOrder) paymentOrders.markDownloaded(paidOrder.id);
       // R64：免费下载 → 「历史订单」的免费一栏（同一文件只记首次）
       else noteFreeDownloads(req, l, [{ key: singleKey, name: shareStore.itemName(singleKey) }]);
-      statsStore.addLog({ action: 'share.download', detail: `分享下载 ${singleKey}（${traffic.bytesDown} 字节，链接 ${l.id}${encMeta ? '，已解密' : ''}）` });
+      statsStore.addLog({ action: 'share.download', detail: `分享下载 ${singleKey}（${traffic.bytesDown} 字节，链接 ${statsStore.logRef(l.id)}${encMeta ? '，已解密' : ''}）` });
     }
   } catch (e) {
-    statsStore.addLog({ action: 'share.download', detail: `分享下载失败 ${l.id}（${useBundle ? '打包' : singleKey}）: ${e.message}`, level: 'error' });
+    statsStore.addLog({ action: 'share.download', detail: `分享下载失败 ${statsStore.logRef(l.id)}（${useBundle ? '打包' : singleKey}）: ${e.message}`, level: 'error' });
     // 云端明确回答"没有这个对象" → 顺手把链接标成已删除，
     // 让下一次访问（以及管理页）直接给出确定答案，不用再白跑一趟。
     // R51：只有**单一普通文件**的链接才这么判 —— 多条目链接里少一个对象不足以
@@ -3761,12 +3815,21 @@ router.get('/s/:id/dl', async (req, res) => {
       shareStore.release(l.id);
       statsStore.addLog({
         action: 'share.download', level: 'warn',
-        detail: `分享下载 ${l.key}（链接 ${l.id}）在传输中因服务端错误中断，已回滚本次下载次数`,
+        detail: `分享下载 ${l.key}（链接 ${statsStore.logRef(l.id)}）在传输中因服务端错误中断，已回滚本次下载次数`,
       });
     }
     res.destroy();
   }
-});
+}
+
+/**
+ * R94（审核 M08-02）：两条注册 —— GET 保持原样（手写 URL / 分页链接 / 单文件直链），
+ * POST 供列表页的「下载选中」提交大批勾选项（请求体没有 16KB 请求行上限）。
+ * 表单体解析用 `urlencoded`：这是唯一在此路径上需要的解析器，且限制 2MB
+ * （快照上限 2000 项 × 最长 key 的百分号编码，远用不到 2MB）。
+ */
+router.get('/s/:id/dl', downloadHandler);
+router.post('/s/:id/dl', express.urlencoded({ extended: false, limit: '2mb' }), downloadHandler);
 
 module.exports = router;
 // 测试钩子（R24-01）：站点对外地址的选取阶梯是纯函数，导出以便在不起服务的前提下

@@ -46,6 +46,9 @@
 #   --ca <zerossl|letsencrypt|litessl> ACME 证书颁发机构（默认 zerossl，可自动换取 EAB）
 #   --eab-kid <KID>         该 CA 的 EAB Key ID（litessl 必需；zerossl 可省略）
 #   --eab-hmac-key <密钥>   该 CA 的 EAB HMAC 密钥（litessl 必需；不写入部署状态文件）
+#                           ⚠️ 会进进程 argv（同机其它用户 ps 可见）。优先用下面两种：
+#   --eab-hmac-key-file <文件>  从文件读 HMAC 密钥（推荐；文件用后由运维自行删除）
+#                           或设环境变量 KEPLER_EAB_HMAC_KEY（同 uid 才能读 /proc/<pid>/environ）
 #   --email <邮箱>          ACME 账户注册 / 通知邮箱（默认 admin@<域名>）
 #   --path <路径>           服务路径前缀（默认 /，推荐根路径；子路径为尽力而为模式）
 #   --repo <git-url>        脚本独立运行时用于拉取源码的仓库地址
@@ -402,6 +405,7 @@ CA_PROVIDER="zerossl"
 # EAB_HMAC_KEY 是密钥，**只进内存与 acme.sh 自己的账户目录，绝不写进状态文件**。
 EAB_KID=""
 EAB_HMAC_KEY=""
+EAB_HMAC_KEY_FILE=""
 # acme.sh 的家目录。可用 ACME_HOME 覆盖（测试里把脚本指到临时目录，避免读到真实账户）——
 # 因此 acme.sh 可执行文件路径一律现算 "${ACME_HOME}/acme.sh"，不要在加载期缓存成常量。
 ACME_HOME="/root/.acme.sh"
@@ -487,6 +491,35 @@ function load_state() {
   return 0
 }
 
+# R94（审核 M13-11）：EAB HMAC 密钥的**取值通道**收敛到一处。
+#
+# 原来的唯一通道是 `--eab-hmac-key <密钥>`，于是密钥会出现在 `deploy.sh` 自身的 argv
+# 里（整个部署期间）以及 `acme.sh --register-account` 的 argv 里（该子进程生命周期内），
+# 同机任意用户 `ps -ef` 都能读到，也会进 shell history。脚本对这项凭据本有明确的
+# 「不回显 / 不落盘」口径（`redact_args` / `save_state`）与回归护栏，但两条都没覆盖
+# 「进程命令行」这个通道。
+#
+# 现在提供两个更安全的入口，优先级：命令行 < 文件 < 环境变量（越靠后越不暴露）：
+#   · `--eab-hmac-key-file <路径>`：脚本读文件内容；文件本身由运维用后删除；
+#   · `KEPLER_EAB_HMAC_KEY`：环境变量（`/proc/<pid>/environ` 只对同 uid / root 可读，
+#     不像 argv 那样对全机可见）；沙箱/CI 里也更好用。
+function resolve_eab_secret() {
+  local from_file="" v=""
+  if [[ -n "$EAB_HMAC_KEY_FILE" ]]; then
+    [[ -r "$EAB_HMAC_KEY_FILE" ]] || die "无法读取 --eab-hmac-key-file 指定的文件：${EAB_HMAC_KEY_FILE}"
+    # `$(< file)` 是 bash 内建读法，不 fork；只取第一行并去掉首尾空白
+    from_file="$(<"$EAB_HMAC_KEY_FILE")"
+    from_file="${from_file%%$'\n'*}"
+    from_file="${from_file#"${from_file%%[![:space:]]*}"}"
+    from_file="${from_file%"${from_file##*[![:space:]]}"}"
+    [[ -n "$from_file" ]] || die "文件 ${EAB_HMAC_KEY_FILE} 里没有可用的 EAB HMAC 密钥"
+    EAB_HMAC_KEY="$from_file"
+  fi
+  v="${KEPLER_EAB_HMAC_KEY:-}"
+  if [[ -n "$v" ]]; then EAB_HMAC_KEY="$v"; fi
+  return 0
+}
+
 function apply_env_overrides() {
   # 注意：这里必须用 if 而不是 `[[ ... ]] && ...` 的简写 —— 简写形式在条件为假时
   # 整条语句返回 1，若它恰好是函数最后一条语句，就会被 set -e 的 ERR trap 当成
@@ -556,7 +589,7 @@ parse_args() {
       # 不能写成 `X="${2:-}"; shift 2`：只给选项不给值时 shift 越界返回 1，
       # 会被 set -e 的 ERR trap 当成「脚本在第 N 行意外失败」，用户看到的是崩溃
       # 而不是「你少给了一个值」。十几个选项同一个坑，所以合并成一个分支处理。
-      --domain|--port|--https-port|--http-port|--dir|--data-dir|--mode|--tls|--email|--path|--repo|--node-version|--mirror|--ca|--eab-kid|--eab-hmac-key)
+      --domain|--port|--https-port|--http-port|--dir|--data-dir|--mode|--tls|--email|--path|--repo|--node-version|--mirror|--ca|--eab-kid|--eab-hmac-key|--eab-hmac-key-file)
         if [[ $# -lt 2 || -z "${2-}" ]]; then
           die "参数 $1 缺少取值（示例：bash ${SCRIPT_NAME} $1 <值>；完整用法见 --help）"
         fi
@@ -579,6 +612,9 @@ parse_args() {
           --ca)           CA_PROVIDER="$2"; CA_EXPLICIT=1 ;;
           --eab-kid)      EAB_KID="$2" ;;
           --eab-hmac-key) EAB_HMAC_KEY="$2" ;;
+          # R94（审核 M13-11）：从**文件**读密钥，避免它出现在 argv 里（`ps` 对同机
+          # 任意用户可见）。命令行形式保留兼容，但帮助里已把它标为次选。
+          --eab-hmac-key-file) EAB_HMAC_KEY_FILE="$2" ;;
         esac
         shift 2 ;;
       --staging)      STAGING=1; shift ;;
@@ -606,6 +642,7 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
   load_state
   apply_env_overrides
   parse_args "$@"
+  resolve_eab_secret
 fi
 
 # ------------------------------------------------------------------------------
@@ -1182,8 +1219,28 @@ ask() {
 }
 
 is_ip_addr() {
-  if [[ "$1" =~ ^[0-9]{1,3}(\.[0-9]{1,3}){3}$ ]]; then return 0; fi
-  if [[ "$1" == *:* ]]; then return 0; fi
+  local s="$1" p
+  # R94（审核 M13-08）：判据必须**真的**认得出 IP，而不是"里面有冒号就算 IPv6"。
+  #
+  # 旧写法 `[[ "$1" == *:* ]]` 把 `foo:bar`、甚至带 `;` 与空格的串都判成合法 IP，
+  # 于是 `collect_config()` 的域名格式校验被整体绕过，`DOMAIN` 被**原样**写进
+  # nginx 的 `server_name` 与 `.env`。这里不存在命令注入（bash 参数展开不做命令
+  # 替换、落盘走 `printf '%s\n' "$content"`），但含 `;` / 空格的串能让 `nginx -t`
+  # 通过而站点行为被篡改 —— 属「需要 root 的自伤 + 配置注入」。
+  #
+  # IPv4：四段、每段 0-255（`10#` 前缀避免 08 / 09 被当成八进制而报错或误判）。
+  if [[ "$s" =~ ^([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})\.([0-9]{1,3})$ ]]; then
+    for p in "${BASH_REMATCH[1]}" "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" "${BASH_REMATCH[4]}"; do
+      (( 10#$p <= 255 )) || return 1
+    done
+    return 0
+  fi
+  # IPv6：字符集只允许十六进制 / 冒号 / 点（点用于内嵌 IPv4），且必须满足
+  # 「含 `::`」或「至少三段十六进制」—— 单冒号的 `host:port` 与 `a:b` 都不算 IP。
+  if [[ "$s" =~ ^[0-9A-Fa-f:.]+$ ]]; then
+    [[ "$s" == *::* ]] && return 0
+    [[ "$s" =~ ^[0-9A-Fa-f]+:[0-9A-Fa-f]+:[0-9A-Fa-f:]+$ ]] && return 0
+  fi
   return 1
 }
 
@@ -1368,8 +1425,35 @@ fetch_node_shasums() {
   return "$rc"
 }
 
+# R94（审核 M13-03）：**校验单取不到时默认中止** —— 与调用点注释「失败即中止，无跳过
+# 开关」的口径对齐（旧实现在这里 `warn` + `return 0`，注释与代码直接矛盾）。
+#
+# 静默放行的后果不是理论问题：tarball 会被 `tar -xzf … -C /usr/local` 解到生产机，
+# 那个 node 二进制随后以 **root** 运行整个系统（含 `data/secret.key` 主密钥），
+# 而用户只看到一行黄色警告。默认 `MIRROR=auto` 时若 nodejs.org 不可达，走的正是这条路径。
+#
+# 「官方源取不到」在某些网络环境确实是常态，硬中止会让这些人彻底装不上 —— 故保留一个
+# **显式**逃生口 `KEPLER_ALLOW_UNVERIFIED_NODE=1`：与静默放行的区别在于运维必须自己写
+# 下来，且日志里是 warn 级别而不是一句轻描淡写的"请自行确认来源可信"。
+_unverified_node_allow() {
+  local why="$1" ver="$2" base="$3"
+  if [[ "${KEPLER_ALLOW_UNVERIFIED_NODE:-0}" == "1" ]]; then
+    warn "${why}，已按 KEPLER_ALLOW_UNVERIFIED_NODE=1 跳过哈希校验（完整性由你自行担保）。"
+    return 0
+  fi
+  HINTS=()
+  add_hint "${why} —— 无法校验即将解压到 /usr/local 的 node 二进制。"
+  add_hint "  该二进制随后会以 root 身份运行整个系统（含 data/secret.key 主密钥）。"
+  add_hint "  可选做法："
+  add_hint "    · 换一个能访问 nodejs.org 的网络 / 代理后重试；"
+  add_hint "    · 或手工把 SHASUMS256.txt 与该 tarball 放到同一目录后重试；"
+  add_hint "    · 确认来源可信、愿意自行担保时，显式加环境变量重跑："
+  add_hint "      KEPLER_ALLOW_UNVERIFIED_NODE=1 $(rerun_cmd)"
+  die_with_hint "Node.js 二进制包无法校验（v${ver}）" "${HINTS[@]}"
+}
+
 # 校验 ${tmp}/node.tar.gz；不通过则直接 die（不提供跳过开关：装一个来路不明的 node
-# 比装不上危险得多）。无法取得校验单时只警告 —— 离线/内网镜像环境下仍要能装。
+# 比装不上危险得多）。取不到校验单同样中止 —— 唯一的显式逃生口见上。
 verify_node_tarball() {
   local file="$1" ver="$2" arch="$3" fallback_base="$4"
   local name="node-v${ver}-linux-${arch}.tar.gz"
@@ -1377,15 +1461,17 @@ verify_node_tarball() {
   dir="$(dirname "$file")"
   sums="${dir}/SHASUMS256.txt"
   if ! fetch_node_shasums "$ver" "$fallback_base" "$sums" || [[ ! -s "$sums" ]]; then
-    warn "无法取得 Node.js v${ver} 的 SHASUMS256.txt，跳过哈希校验（完整性问题请自行确认来源可信）。"
+    _unverified_node_allow "无法取得 Node.js v${ver} 的 SHASUMS256.txt" "$ver" "$fallback_base"
     return 0
   fi
   want="$(awk -v n="$name" '$2 == n { print $1; exit }' "$sums")"
   if [[ -z "$want" ]]; then
-    warn "校验单里没有 ${name}（可能是架构名与官方不一致），跳过哈希校验。"
+    _unverified_node_allow "校验单里没有 ${name}（架构名与官方不一致）" "$ver" "$fallback_base"
     return 0
   fi
   if ! got="$(sha256_of "$file")" || [[ -z "$got" ]]; then
+    # 这一条**保留降级**：本机没有任何 sha256 工具时（极精简镜像 / 离线内网）无解，
+    # 拒绝安装会把「能装上」直接换成「装不上」，而那与供应链攻击无关。
     warn "本机没有 sha256sum / shasum / openssl，跳过哈希校验。"
     return 0
   fi
@@ -2072,16 +2158,46 @@ TLS_KEY_FILE=${tls_key}
 "
   fi
   local content
+  # R94（审核 M13-05）：监听地址按形态区分。
+  #
+  #  · systemd：Nginx 从 `127.0.0.1:${APP_PORT}` 反代过来，应用**没有任何理由**对全网卡
+  #    监听。旧默认 `HOST=0.0.0.0` 让应用端口在局域网内可直连 —— 既绕过反代层的全部
+  #    控制（与脚本自己写的「由 Nginx 反代，不对外暴露」自相矛盾），又给 M13-02 的
+  #    「私网对端被当作可信代理」提供了前置条件。
+  #  · docker：容器内必须监听 0.0.0.0，宿主机侧由 compose 的 `127.0.0.1:${APP_PORT}:3000`
+  #    收窄。
+  #
+  # 用 `--skip-nginx` 自建反代时，反代一般也在本机 ⇒ 127.0.0.1 仍然正确；反代在**另一台
+  # 机器**上时需手工把这一行改回 0.0.0.0 并配好防火墙（.env 注释里也写明了）。
+  local host_line="HOST=127.0.0.1"
+  if [[ "$MODE" == "docker" ]]; then host_line="HOST=0.0.0.0"; fi
+  # R94（审核 M13-02）：可信代理**必须显式收窄**。
+  #
+  # `server/security.js` 的 `proxyPeerTrusted()` 在没配本项时默认允许「回环 + 私网」——
+  # 那是给容器/内网反代留的兜底，却把「同网段任意主机」也算成可信代理：叠加
+  # `TRUST_PROXY=1` 之后，局域网里任何一台机器直连应用端口并自带 `X-Forwarded-For`，
+  # 其首段就会被采信为客户 IP。而 IP 正是 IP 黑名单 / 登录限流 / 失败锁定 / 分享限流
+  # 的**唯一身份键**，伪造即全绕。
+  #
+  #  · systemd：Nginx 与反代同机，对端恒为回环。
+  #  · docker：Nginx 在宿主机、应用在容器内，对端是 docker 网桥网关（默认 172.17.0.1，
+  #    compose 自定义网络落在 172.16/12 内）。自定义到 10.x / 192.168.x 的实例需自行改。
+  local trust_from="TRUST_PROXY_FROM=127.0.0.1"
+  if [[ "$MODE" == "docker" ]]; then trust_from="TRUST_PROXY_FROM=172.16.0.0/12,127.0.0.1"; fi
   # 注：本文件内容不含时间戳 —— 保证重复执行时判定为「未变化」，不产生无意义备份
   content="# Kepler 运行环境（由 ${SCRIPT_NAME} 生成）
 # 修改后执行：systemctl restart ${SERVICE_NAME}（docker 方式：docker compose restart）
 NODE_ENV=production
-HOST=0.0.0.0
+${host_line}
+# R94（审核 M13-06）：「本站对外提供服务」由这个**显式开关**决定，不再从 HOST 推导。
+# 旧实现用「HOST 不是回环」判断部署模式 —— 于是一个看起来只是更安全的动作
+# （把 HOST 改回 127.0.0.1）会静默关掉 HSTS 与 Cookie 的 Secure 属性，且没有任何提示。
+# 本行由脚本无条件写入，请勿删除。
+DEPLOY_MODE=1
 # R38：「本站对外域名」—— 应用据此回答「这个请求是不是本站」（Windows Hello 的 rpId
 # 白名单、HTTPS 跳转目标）。必须是下面 nginx server_name 用的那个域名本身。
-# 为什么不靠 HOST：HOST 是**监听地址**，部署时必须写 0.0.0.0 才能被外部访问，而
-# 0.0.0.0 永远不可能出现在请求的 Host 头里 —— 只认它会把「用真实域名访问本站」
-# 判成「访问了外站」，Windows Hello 直接 403。
+# 为什么不靠 HOST：HOST 是**监听地址**，0.0.0.0 永远不可能出现在请求的 Host 头里 ——
+# 只认它会把「用真实域名访问本站」判成「访问了外站」，Windows Hello 直接 403。
 SITE_DOMAIN=${DOMAIN}
 PORT=${port}
 WEBDAV_PORT=${WEBDAV_PORT}
@@ -2094,6 +2210,8 @@ ${tls_lines}# 数据目录：保存加密主密钥、账户、配置与统计，
 S3_DATA_DIR=${data_dir}
 # 位于 Nginx 之后：信任 X-Forwarded-*，使「部署模式」下的 HTTPS 判定正确
 TRUST_PROXY=1
+# R94（审核 M13-02）：可信代理必须显式收窄（默认允许「回环 + 私网」过宽，见上方注释）
+${trust_from}
 # WebDAV 对外基地址（不含 /dav/，应用会自动补上）：界面「服务器地址」按它显示。
 # 留空则由应用按访问请求推断（自建反代时请留空，或在 Nginx 里自己加 /dav/ 转发）。
 WEBDAV_PUBLIC_URL=${webdav_public}
@@ -3401,6 +3519,24 @@ setup_systemd_service() {
     "  · 服务启动命令：cd ${INSTALL_DIR} && ${NODE_BIN} server/index.js"
   check_port_free
   chown -R "${RUN_USER}:${RUN_USER}" "$INSTALL_DIR" "$DATA_DIR" 2>/dev/null || true
+  # R94（审核 M13-04）：**以 root 身份被执行的东西不能归应用账号所有**。
+  #
+  # 上面那条 `chown -R` 把整个安装目录（含 `deploy.sh` 本身）交给了 `kepler`，而
+  # `/usr/local/bin/kepler` 的内容就是 `exec sudo -E bash /opt/kepler/deploy.sh "$@"`，
+  # 管理菜单的「重新安装」也 `exec bash /opt/kepler/deploy.sh --reinstall` ——
+  # 于是一条完整的提权链成立：**应用进程（kepler）改写 deploy.sh → 管理员下次执行
+  # `kepler` 时该脚本以 root 被 exec**。`script_is_sane()` 只校验 shebang 与 `bash -n`，
+  # 一份语法正确的后门轻松通过。应用本就握着 `data/secret.key` 与全部云凭据，
+  # 这条链把「应用层失陷」升级成「主机 root 失陷」，且不留痕迹。
+  #
+  # 只收紧目录本身与 deploy.sh：目录归 root ⇒ kepler 无法删除/重建其中任何条目；
+  # deploy.sh 归 root 0755 ⇒ 无法原地改写。应用运行只需要**读**这些文件，
+  # 数据目录仍然完全归它所有（下一行）。
+  chown root:root "$INSTALL_DIR" 2>/dev/null || true
+  if [[ -f "${INSTALL_DIR}/deploy.sh" ]]; then
+    chown root:root "${INSTALL_DIR}/deploy.sh" 2>/dev/null || true
+    chmod 0755 "${INSTALL_DIR}/deploy.sh" 2>/dev/null || true
+  fi
   chmod 0750 "$DATA_DIR" || true
 
   local unit="/etc/systemd/system/${SERVICE_NAME}.service"

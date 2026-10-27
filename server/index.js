@@ -260,7 +260,25 @@ app.use('/api', (req, res, next) => {
  *  ② 两者都必须在 ipGuard 与 `/api` 鉴权**之后**（本条）。
  * 因此整体下移到鉴权块之后、路由之前 —— 顺序约束一条不破，只是不再为未认证请求缓冲。
  */
-app.use(['/api/fs/upload/simple', '/api/fs/upload/chunk'], express.raw({ type: () => true, limit: '64mb' }));
+const UPLOAD_RAW_PATHS = ['/api/fs/upload/simple', '/api/fs/upload/chunk'];
+/**
+ * R94（审核 M07-01）：**内存闸门必须挂在 raw 解析之前**，而且应用级这条 raw
+ * 恰好绕过了路由上的闸门。
+ *
+ * `upload-gate.js` 的设计前提写在它自己的模块注释里：「闸门必须在 `express.raw`
+ * **之前**，否则请求体已经读完，闸门只挡住了『处理』而没挡住『占内存』」。路由文件里
+ * 的相对顺序是对的（`uploadGate.gate(), express.raw(...)`），但这里还有一条**应用级**
+ * raw：它在 `app.use('/api', routes)` 之前跑，先把请求体读完并置 `req._body = true`，
+ * 于是路由上那条 `express.raw` **整段跳过**、`uploadGate.gate()` 反而排到了 body
+ * 之后 —— 闸门每次都只能对着「已经躺在内存里的 64MB」做判定，在途/并发上限形同虚设。
+ *
+ * 修法是在应用级 raw 之前把同一枚闸门再挂一次（闸门只读 `Content-Length`，不碰 body，
+ * 提前挂没有任何副作用）；路由上那一份保留 —— 它继续覆盖**不经过 index.js** 的挂载
+ * 形态（测试直接挂 `routes/fs.js`、将来拆分子应用）。两处同时命中时由 `gate()` 内部
+ * 的 `req._uploadGatePassed` 做幂等，一次请求只占一个名额。
+ */
+app.use(UPLOAD_RAW_PATHS, require('./upload-gate').gate());
+app.use(UPLOAD_RAW_PATHS, express.raw({ type: () => true, limit: '64mb' }));
 
 /**
  * 审计 I-4：**支付异步通知用更小的体积上限**。
@@ -572,8 +590,10 @@ const httpServer = registerServer(http.createServer(app), 'HTTP');
 try {
   require('./routes/auth').primeSetupToken();
 } catch (e) {
-  // 生成失败不影响启动：`/auth/init` 仍会懒生成（见 routes/auth.js 的 ensureSetupToken）
-  console.warn('[Storage Manager] 安装令牌预生成失败（不影响启动）：', e && e.message);
+  // R94（审核 M01-02）：生成失败**就是没有令牌**，不再有「懒生成」兜底 ——
+  // `setupTokenMatches()` 现在只读不写（否则初始化完成后任何一次匿名 init 请求
+  // 都能让令牌文件复活）。生成失败时按「无令牌」处理，去查这条告警即可。
+  console.warn('[Storage Manager] 安装令牌预生成失败（不影响启动，但部署模式下本次将无法初始化）：', e && e.message);
 }
 /**
  * R82：**启动时清理历史遗留的「支付中」订单**（只跑一次，标记落在 `payments.json` 顶层）。

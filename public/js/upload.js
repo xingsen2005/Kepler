@@ -114,6 +114,20 @@ export const uploadMgr = {
   pause(id) {
     const t = find(id);
     if (!t || t.state !== 'uploading') return;
+    /**
+     * R94（审核 M07-07）：**合并阶段没有可中止的句柄**。
+     *
+     * 分片传完之后前端进入 `phase === 'processing'` 并 `await API.uploadComplete()`；
+     * 此刻 `t.xhrs` 是空的，`abort()` 什么也中止不了，`await` 也不会被打断。旧实现
+     * 照样把状态改成 `paused`，于是界面先显示"已暂停"、几十秒后自己跳成"已完成" ——
+     * 状态机自相矛盾，而用户会以为"暂停"真的生效了。
+     * 这里如实拦住并说明原因（见 `blocked`），而不是先骗一下再自己改口。
+     */
+    if (t.phase === 'processing') {
+      t.blocked = '服务器正在合并文件，此阶段无法暂停';
+      this.render();
+      return;
+    }
     t.paused = true;
     t.xhrs.forEach((x) => { try { x.abort(); } catch (e) { /* ignore */ } });
     t.state = 'paused';
@@ -133,11 +147,41 @@ export const uploadMgr = {
   async cancel(id) {
     const t = find(id);
     if (!t) return;
+    /**
+     * R94（审核 M07-07）：合并已在云端开始 —— 这时取消只会造成"界面说已取消、
+     * 对象其实已生成"的分裂状态。如实拒绝并说明原因（与 `pause()` 同口径）。
+     */
+    if (t.phase === 'processing') {
+      t.blocked = '服务器正在合并文件，此阶段无法取消';
+      this.render();
+      return;
+    }
+    t.blocked = '';
     t.canceled = true;
     t.xhrs.forEach((x) => { try { x.abort(); } catch (e) { /* ignore */ } });
-    if (['uploading', 'paused', 'waiting'].includes(t.state)) {
-      t.state = 'canceled';
-      if (t.sessionId) { try { await API.uploadAbort(t.sessionId); } catch (e) { /* ignore */ } }
+    /**
+     * R94（审核 M07-05）：取消的判据是「**有没有分片还挂在云端**」，不是「任务处于
+     * 什么状态」。旧实现只在 `uploading / paused / waiting` 时调 abort —— 而「取消」
+     * 按钮在 `failed` 态同样渲染，于是「中途失败 → 点取消」这条最需要回收的路径
+     * 恰恰不发 abort：界面显示"已取消"，云端 UploadId 与已传分片继续计费到 7 天后
+     * 才被 prune 回收。判据改成 `sessionId` 非空即回收（它才是云端资源的句柄）。
+     */
+    if (['uploading', 'paused', 'waiting', 'failed'].includes(t.state)) t.state = 'canceled';
+    if (t.sessionId) {
+      const sid = t.sessionId;
+      try {
+        await API.uploadAbort(sid);
+      } catch (e) {
+        /**
+         * R94（审核 M07-05）：**不能吞掉** —— 服务端在"远端中止失败"时回 502 + `ok:false`，
+         * 那正是"本地已取消、云端分片还在计费"的唯一信号。旧实现连这句都扔了，
+         * 用户除了账单没有任何线索。
+         */
+        t.error = '已在本地取消，但云端碎片未能回收；系统稍后会重试清理'
+          + (e && e.message ? `（${e.message}）` : '');
+      } finally {
+        t.sessionId = '';
+      }
     }
     this.render();
     pump();
@@ -181,6 +225,10 @@ export const uploadMgr = {
       }[t.state] || ['', ''];
       // R29-01：字节已全部发出、等服务端确认时明确告知 —— 否则进度条停在 99% 会被当成"卡死"
       if (t.state === 'uploading' && t.phase === 'processing') st[0] = '服务器处理中…';
+      // R94（审核 M07-05）：云端碎片没回收时如实说，别让"已取消"变成谎报
+      if (t.state === 'canceled' && t.error) st[0] = `已取消（${escapeHtml(t.error)}）`;
+      // R94（审核 M07-07）：合并阶段被拦下的操作要给出原因（否则就是"点了没反应"）
+      if (t.blocked) { st[0] = escapeHtml(t.blocked); st[1] = 'bad'; }
       const actions = [];
       if (t.state === 'uploading') actions.push(`<button class="icon-btn small" data-act="pause" data-id="${t.id}" title="暂停">${window.__SVG.pause}</button>`);
       if (t.state === 'paused') actions.push(`<button class="icon-btn small" data-act="resume" data-id="${t.id}" title="继续">${window.__SVG.play}</button>`);
@@ -329,9 +377,18 @@ async function runTask(t) {
     // R29-01：所有分片都传完，但**合并是在云端做的**（大文件上云合并可能耗时数十秒），
     // 这里显式进入「服务器处理中」相位，避免进度条在等待期间毫无变化。
     t.phase = 'processing';
+    t.blocked = '';
     uploadMgr.render();
     await API.uploadComplete(t.sessionId);
     t.sessionId = '';
+    t.blocked = '';
+    /**
+     * R94（审核 M07-07）：取消/暂停恰好落在 `phase` 置位**之前**的那一瞬间时，
+     * 合并请求已经发出且成功了 —— 文件确实已经在云端。这种情况如实显示"已完成"，
+     * 而不是记成"已取消"（后者会让用户重传，凭空多出一个重复对象）。
+     */
+    t.canceled = false;
+    t.paused = false;
   }
   /**
    * R29-01：上传**已经成功**，后续的界面刷新即使出错也绝不能把它改判成「失败」。
@@ -344,6 +401,15 @@ async function runTask(t) {
   t.phase = 'done';
   t.progress = 100;
   t.loaded = t.size;
+  /**
+   * R94（审核 M07-09）：**成功之后立刻放掉 `File` 引用**。
+   *
+   * `done` 的任务不再需要文件内容（重试只对 `failed` / `canceled` 开放），但旧的
+   * 任务对象会一直留在 `tasks` 数组里直到用户点「清除已完成」—— 而 `File` 持有的是
+   * 浏览器里那份真实数据（大文件可达数 GB），于是标签页内存随上传次数单调增长。
+   * `failed` / `canceled` 仍然保留引用：它们的「重试」要靠这份数据。
+   */
+  t.file = null;
   try { uploadMgr.render(); } catch (e) { /* 渲染失败不影响"已上传成功"这一事实 */ }
   try { App.refreshStorage && App.refreshStorage(); } catch (e) { /* 立即刷新状态栏存储用量 */ }
   try { notifyCurrentPrefix(t.prefix); } catch (e) { /* 刷新文件列表 */ }

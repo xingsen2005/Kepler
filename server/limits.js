@@ -755,6 +755,20 @@ const COUPON_MIN_SPEND_MAX_FEN = COUPON_AMOUNT_MAX_FEN;
 /** 单张券最多保留多少条核销台账（超出丢最旧；`used` 计数始终准确） */
 const COUPON_USES_MAX = 200;
 
+/**
+ * 【R94】单张券的「订单号 → 身份」索引上限（审核 M10-01）。
+ *
+ * 核销台账被截断到 200 条是为了**显示**（管理界面只展示最近的使用记录），
+ * 但**幂等判据**与**退款回退定位**原先也读这份台账 —— 于是一张不限次券被核销
+ * 超过 200 次之后：同一笔订单重复核销会重复扣减配额；早期订单退款时
+ * `releaseByOrder()` 定位不到 ⇒ 券**不会退还**，连日志都不留。
+ *
+ * 索引只存 `订单号 → 身份`，体量远小于台账（不含时间戳、不重复身份），
+ * 上限给到 2000 已远超退款的实际回溯范围；越过上限时**显式告警**而不是静默出错
+ * （见 `coupon-store.noteOrderIdx()`）。
+ */
+const COUPON_ORDER_IDX_MAX = 2000;
+
 /** 券码归一化：**直接复用** `normalizeInviteCode`（去全部空白 + 转大写，语义逐字相同）。
  *  刻意不再抄一份实现 —— 同一判据两份代码必然漂移，而漂移的表现是
  *  「邀请码能粘贴带空格、优惠券却说无效」这种没人会往那儿想的差异。 */
@@ -794,12 +808,33 @@ function parseCouponCountInput(v) {
  * 全局一致，杜绝浮点误差。最低 0.01 元：0 元券在语义上就是「免费」，
  * 那会让下单链路必须处理「应付 0 元」这种网关不接受的状态（本版本刻意不支持）。
  */
+/**
+ * 「元」→「分」的唯一实现点（R94 · 审核 M10-04）。
+ *
+ * `Math.round(n * 100)` 对**三位小数**会少算 1 分：`1.005 * 100` 在二进制浮点下是
+ * `100.49999999999999`，`Math.round` 得 100（¥1.00），正确结果应是 101（¥1.01）。
+ * 原因是浮点乘积落在「半分」的下侧，而 `Math.round` 只做「就近取整」。
+ * 实测：`1.005 → 100`、`0.145 → 14`、`1.015 → 101`。
+ *
+ * 这里先用 `toFixed(6)` 把乘积拉回十进制可观测量级（消除 1e-14 级别的表示误差），
+ * 再做四舍五入 —— 对两位小数输入是**逐值等价**的（不会改变任何既有结果），
+ * 对三位小数输入则按「四舍五入到分」得到用户预期的那一分。
+ *
+ * @param {number} n 元（可为小数）
+ * @returns {number} 整数分
+ */
+function yuanToFen(n) {
+  const v = Number(n);
+  if (!Number.isFinite(v)) return 0;
+  return Math.round(Number((v * 100).toFixed(6)));
+}
+
 function parseCouponAmountInput(v) {
   if (v === undefined || v === null || v === '') return { ok: false, error: '请填写优惠金额' };
   const n = Number(v);
   if (!Number.isFinite(n)) return { ok: false, error: '优惠金额必须是数字' };
   if (n < 0) return { ok: false, error: '优惠金额不能为负数' };
-  const fen = Math.round(n * 100);
+  const fen = yuanToFen(n); // R94（审核 M10-04）：三位小数不再少算 1 分
   if (fen < COUPON_AMOUNT_MIN_FEN) return { ok: false, error: '优惠金额最低 0.01 元' };
   if (fen > COUPON_AMOUNT_MAX_FEN) return { ok: false, error: `优惠金额不能超过 ${COUPON_AMOUNT_MAX_FEN / 100} 元` };
   return { ok: true, value: fen };
@@ -820,7 +855,7 @@ function parseCouponMinSpendInput(v) {
   if (!Number.isFinite(n)) return { ok: false, error: '使用门槛必须是数字' };
   if (n < 0) return { ok: false, error: '使用门槛不能为负数' };
   if (n === 0) return { ok: true, value: 0 };
-  const fen = Math.round(n * 100);
+  const fen = yuanToFen(n); // R94（审核 M10-04）：同上
   if (fen < COUPON_AMOUNT_MIN_FEN) return { ok: false, error: '使用门槛最低 0.01 元；不需要门槛请留空或填 0' };
   if (fen > COUPON_MIN_SPEND_MAX_FEN) {
     return { ok: false, error: `使用门槛不能超过 ${COUPON_MIN_SPEND_MAX_FEN / 100} 元` };
@@ -932,6 +967,7 @@ function parseRestoreFailsInput(v) {
 module.exports = {
   LIMITS, resolveCap, HARD_MAX,
   MB, normalizeSpeedLimit, toMBps, parseSpeedLimitInput,
+  yuanToFen, // R94：元 → 分的唯一实现点（金额 / 券面额 / 使用门槛共用）
   CONCURRENCY_FILES_MIN, CONCURRENCY_FILES_MAX, parseConcurrencyInput,
   SMTP_PORT_DEFAULT, SMTP_PORT_MIN, SMTP_PORT_MAX, normalizeSmtpPort, parseSmtpPortInput,
   SMTP_HOST_MAX, SMTP_ADDRESS_MAX, SMTP_NAME_MAX, SMTP_PASSWORD_MAX,
@@ -955,6 +991,7 @@ module.exports = {
   COUPON_CODE_ALPHABET, COUPON_CODE_LEN, COUPON_CODE_RE,
   COUPON_BATCH_MAX, COUPON_NOTE_MAX, COUPON_MAX_USES_MAX, COUPON_TYPES,
   COUPON_MAX_TARGETS, COUPON_AMOUNT_MIN_FEN, COUPON_AMOUNT_MAX_FEN, COUPON_USES_MAX,
+  COUPON_ORDER_IDX_MAX,
   COUPON_MIN_SPEND_MAX_FEN, parseCouponMinSpendInput,
   normalizeCouponCode, normalizeCouponType,
   parseCouponCodeInput, parseCouponCountInput, parseCouponAmountInput,

@@ -15,7 +15,10 @@
  *    startAt, expireAt,              // 生效 / 到期时刻（null = 立即可用 / 永久有效）
  *    disabled,                       // 管理员手动停用（**可逆**，与 expired 区分开）
  *    note, createdAt, createdBy,
- *    uses: [{ identity, orderId, usedAt }]  // 核销台账（perUserOnce 与退款回退的依据）
+ *    uses: [{ identity, orderId, usedAt }], // 核销台账（**只保留最近 200 条**，供显示）
+ *    identities: [identity],                 // 【R69】不截断的身份索引（「每人一次」判据）
+ *    orderIdx: { orderId: identity },        // 【R94】不截断的订单索引（幂等判据 + 退款定位）
+ *    orderIdxDropped                         // 【R94】因索引上限被丢弃的条数（> 0 ⇒ 需告警）
  *  }
  *
  * ## 三处刻意的设计取舍
@@ -57,6 +60,7 @@ const secureStore = require('./secure-store');
 const {
   COUPON_CODE_ALPHABET, COUPON_CODE_LEN, COUPON_CODE_RE,
   COUPON_MAX_TARGETS, COUPON_TYPES, COUPON_USES_MAX, COUPON_MIN_SPEND_MAX_FEN,
+  COUPON_ORDER_IDX_MAX,
   normalizeCouponCode, normalizeCouponType,
 } = require('./limits');
 
@@ -221,6 +225,13 @@ function normalizeRecord(r, seen, warn) {
      * 台账继续截断（那是显示与退款定位），判据改读这里。
      */
     identities: normalizeIdentities(r.identities, r.uses),
+    /**
+     * 【R94】「订单号 → 身份」索引（审核 M10-01）：**不截断**，与 `identities` 同构。
+     * 幂等判据与退款回退都读它，不再读只保留最近 200 条的 `uses`。
+     */
+    orderIdx: normalizeOrderIdx(r.orderIdx, r.uses),
+    /** 因索引上限被丢弃的条数（> 0 ⇒ 更早的订单退款会退还不到券，需告警） */
+    orderIdxDropped: Number.isInteger(r.orderIdxDropped) && r.orderIdxDropped > 0 ? r.orderIdxDropped : 0,
   };
 }
 
@@ -238,6 +249,57 @@ function normalizeIdentities(raw, uses) {
   // 旧记录没有这个字段：从台账里恢复（截断前的部分已经不可知，属可接受的降级）
   if (!Array.isArray(raw) && Array.isArray(uses)) uses.forEach((u) => push(u && u.identity));
   return out;
+}
+
+/**
+ * 【R94】「订单号 → 身份」索引归一化（审核 M10-01）。
+ *
+ * 与 `identities` 同构 —— **不随台账截断**。旧记录没有这个字段时，从（可能已被
+ * 截断的）台账尽力恢复：能恢复多少覆盖多少，足以接住「刚核销就被退款」这条常见路径。
+ */
+function normalizeOrderIdx(raw, uses) {
+  const out = {};
+  let n = 0;
+  const put = (k, v) => {
+    const key = String(k == null ? '' : k);
+    if (!key) return;
+    if (Object.prototype.hasOwnProperty.call(out, key)) { out[key] = String(v == null ? '' : v); return; }
+    if (n >= COUPON_ORDER_IDX_MAX) return;
+    out[key] = String(v == null ? '' : v);
+    n += 1;
+  };
+  if (raw && typeof raw === 'object' && !Array.isArray(raw)) {
+    for (const k of Object.keys(raw)) put(k, raw[k]);
+  } else if (Array.isArray(uses)) {
+    uses.forEach((u) => { if (u && u.orderId) put(u.orderId, u.identity); });
+  }
+  return out;
+}
+
+/**
+ * 【R94】记一条「订单号 → 身份」（**唯一写入点**，审核 M10-01）。
+ *
+ * 台账 `uses` 管**显示**（截断到 200 条），本索引管**幂等判据**与**退款回退定位** ——
+ * 两者原先共用同一份会被截断的数组，于是第 201 次核销之后：
+ * ① 同一笔订单重复核销会重复扣配额；② 早期订单退款时定位不到、券不退还。
+ *
+ * 越过上限时丢最旧（对象保留插入顺序）并**告警**：越界之后退款定位会开始漏，
+ * 必须让运维看得见，而不是像原来那样静默失败。
+ */
+function noteOrderIdx(c, orderId, identity) {
+  const oid = String(orderId || '');
+  if (!oid) return;
+  if (!c.orderIdx || typeof c.orderIdx !== 'object' || Array.isArray(c.orderIdx)) c.orderIdx = {};
+  if (!Object.prototype.hasOwnProperty.call(c.orderIdx, oid)
+    && Object.keys(c.orderIdx).length >= COUPON_ORDER_IDX_MAX) {
+    delete c.orderIdx[Object.keys(c.orderIdx)[0]];
+    c.orderIdxDropped = Number(c.orderIdxDropped || 0) + 1;
+    if (c.orderIdxDropped === 1 || c.orderIdxDropped % 200 === 0) {
+      console.warn(`[coupon-store] 券 ${c.code || c.id} 的订单索引已满（上限 ${COUPON_ORDER_IDX_MAX} 条），`
+        + `更早的订单退款时将无法退还该券（累计丢弃 ${c.orderIdxDropped} 条）`);
+    }
+  }
+  c.orderIdx[oid] = String(identity || '');
 }
 
 function normalize(raw) {
@@ -463,15 +525,46 @@ function consume({ couponId, identity, orderId }) {
   const c = get(couponId);
   if (!c) return null;
   const oid = String(orderId || '');
-  if (oid && c.uses.some((u) => u.orderId === oid)) return view(c);
+  /**
+   * R94（审核 M10-01）：幂等判据改读**不截断**的 `orderIdx`。
+   *
+   * 原来读的是 `c.uses` —— 而它被刻意截断到 `COUPON_USES_MAX`(200) 条。
+   * 一张不限次券被核销超过 200 次之后，早期订单的台账行已被挤出数组，
+   * 于是「同一笔订单重复调用不会重复计数」这条承诺**静默失效**：`used` 会再加 1。
+   */
+  if (oid && c.orderIdx && Object.prototype.hasOwnProperty.call(c.orderIdx, oid)) return view(c);
+
+  /**
+   * R94（审核 M10-02）：**配额判据下沉到写点**。
+   *
+   * 原来「不许超过 maxUses / 停用 / 未开始 / 已过期 / 每人一次」的**唯一实现点**在
+   * 读侧的 `validateForUse()`，而本函数只做「同 orderId 幂等」的短路、其余一律
+   * `used += 1` —— 于是「校验 → 核销」之间只要存在一个 `await`（付费流程里关旧单
+   * 要出网，窗口宽度 = 网关往返），两个并发请求就都能通过校验并各自核销，`used`
+   * 突破 `maxUses`（超发）。
+   *
+   * 本函数是**全同步**的：Node 单线程下「判据 + 计数」在同一个同步片段内完成，
+   * 不可能被切到另一个请求。判据补齐后，那段窗口自动消失，且新增调用点也不会
+   * 再绕过规则（这才是「唯一实现点」该有的样子）。
+   *
+   * @returns {object|null} 成功 = 券视图；券不存在 = `null`；
+   *   **被拒 = `{ ok:false, reason, coupon }`**（调用方必须检查 `ok === false`）
+   */
+  const st = status(c);
+  if (st !== 'active') return { ok: false, reason: st, coupon: view(c) };
+  if (c.perUserOnce && String(identity || '')
+    && Array.isArray(c.identities) && c.identities.indexOf(String(identity || '')) >= 0) {
+    return { ok: false, reason: 'already_used', coupon: view(c) };
+  }
 
   c.uses.push({
     identity: String(identity || ''),
     orderId: oid,
     usedAt: new Date().toISOString(),
   });
-  // 台账截断只影响「最早那几条的退款定位」，计数永远准
+  // 台账截断只影响「显示」；幂等与退款定位由不截断的 `orderIdx` 承担（见 noteOrderIdx）
   if (c.uses.length > COUPON_USES_MAX) c.uses = c.uses.slice(-COUPON_USES_MAX);
+  noteOrderIdx(c, oid, identity);
   /*
    * R69：「每人一次」的判据索引**不截断**。台账被截断的是显示与退款定位，
    * 身份集合必须一直留着 —— 否则第 201 次核销之后，最早那位用户又能用同一张券。
@@ -495,21 +588,37 @@ function releaseByOrder(orderId) {
   const oid = String(orderId || '');
   if (!oid) return null;
   for (const c of load().coupons) {
+    /**
+     * R94（审核 M10-01）：定位改读**不截断**的 `orderIdx`。
+     *
+     * 原来是 `c.uses.findIndex(...)` —— 台账只留最近 200 条，一张券被核销超过 200 次后，
+     * 早期订单的台账行已被挤出 ⇒ 退款时这里返回 `null`，券**不会退还**、`used` 不减，
+     * 而退款路由的日志只有在 `couponReleased` 非空时才追加「已恢复可用」那一句，
+     * 于是「券没退」这件事**连日志都不留**。台账行仍尽量删（显示要一致），但定位
+     * 以索引为准：索引命中而台账里已无行时，照样能正确回退。
+     */
+    const idxInIdx = c.orderIdx && Object.prototype.hasOwnProperty.call(c.orderIdx, oid);
     const idx = c.uses.findIndex((u) => u.orderId === oid);
-    if (idx < 0) continue;
-    const [hit] = c.uses.splice(idx, 1);
+    if (!idxInIdx && idx < 0) continue;
+    const hit = idx >= 0 ? c.uses.splice(idx, 1)[0] : null;
+    const who = idxInIdx ? String(c.orderIdx[oid] || '') : String((hit && hit.identity) || '');
+    if (idxInIdx) delete c.orderIdx[oid];
     c.used = Math.max(0, Number(c.used || 0) - 1);
     /**
-     * R69：索引也要回退 —— 但只在「该身份确实没有其它核销记录」时移除。
+     * R69 / R94：索引也要回退 —— 但只在「该身份确实没有其它核销记录」时移除。
      * 同一用户可能用同一张券下过多笔订单（`perUserOnce` 为假时），
      * 退掉其中一笔就把他从"用过"里删掉，等于把"每人一次"的额度还给他了。
+     *
+     * 判据同样读 `orderIdx`（不截断）；若索引曾经丢过条目（`orderIdxDropped > 0`），
+     * 就无法确定「还有没有别的核销」⇒ **保守地不移除**：宁可多留一次额度限制，
+     * 也不能凭空把「每人一次」还回去。
      */
-    if (Array.isArray(c.identities) && hit && hit.identity) {
-      const still = c.uses.some((u) => u.identity === hit.identity);
-      if (!still) c.identities = c.identities.filter((x) => x !== hit.identity);
+    if (who && Array.isArray(c.identities) && !(Number(c.orderIdxDropped || 0) > 0)) {
+      const still = Object.keys(c.orderIdx || {}).some((k) => String(c.orderIdx[k]) === who);
+      if (!still) c.identities = c.identities.filter((x) => x !== who);
     }
     persist();
-    return { couponId: c.id, identity: hit.identity, used: c.used };
+    return { couponId: c.id, identity: who, used: c.used };
   }
   return null;
 }

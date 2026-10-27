@@ -38,10 +38,15 @@ jobs:
         node: ['24']
     steps:
       - name: 检出代码
-        uses: actions/checkout@v4
+        # R94（审核 M13-09）：固定到 commit SHA，不用浮动 tag。
+        # `@v4` 是**可变**引用 —— 上游（或其账号被攻陷后）可以把它指向任意代码，
+        # 而 CI 会照常执行。SHA 不可变；升级时要显式改这一行（注释里保留版本号便于辨认）：
+        #   actions/checkout v4 = 11d5960a326750d5838078e36cf38b85af677262
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
 
       - name: 安装 Node ${{ matrix.node }}
-        uses: actions/setup-node@v4
+        #   actions/setup-node v4 = 49933ea5288caeca8642d1e84afbd3f7d6820020
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
         with:
           node-version: ${{ matrix.node }}
           cache: npm

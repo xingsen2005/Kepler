@@ -70,11 +70,24 @@ async function listLevel(s3, cfg, prefix) {
     }
     // 游标优先取云端给的 NextMarker；未给则回退到本页最后一个 Key
     // （与 listAll/listPage 的既有约定一致，避免不同厂商返回口径不一致导致死循环）
-    marker = data.NextMarker || (contents.length ? contents[contents.length - 1].Key : '');
+    const nextMarker = data.NextMarker || (contents.length ? contents[contents.length - 1].Key : '');
     const isTrunc = String(data.IsTruncated) === 'true';
+    /**
+     * R94（审核 M11-04）：**前进性检测**。
+     *
+     * 继续条件原来是「`IsTruncated` 为真且游标非空」，但从不检查游标是否**真的向前移动**。
+     * 上游一旦返回 `IsTruncated:true` 却给出与上次相同的 `NextMarker`（或本页 0 条对象
+     * 而游标恒定），这里就变成了无限循环：既不触发 `capped`、也不触发 `!marker`。
+     * 而 WebDAV 的 HTTPS 服务没有响应级超时 ⇒ 该请求**永久挂住**，且每一轮都真实
+     * 打一次云端 `getBucket`（**计费**）。`PROPFIND_CAP` 只限制已收集条目数，
+     * 对「0 条/页」的异常上游完全无效。
+     */
+    const stuck = isTrunc && !!nextMarker && nextMarker === marker;
+    marker = nextMarker;
     if (capped) { truncated = true; more = false; }
     else if (!isTrunc) { more = false; }
     else if (!marker) { truncated = true; more = false; } // 云端说"还有"但不给游标 → 只能停
+    else if (stuck) { truncated = true; more = false; }   // 游标没前进 → 按截断处理，宁可少列也不死循环
   }
   return { files, dirs, truncated };
 }
@@ -220,7 +233,22 @@ async function forEachPrefixPage(s3, cfg, prefix, onPage) {
       items.push({ key: c.Key, size: Number(c.Size) || 0, lm: c.LastModified, dir: false });
     }
     const isTruncated = String(data.IsTruncated) === 'true';
-    marker = data.NextMarker || (items.length ? items[items.length - 1].key : '');
+    const nextMarker = data.NextMarker || (items.length ? items[items.length - 1].key : '');
+    /**
+     * R94（审核 M11-04）：与 `listLevel()` 同一道前进性检测，但这里的后果更严重 ——
+     * 本函数是「列举 → 复制 / 移动 / 删除」的驱动循环，静默继续就是无限循环
+     * （每条请求永久挂住 + 无限次云端调用）；而**只看已复制的页数**也无法判断完整性。
+     * 故这里不静默收尾，直接**抛错中止**：宁可让 COPY/MOVE 明确失败并保留可重试的
+     * 半成品，也不能让调用方以为「已经复制完整」随后把源删掉。
+     */
+    if (isTruncated && nextMarker && nextMarker === marker) {
+      const e = new Error('云端列举游标没有前进（上游返回了重复的 NextMarker），已中止本次列举'
+        + '—— 继续下去会无限次调用云端且结果不完整');
+      e.status = 502;
+      e.code = 'LIST_CURSOR_STUCK';
+      throw e;
+    }
+    marker = nextMarker;
     if (await onPage(items, { isTruncated, nextMarker: marker }) === false) return;
     more = isTruncated && !!marker;
   }

@@ -111,7 +111,25 @@ function normalizeSize(n) {
 let slots = [];       // [{ w, current }] —— current 非空表示该线程正忙
 let queue = [];       // 等待空闲线程的任务
 let targetN = 0;      // 目标线程数（configure 决定）；0 = 尚未配置 ⇒ 走同步
-let degraded = false; // 线程出过错 ⇒ 整体退回主线程（fail-safe，不再重试）
+let degraded = false; // 线程出过错 ⇒ 整体退回主线程（冷却期内不再重试）
+/**
+ * R94（审核 M09-07）：降级不再是**永久**状态。
+ *
+ * 旧实现把 `degraded` 一次置真就再也不复位，`configure()` 也以它为短路条件 ⇒
+ * **一次瞬时的线程抖动**（并发大文件上传时的内存尖峰、容器 `pids.max` 顶到上限）
+ * 会把整个进程生命周期钉在「所有加密退回主线程同步执行」上，而 magic 模式一个
+ * 48MB 分片同步异或约 3 秒、期间全站零响应。管理员改「线程并发」设置也无效
+ * （`configure` 直接返回 0），除重启进程外**没有任何自救手段**。
+ *
+ * 现在改成**冷却后自动重试**：降级只封锁 `DEGRADE_COOLING_MS`，窗口过了下一个
+ * 加密任务就会尝试重建线程；重建后若立刻又炸，`degrade()` 会把时间戳刷新，
+ * 于是自然变成「每分钟最多重试一次」的退避 —— 既不会在资源紧张时形成
+ * spawn/失败抖动循环，也不会让一次抖动永久降级。
+ */
+let degradedAt = 0;
+let degradeCount = 0;
+/** 降级后的冷却窗口：窗口内不再尝试建池（避免抖动循环），窗口外自动重试 */
+const DEGRADE_COOLING_MS = 60 * 1000;
 let seq = 0;
 
 /** 当前目标线程数 */
@@ -130,7 +148,13 @@ function enabled() { return !disabled() && !degraded && targetN >= 1; }
  * @returns {number} 实际生效的线程数（0 = 关闭）
  */
 function configure(n) {
-  if (disabled() || degraded) return 0;
+  if (disabled()) return 0;
+  if (degraded) {
+    // R94（审核 M09-07）：冷却窗口内不重试；窗口外**允许复位并重建一次**。
+    // 复位失败无所谓 —— 只要线程再炸一次，`degrade()` 就会刷新时间戳回到冷却。
+    if (Date.now() - degradedAt < DEGRADE_COOLING_MS) return 0;
+    degraded = false;
+  }
   const want = normalizeSize(n);
   if (want === targetN) return targetN;
   drainLocally();       // 重建前先把在途/排队任务在主线程算完，绝不丢任务
@@ -150,14 +174,17 @@ function closeAll() {
   slots = [];
 }
 
-/** 整体退回主线程：在途与排队任务全部就地算完，之后不再新建线程 */
+/** 整体退回主线程：在途与排队任务全部就地算完，之后进入冷却（见 `DEGRADE_COOLING_MS`） */
 function degrade(err) {
   if (!degraded) {
     degraded = true;
-    targetN = 0;
+    degradeCount += 1;
     // 这里的日志不能走 statsStore（本模块要被 worker 线程加载，不引入多余依赖）
     console.error('[enc-pool] 加密工作线程不可用，已退回主线程同步加密：', (err && err.message) || err);
   }
+  // 每次异常都刷新时间戳：反复失败 ⇒ 反复进入冷却 ⇒ 天然退避
+  degradedAt = Date.now();
+  targetN = 0;
   drainLocally();
   closeAll();
 }
@@ -188,7 +215,22 @@ function maxQueue() { return Math.max(4, size() * 4); }
 function freeSlot() { return slots.find((s) => !s.current) || null; }
 
 function spawnSlot() {
-  const w = new Worker(WORKER_FILE, { workerData: { role: 'enc-worker' } });
+  let w;
+  try {
+    w = new Worker(WORKER_FILE, { workerData: { role: 'enc-worker' } });
+  } catch (e) {
+    /**
+     * R94（审核 M09-08）：「永远有同步兜底」这条约定必须覆盖「线程**根本起不来**」。
+     *
+     * `new Worker()` 在线程创建失败时（EMFILE / ENOMEM / 容器 `pids.max`）是**同步抛错**，
+     * 而它原来位于 `submit()` 里、`viaPoolOrLocal` 的 `try` 之外 ⇒ 异常直接穿透到
+     * `encStore.encryptBufferAsync`，最终被 catch 成一次 500 上传失败。
+     * 讽刺的是这恰恰发生在资源已经紧张的时候，而那时最需要的正是「退回主线程
+     * 把这一次算完」—— 也就是从「变慢」退化成「整体不可用」。
+     */
+    degrade(e);
+    return null;
+  }
   const slot = { w, current: null };
   w.on('message', (m) => onReply(slot, m));
   w.on('error', (e) => degrade(e));
@@ -261,14 +303,31 @@ function submit(job) {
   if (!enabled()) return null;
   if (!job.buf || job.buf.length < MIN_WORKER_BYTES) return null;
   let slot = freeSlot();
-  if (!slot && slots.length < targetN) slot = spawnSlot();
+  if (!slot && slots.length < targetN) {
+    slot = spawnSlot();
+    // R94（审核 M09-08）：线程起不来时 `spawnSlot()` 已 `degrade()` 并返回 null，
+    // 这里必须**当场退回主线程**（返回 null），不能继续往队列里塞 —— 降级后队列
+    // 没有消费者，塞进去就是永不 resolve 的挂起。
+    if (!slot) return null;
+  }
   if (slot) return runOn(slot, job);
   if (queue.length >= maxQueue()) return null;
   return new Promise((resolve, reject) => { queue.push({ job, resolve, reject }); });
 }
 
 async function viaPoolOrLocal(job, shape) {
-  const p = submit(job);
+  let p = null;
+  try {
+    p = submit(job);
+  } catch (e) {
+    /**
+     * R94（审核 M09-08）：`submit()` 也是「可能抛」的一环（线程创建失败、队列里
+     * 的分配抛错）。原来它位于 `try` 之外 ⇒ 「单次任务失败也必须能出结果」这条
+     * 兜底**覆盖不到**提交阶段。这里补上同一口径的兜底：降级 + 主线程算完。
+     */
+    degrade(e);
+    p = null;
+  }
   if (!p) return shape(execLocal(job));
   try {
     return shape(await p);
@@ -324,7 +383,10 @@ function stats() {
   return {
     enabled: enabled(), size: size(), workers: slots.length,
     busy: slots.filter((s) => s.current).length, queued: queue.length,
-    degraded, cpuBudget: cpuBudget(), minBytes: MIN_WORKER_BYTES,
+    degraded, degradeCount, cpuBudget: cpuBudget(), minBytes: MIN_WORKER_BYTES,
+    // R94（审核 M09-07）：降级不再是终态，运维要看得出「还要等多久自动重试」
+    cooldownMs: DEGRADE_COOLING_MS,
+    cooling: degraded && (Date.now() - degradedAt) < DEGRADE_COOLING_MS,
   };
 }
 
@@ -334,12 +396,32 @@ function _resetForTest() {
   closeAll();
   targetN = 0;
   degraded = false;
+  degradedAt = 0;
+  degradeCount = 0;
   seq = 0;
+}
+
+/**
+ * 仅供测试：把「降级」摆到指定时刻之前，用来驱动 `configure()` 的冷却判据。
+ *
+ * 真实降级只能由工作线程异常触发（OOM / 线程创建失败），在测试进程里造不出来；
+ * 而「降级是永久的」这个缺陷恰恰只在 `configure()` 的冷却分支里能观察到，
+ * 所以这里给出一个**只影响时间戳**的钩子 —— 判据本身仍然是真的。
+ *
+ * @param {number} agoMs 距现在多少毫秒之前发生了降级
+ */
+function _degradeForTest(agoMs) {
+  drainLocally();
+  closeAll();
+  degraded = true;
+  degradeCount += 1;
+  targetN = 0;
+  degradedAt = Date.now() - Math.max(0, Number(agoMs) || 0);
 }
 
 module.exports = {
   HARD_MAX_WORKERS, MIN_WORKER_BYTES,
   configure, size, enabled, disabled,
   xor, aesSeal, shutdown, stats,
-  _resetForTest,
+  _resetForTest, _degradeForTest,
 };

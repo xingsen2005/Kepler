@@ -24,6 +24,8 @@ const fs = require('fs');
 const path = require('path');
 const { Transform } = require('stream');
 const secureStore = require('./secure-store');
+// R94（审核 M09-04）：元数据表改用与其它高频 store 同款的去抖合并写
+const coalesce = require('./coalesce');
 const atomicWrite = require('./atomic-write');
 const configStore = require('./config-store'); // 仅复用 unwritableError（备份 + 拒绝覆盖语义）
 const encXor = require('./enc-xor'); // R48：magic 密钥流纯原语（与工作线程共用同一实现）
@@ -140,6 +142,32 @@ function defaultSettings() {
   };
 }
 
+/**
+ * R94（审核 M09-02）：`enc-settings.json` **读不出来**时不能装作「默认设置」。
+ *
+ * 旧实现捕获读盘异常后直接落到 `defaultSettings()`（`mode: 'none'`、
+ * `passwordHash: ''`），于是两条安全控制同时**静默 fail-open**：
+ *  ① 此后所有新上传以**明文**落云（`encryptBufferImpl` 看到 `mode === 'none'` 就返回 null）；
+ *  ② 「查看密码」门禁恒不成立 ⇒ 任何已登录用户可下载全部历史加密文件的明文。
+ * 而界面上的 `mode: 'none' / passwordSet: false` 与「管理员主动关掉」完全同形，
+ * 唯一线索只有服务端日志和 `/api/health` 的 corruptList。
+ *
+ * 现在加一个显式状态：**写路径拒绝写入**（宁可 503 也不产出一份明文），
+ * **读门禁 fail-closed**（`passwordSet()` 恒为 true，多要一次密码比放开好）。
+ * 设置读不出来是运维事故，不是「一切正常」。
+ */
+let settingsUnavailable = false;
+
+function settingsUnavailableError() {
+  const e = new Error(
+    '加密设置文件 data/enc-settings.json 无法读取（可能损坏 / 权限不对 / 主密钥被轮换）。'
+    + '为避免把新文件以明文写入云端，上传写入已暂停；请用 .corrupt-* 备份恢复该文件后重启服务。'
+  );
+  e.status = 503;
+  e.code = 'ENC_SETTINGS_UNAVAILABLE';
+  return e;
+}
+
 function loadSettings() {
   if (settings) return settings;
   // S4：加密存储（兼容历史明文文件）
@@ -150,7 +178,9 @@ function loadSettings() {
   try {
     j = secureStore.readJson(SETTINGS_FILE, null);
   } catch (e) {
-    console.error('[enc-store] 加密设置文件损坏，已降级为默认设置并锁定写入：', e.message);
+    // R94（审核 M09-02）：标记「设置不可用」—— 写路径 503、读门禁 fail-closed（见 settingsUnavailable）
+    settingsUnavailable = true;
+    console.error('[enc-store] 加密设置文件损坏：已锁定写入并暂停上传写入（见 /api/health）：', e.message);
   }
   if (j && typeof j === 'object') {
     settings = Object.assign(defaultSettings(), {
@@ -171,7 +201,9 @@ function loadSettings() {
 function persistSettings() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
   settings.updatedAt = iso();
-  secureStore.writeJson(SETTINGS_FILE, settings); // 同步写入：设置变更低频且关键
+  // R94（审核 M09-05）：同样换成会抛错的写入口 —— 加密方式 / 查看密码的变更
+  // 若只是「以为写下去了」，重启后就会退回旧设置（fail-open 到不加密）。
+  secureStore.writeJsonStrict(SETTINGS_FILE, settings);
 }
 
 /** 魔数输入解析：'0x' 开头按十六进制，否则按 UTF-8 文本；1-64 字节 */
@@ -230,7 +262,18 @@ async function updateSettings(patch) {
     }
   }
   masterKey(); // 确保密钥文件存在
+  /**
+   * R94（审核 M09-02）：**管理员必须能从接口上把设置救回来**。
+   *
+   * 读不出来时 `secureStore` 会把该文件列入 `corruptFiles` 并拒绝一切写入 ——
+   * 那条锁的本意是「别用空表覆盖掉可能还能人工恢复的原件」，但它同时把
+   * 「管理员确认后重建该文件」这条唯一出路也堵死了（旧实现只能上服务器改文件再重启）。
+   * 显式调用 `updateSettings()` 就是那个「确认」动作：解除锁 → 用新值重建。
+   * 损坏的原件已在 `corruptError()` 里改名成 `.corrupt-*` 备份，不会被覆盖丢内容。
+   */
+  if (settingsUnavailable) secureStore.clearCorrupt(SETTINGS_FILE);
   persistSettings();
+  settingsUnavailable = false; // 重建成功：恢复正常（写失败会抛错，走不到这里）
   return settingsView();
 }
 
@@ -245,10 +288,27 @@ function settingsView() {
     passwordSet: !!s.passwordHash,
     encryptedCount: Object.keys(loadMeta().files).length,
     updatedAt: s.updatedAt,
+    /**
+     * R94（审核 M09-02）：设置**读不出来**时必须与「管理员主动关掉加密」区分开。
+     * 两者在界面上原本完全同形（`mode: 'none' / passwordSet: false`），管理员无从分辨
+     * 「这是我设的」还是「这是读盘失败后的降级值」。带上这个字段，前端就能给出
+     * 明确提示（此时写路径已暂停、下载门禁仍按「已设密码」处理）。
+     */
+    settingsUnavailable,
   };
 }
 
 function currentMode() { return loadSettings().mode; }
+
+/**
+ * R94（审核 M09-02）：设置不可用时**写路径必须抛错**（而不是按 'none' 明文写云）。
+ * 单独开一个入口而不是让 `currentMode()` 抛：`currentMode()` 还被读路径与界面调用，
+ * 在那里抛会把「读不到设置」放大成整站不可用；写路径才是必须 fail-closed 的那条。
+ */
+function assertSettingsUsable() {
+  loadSettings(); // 触发一次读盘（首次调用时才真的读）
+  if (settingsUnavailable) throw settingsUnavailableError();
+}
 
 /* ============================ 元数据存储 ============================ */
 
@@ -301,16 +361,51 @@ function persistMeta() {
     throw err;
   }
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-  const seq = ++metaSeq;
-  // 异步串行写入：元数据变更较频繁，避免阻塞事件循环（P1）
-  // R23-02：写失败（writeJsonAsync 现 resolve(false)）时**不得**标记已落盘 ——
-  // 否则 metaDirty() 变 false、flushMeta() 跳过同步落盘，解密唯一凭据会永久丢失。
-  secureStore.writeJsonAsync(META_FILE, loadMeta())
-    .then((ok) => { if (ok !== false && seq > metaSavedSeq) metaSavedSeq = seq; });
+  metaSeq += 1;
+  /**
+   * R94（审核 M09-04）：改成**去抖合并写**（与 config-store / upload-sessions /
+   * payment-orders 同一套原语 `coalesce.debouncedPersist`）。
+   *
+   * 旧实现每次变更都直接 `writeJsonAsync(META_FILE, loadMeta())`，而 `serialize()`
+   * 是**全量**的（整张表 JSON.stringify + 整表 AES-GCM，同步跑在主线程），
+   * 于是「一次批量上传 N 个文件」= N 次全表加密 + N 次全量写盘，总字节数 O(N²)。
+   * 实测 200 条小元数据写出 8.89 MB；表越大，每次变更对全站（下载 / WebDAV /
+   * 健康检查）的同步停顿越长。
+   *
+   * 关键节点（云端写成功后）仍然走 `flushMeta()` 的**同步**写，语义不变 ——
+   * 去抖只作用于「同一窗口内的多次普通变更」，不会推迟那次必须立刻落盘的写。
+   */
+  metaWriter.schedule();
 }
 
 /** 是否存在尚未落盘的元数据变更 */
 function metaDirty() { return metaSeq > metaSavedSeq; }
+
+/**
+ * R94（审核 M09-04）：元数据表的去抖写。
+ *
+ * 取值那一刻记下「本次要落盘的是哪个序号」，写成功后才把 `metaSavedSeq` 推到它 ——
+ * 于是去抖不会破坏 R23-02 的契约（写失败必须保持 dirty，等下一轮重试）。
+ * `getSnapshot()` 返回 `loadMeta()`（落盘瞬间的最新快照），损坏时返回 null（不写）。
+ */
+let metaSeqAtSnapshot = 0;
+const metaWriter = coalesce.debouncedPersist(
+  META_FILE,
+  () => {
+    if (metaCorrupt) return null;
+    metaSeqAtSnapshot = metaSeq;
+    return loadMeta();
+  },
+  {
+    debounceMs: 250,
+    dataDir: DATA_DIR,
+    write: async (file, snap) => {
+      const ok = await secureStore.writeJsonAsync(file, snap);
+      if (ok !== false && metaSeqAtSnapshot > metaSavedSeq) metaSavedSeq = metaSeqAtSnapshot;
+      return ok;
+    },
+  },
+);
 
 /**
  * 同步落盘元数据（幂等；无变更时不产生任何 I/O）。
@@ -323,7 +418,12 @@ function flushMeta() {
   if (!metaDirty()) return false;
   if (metaCorrupt) return false; // 损坏状态下不写（persistMeta 已在变更点抛错）
   try {
-    persistMetaSync();
+    /**
+     * R94（审核 M09-01 / M09-06）：只有**真的写下去**才推进序号。
+     * `persistMetaSync()` 现在返回 false 表示「按纪律跳过未写」（退出路径目录不存在），
+     * 抛错表示写失败 —— 两种都不得把 `metaSavedSeq` 推到 `metaSeq`。
+     */
+    if (persistMetaSync() === false) return false;
     metaSavedSeq = metaSeq;
     return true;
   } catch (e) {
@@ -361,16 +461,31 @@ function persistMetaSync(opts = {}) {
    * 第二份内联实现，于是「把 canonical 改成 `return true`」这种回归无人能发现
    * （第 12 轮实测：invariants 15/15 与 audit11 15/15 全绿）。
    */
-  if (opts.exit && !secureStore.exitPathWritable(DATA_DIR)) return;
+  if (opts.exit && !secureStore.exitPathWritable(DATA_DIR)) return false;
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
-  secureStore.writeJson(META_FILE, loadMeta());
+  /**
+   * R94（审核 M09-01）：用**会抛错**的写入口。旧实现走 `writeJson()`（吞错），
+   * 于是下面 `flushMeta()` / `flushMetaSync()` 的 `catch` 永远不会触发，
+   * `metaSavedSeq` 被无条件推进 —— 写失败等于「假装成功」，而 `enc-meta.json`
+   * 是解密的唯一凭据，丢了就是文件永久不可解（云端有密文、本地没有 IV/TAG）。
+   * 现在写失败会抛到这里 → 调用方不推进序号 → `metaDirty()` 保持 true →
+   * 退出钩子仍会重试。
+   */
+  secureStore.writeJsonStrict(META_FILE, loadMeta());
+  return true;
 }
 
 /** 退出路径的同步落盘（R11-07：只写不建）。与 upload-sessions.flushSync() 同款 */
 function flushMetaSync() {
   if (!metaDirty()) return false;
   try {
-    persistMetaSync({ exit: true });
+    /**
+     * R94（审核 M09-06）：`persistMetaSync({ exit: true })` 在「数据目录不存在」时
+     * **按纪律不写**（退出路径只写不建）—— 旧实现照样把 `metaSavedSeq` 推进，
+     * 于是这次「没写」被记成「已落盘」，后续任何 flush 都会被 `metaDirty() === false`
+     * 挡掉。返回 false 表示「本轮没写」，序号保持不动。
+     */
+    if (persistMetaSync({ exit: true }) === false) return false;
     metaSavedSeq = metaSeq;
     return true;
   } catch (e) { return false; }
@@ -695,6 +810,7 @@ function encryptBuffer(bucket, key, buf) {
  * 校验、元数据组装、以及「不写元数据」的契约（R7-02）两条路径**完全共用**。
  */
 function encryptBufferImpl(ex, bucket, key, buf) {
+  assertSettingsUsable(); // R94（审核 M09-02）：设置读不出来时绝不以明文落云
   const s = loadSettings();
   if (s.mode === 'none') return null;
   if (s.mode === 'magic' && buf && buf.length > LIMITS.MAGIC_SYNC_MAX) {
@@ -1263,7 +1379,11 @@ function decryptTransform(meta) {
 
 /* ============================ 查看密码（权限验证）与令牌 ============================ */
 
-function passwordSet() { return !!loadSettings().passwordHash; }
+function passwordSet() {
+  // R94（审核 M09-02）：设置不可用时 fail-closed —— 读不到设置不等于「没设密码」
+  if (settingsUnavailable) return true;
+  return !!loadSettings().passwordHash;
+}
 
 /** 校验加密文件查看密码（SEC-05：async —— 该入口在 /enc/unlock 上，是攻击者可达路径） */
 async function checkPassword(pw) {

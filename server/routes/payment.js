@@ -153,6 +153,20 @@ router.post('/payment/orders/:id/refund', requireAdmin, (req, res) => {
     let couponReleased = null;
     if (o.couponId && o.couponType && o.couponType !== 'any') {
       couponReleased = couponStore.releaseByOrder(o.id);
+      /**
+       * R94（审核 M10-01）：回退失败必须**显式告警**。
+       *
+       * 旧实现找不到台账行时静默返回 `null`，而下面这条日志只有在成功时才追加
+       * 「已恢复可用」那一句 —— 于是「券没退」这件事**在审计日志里完全看不出来**，
+       * 买家来问「我退款了为什么券还没回来」时，管理员没有任何线索。
+       */
+      if (!couponReleased) {
+        statsStore.addLog({
+          action: 'coupon.release-miss', level: 'warn',
+          detail: `订单 ${o.id} 退款时未能退还优惠券 ${o.couponId}（类型 ${o.couponType}）：`
+            + '券记录可能已被删除，或核销记录已超出索引回溯范围 —— 该用户可能仍被判为「已使用」',
+        });
+      }
     }
     statsStore.addLog({
       action: 'payment.refund', level: 'warn',

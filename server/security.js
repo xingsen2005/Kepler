@@ -11,8 +11,25 @@
  */
 const DEPLOY_HOST = String(process.env.HOST || '127.0.0.1');
 const IS_LOOPBACK = DEPLOY_HOST === '127.0.0.1' || DEPLOY_HOST === 'localhost' || DEPLOY_HOST === '::1';
-/** 是否部署模式（监听局域网/公网）：此时强制 HTTPS + Secure Cookie */
-const IS_DEPLOY = !IS_LOOPBACK;
+/**
+ * 是否部署模式（监听局域网/公网）：此时强制 HTTPS + Secure Cookie
+ *
+ * R94（审核 M13-06）：判据不再**只**看 `HOST` 是否回环。
+ *
+ * 旧定义是 `!IS_LOOPBACK`，于是「把 `HOST` 改回 `127.0.0.1`」这个看起来只是为了
+ * 收紧暴露面的动作，会**静默**关掉 HSTS 与会话 Cookie 的 `Secure` 属性 ——
+ * 而它恰恰是 M13-05 建议的加固动作（应用端口本不该对全网卡监听）。两者一起改时
+ * 如果只改了 `HOST`，得到的结果是「更安全地监听 + 更不安全地下发 Cookie」，
+ * 且没有任何报错或日志提示。
+ *
+ * 现在改为：`DEPLOY_MODE=1`（部署脚本无条件写入）**或** 监听非回环地址，两者任一成立
+ * 即部署模式。这样 `HOST` 与「是否对外提供服务」彻底解耦：
+ *  · `deploy.sh` 生成的实例无论是 systemd（`HOST=127.0.0.1` + Nginx 反代）还是
+ *    docker（容器内 `HOST=0.0.0.0`）都带 `DEPLOY_MODE=1` ⇒ 行为不变；
+ *  · 本地开发（无该变量、`HOST` 缺省 127.0.0.1）仍是非部署模式 ⇒ 行为不变。
+ */
+const DEPLOY_MODE = /^(?:1|true|yes|on)$/i.test(String(process.env.DEPLOY_MODE || '').trim());
+const IS_DEPLOY = DEPLOY_MODE || !IS_LOOPBACK;
 
 /**
  * R38：**本站对外域名**（部署脚本写入 `SITE_DOMAIN=s3.example.com`）。
@@ -555,6 +572,17 @@ function limitMiddleware(limiter, keyFn) {
 const ACCOUNT_FAIL_SOFT = 20;
 const ACCOUNT_FAIL_DELAY_MAX_MS = 1500;
 const ACCOUNT_FAILS_MAX = 20000;
+/**
+ * R94（审核 M01-03）：账户级失败计数**必须衰减**。
+ *
+ * 旧实现把 `lastAt` 写进记录后**从来不读** —— 于是一个正常用户几年里零散输错
+ * 20 次口令之后，此后**每次**登录都要多等 1.5 秒（上限），永远不恢复。而这个
+ * 计数器只承担「压撞库吞吐」，不承担「锁死账户」，没有理由跨月累计。
+ *
+ * 窗口取 15 分钟，与失败锁定表（`createFailLock` 的 `windowMs`）同口径：
+ * 超过窗口没有新的失败，就从 0 重新计。
+ */
+const ACCOUNT_FAIL_WINDOW_MS = 15 * 60 * 1000;
 const accountFails = new Map(); // username -> { count, lastAt }
 
 function normalizeAccountKey(username) {
@@ -564,6 +592,7 @@ function normalizeAccountKey(username) {
 function noteAccountFail(username) {
   const key = normalizeAccountKey(username);
   if (!key) return;
+  const now = Date.now();
   const rec = accountFails.get(key);
   if (!rec && accountFails.size >= ACCOUNT_FAILS_MAX) {
     for (const k of accountFails.keys()) {
@@ -571,7 +600,9 @@ function noteAccountFail(username) {
       accountFails.delete(k);
     }
   }
-  accountFails.set(key, { count: (rec ? rec.count : 0) + 1, lastAt: Date.now() });
+  // 窗口外没有新失败 ⇒ 从头计（这一句就是「衰减」的全部：不读 lastAt 等于永不过期）
+  const prev = rec && now - (rec.lastAt || 0) <= ACCOUNT_FAIL_WINDOW_MS ? rec.count : 0;
+  accountFails.set(key, { count: prev + 1, lastAt: now });
 }
 
 function resetAccountFail(username) {
@@ -584,6 +615,8 @@ function accountFailDelayMs(username) {
   const key = normalizeAccountKey(username);
   const rec = key ? accountFails.get(key) : null;
   if (!rec) return 0;
+  // R94：过期记录不再产生任何延迟（否则「衰减」只发生在下一次失败时，成功登录照样被拖）
+  if (Date.now() - (rec.lastAt || 0) > ACCOUNT_FAIL_WINDOW_MS) return 0;
   const over = rec.count - ACCOUNT_FAIL_SOFT;
   if (over <= 0) return 0;
   return Math.min(ACCOUNT_FAIL_DELAY_MAX_MS, 100 * over);
@@ -885,6 +918,35 @@ const resetLock = createFailLock({ name: 'auth-reset', maxFails: 5, baseLockMs: 
 /** 已登录用户请求「邮箱验证码」（自助设置 / 修改邮箱）：每 IP 每 10 分钟 ≤ 10 次 */
 const emailCodeLimiter = createLimiter({ name: 'auth-email-code', windowMs: 10 * 60 * 1000, max: 10 });
 
+/**
+ * 「邮箱验证码」的**按用户**总量闸门（R94 · 审核 M03-06）。
+ *
+ * ## 为什么按 IP 那一层不够
+ *
+ * `email-code.js` 的重发冷却是按 `purpose|邮箱` 记的 —— 攻击者**换一批地址**
+ * 就绕开了；于是唯一的总量约束只剩上面的 `emailCodeLimiter`（每 IP 10 次 / 10 分钟），
+ * 代理池下既不构成上限、也不区分「一个人换了 10 个地址」与「10 个人各发 1 封」。
+ * 结果是本站可以用管理员的 SMTP 账号向任意第三方地址发信（骚扰 + 烧配额），
+ * 而模块注释的第一条防线写的正是「别让本站成为给任意邮箱发信的工具」。
+ *
+ * 按**用户**计一条日配额，换 IP、换地址都不再能绕过；正常用户改一次邮箱
+ * 顶多要 2～3 封（输错验证码重发、地址写错重填），20 封/天足够宽。
+ */
+const emailCodeUserLimiter = createLimiter({ name: 'auth-email-code-user', windowMs: 24 * 60 * 60 * 1000, max: 20 });
+
+/**
+ * R94（审核 M07-03）：`/fs/upload/init` 的按用户配额（每小时新建上传会话数）。
+ *
+ * 这条端点的每一次成功调用都会**真的**打一次云端 `multipartInit` 并生成一条会话；
+ * 旧实现对它没有任何速率约束，于是「登录 → 循环 2000 次」就能把全局会话数顶过
+ * `MAX_SESSIONS`，下一次 `prune` 按 `updatedAt` 升序淘汰时被中止的必然是**别人**
+ * 更早的真实上传（远端 `multipartAbort`，已传分片全部作废）。
+ *
+ * 正常用户一小时开不了 60 个分片任务（每个任务都要传完几十 MB 才结束）；超出的
+ * 请求直接 429，比「事后淘汰别人的会话」诚实得多。
+ */
+const uploadInitLimiter = createLimiter({ name: 'fs-upload-init-user', windowMs: 60 * 60 * 1000, max: 60 });
+
 module.exports = {
   DEPLOY_HOST, IS_LOOPBACK, IS_DEPLOY, TRUST_PROXY, TRUST_PROXY_HOPS,
   SITE_DOMAIN, // R38：部署脚本写入的本站对外域名（「本站」允许集的权威来源）
@@ -911,5 +973,7 @@ module.exports = {
   backupExportLimiter, // R38：备份导出校验账户口令的限流（与 passwordLimiter 刻意分开）
   backupImportLimiter, // R78：备份导入（口令 + 导出码）的限流，与导出各给一条预算
   // R54②：注册 / 忘记密码 / 重置密码 / 邮箱验证码
-  registerLimiter, registerConflictLimiter, REGISTER_CONFLICT_KEY, forgotLimiter, resetLimiter, resetLock, emailCodeLimiter,
+  registerLimiter, registerConflictLimiter, REGISTER_CONFLICT_KEY, forgotLimiter, resetLimiter, resetLock,
+  emailCodeLimiter, emailCodeUserLimiter,
+  uploadInitLimiter, // R94：/fs/upload/init 的按用户小时配额（见定义处）
 };

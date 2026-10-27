@@ -509,6 +509,21 @@ function normalizeKey(key) {
   if (typeof key !== 'string') throw badRequest('Key 必须为字符串');
   let k = key.replace(/\\/g, '/').replace(/^\/+/, '');
   /**
+   * R94（审核 M07-08）：**剥掉 Unicode 双向控制字符**。
+   *
+   * 这些字符不可见，却会**重排其后文本的显示顺序**。`escapeHtml()` 不改变它们，
+   * 浏览器按 bidi 算法渲染，于是 `合同\u202Etxt.exe` 在文件列表里显示成
+   * `合同exe.txt` —— 扩展名看起来被反转了；下载时 `Content-Disposition` 用的
+   * 还是同一个文件名，系统保存对话框里同样被骗（CWE-1007）。
+   *
+   * 处理方式选「剥掉」而不是「拒绝」：key 由本地文件名拼出，用户对自己文件里有没有
+   * 这些不可见字符毫无概念，400 只会变成一句无法执行的报错；而剥掉是幂等的，剥完
+   * 的 key 不含任何方向控制字符，欺骗性随之消失。
+   * 覆盖：U+200E/U+200F（LRM/RLM）、U+202A–U+202E（嵌入/覆盖）、U+2066–U+2069（隔离）。
+   */
+  // eslint-disable-next-line no-control-regex
+  k = k.replace(/[\u200E\u200F\u202A-\u202E\u2066-\u2069]/g, '');
+  /**
    * R87①：**空字符必须拒绝**。
    *
    * `list-cache` / `search-candidates` 在把 key 拼成缓存键时会把 `\u0000` 剥掉，

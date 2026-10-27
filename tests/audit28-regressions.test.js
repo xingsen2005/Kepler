@@ -106,9 +106,12 @@ test('R28-02 · 单桶配额必须由服务端强制（且两层闸门都在写�
   const countWd = (wdSrc.match(/assertBucketQuota\(/g) || []).length;
   // ⚠️ 这是**硬计数**：每新增一个 /fs 写入口都必须同步这里（R52 的 /fs/copy 就是靠它
   // 被提醒去补闸门的）。数字对不上不一定是缺陷，但**必须**先回答「新入口有没有过闸门」。
-  assertEqual(countFs, 6,
-    'R28-02：/fs 的 6 个写入口（mkdir / upload/simple / upload/init / rename / move / copy）'
-    + `都必须过桶级闸门，实际 ${countFs} 处`);
+  assertEqual(countFs, 8,
+    'R28-02：/fs 的 8 个写入口（mkdir / upload/simple / upload/init / rename / move / copy'
+    + ' / upload/chunk / upload/complete）都必须过桶级闸门，实际 ' + `${countFs} 处`);
+  // R94（审核 M07-02）：`chunk` 与 `complete` 是**真正的写云端出口**，它们原先不过闸门 ⇒
+  // 配额可以被「先 init 再逐片写」绕过。因此计数从 6 提到 8 —— 提数字不是放宽，
+  // 是那两个新入口**各自补了一次** `assertBucketQuota()`。
   assertEqual(countWd, 4,
     'R28-02：WebDAV 的 4 个写入口（PUT 目录 / PUT 文件 / MKCOL / COPY·MOVE）'
     + `都必须过桶级闸门，实际 ${countWd} 处`);

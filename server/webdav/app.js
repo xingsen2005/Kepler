@@ -444,6 +444,34 @@ function buildApp() {
       const key = spaceKey(req.path);
       if (!key) return res.status(409).end();
       const dirKey = key.endsWith('/') ? key : key + '/';
+      /**
+       * R94（审核 M11-05）：父集合必须存在（RFC 4918 §9.3 要求 409 Conflict）。
+       *
+       * 旧实现只查「目标自己存不存在」，于是 `MKCOL /dav/a/b/c/` 在 `a/`、`a/b/` 都
+       * 不存在时照样 201，在桶里留下一个**没有父目录的占位对象**：后续列举时它以
+       * `a/` 的 CommonPrefix 形式出现，用户看到「凭空多出来的目录」，而按层级创建的
+       * 客户端会遇到「目录结构与服务端对不上」。
+       *
+       * ⚠️ 空间根（`u/<id>/`）在用户还没有任何对象时**并不是**一个真实存在的对象，
+       * 故 `parent === 空间根` 必须视为存在 —— 否则新用户第一次新建目录就被 409 挡掉。
+       */
+      const rootKey = requestContext.spaceRoot() || '';
+      const parentKey = dirKey.slice(0, dirKey.slice(0, -1).lastIndexOf('/') + 1);
+      if (parentKey && parentKey !== dirKey && parentKey !== rootKey) {
+        let parentExists = true;
+        try {
+          await p(s3, 'headObject', { Bucket: cfg.bucket, Region: cfg.region, Key: parentKey }, { noStat: true });
+        } catch (e) {
+          const st = Number((e && (e.statusCode || e.status)) || 0);
+          const code = String((e && (e.code || e.Code)) || '');
+          // 探测失败但**不是**「不存在」时按存在处理（fail-open）：宁可多建一层，
+          // 也不要因为一次网络抖动让用户完全无法新建目录。
+          if (st === 404 || /NoSuchKey|NotFound/i.test(code)) parentExists = false;
+        }
+        if (!parentExists) {
+          return res.status(409).type('text/plain').send('409 Conflict：父集合不存在，请先创建上级目录');
+        }
+      }
       // R25：新建集合是 0 字节对象 → `addBytes=0`
       await bucketStats.assertCredentialQuota(cfg.credentialId, { addBytes: 0 });
       await bucketStats.assertBucketQuota(s3, cfg, { addBytes: 0 }); // R28-02：单桶上限
@@ -510,8 +538,19 @@ function buildApp() {
       if (!destHeader) return res.status(400).type('text/plain').send('400：缺少 Destination 头');
       let destUrl;
       let destPath;
+      /**
+       * R94（审核 M11-03）：`Destination` 的取值是 RFC 4918 §8.3 的 `Simple-ref` ——
+       * 既可写完整绝对 URI，也可写**绝对路径**（`/dav/x.txt`）或**相对引用**（`x.txt`）。
+       * 旧实现只做 `new URL(destHeader)`（无 base），后两种合规写法直接抛异常 → 400
+       * 「Destination 无效」，这类客户端在本服务上 MOVE / COPY 完全不可用。
+       * 反代部署尤其容易踩到（Nginx 改写 Host 但不改 WebDAV 头），RFC 4918 附录 F
+       * 正是为这种场景把绝对路径写进 `Simple-ref` 的。
+       *
+       * 现在以**请求自身**为 base 解析：绝对 URI 仍然按原样走（跨主机仍由下面的 403 拦），
+       * 绝对路径 / 相对引用则解析成等价的目标路径，后续照常过 `inMount()` + `spaceKey()`。
+       */
       try {
-        destUrl = new URL(destHeader);
+        destUrl = new URL(destHeader, 'https://' + String(req.headers.host || 'localhost') + String(req.path || '/'));
         destPath = destUrl.pathname;
       } catch (e) { return res.status(400).send('Destination 无效'); }
       // FUN-06：Destination 必须位于本服务的挂载点之下。
@@ -556,6 +595,41 @@ function buildApp() {
 
       const srcIsDir = srcKey.endsWith('/');
       /**
+       * R94（审核 M11-01）：`Destination` 指向**集合**时，目标 key 不是 Destination 本身。
+       *
+       * RFC 4918 §9.8.1 / §9.8.3：Destination 为集合 URI 时表示「把这个成员放进该集合」，
+       * 真正的目标键是 `<集合>/<源名>`。旧实现把 Destination 逐字当目标 key，于是在
+       * 对象存储「目录 = 一个以 `/` 结尾的 0 字节占位对象」的模型下：
+       *   `MOVE /dav/z.txt` + `Destination: /dav/target/`
+       *   ⇒ `copyObject('z.txt' → 'target/')` 把文件内容写进**集合占位对象**，
+       *     再 `deleteObject('z.txt')`。回 201，客户端以为成功 —— 而 `target/` 带尾斜杠，
+       *     会被列举/遍历逻辑一律当成目录、`GET /dav/target/` 回 405 ⇒ **数据不再可取**。
+       * 这是「把文件拖进文件夹」这种最普通操作的必然后果，属不可自愈的数据损坏。
+       *
+       * 修法即 RFC 的语义：文件源 + Destination 以 `/` 结尾 ⇒ 目标 = `Destination + 源名`。
+       * 目录源（`srcIsDir`）不受影响：它的目标本来就该是集合前缀本身（见下方目录分支）。
+       */
+      let targetKey = dstKey;
+      if (!srcIsDir && dstKey.endsWith('/')) {
+        const base = srcKey.slice(srcKey.lastIndexOf('/') + 1);
+        if (!base) return res.status(400).type('text/plain').send('400：源路径无效');
+        targetKey = dstKey + base;
+      }
+      /**
+       * 目标键**永远不许以 `/` 结尾**（文件源分支的全部后续操作都以它为写入目标）。
+       * 这是上面那条语义修复的兜底：无论 Destination 写成什么样，文件内容都不会再
+       * 落进集合占位对象里。
+       */
+      if (!srcIsDir && targetKey.endsWith('/')) {
+        return res.status(409).type('text/plain').send('409：目标不能是集合');
+      }
+      // 补上「Destination 带尾斜杠」时的自指：`a.txt` → `Destination: /dav/a.txt/`
+      // 在语义上等于 `a.txt/a.txt`，仍是一次无意义（且会把对象写进自己前缀下）的操作。
+      if (targetKey === srcKey) {
+        return res.status(403).type('text/plain')
+          .send(`403 Forbidden：${isMove ? '移动' : '复制'}目标与源相同`);
+      }
+      /**
        * R25：COPY / MOVE 的配额闸门 —— `addBytes=0`（只拦「已超额」）。
        *
        * 为什么不传源对象大小：COPY 会新增一份占用，但它要么是文件（大小已知需先 HEAD，
@@ -571,11 +645,11 @@ function buildApp() {
       if (!srcIsDir) {
         // 文件
         // R10-11：判据统一走 destinationExists（与目录分支同源）
-        if (!overwrite && await destinationExists(s3, cfg, dstKey, false)) {
+        if (!overwrite && await destinationExists(s3, cfg, targetKey, false)) {
           return res.status(412).end();
         }
         if (isMove) {
-          await gateway.moveObject(cfg.bucket, srcKey, dstKey, 'webdav.move', userLabel);
+          await gateway.moveObject(cfg.bucket, srcKey, targetKey, 'webdav.move', userLabel);
         } else {
           /**
            * R27-06：COPY 是**净增**占用（MOVE 是净零，故不计），必须把真实拷入的
@@ -585,7 +659,7 @@ function buildApp() {
            * 又是「已超额才拒」（`addBytes: 0`），于是在缓存刷新的 15 分钟窗口内可以
            * 把一个大对象反复 COPY 成 copy1/、copy2/…，账面纹丝不动、存储成倍增长。
            */
-          const r = await gateway.copyObject(cfg.bucket, srcKey, dstKey, 'webdav.copy', userLabel);
+          const r = await gateway.copyObject(cfg.bucket, srcKey, targetKey, 'webdav.copy', userLabel);
           if (r && r.bytes) bucketStats.recordUsageDelta(cfg, r.bytes);
         }
         return res.status(201).end();
