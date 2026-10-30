@@ -417,18 +417,34 @@ function visitorIdentity(req) {
 /**
  * R62：读取并校验「当前浏览器选中的券」。
  *
+ * @param {object} [orderHint] 本次请求里刚建好 / 正要展示的那张单（下单后的扫码页用，
+ *   那一秒浏览器还没有支付票据 Cookie，见 `heldCouponState()`）。
  * @returns {null | {code:string, ok:boolean, message:string,
  *                   originalFen?:number, discountFen?:number, payableFen?:number, coupon?:object}}
  *   `null` = 这个浏览器没选券；`ok:false` 的返回**不会**被写进 Cookie（见 `POST /s/:id/coupon`）。
  */
-function couponStateFor(l, req) {
+function couponStateFor(l, req, orderHint) {
   const code = getCookie(req, couponCookieName(l.id));
   if (!code) return null;
   const who = visitorIdentity(req);
   const r = couponStore.validateForUse({
     code, link: l, identity: who.identity, userId: who.userId,
   });
-  if (!r.ok) return { code, ok: false, message: r.message };
+  /**
+   * R96：券「不可用」不等于「这笔交易不享这个优惠」。
+   *
+   * `validateForUse()` 回答的是「**现在**还能不能拿这张券去开一张新单」，而买家
+   * 眼前这笔钱是**在途订单**的金额 —— 券在建单那一刻就核销了，所以只要那张单还
+   * 活着，同一张券对同一身份必然判 `already_used`（`perUserOnce`）；停用 / 过期
+   * 同样会让它判不可用，可订单快照里的券后价不会因此变。
+   *
+   * 旧实现在这里直接认「不可用 ⇒ 按原价渲染 + 不渲染 hidden `coupon`」，于是页面
+   * 与下单侧（`submittedCode` 回落到券 Cookie ⇒ 判 `couponChanged=false` ⇒ 复用 /
+   * 退券重验后按新价建单）给出两个数：**页面 ¥5.00、实扣 ¥4.00**。
+   */
+  if (!r.ok) {
+    return heldCouponState(l, req, code, r.reason, orderHint) || { code, ok: false, message: r.message };
+  }
   return {
     code,
     ok: true,
@@ -438,6 +454,54 @@ function couponStateFor(l, req) {
     payableFen: r.payableFen,
     coupon: r.coupon,
   };
+}
+
+/**
+ * R96：券被判「不可用」时，再问一句「它是不是正被**我自己的在途单**占着」。
+ *
+ * 判据必须与 `POST /s/:id/pay` 的复用/重建逻辑**同一套**，否则两个数又会分叉：
+ *
+ *  · ① **应付额没变**（`computePayable(当前标价, 券) === 在途单金额`）⇒ 下单侧走
+ *    `sameChannel` 复用，实扣就是**订单快照**里的金额（哪怕券已被停用/过期 ——
+ *    网关侧那张单不受券台账影响）。
+ *  · ② **应付额变了**（分享者改价）⇒ 下单侧先退券再重验：只有 `already_used`
+ *    这一种原因会被「退券」治好（券其实好好的，只是被这张单占着），退完按新价
+ *    建单，实扣是 `computePayable(新标价, 券)`。停用/过期/用尽退完照样不可用，
+ *    下单侧会回付费页报错（**不产生扣款**），所以这里返回 `null` 让页面照原样提示。
+ *
+ * @param {object} [orderHint] 本次请求里**刚建好 / 正要展示**的那张单。
+ *   下单成功后的扫码页属于「同一个请求」—— 浏览器这时还没拿到 `sp_<id>_pay` 票据
+ *   Cookie（那正是本次响应 `Set-Cookie` 写下去的），只靠 Cookie 找不到这张单，
+ *   于是页面会把刚核销的券报成「您已使用过该优惠券」。有这个提示就能找到它。
+ * @returns {null | {code, ok:true, message, originalFen, discountFen, payableFen, coupon}}
+ *   `null` = 确实不可用（或这张券不是在途单上的那张）⇒ 调用方按原价渲染。
+ */
+function heldCouponState(l, req, code, reason, orderHint) {
+  const hinted = orderHint && orderHint.status === 'pending' ? orderHint : null;
+  const payer = hinted ? null : payerStateFor(l, req);
+  const order = hinted || (payer && payer.state === 'pending' ? payer.order : null);
+  if (!order || String(order.couponCode || '') !== code) return null;
+  const c = couponStore.findByCode(code);
+  if (!c) return null;
+  const calc = couponStore.computePayable(Number(l.paid && l.paid.amountFen) || 0, c.amountFen);
+  const base = { code, ok: true, message: '', coupon: c };
+  // ① 复用在途单：金额一切以订单快照为准（它才是网关侧那张待收款单上写的数）
+  if (calc.payableFen === Number(order.amountFen)) {
+    return Object.assign(base, {
+      originalFen: Number(order.originalFen) || calc.originalFen,
+      discountFen: Math.max(0, Number(order.discountFen) || 0),
+      payableFen: Number(order.amountFen) || 0,
+    });
+  }
+  // ② 退券重验能治好的唯一一种：券被这张单占着（其余原因退完还是不可用）
+  if (reason === 'already_used') {
+    return Object.assign(base, {
+      originalFen: calc.originalFen,
+      discountFen: calc.discountFen,
+      payableFen: calc.payableFen,
+    });
+  }
+  return null;
 }
 
 /** 手动解析请求头中的 Cookie（避免引入 cookie-parser 依赖） */
@@ -2154,7 +2218,33 @@ router.post('/s/:id/pay', asyncHandler(async (req, res) => {
     || getCookie(req, couponCookieName(l.id));
   const pendingCode = pendingOrder ? String(pendingOrder.couponCode || '') : '';
   const couponChanged = !!pendingOrder && submittedCode !== pendingCode;
-  const sameChannel = !!(pendingOrder && pendingOrder.platform === platform && !couponChanged);
+  /**
+   * R95：**换价即新单**，与「换渠道 / 换券」同构 —— 补上 R84（L-2）那句推理漏掉的一项。
+   *
+   * 那句是「判据只比券码：金额本来就是由券算出来的，券码相同则金额必然相同」。它对，
+   * 但不完整：应付额 = f(标价, 券)。**券码相同只保证第二个入参没变**，分享者在这 2 小时
+   * 保留窗口里改一次价（`PENDING_KEEP_MS`），第一个入参变了照样分叉 —— 而付费页渲染的
+   * 是链接**当前**标价（`payPage()` 里的 `ps.amountFen`），交给网关的却是订单快照
+   * `order.amountFen`。于是「页面 ¥10、实扣 ¥5」或「页面 ¥5、实扣 ¥10」，没有任何提示。
+   *
+   * 判据用**应付额**而不是标价，因为用户看到与网关收到的都是应付额：标价变了但券把它
+   * 抵平（例：原价 5 元 + 5 元券 → 应付 1 分；改成 3 元 + 5 元券 → 仍是 1 分）时
+   * 没有分叉，就不该白白废掉一张能在网关侧直接付的在途单。
+   *
+   * `payableNow` 复算的是「按**当前**标价 + 这张旧单上的券」应付多少 —— 与
+   * `payPage()` / `createCharge()` 用的是同一组纯函数（`couponStore.computePayable()`），
+   * 不另写一份折扣公式。券已被删除 / 改成禁用时 `findByCode()` 取不到 ⇒ 按「无券」算，
+   * 必定与旧单的券后价不等 ⇒ 走新单分支，由那边重新校验并给出「券不可用」。
+   */
+  const payableNow = (() => {
+    const price = Number(ps.amountFen) || 0;
+    if (!pendingOrder || !pendingCode) return price;
+    const c = couponStore.findByCode(pendingCode);
+    return c ? couponStore.computePayable(price, c.amountFen).payableFen : price;
+  })();
+  const priceChanged = !!pendingOrder && Number(pendingOrder.amountFen) !== payableNow;
+  const sameChannel = !!(pendingOrder && pendingOrder.platform === platform
+    && !couponChanged && !priceChanged);
   /**
    * R84（L-3）：**重复提交合并**（见 `findTwinPending()`）。
    *
@@ -2213,12 +2303,23 @@ router.post('/s/:id/pay', asyncHandler(async (req, res) => {
     if (pendingOrder) {
       /**
        * 收尾原因按「到底换了什么」分开记 —— 这是事后查对账时唯一线索：
-       * 用户说「我明明用了券」，得能一眼看出旧单是被换渠道废的，还是被换券废的。
+       * 用户说「我明明用了券」，得能一眼看出旧单是被换渠道废的、被换券废的，
+       * 还是被分享者那一次改价废的（R95 之后共三种）。
        */
       const byCoupon = couponChanged && pendingOrder.platform === platform;
+      const byPrice = !byCoupon && priceChanged;
       const switchText = byCoupon
         ? `更换优惠券（${pendingCode || '无券'} → ${submittedCode || '无券'}）`
-        : `更换支付渠道（${pendingOrder.platform} → ${platform}）`;
+        : byPrice
+          ? `标价变更（原在途单应付 ¥${paymentRules.formatAmount(pendingOrder.amountFen)}`
+            + ` → 现应付 ¥${paymentRules.formatAmount(payableNow)}）`
+          : `更换支付渠道（${pendingOrder.platform} → ${platform}）`;
+      const switchWhat = byCoupon ? '券' : (byPrice ? '价' : '渠道');
+      const voidedReason = byCoupon
+        ? `已更换优惠券（${pendingCode || '无券'} → ${submittedCode || '无券'}），原在途订单作废`
+        : byPrice
+          ? '分享者已调整标价，原在途订单作废'
+          : '已更换支付方式，原在途订单作废';
 
       /**
        * R90（PAY-F1）：**先关网关单，再建新单**。
@@ -2253,7 +2354,7 @@ router.post('/s/:id/pay', asyncHandler(async (req, res) => {
         if (settled && settled.status === 'paid') {
           statsStore.addLog({
             action: 'share.pay', level: 'warn',
-            detail: `分享链接 ${statsStore.logRef(l.id)} 的订单 ${pendingOrder.id} 在换${byCoupon ? '券' : '渠道'}时发现**已完成支付**：`
+            detail: `分享链接 ${statsStore.logRef(l.id)} 的订单 ${pendingOrder.id} 在换${switchWhat}时发现**已完成支付**：`
               + '已按该笔交付，本次不再建新单（IP：' + ip + '）',
           });
           return res.redirect(303, '/s/' + encodeURIComponent(l.id) + '?e=paid');
@@ -2279,17 +2380,12 @@ router.post('/s/:id/pay', asyncHandler(async (req, res) => {
         });
       }
 
-      paymentOrders.markFailed(pendingOrder.id, byCoupon
-        ? `已更换优惠券（${pendingCode || '无券'} → ${submittedCode || '无券'}），原在途订单作废`
-        : '已更换支付方式，原在途订单作废');
+      paymentOrders.markFailed(pendingOrder.id, voidedReason);
       releaseCouponForOrder(pendingOrder);
       statsStore.addLog({
         action: 'share.pay', level: 'warn',
-        detail: byCoupon
-          ? `分享链接 ${statsStore.logRef(l.id)} 更换优惠券（${pendingCode || '无券'} → ${submittedCode || '无券'}）：`
-            + `原在途订单 ${pendingOrder.id} 已作废并退券，本次另建新单（IP：${ip}）`
-          : `分享链接 ${statsStore.logRef(l.id)} 更换支付渠道（${pendingOrder.platform} → ${platform}）：`
-            + `原在途订单 ${pendingOrder.id} 已作废，本次另建新单（IP：${ip}）`,
+        detail: `分享链接 ${statsStore.logRef(l.id)} ${switchText}：原在途订单 ${pendingOrder.id} 已作废`
+          + `${pendingCode ? '并退券' : ''}，本次另建新单（IP：${ip}）`,
       });
     }
     /**
@@ -2400,7 +2496,7 @@ router.post('/s/:id/pay', asyncHandler(async (req, res) => {
    * 遇到「渠道已停用」时的处置保持一致。
    */
   if (order.qrPayload) {
-    return payPage(res, l, ps, available, '', '', couponStateFor(l, req), {
+    return payPage(res, l, ps, available, '', '', couponStateFor(l, req, order), {
       qr: qrBoxHtml(order.qrPayload, (paymentProviders.platform(order.platform) || {}).name || order.platform),
       order,
     });
@@ -2467,7 +2563,7 @@ router.post('/s/:id/pay', asyncHandler(async (req, res) => {
    * （见 `qrBoxHtml()` 的说明），网关返回的 SVG 只当「有没有拿到码」的信号用。
    */
   if (charge.kind === 'qrcode' && charge.codeUrl) {
-    return payPage(res, l, ps, available, '', '', couponStateFor(l, req), {
+    return payPage(res, l, ps, available, '', '', couponStateFor(l, req, order), {
       qr: qrBoxHtml(charge.codeUrl, (paymentProviders.platform(order.platform) || {}).name || order.platform),
       order,
     });

@@ -136,14 +136,211 @@ test('编码结果满足 QR 的结构约束', () => {
   }
 });
 
-test('回读格式信息：应命中纠错级别 M 下的某一掩码（位序 bit14→bit0）', () => {
-  const q = qr.encode('weixin://wxpay/bizpayurl?pr=abcdefg');
-  const read = [];
-  for (let i = 0; i <= 5; i++) read.push(q.modules[8][i]);
-  read.push(q.modules[8][7], q.modules[8][8], q.modules[7][8]);
-  for (let i = 9; i <= 14; i++) read.push(q.modules[14 - i][8]);
-  const s = read.slice().reverse().join(''); // get(i) 是 bit i，标准串按 bit14→bit0 书写
-  assert(FORMAT_M.includes(s), `回读的格式串 ${s} 应命中 M 级别掩码之一`);
+test('格式信息落在标准位置：回读值与 encode() 实际使用的掩码一致（R95）', () => {
+  const samples = [
+    'weixin://wxpay/bizpayurl?pr=abcdefg',
+    'https://example.com/s/abcdefghijklmnop',
+    'x'.repeat(120),
+  ];
+  for (const text of samples) {
+    const q = qr.encode(text);
+    const r = readFormatAtStandardPositions(q.modules);
+    // 判据落在**位置**上：主副本与副本都必须「精确命中」（距离 0）某个合法码字，
+    // 且解出的 (纠错级别, 掩码) 等于编码器真正用的那一组。
+    // 旧实现把每个 bit 的 (行, 列) 整体写反 ⇒ 读回来是正确串的逐位颠倒，
+    // 它往往离**别的**合法码字只差 3 位（BCH 能纠 3 位），所以必须要求距离 0。
+    assertEqual(r.ec, 0, `版本 ${q.version}：「${text.slice(0, 12)}…」的纠错级别应为 M（00），实际 ${r.ec}`);
+    assertEqual(r.maskA, q.mask, `版本 ${q.version}：主副本读出的掩码应等于 encode() 使用的 ${q.mask}`);
+    assertEqual(r.maskB, q.mask, `版本 ${q.version}：副本读出的掩码应等于 encode() 使用的 ${q.mask}`);
+  }
+});
+
+/* ================================================================== *
+ * 5 · 独立解码（R95）：把矩阵真的解回原文
+ * ================================================================== */
+
+/**
+ * 为什么要有这一节：「回读自己写的位置」永远自洽 —— 行列写反也不报错。
+ * 旧用例（`modules[8][i]` 读回、再 reverse 后比 `FORMAT_M`）验的是「这 15 位按**实现
+ * 的**位序读出来是个合法 M 级码字」，对「位置对不对」一无所知；而 `placeFormat()`
+ * 的行列互换恰好是「位序内部自洽、位置全错」，于是整片测试区从它眼皮底下通过。
+ *
+ * 这一段是**按 ISO/IEC 18004 另写一份解码器**（功能图案占位、格式信息位置、掩码、
+ * 蛇形走位、反交织、RS 校验子、Byte 模式解析），不复用 `server/qrcode.js` 的任何
+ * 布局函数。它能解回原文，才说明「扫码器扫得出来」。
+ */
+
+const QR_M_BLOCKS = [null,
+  { b: [16], ec: 10 }, { b: [28], ec: 16 }, { b: [44], ec: 26 }, { b: [32, 32], ec: 18 },
+  { b: [43, 43], ec: 24 }, { b: [27, 27, 27, 27], ec: 16 }, { b: [31, 31, 31, 31], ec: 18 },
+  { b: [38, 38, 39, 39], ec: 22 }, { b: [36, 36, 36, 37, 37], ec: 22 },
+  { b: [43, 43, 43, 43, 44], ec: 26 }];
+
+const QR_ALIGN = [null, [], [6, 18], [6, 22], [6, 26], [6, 30], [6, 34], [6, 22, 38], [6, 24, 42], [6, 26, 46], [6, 28, 50]];
+
+/** BCH(15,5) 生成多项式 0x537，异或掩模 0x5412 —— 32 个合法格式码字 */
+const FORMAT_WORDS = (() => {
+  const out = [];
+  for (let ec = 0; ec < 4; ec++) {
+    for (let m = 0; m < 8; m++) {
+      const d0 = (ec << 3) | m;
+      let d = d0 << 10;
+      for (let i = 0; i < 5; i++) if ((d >>> (14 - i)) & 1) d ^= 0x537 << (4 - i);
+      out.push({ ec, mask: m, word: ((d0 << 10) | d) ^ 0x5412 });
+    }
+  }
+  return out;
+})();
+
+function bitDiff(a, b) {
+  let v = a ^ b, n = 0;
+  while (v) { n += v & 1; v >>= 1; }
+  return n;
+}
+
+/**
+ * ISO/IEC 18004 §7.9.1 规定的格式信息位置（`m[行][列]`）。
+ *
+ * 与 ZXing `MatrixUtil.TYPE_INFO_COORDINATES` 的 `(x=列, y=行)` 一一对应：
+ * `{8,0}…{0,8}` 换成本文件的写法则为 bit0~bit5 落在 **(0..5, 8)**（竖条）。
+ */
+function readFormatAtStandardPositions(m) {
+  const size = m.length;
+  const a = [], b = [];
+  for (let i = 0; i <= 5; i++) a[i] = m[i][8];
+  a[6] = m[7][8]; a[7] = m[8][8]; a[8] = m[8][7];
+  for (let i = 9; i <= 14; i++) a[i] = m[8][14 - i];
+  for (let i = 0; i <= 7; i++) b[i] = m[8][size - 1 - i];
+  for (let i = 8; i <= 14; i++) b[i] = m[size - 15 + i][8];
+  const toInt = (bits) => bits.reduce((s, bit, i) => s + (bit << i), 0);
+  const pick = (bits) => {
+    const w = toInt(bits);
+    const hit = FORMAT_WORDS.find((v) => bitDiff(w, v.word) === 0);
+    return hit ? { ec: hit.ec, mask: hit.mask } : { ec: -1, mask: -1 };
+  };
+  const pa = pick(a), pb = pick(b);
+  return { ec: pa.ec, maskA: pa.mask, maskB: pb.mask };
+}
+
+const QR_MASKS = [
+  (r, c) => (r + c) % 2 === 0, (r) => r % 2 === 0, (r, c) => c % 3 === 0,
+  (r, c) => (r + c) % 3 === 0, (r, c) => (Math.floor(r / 2) + Math.floor(c / 3)) % 2 === 0,
+  (r, c) => ((r * c) % 2) + ((r * c) % 3) === 0,
+  (r, c) => (((r * c) % 2) + ((r * c) % 3)) % 2 === 0,
+  (r, c) => (((r + c) % 2) + ((r * c) % 3)) % 2 === 0,
+];
+
+/** 功能图案占位图（独立按规范算，不读 qrcode.js 的 flag） */
+function qrFuncMap(version) {
+  const size = version * 4 + 17;
+  const f = Array.from({ length: size }, () => new Array(size).fill(false));
+  const mark = (r, c) => { if (r >= 0 && r < size && c >= 0 && c < size) f[r][c] = true; };
+  for (const [r0, c0] of [[0, 0], [0, size - 7], [size - 7, 0]]) {
+    for (let dr = -1; dr <= 7; dr++) for (let dc = -1; dc <= 7; dc++) mark(r0 + dr, c0 + dc);
+  }
+  for (let i = 0; i < size; i++) { mark(6, i); mark(i, 6); }
+  const co = QR_ALIGN[version] || [];
+  for (const r0 of co) for (const c0 of co) {
+    if ((r0 === 6 && c0 === 6) || (r0 === 6 && c0 === size - 7) || (r0 === size - 7 && c0 === 6)) continue;
+    for (let dr = -2; dr <= 2; dr++) for (let dc = -2; dc <= 2; dc++) mark(r0 + dr, c0 + dc);
+  }
+  for (let i = 0; i <= 8; i++) { mark(8, i); mark(i, 8); }
+  for (let i = 0; i < 8; i++) { mark(8, size - 1 - i); mark(size - 1 - i, 8); }
+  if (version >= 7) {
+    for (let i = 0; i < 6; i++) for (let j = 0; j < 3; j++) { mark(i, size - 11 + j); mark(size - 11 + j, i); }
+  }
+  return f;
+}
+
+/** 按规范顺序读码字（右下角起、两列一组蛇形、跳过第 6 列），并就地反掩码 */
+function qrReadCodewords(m, f, mask) {
+  const size = m.length, bits = [];
+  for (let right = size - 1; right >= 1; right -= 2) {
+    if (right === 6) right = 5;
+    for (let vert = 0; vert < size; vert++) {
+      for (let k = 0; k < 2; k++) {
+        const upward = ((right + 1) & 2) === 0;
+        const row = upward ? size - 1 - vert : vert;
+        const col = k === 0 ? right : right - 1;
+        if (col < 0 || f[row][col]) continue;
+        bits.push(m[row][col] ^ (QR_MASKS[mask](row, col) ? 1 : 0));
+      }
+    }
+  }
+  const out = [];
+  for (let i = 0; i + 8 <= bits.length; i += 8) {
+    let v = 0;
+    for (let j = 0; j < 8; j++) v = (v << 1) | bits[i + j];
+    out.push(v);
+  }
+  return out;
+}
+
+/** RS 校验子：整块（数据 + 纠错）在 α^0…α^(ec-1) 处必须全为 0 */
+function qrRsClean(block, ecLen) {
+  for (let i = 0; i < ecLen; i++) {
+    let acc = 0;
+    for (const cw of block) acc = qr.gfMul(acc, alphaPow(i)) ^ cw;
+    if (acc !== 0) return false;
+  }
+  return true;
+}
+
+/**
+ * 独立解码。返回 `{ok, text, mask, ec}`；失败时 `why` 说明卡在哪一步 ——
+ * 「格式信息读不出来」「RS 校验不过」「模式不对」是三类完全不同的病因。
+ */
+function qrDecode(m) {
+  const size = m.length;
+  const version = (size - 17) / 4;
+  const fmt = readFormatAtStandardPositions(m);
+  if (fmt.ec < 0 || fmt.maskA !== fmt.maskB) return { ok: false, why: '格式信息在标准位置读不出合法的 (级别, 掩码)' };
+  if (fmt.ec !== 0) return { ok: false, why: `纠错级别不是 M（读到 ${fmt.ec}）` };
+  const tbl = QR_M_BLOCKS[version];
+  if (!tbl) return { ok: false, why: `版本 ${version} 超出本解码器表` };
+  const cw = qrReadCodewords(m, qrFuncMap(version), fmt.maskA);
+  // 反交织：先按「第 i 个字节取自各块」摊平，再按块长度切回
+  const datas = tbl.b.map(() => []);
+  let p = 0;
+  for (let i = 0; i < Math.max.apply(null, tbl.b); i++) {
+    for (let bi = 0; bi < tbl.b.length; bi++) if (i < tbl.b[bi]) datas[bi].push(cw[p++]);
+  }
+  const ecs = tbl.b.map(() => []);
+  for (let i = 0; i < tbl.ec; i++) for (let bi = 0; bi < tbl.b.length; bi++) ecs[bi].push(cw[p++]);
+  for (let bi = 0; bi < tbl.b.length; bi++) {
+    if (!qrRsClean(datas[bi].concat(ecs[bi]), tbl.ec)) {
+      return { ok: false, why: `第 ${bi + 1} 块的 RS 校验子不为 0（按格式信息解不出内容）` };
+    }
+  }
+  const data = datas.reduce((s, b) => s.concat(b), []);
+  const bs = [];
+  for (const byte of data) for (let j = 7; j >= 0; j--) bs.push((byte >>> j) & 1);
+  let at = 0;
+  const take = (n) => { let v = 0; for (let i = 0; i < n; i++) { v = (v << 1) | bs[at]; at += 1; } return v; };
+  const mode = take(4);
+  if (mode !== 0b0100) return { ok: false, why: `模式指示符不是 Byte（读到 ${mode.toString(2)}）` };
+  const len = take(version <= 9 ? 8 : 16);
+  const bytes = [];
+  for (let i = 0; i < len; i++) bytes.push(take(8));
+  return { ok: true, text: Buffer.from(bytes).toString('utf8'), mask: fmt.maskA, ec: fmt.ec };
+}
+
+test('独立解码器：能把矩阵解回原文（这才是「扫码器扫得出来」）', () => {
+  const samples = [
+    'weixin://wxpay/bizpayurl?pr=abcdefg',
+    'https://example.com/s/abcdefghijklmnop',
+    'A'.repeat(60),                      // 版本 4：两块交织
+    'B'.repeat(120),                     // 版本 7：四块 + 版本信息位
+    'C'.repeat(200),                     // 版本 10：五块（块长不等）
+  ];
+  for (const text of samples) {
+    const q = qr.encode(text);
+    assert(q, `「${text.slice(0, 8)}…」应编码成功`);
+    const r = qrDecode(q.modules);
+    assert(r.ok, `「${text.slice(0, 8)}…」（版本 ${q.version}）解不出来：${r.why}`);
+    assertEqual(r.text, text, `解出的内容应与原文逐字相同（版本 ${q.version}）`);
+    assertEqual(r.mask, q.mask, `解出的掩码应等于编码器实际使用的掩码（版本 ${q.version}）`);
+  }
 });
 
 test('SVG 输出：尺寸与内容正确', () => {

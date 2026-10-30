@@ -10783,7 +10783,7 @@ const CASES = [
       file: 'server/share-routes.js',
       // R84（L-2）给判据加了 `&& !couponChanged`，本条随之**重锚**：
       // 形态仍是「只要求有在途单」—— 把渠道与券的比较一起去掉正是最彻底的退化。
-      anchor: '  const sameChannel = !!(pendingOrder && pendingOrder.platform === platform && !couponChanged);',
+      anchor: "  const sameChannel = !!(pendingOrder && pendingOrder.platform === platform\n    && !couponChanged && !priceChanged);",
       replacement: '  const sameChannel = !!pendingOrder; // R82 反向变异：不看渠道就复用',
       testFile: 'audit82-regressions.test.js',
       minFail: 2,
@@ -10797,7 +10797,7 @@ const CASES = [
        */
       name: 'R82-01b · 换渠道时不收尾原在途订单（后台永远停在「支付中」）',
       file: 'server/share-routes.js',
-      anchor: "      paymentOrders.markFailed(pendingOrder.id, byCoupon\n        ? `已更换优惠券（${pendingCode || '无券'} → ${submittedCode || '无券'}），原在途订单作废`\n        : '已更换支付方式，原在途订单作废');",
+      anchor: '      paymentOrders.markFailed(pendingOrder.id, voidedReason);',
       replacement: '      void byCoupon; // R82 反向变异：不收尾原在途订单',
       testFile: 'audit82-regressions.test.js',
       minFail: 2,
@@ -10826,7 +10826,7 @@ const CASES = [
        */
       name: 'R82-03a · 同渠道也不复用（每次点击都新建订单）',
       file: 'server/share-routes.js',
-      anchor: '  const sameChannel = !!(pendingOrder && pendingOrder.platform === platform && !couponChanged);',
+      anchor: "  const sameChannel = !!(pendingOrder && pendingOrder.platform === platform\n    && !couponChanged && !priceChanged);",
       replacement: '  const sameChannel = false; // R82 反向变异：永不复用',
       testFile: 'audit82-regressions.test.js',
       minFail: 1,
@@ -11049,8 +11049,8 @@ const CASES = [
        */
       name: 'R84-08a · 复用在途订单时忽略新提交的券（页面价与实扣价分叉）',
       file: 'server/share-routes.js',
-      anchor: '  const sameChannel = !!(pendingOrder && pendingOrder.platform === platform && !couponChanged);',
-      replacement: '  const sameChannel = !!(pendingOrder && pendingOrder.platform === platform); // R84 反向变异：不看券',
+      anchor: "  const sameChannel = !!(pendingOrder && pendingOrder.platform === platform\n    && !couponChanged && !priceChanged);",
+      replacement: '  const sameChannel = !!(pendingOrder && pendingOrder.platform === platform && !priceChanged); // R84 反向变异：不看券',
       testFile: 'audit84-regressions.test.js',
       minFail: 1,
     },
@@ -12452,6 +12452,94 @@ const CASES = [
       anchor: '        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262',
       replacement: '        uses: actions/checkout@v4',
       testFile: 'audit94-regressions.test.js',
+      minFail: 1,
+    },
+
+    /* ============================================================== *
+     * R95 台账（《支付系统检查报告》DeepSeek V4.1 Flash 1017）
+     *
+     * 报告 2 条结论全部成立，故这一轮**没有**「判为幻觉」的条目进
+     * `Audit_illusion_report.md`（只登记了第 4 节那条未验证线索）。
+     * 两条都是「一旦退回旧实现，用户当场付不了钱 / 付错钱」的形态，
+     * 因此都要求「退回旧代码必须变红」。
+     * ============================================================== */
+    {
+      /**
+       * 格式信息的 (行, 列) 写反 ⇒ 解码器在标准位置读回来是「正确串的逐位颠倒」，
+       * BCH 把它纠成另一组 (级别, 掩码) ⇒ 微信 Native / 支付宝当面付 / 分享二维码
+       * 全部扫不出内容。判据是 `tests/qrcode.test.js` 的独立解码器（解不回原文即红）。
+       *
+       * 变异只改**一行**（主副本的前 6 位），副本仍是对的 —— 这正是最容易被
+       * 「只比两份副本是否一致」的判据放过的形态，故那条判据要求「各自精确命中」。
+       */
+      name: 'R95-01a · 二维码格式信息行列写反（扫码器读不出掩码，二维码全废）',
+      file: 'server/qrcode.js',
+      anchor: '  for (let i = 0; i <= 5; i++) m[i][8] = get(i);',
+      replacement: '  for (let i = 0; i <= 5; i++) m[8][i] = get(i);',
+      testFile: 'qrcode.test.js',
+      minFail: 2,
+    },
+    {
+      /**
+       * 复用判据不看金额 ⇒ 分享者改价后，付费页显示新价、网关收到旧价。
+       * 变异把 `!priceChanged` 去掉，正是 R84（L-2）留在原地的那个缺口。
+       */
+      name: 'R95-02a · 复用在途订单不看应付额（改价后页面价 ≠ 实扣价）',
+      file: 'server/share-routes.js',
+      anchor: '    && !couponChanged && !priceChanged);',
+      replacement: '    && !couponChanged);',
+      testFile: 'audit95-regressions.test.js',
+      minFail: 2,
+    },
+    {
+      /**
+       * 把「应付额」判据退化成「标价」判据 ⇒ 标价变了但券后应付没变的订单被白白
+       * 作废（多一笔出网、退一次券）。它是上一条的**反面**：只守「必须新建」
+       * 而不管「不该新建」，就会把正常复用改坏。
+       */
+      name: 'R95-03a · 改价判据退化成比标价（券后应付不变也强制作废旧单）',
+      file: 'server/share-routes.js',
+      anchor: '    return c ? couponStore.computePayable(price, c.amountFen).payableFen : price;',
+      replacement: '    return price;',
+      testFile: 'audit95-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * 券被判「不可用」时**不再回头看那张在途单** ⇒ 付费页按原价渲染，而下单侧
+       * 照旧按券后价复用/重建 —— 报告第 4 节那条「页面 ¥5.00 / 实扣 ¥4.00」。
+       * 变异就是把 `couponStateFor()` 里那个回落整个去掉（回到 R95 的状态）。
+       */
+      name: 'R96-01a · 券被在途单占用时页面按原价渲染（页面价 ≠ 实扣价）',
+      file: 'server/share-routes.js',
+      anchor: '    return heldCouponState(l, req, code, r.reason, orderHint) || { code, ok: false, message: r.message };',
+      replacement: '    return { code, ok: false, message: r.message };',
+      testFile: 'audit96-regressions.test.js',
+      minFail: 4,
+    },
+    {
+      /**
+       * 复用判据退化成「比标价」⇒ 标价没变但挂着券的在途单落进「退券重验」那一支，
+       * 而停用/过期这两种原因退完还是不可用 ⇒ 页面又变回原价。守的是「① 那一支
+       * 用**券后应付**判定，不是用标价判定」。
+       */
+      name: 'R96-02a · 复用判据退化成比标价（挂券的在途单被当成不可用）',
+      file: 'server/share-routes.js',
+      anchor: '  if (calc.payableFen === Number(order.amountFen)) {',
+      replacement: '  if ((Number(l.paid && l.paid.amountFen) || 0) === Number(order.amountFen)) {',
+      testFile: 'audit96-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * 「退券重验」只治 `already_used` 这一种原因 —— 变异把它一并去掉 ⇒ 改价后
+       * 页面按原价渲染，而下单侧退券重验成功、按新价扣券后价，两个数又分叉。
+       */
+      name: 'R96-03a · 改价后不退券重验（页面价 ≠ 实扣价）',
+      file: 'server/share-routes.js',
+      anchor: "  if (reason === 'already_used') {",
+      replacement: '  if (false) {',
+      testFile: 'audit96-regressions.test.js',
       minFail: 1,
     },
   ];

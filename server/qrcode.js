@@ -373,15 +373,29 @@ function placeFormat(m, maskId) {
   const size = m.length;
   const bits = formatBits(maskId);
   const get = (i) => (bits >>> i) & 1;
-  // 左上（横 + 竖）
-  for (let i = 0; i <= 5; i++) m[8][i] = get(i);
-  m[8][7] = get(6);
+  /**
+   * R95：写入坐标按 ISO/IEC 18004 §7.9.1 摆放（`m[行][列]`）。
+   *
+   * 旧实现把每个 bit 的 (行, 列) 整体写反了：`m[8][i]` 写的是「第 8 行第 i 列」，
+   * 而标准要求 bit0~bit5 竖排在**第 8 列**的 0~5 行。后果是解码器在标准位置读到的
+   * 15 位恰好是正确串的**逐位颠倒**（只有 m[8][8] 是不动点），BCH 把它"纠"成另一组
+   * (纠错级别, 掩码) 参数，于是数据区写得再对也解不出内容 —— 微信 Native / 支付宝
+   * 当面付 / 分享二维码全部扫不出来。数据区、纠错码、掩码选择与版本表都没有问题，
+   * 唯一错的就是这 15 个比特的位置，所以修法只有坐标。
+   *
+   * 两份副本同样按标准的坐标写，不再"照抄互换后的主副本"：
+   *  · bit0~bit7  → (8, size-1 … size-8)
+   *  · bit8~bit14 → (size-7 … size-1, 8)
+   */
+  // 主副本（左上，紧贴定位图案）
+  for (let i = 0; i <= 5; i++) m[i][8] = get(i);
+  m[7][8] = get(6);
   m[8][8] = get(7);
-  m[7][8] = get(8);
-  for (let i = 9; i <= 14; i++) m[14 - i][8] = get(i);
-  // 右上 + 左下（副本）
-  for (let i = 0; i <= 7; i++) m[size - 1 - i][8] = get(i);
-  for (let i = 8; i <= 14; i++) m[8][size - 15 + i] = get(i);
+  m[8][7] = get(8);
+  for (let i = 9; i <= 14; i++) m[8][14 - i] = get(i);
+  // 副本（右上 + 左下）
+  for (let i = 0; i <= 7; i++) m[8][size - 1 - i] = get(i);
+  for (let i = 8; i <= 14; i++) m[size - 15 + i][8] = get(i);
   m[size - 8][8] = 1; // 固定深色模块
 }
 
@@ -390,7 +404,7 @@ function placeFormat(m, maskId) {
 /**
  * 生成二维码矩阵
  * @param {string} text 待编码内容
- * @returns {{version: number, size: number, modules: number[][]}|null} 超出容量返回 null
+ * @returns {{version: number, size: number, mask: number, modules: number[][]}|null} 超出容量返回 null
  */
 function encode(text) {
   const bytes = Buffer.from(String(text), 'utf8');
@@ -413,15 +427,17 @@ function encode(text) {
   placeData(m, f, codewords, version);
 
   // 8 种掩码各算一次惩罚分，取最低者（掩码编号会写进格式信息，编码与解码因此一致）
-  let best = null, bestScore = Infinity;
+  let best = null, bestScore = Infinity, bestMask = -1;
   for (let id = 0; id < 8; id++) {
     const cand = m.map((row) => row.slice());
     applyMask(cand, f, id);
     placeFormat(cand, id);
     const s = penalty(cand);
-    if (s < bestScore) { bestScore = s; best = cand; }
+    if (s < bestScore) { bestScore = s; best = cand; bestMask = id; }
   }
-  return { version, size, modules: best };
+  // `mask` 一并返回：解码/排查时「这张码用的是哪套掩码」是第一个要问的问题，
+  // 而从矩阵反推需要重算格式信息表（R95 的回归测试正是这么用的）。
+  return { version, size, mask: bestMask, modules: best };
 }
 
 /**
