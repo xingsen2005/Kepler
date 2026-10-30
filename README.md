@@ -4,13 +4,26 @@
 
 **此为项目介绍与快速开始教程，开发文档因篇幅原因已分离，本文档仅简单讲述如何使用，任何理解项目本身、二次开发等需求请阅读 [Develop_Document.md](./Develop_Document.md)。**
 
-**一键部署**：把下面两行整段复制到终端执行：
+<h1>〇、极速部署</h1>
+
+以 AWS EC2 实例为例：
+
+1. 创建服务器时，任意选择一个较高版本的 Linux 系统（这可以有效防止 Node 环境安装失败）；
+2. 创建密钥对，保存 pem 格式的密钥文件（AWS 服务器没有密码，仅允许使用密钥对连接）；
+3. 创建/修改安全组（默认名为 default），入站规则放行 22、80、443、3000、3443、8443 端口（类型选择 自定义 TCP，源信息设置为 0.0.0.0/0），出站规则放行所有 TCP；
+4. 使用 XShell 等工具连接服务器；
+5. 在 AWS 控制台点击“连接”，选择“在 SSH 客户端中”，可以看到连接要使用的用户名；
+6. SSH 客户端会自动识别到这是必须使用密钥对连接的服务器类型：浏览选择 pem 文件，密码留空。
+
+7. 把下面两行整段复制到终端执行：
 
 ```bash
 curl -fLo /tmp/kepler-deploy.sh https://raw.githubusercontent.com/xingsen2005/Kepler/main/deploy.sh \
   && sudo bash /tmp/kepler-deploy.sh
 ```
 > 成功安装后，可在控制台任意位置执行 `kepler` 指令（需 root权限），进入数字选单，可执行更新、修改端口、修改初始管理员用户名、修改初始管理员密码及卸载操作。
+
+阿里云、腾讯云等服务器实例比 AWS 简单的多，在此不再赘述。
 
 ---
 
@@ -111,7 +124,7 @@ npm run lint     # 代码检查（ESLint 可选，未安装时给出安装指引
 | --- | --- |
 | `npm start` | 启动服务（HTTP + HTTPS） |
 | `npm run dev` | 开发模式，`node --watch` 监听文件变更自动重启（Node 内置，无需 nodemon） |
-| `npm test` | 运行 `tests/**/*.test.js` 全部测试（94 个文件 / 1559 条用例，零新增依赖） |
+| `npm test` | 运行 `tests/**/*.test.js` 全部测试（96 个文件 / 1632 条用例，零新增依赖） |
 | `npm run test:watch` | 测试监听模式，代码变更后即时重跑 |
 | `npm run lint` | ESLint 检查；未安装 eslint 时降级提示安装命令，不阻断流程 |
 
