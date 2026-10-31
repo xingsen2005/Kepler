@@ -30,6 +30,12 @@ const roles = require('../roles');
 const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
+/**
+ * R98：注销申请的冷静期。登录成功是"撤销注销"的**唯一自动入口**，
+ * 因此这里必须能拿到"真正删除一个账户"的实现（到期未清扫时由登录路径执行）。
+ * 政策（15 天）与清理动作都在 `account-deletion.js`，本模块不自己算日期。
+ */
+const accountDeletion = require('../account-deletion');
 
 const router = express.Router();
 
@@ -108,13 +114,58 @@ async function precheckLogin(req, res, username) {
 function completeLogin(res, user, remember, ip) {
   security.loginLock.reset(loginLockKey(ip || '', user.username));
   security.resetAccountFail(user.username); // R69：成功一次即清掉跨 IP 累计
+  /**
+   * R98：注销冷静期的**唯一自动撤销点**。
+   *
+   * 产品口径是「提交申请后 15 天自动删除，期间再次登录即可立即撤销」。放在这里而不是
+   * 放在登录页 / 前端，是因为"登录成功"是一个**服务端事实**：不论走密码、走 Windows
+   * Hello、还是将来多一种二次验证，只要真正通过了，就必须撤销 —— 否则同一次登录
+   * 在两条路径上会有两种结果（一条撤销、一条不撤销），而用户完全看不出来。
+   *
+   * 两种分支：
+   *  ① **未到期** ⇒ 撤销申请，并在响应里带 `deletionCancelled`，让界面如实告知
+   *     （"你的注销申请已撤销"必须被说出来，否则用户会以为账户仍将被删除）；
+   *  ② **已到期** ⇒ 不再撤销，**当场执行删除**。清扫器每小时才跑一次，若这里放行，
+   *     就会出现"过了 15 天还能靠登录续命"的窗口 —— 那与承诺的"自动删除"不符。
+   *     删除失败（例如库里只剩这一个管理员）时不签发会话：账户已处于"应删"状态，
+   *     让它继续可用比拒绝登录更危险。
+   */
+  let deletionCancelled = false;
+  let view = user;
+  if (user && user.deletion) {
+    if (Date.parse(user.deletion.deleteAt) <= Date.now()) {
+      try {
+        accountDeletion.purgeUser(user.id, '注销申请到期，已自动删除');
+        statsStore.addLog({
+          action: 'users.delete', level: 'warn',
+          detail: `账户「${user.username}」的注销申请已到期，登录时执行删除（清扫器尚未跑到）`,
+        });
+        return res.status(403).json({ error: '该账户已注销', deleted: true });
+      } catch (e) {
+        statsStore.addLog({
+          action: 'users.delete', level: 'error',
+          detail: `账户「${user.username}」到期注销失败：${e.message}`,
+        });
+        return res.status(403).json({ error: '该账户已申请注销，且注销未能完成，请联系管理员' });
+      }
+    }
+    deletionCancelled = configStore.cancelAccountDeletion(user.id);
+    if (deletionCancelled) {
+      const raw = configStore.findUserRawById(user.id);
+      view = raw ? configStore.userView(raw) : user;
+      statsStore.addLog({
+        action: 'users.deletion.cancel', level: 'warn',
+        detail: `用户「${user.username}」登录成功，注销申请已自动撤销`,
+      });
+    }
+  }
   const token = authSession.createSession(user, { remember: !!remember });
   res.setHeader('Set-Cookie', sessionCookie(token));
   statsStore.addLog({
     action: 'auth.login',
     detail: `用户「${user.username}」登录成功${remember ? '（已勾选记住登录状态，有效期 30 天）' : ''}`,
   });
-  return res.json({ ok: true, user });
+  return res.json({ ok: true, user: view, deletionCancelled });
 }
 
 // 登录第一步：校验人机验证与密码；启用 Windows Hello 时返回挑战而不签发会话

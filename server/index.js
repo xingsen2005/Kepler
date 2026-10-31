@@ -13,6 +13,8 @@ const https = require('https');
 const routes = require('./routes');
 const shareRoutes = require('./share-routes');
 const configStore = require('./config-store');
+// R97：主密钥信封（启动期自动解锁 / 锁定态判定）
+const keyring = require('./keyring');
 const uploadSessions = require('./upload-sessions');
 const statsStore = require('./stats-store');
 // R12-07：停机前需把加密元数据的去抖异步写刷干（flushMetaSync）
@@ -26,6 +28,15 @@ const secureStore = require('./secure-store');
 const paymentOrders = require('./payment-orders');
 // R65：订单取回的自动封禁（同样有去抖落盘，停机前要刷一次）
 const restoreGuard = require('./restore-guard');
+/**
+ * R98：注销申请的到期清扫。
+ *
+ * 与 `uploadSessions.prune()` 同一处置：**首次必须等解锁完成**（用户表在 `config.enc` 里，
+ * 锁定态读它会抛 `KEYRING_LOCKED`），之后按小时兜一次。定时器 `unref()`，不阻止进程退出。
+ */
+const accountDeletion = require('./account-deletion');
+// R99：完整性巡检（后台只读体检；判据与门控全在该模块，这里只负责定时调它）
+const integrity = require('./integrity');
 const { gzipMiddleware } = require('./gzip');
 const requestContext = require('./request-context');
 const { loadTlsCert, hintText } = require('./tls-cert');
@@ -204,11 +215,37 @@ const PUBLIC_API = new Set([
   // 不走这条接口，但未登录访客在主站登录页同样要能读到它。返回值受
   // `agreement-view.publicPayload()` 控制：三页全关时连一份正文都不会下发。
   '/site/agreements',
+  // R97：主密钥解锁。锁定态下**没有任何会话**（连根用户都还没登录），若这两条需要
+  // 鉴权就永远走不到 —— 服务会卡在「要解锁才能登录、要登录才能解锁」的死锁里。
+  // 暴露面由 `security.keyUnlockLimiter` + `keyUnlockLock` 约束（见 routes/key.js）。
+  '/key/status', '/key/unlock',
 ]);
+
+/**
+ * R97：**锁定态闸门**必须挂在鉴权之前。
+ *
+ * 锁定态的含义是"进程里没有 DEK，`config.enc` 解不开"。此时：
+ *  · 鉴权本身就要读配置（`findUserRawById`）⇒ 它会在更深的地方抛 `KEYRING_LOCKED`，
+ *    被全局错误中间件兜成 500「服务器内部错误」，前端完全看不出该干什么；
+ *  · 任何一条需要配置的接口都会走到同一个结局。
+ *
+ * 所以在入口处一次性挡住，回一个**可识别**的 503 + `locked: true`，前端据此渲染
+ * 解锁页。放行的只有解锁自身与状态查询 —— 连 `/auth/login` 也要挡：口令哈希就在
+ * 解不开的那份配置里，让它"通过"是不可能的，只会给出误导性的"用户名或密码错误"。
+ */
+const LOCKED_ALLOWED = new Set(['/key/status', '/key/unlock']);
+
 app.use('/api', (req, res, next) => {
   // CSRF：非安全方法必须携带同源自定义头 X-Requested-With（S8）
   if (!security.csrfGuard(req)) {
     return res.status(403).json({ error: '请求缺少同源校验头，已拒绝（CSRF 防护）' });
+  }
+  if (!LOCKED_ALLOWED.has(req.path) && configStore.isLocked()) {
+    return res.status(503).json({
+      error: '服务处于锁定状态：请先提供主口令解锁',
+      locked: true,
+      code: 'KEYRING_LOCKED',
+    });
   }
   if (PUBLIC_API.has(req.path)) return next();
   const token = authSession.parseToken(req);
@@ -533,6 +570,41 @@ if (!lockRes.ok) {
 }
 
 /**
+ * R97：**启动期自动解锁**（无头部署的命门）。
+ *
+ * 启用信封加密之后，进程重启时内存里没有 DEK，`config.enc` 解不开 —— 服务会以
+ * **锁定态**起来。容器 / systemd 场景没人能点前端，靠环境变量里的主口令自动解锁。
+ *
+ * 为什么是"尽力而为"而不是"失败就退出"：口令写错的正确反馈是**让管理员看到
+ * 解锁页**；直接退出会形成"起不来 → 看不到日志 → 改不对变量"的循环，尤其
+ * 容器反复重启时日志很容易被滚掉。锁定态至少是可用（可观测、可人工解锁）的。
+ *
+ * 位置放在单实例锁之后：还没拿到锁的进程不该去动 `data/`。
+ */
+const bootUnlock = keyring.autoUnlockFromEnv()
+  .then((r) => {
+    if (r.ok && r.reason === 'env') {
+      console.log('[Storage Manager] 已用环境变量中的主口令解锁主密钥。');
+    } else if (!r.ok && r.reason !== 'absent' && r.reason !== 'no-passphrase') {
+      // 区分"口令错"（部署配置写错，改 env 即可）与"容器坏"（要运维介入）
+      console.warn(
+        `[Storage Manager] 主密钥自动解锁失败（${r.reason}）：服务将以**锁定态**启动，`
+        + '请在管理界面用主口令解锁。'
+      );
+    } else if (!r.ok && r.reason === 'no-passphrase' && keyring.exists()) {
+      console.warn(
+        `[Storage Manager] 检测到密钥信封但未设置 ${keyring.ENV_PASSPHRASE}：`
+        + '服务以锁定态启动，需人工解锁（无头部署请设置该环境变量）。'
+      );
+    }
+    return r;
+  })
+  .catch((e) => {
+    console.error('[Storage Manager] 主密钥自动解锁异常：', (e && e.message) || e);
+    return { ok: false, reason: 'error' };
+  });
+
+/**
  * 清理过期上传会话（并尽力中止远端分片，避免产生无用存储费用）。
  *
  * R7-07：必须放在单实例锁**之后**。此前它排在锁之前 —— 于是抢锁失败、即将
@@ -555,9 +627,65 @@ const pruneSessions = () => {
     } catch (e) { return null; }
   });
 };
-pruneSessions();
+/**
+ * ⚠️ R97：**首次清扫必须等解锁完成**。
+ *
+ * `uploadSessions.prune()` 会读 `upload-sessions.json`，而它是加密落盘的。锁定态下
+ * 解密必然失败 —— 虽然 `secure-store` 已经会认 `KEYRING_LOCKED` 并原样抛出（不判
+ * 损坏），但那意味着整个启动期的清理会以异常收场。等解锁完成再跑，语义才正确：
+ * "锁定态下什么都不该读数据"。
+ *
+ * 定时器照常注册（一小时一次），不必等 —— 那时多半早已解锁；万一仍未解锁，
+ * 它会和首次清扫一样读到 `KEYRING_LOCKED` 并跳过。
+ */
+bootUnlock.then(() => { try { pruneSessions(); } catch (e) { /* 清扫失败不影响启动 */ } });
 const pruneTimer = setInterval(pruneSessions, PRUNE_INTERVAL_MS);
 if (typeof pruneTimer.unref === 'function') pruneTimer.unref();
+
+/**
+ * R98：注销申请的到期清扫。
+ *
+ * 口径是「提交后 15 天自动删除」，因此**必须有后台执行者** —— 否则只有"下次登录"
+ * 这一条路径（而到期账户往往正好不再登录）。与上面的会话清扫同款：启动跑一次 +
+ * 每小时兜一次，`unref()` 不阻止退出。
+ *
+ * 启动这一次同样等 `bootUnlock`：用户表在加密配置里，锁定态读不到（读到就是异常）。
+ * 锁定态下跳过是正确语义 —— 解锁前"没有能力知道谁到期了"。
+ */
+const DELETION_SWEEP_MS = 60 * 60 * 1000;
+const sweepDeletions = () => {
+  try { accountDeletion.purgeDue(); } catch (e) { /* 单条失败已在内部逐条吞掉，这里兜底 */ }
+};
+bootUnlock.then(() => { sweepDeletions(); });
+const deletionTimer = setInterval(sweepDeletions, DELETION_SWEEP_MS);
+if (typeof deletionTimer.unref === 'function') deletionTimer.unref();
+
+/**
+ * R99：完整性巡检（只读体检）。
+ *
+ * 与上面两个清扫器的差别，也是这里多写一层 `setTimeout` 的理由：
+ *  - 那两位读的是**本地文件**，代价可以忽略；
+ *  - 巡检会**对云端逐个发 HEAD**（每桶每轮上限 `INTEGRITY_BATCH`，默认 200）。
+ *
+ * 因此不能"解锁瞬间就打满"：容器刚起来时前端正在并发拉列表、读配置，此时再叠上
+ * 上百个 HEAD，用户看到的就是"刚部署完特别卡"。这里延迟 `FIRST_RUN_DELAY_MS`
+ * 再跑首轮，之后按间隔走。
+ *
+ * ⚠️ 定时器**不等解锁**就注册：`integrity.runOnce()` 自己会把「锁定态」作为第一条
+ * 判据并直接返回（原因见该模块文件头 —— 锁定态读 enc-meta 会把元数据锁死），
+ * 所以锁定期间每小时空跑一次是**正确**行为，而不是需要在这里再判一次的状态。
+ */
+const FIRST_RUN_DELAY_MS = 60 * 1000;
+const runIntegrity = () => {
+  if (!integrity.enabled()) return;
+  integrity.runOnce().catch((e) => {
+    console.warn(`[Storage Manager] 完整性巡检失败：${(e && e.message) || e}`);
+  });
+};
+const integrityFirstTimer = setTimeout(runIntegrity, FIRST_RUN_DELAY_MS);
+if (typeof integrityFirstTimer.unref === 'function') integrityFirstTimer.unref();
+const integrityTimer = setInterval(runIntegrity, Math.max(1, integrity.intervalMs()));
+if (typeof integrityTimer.unref === 'function') integrityTimer.unref();
 
 /**
  * 清扫历史遗留的孤儿临时文件。

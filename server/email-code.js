@@ -39,11 +39,15 @@ const {
 /**
  * 验证码的用途。
  *
- * 两个用途**必须分开存**，不能只按邮箱存一份：否则用户点「修改邮箱」拿到一个码，
+ * 三种用途**必须分开存**，不能只按邮箱存一份：否则用户点「修改邮箱」拿到一个码，
  * 转头把它填进「忘记密码」也成立 —— 而这两件事的信任前提完全不同
  * （前者是「已登录的人在证明自己拥有新邮箱」，后者是「没登录的人在要回账户」）。
+ *
+ * R98 新增 `delete`（注销账户）：它同样是「已登录的人在证明自己拥有绑定邮箱」，
+ * 但**不能与 `verify` 混用**。共用一份的话，将来任何一处放宽 verify 的用途
+ * （比如允许拿它做"确认操作"）都会顺带把注销也放宽，而注销是不可逆的。
  */
-const CODE_PURPOSES = ['verify', 'reset'];
+const CODE_PURPOSES = ['verify', 'reset', 'delete'];
 
 /** 键 = `${purpose}|${email}` */
 const codes = new Map();
@@ -407,16 +411,35 @@ async function sendCodeMail({ purpose, email, username, code }) {
   const { cfg, gate } = mailerState();
   if (gate) throw Object.assign(new Error(gate.error), { status: gate.status });
   const siteName = configStore.siteView(configStore.load()).siteName;
-  const title = purpose === 'reset' ? '重置密码' : '验证邮箱';
-  const subject = `${siteName} ${title}验证码`;
+  /**
+   * R98：文案与用途**一一对应**。
+   *
+   * `title` 是邮件标题里的动作名，`action` 是正文句子里"正在做什么"—— 两者分开写，
+   * 是因为中文里「为账户「alice」注销账户」读不通。这里用表而不是嵌套三元：
+   * 新增用途时忘了补文案会得到一个 `verify` 的老文案（把注销说成"验证邮箱"），
+   * 用户会以为点错了地方。表里显式列全，缺项时回退到 verify 只作为兜底。
+   */
+  const COPY = {
+    reset: { title: '重置密码', action: '重置密码' },
+    delete: { title: '注销账户', action: '申请注销账户' },
+    verify: { title: '验证邮箱', action: '验证邮箱' },
+  };
+  const copy = COPY[purpose] || COPY.verify;
+  const subject = `${siteName} ${copy.title}验证码`;
   const who = username ? `账户「${username}」` : '您的账户';
   const text = [
-    `您正在为${who}${title}。`,
+    `您正在为${who}${copy.action}。`,
     '',
     `验证码：${code}`,
     '',
     `有效期 ${Math.round(EMAIL_CODE_TTL_MS / 60000)} 分钟，请勿转告他人。`,
-    '如果这不是您本人的操作，请忽略本邮件（您的账户不会因此受到影响）。',
+    /**
+     * 注销的提醒必须与其它两种**不同**：这里"忽略本邮件"不等于"什么都没发生" ——
+     * 申请已经生效，只是还在 15 天冷静期里。要告诉用户怎么补救。
+     */
+    purpose === 'delete'
+      ? '若这不是您本人的操作，请立即登录本系统撤销该申请并修改登录密码。'
+      : '如果这不是您本人的操作，请忽略本邮件（您的账户不会因此受到影响）。',
     '',
     `—— ${siteName}`,
     '',

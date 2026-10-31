@@ -609,7 +609,10 @@ export function escapeHtml(s) { return String(s).replace(/[&<>"']/g, (c) => ({ '
 export function fmtSize(n) { return n + ' B'; }
 export function fmtTime() { return 'T'; }
 export function isStaffRole(role) { return role === 'admin' || role === 'root'; }
+export function isRootRole(role) { return role === 'root'; }
 export function roleLabel(role) { return role === 'root' ? '根用户' : (role === 'admin' ? '管理员' : '普通用户'); }
+// R98：展示名（昵称优先）—— main.js / profile.js 会具名导入，桩缺一个导出就会在 ESM 链接期整片变红
+export function displayName(u) { return (u && (String(u.nickname || '').trim() || u.username)) || ''; }
 export function toast() {}
 export function confirmDialog() { return Promise.resolve(true); }
 export function openModal() { return { close() {}, bodyEl: {}, overlay: {} }; }
@@ -740,7 +743,10 @@ export const API = {
   fs.writeFileSync(path.join(dir, 'util.js'), `
 export const __toast = (globalThis.__r52Toast = []);
 export function isStaffRole(role) { return role === 'admin' || role === 'root'; }
+export function isRootRole(role) { return role === 'root'; }
 export function roleLabel(role) { return role === 'root' ? '根用户' : (role === 'admin' ? '管理员' : '普通用户'); }
+// R98：展示名（昵称优先）—— main.js / profile.js 会具名导入，桩缺一个导出就会在 ESM 链接期整片变红
+export function displayName(u) { return (u && (String(u.nickname || '').trim() || u.username)) || ''; }
 export function toast(m, o) { globalThis.__r52Toast.push([m, o]); }
 export function confirmDialog() { return Promise.resolve(true); }
 export function promptDialog() { return Promise.resolve('x'); }

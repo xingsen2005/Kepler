@@ -340,6 +340,15 @@ export const API = {
   // 自助资料（普通用户亦可调用；仅允许改用户名与密码）
   myProfile: () => request('GET', '/api/users/me'),
   updateMyProfile: (b) => request('PUT', '/api/users/me', b),
+  /**
+   * R98：注销账户（15 天冷静期）。
+   *
+   * 三步是**有序**的：先发码 → 再提交申请 → 期间可撤销。`cancelAccountDeletion` 同时
+   * 是登录自动撤销之外的手动通道（正登录着的人不必"退出再登录"来反悔）。
+   */
+  deleteAccountCode: () => request('POST', '/api/users/me/deletion/code'),
+  requestAccountDeletion: (code) => request('POST', '/api/users/me/deletion', { code }),
+  cancelAccountDeletion: () => request('DELETE', '/api/users/me/deletion'),
 
   // Windows Hello（WebAuthn）：注册 / 关闭
   webauthnRegisterOptions: (password) => request('POST', '/api/webauthn/register/options', { password }),
@@ -432,6 +441,19 @@ export const API = {
   encStatus: () => request('GET', '/api/enc/status'),
   updateEncSettings: (b) => request('PUT', '/api/enc/settings', b),
   encUnlock: (password) => request('POST', '/api/enc/unlock', { password }),
+
+  // R97：主密钥信封（解锁 / 迁移 / 轮转）。
+  // `keyStatus` / `keyUnlock` 走的是**匿名可达**的两条接口（已登记服务端 PUBLIC_API）——
+  // 锁定态下前端还没有会话，这两条是唯一能用的；它们不签发会话，解锁后仍需正常登录。
+  keyStatus: () => request('GET', '/api/key/status'),
+  keyUnlock: (passphrase) => request('POST', '/api/key/unlock', { passphrase }),
+  keyMigrate: (b) => request('POST', '/api/key/migrate', b),
+  keyRotateLogin: (b) => request('POST', '/api/key/rotate-login', b),
+
+  // R99：完整性巡检（仅管理员）。读状态是纯本地；「立即巡检」会真的对云端发 HEAD，
+  // 因此是 POST —— 它消耗请求配额，且会推进服务端的轮转游标，不是只读查询。
+  integrityStatus: () => request('GET', '/api/integrity'),
+  integrityRun: () => request('POST', '/api/integrity/run'),
 
   // IP 访问屏蔽
   ipGuard: () => request('GET', '/api/ipguard'),

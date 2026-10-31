@@ -43,6 +43,10 @@ const EXPECTED = [
   // 必须是有身份的人，所以不在白名单里。
   'POST /auth/register', 'POST /auth/forgot', 'POST /auth/reset', 'POST /auth/email/code',
   'GET /users/me', 'PUT /users/me',
+  // R98：自助注销（发码 / 提交 / 撤销）。三条都排在 `/users/me` 之后、
+  // `/users/:id` 之前 —— 前两条路径有两段，不会被 `:id` 吞掉；但顺序仍按"自助在前"排，
+  // 免得将来把 `/users/:id` 改成通配时静默接走它们。
+  'POST /users/me/deletion/code', 'POST /users/me/deletion', 'DELETE /users/me/deletion',
   'GET /users', 'POST /users', 'PUT /users/:id', 'DELETE /users/:id', 'POST /users/:id/logout',
   // R33：账户封禁 / 解封（管理员在「用户管理」中的封禁按钮与本行的时间选择器）
   'POST /users/:id/ban', 'POST /users/:id/unban',
@@ -137,6 +141,14 @@ const EXPECTED = [
   'POST /fs/rename', 'POST /fs/move', 'POST /fs/copy', 'POST /fs/delete', 'GET /fs/tree',
   'GET /stats/speed', 'GET /stats/storage', 'GET /stats/summary', 'GET /stats/logs',
   'GET /health',
+  // R97：主密钥信封（解锁 / 迁移 / 轮转）。
+  // 前两条**匿名可达**（已登记进 index.js 的 PUBLIC_API）—— 锁定态下还没有会话，
+  // 若不匿名就永远解不开，服务会死锁在「等解锁」与「等登录」之间；
+  // 后两条仅根用户（不是 requireAdmin：改解锁因子影响全实例解密能力）。
+  'GET /key/status', 'POST /key/unlock', 'POST /key/migrate', 'POST /key/rotate-login',
+  // R99：完整性巡检（只读体检）。两条都仅管理员：结果里含全部桶名与对象键，
+  // 而 `POST /integrity/run` 还会**真的**对云端逐个发 HEAD（消耗真实请求配额）。
+  'GET /integrity', 'POST /integrity/run',
   // R34：「关于」卡片的「检查更新」（服务端代理 GitHub，见 server/update-check.js）
   'GET /update/check',
 ];
@@ -247,6 +259,9 @@ test('敏感接口均挂载 requireAdmin', () => {
     // `GET /coupons` 会原样回传券码明文，少挂一个守卫就等于把券发给所有登录用户。
     'GET /coupons', 'POST /coupons', 'POST /coupons/bulk',
     'POST /coupons/delete', 'PUT /coupons/:id',
+    // R99：巡检结果里有**全部桶名与对象键**（账号资产的另一份清单），
+    // 且 `POST /integrity/run` 会让服务端真的出网 —— 与「连接验证」同级。
+    'GET /integrity', 'POST /integrity/run',
   ];
   const unprotected = mustBeAdmin.filter((r) => !adminGuarded.includes(r));
   assertEqual(unprotected.length, 0,
@@ -324,6 +339,9 @@ test('自助接口不挂 requireAdmin（普通用户必须可用）', () => {
   // 普通用户无法修改自己的资料 / 启用 Windows Hello。
   const selfServe = [
     'GET /users/me', 'PUT /users/me',
+    // R98：注销是"处置自己的账户"，不是管理动作 —— 误挂 requireAdmin 会让普通用户
+    // 永远注销不了，而管理员反倒能注销自己（权限模型颠倒）
+    'POST /users/me/deletion/code', 'POST /users/me/deletion', 'DELETE /users/me/deletion',
     'POST /webauthn/register/options', 'POST /webauthn/register/verify',
     'POST /webauthn/disable',
     'POST /auth/login/webauthn',

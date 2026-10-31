@@ -25,6 +25,7 @@
  *   routes/links.js     分享链接管理
  *   routes/fs.js        文件系统（列表 / 上传 / 下载 / 重命名 / 移动 / 删除）
  *   routes/stats.js     监控统计 + 健康检查
+ *   routes/integrity.js 完整性巡检 / 防勒索校验（R99，仅管理员；只读、不碰密钥）
  *
  * ⚠️ 挂载顺序约束（与拆分前保持一致，勿随意调整）：
  *  1. `/captcha/public` 必须在鉴权白名单内 —— 已在 index.js 的 PUBLIC_API 中声明；
@@ -45,6 +46,11 @@ router.use(require('./routes/captcha'));
 router.use(require('./routes/payment'));
 router.use(require('./routes/webauthn'));
 router.use(require('./routes/config'));
+// R97：密钥管理（4 条）。`GET /key/status` 与 `POST /key/unlock` 是**匿名可达**的
+// （已登记进 index.js 的 PUBLIC_API）—— 锁定态下没有会话，若不匿名就永远解不开，
+// 服务会死锁在"等解锁"与"等登录"之间。另外两条仅根用户。
+// 挂在 config 之后只是就近：它只注册 `/key/*`，与前后模块无路径歧义。
+router.use(require('./routes/key'));
 router.use(require('./routes/buckets'));
 router.use(require('./routes/ipguard'));
 // R37：下载限速的只读查询（`GET /throttle/ceiling`）。挂在这里只是就近 ——
@@ -79,5 +85,13 @@ router.use(require('./routes/coupon'));
 router.use(require('./routes/links'));
 router.use(require('./routes/fs'));
 router.use(require('./routes/stats'));
+/**
+ * R99：完整性巡检（2 条，全部 requireAdmin）。
+ *
+ * 挂在**最后**只是就近与安全：它注册的是 `/integrity` 与 `/integrity/run` 两个字面量
+ * 路径，与前面任何模块都不存在路径歧义；而排在最后可以保证**不会挤动**
+ * `tests/routes-surface.test.js` 里 `/users/me` 那些全局下标断言。
+ */
+router.use(require('./routes/integrity'));
 
 module.exports = router;

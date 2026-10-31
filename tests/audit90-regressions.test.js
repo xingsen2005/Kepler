@@ -234,7 +234,8 @@ test('R90-04 · FS-S1 · 真 HTTP：超限请求的 handler 从未被调用（�
 
 test('R90-05 · 前端：改名分支必须带 currentPassword（空则当场拦下，不裸奔到服务端）', () => {
   const src = readSrc('public/js/profile.js');
-  const start = src.indexOf('async function save(overlay, close) {');
+  // R98：资料编辑由弹窗改为页面后，save() 不再接对话框的 overlay/close
+  const start = src.indexOf('async function save() {');
   assert(start >= 0, 'profile.js 里应存在 save()（取不到 = 本条检查已失效）');
   const end = src.indexOf('const r = await API.updateMyProfile(body);', start);
   assert(end > start, 'save() 里应存在提交动作（取不到 = 本条检查已失效）');

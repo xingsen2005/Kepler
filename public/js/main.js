@@ -1,6 +1,6 @@
 /** 应用入口 —— 全局状态、工具栏、状态栏、视图调度 */
 import { API, setWriteObserver } from './api.js';
-import { toast, fmtSize, openModal, openAgreementDialog, escapeHtml, confirmDialog, showQuotaDialog, banNotice, isStaffRole, roleLabel } from './util.js';
+import { toast, fmtSize, openModal, openAgreementDialog, escapeHtml, confirmDialog, showQuotaDialog, banNotice, isStaffRole, roleLabel, displayName } from './util.js';
 import { explorer } from './explorer.js';
 import { filetype } from './filetype.js';
 import { ops } from './ops.js';
@@ -18,7 +18,7 @@ import * as invitemgr from './invitemgr.js';
 import * as couponmgr from './couponmgr.js';
 import { verifyWindowsHello, webauthnSupported } from './webauthn.js';
 import { providerMeta } from './provider-logos.js';
-import { openProfileDialog } from './profile.js';
+import { openProfilePage, refreshProfilePage } from './profile.js';
 // R70：PWA（Service Worker 注册 / 「安装到桌面」入口）。刻意**不**在此处做任何 I/O ——
 // 真正的监听与注册在 init() 里由 initPwa() 一次性挂上，模块加载期无副作用。
 import * as pwa from './pwa.js';
@@ -279,6 +279,26 @@ async function init() {
    * 失败也不会让 init() 连锁中断。
    */
   pwa.initPwa();
+
+  /**
+   * R97：**先问密钥状态**，锁定则直接停在解锁页。
+   *
+   * 必须排在下面三次请求（站点名 / 协议正文 / 鉴权探测）之前：锁定态下它们全部
+   * 回 503（口令哈希就在那份解不开的配置里，连登录都无从谈起），先打一遍只会
+   * 让页面闪一下"加载失败"，然后才慢吞吞地显示解锁页。
+   *
+   * 状态拿不到（网络错误）时按"未锁定"继续走原流程 —— 真锁定的话，后面每一个
+   * 请求都会带 `locked: true` 回来，用户仍能看到正确的提示，而不是卡在空白页。
+   */
+  try {
+    const ks = await API.keyStatus();
+    if (ks && ks.locked) {
+      authMode = 'unlock';
+      App.state.authReady = true;
+      showAuthOverlay();
+      return;
+    }
+  } catch (e) { /* 见上：按未锁定处理 */ }
 
   /**
    * R54：站点名称 → 浏览器标题栏。
@@ -544,6 +564,14 @@ function showAuthOverlay() {
   const isInit = authMode === 'init';
   const isRegister = authMode === 'register';
   const isForgot = authMode === 'forgot';
+  /**
+   * R97：**锁定态**（第五种形态）。
+   *
+   * 它和登录长得像但语义完全不同：登录证明"我是谁"，解锁证明"我有权打开这份数据"。
+   * 锁定态下服务端所有需要配置的接口都回 503 —— 连登录都做不了（口令哈希就在
+   * 解不开的那份配置里），所以这一页必须能独立出现、且只需要一个输入框。
+   */
+  const isUnlock = authMode === 'unlock';
   const rememberBox = document.getElementById('auth-remember');
   const rememberItem = document.getElementById('auth-remember-item');
 
@@ -560,6 +588,17 @@ function showAuthOverlay() {
   document.getElementById('auth-invite').value = '';
   // 邀请码框默认整条隐藏，只有「注册 + 邀请码模式」那一个分支把它打开
   if (inviteItem) inviteItem.hidden = true;
+  /**
+   * R97：用户名 / 密码这两条的显隐由下面的形态分支各自决定，所以**先复位**。
+   *
+   * 遮罩是常驻 DOM、只切 `hidden` 的：锁定态藏掉了用户名输入框，若这里不复位，
+   * 解锁成功后切回登录形态会看到一个只剩密码框的登录页 —— 而它没有任何报错，
+   * 用户只会觉得"用户名去哪了"。
+   */
+  const userItemReset = userInput.closest('.form-item');
+  if (userItemReset) userItemReset.hidden = false;
+  const pwItemReset = document.getElementById('auth-password').closest('.form-item');
+  if (pwItemReset) pwItemReset.hidden = false;
   // 安装令牌同理：只有「部署模式 + 首次初始化」才要求填写（本机回环不受影响）
   if (setupItem) setupItem.hidden = !(isInit && setupTokenRequired);
   if (setupInput) setupInput.value = '';
@@ -584,7 +623,26 @@ function showAuthOverlay() {
    */
   userInput.placeholder = isForgot ? '请输入用户名或已绑定的邮箱' : '请输入用户名';
 
-  if (isInit) {
+  if (isUnlock) {
+    /**
+     * 锁定态：只留「主口令」一个输入框。
+     *
+     * 用户名整条藏掉 —— 解锁不需要身份（谁拿到口令谁就能解锁），摆一个用不上的
+     * 用户名框只会让人以为"要先输用户名"。密码框的 label 也要改成「主口令」，
+     * 否则用户会以为这里是登录、从而填错东西。
+     */
+    title.textContent = '服务已锁定';
+    sub.textContent = '本实例启用了主密钥信封加密，启动后需要主口令解锁才能读取数据';
+    const userItem = userInput.closest('.form-item');
+    if (userItem) userItem.hidden = true;
+    const pwItem = document.getElementById('auth-password').closest('.form-item');
+    if (pwItem) pwItem.hidden = false;
+    pwLabel.textContent = '主口令';
+    confirmItem.hidden = true;
+    codeItem.hidden = true;
+    submitBtn.textContent = '解 锁';
+    foot.textContent = '主口令即根用户的登录口令；解锁成功后仍需正常登录。忘记主口令将无法解密数据，请谨慎保管';
+  } else if (isInit) {
     /**
      * R71 起这一页建的是**根用户**，不是管理员 —— 界面必须照实说。
      *
@@ -844,14 +902,37 @@ function bindAuth() {
 
 /** 当前形态下提交按钮的文案（重绘与"请求收尾还原"共用一处，避免两边写岔） */
 function authSubmitLabel() {
+  if (authMode === 'unlock') return '解 锁';
   if (authMode === 'init') return '创建并登录';
   if (authMode === 'register') return '注 册';
   if (authMode === 'forgot') return forgotStep === 1 ? '发送验证码' : '重置密码';
   return '登 录';
 }
 
-/* ------------------ R57：忘记密码第二步的「重新发送验证码」 ------------------ */
+/**
+ * R97：提交主口令解锁。
+ *
+ * 成功后**刷新页面**，而不是就地进入主界面：解锁只让进程拿到 DEK，会话并不会因此
+ * 产生（服务端刻意不签发 —— 否则"解锁"就成了一条免登录通道）。就地切换会让人
+ * 误以为"解锁 = 登录"，所以让页面重新走一遍启动流程，该登录就登录。
+ */
+async function submitUnlock(submitBtn) {
+  const pw = document.getElementById('auth-password');
+  const passphrase = pw ? pw.value : '';
+  if (!passphrase) { showAuthError('请输入主口令'); return; }
+  const label = submitBtn ? submitBtn.textContent : '';
+  if (submitBtn) { submitBtn.disabled = true; submitBtn.textContent = '解锁中…'; }
+  try {
+    await API.keyUnlock(passphrase);
+    window.location.reload();
+  } catch (e) {
+    showAuthError((e && e.message) || '解锁失败');
+  } finally {
+    if (submitBtn) { submitBtn.disabled = false; submitBtn.textContent = label; }
+  }
+}
 
+/* ------------------ R57：忘记密码第二步的「重新发送验证码」 ------------------ */
 /**
  * 那颗按钮的文案与可用性（**唯一渲染点**）。
  *
@@ -1002,6 +1083,11 @@ function takeShareNext() {
 
 async function doAuthSubmit() {
   const submitBtn = document.getElementById('btn-auth-submit');
+  /**
+   * R97：锁定态走**另一条路** —— 它不需要用户名，也不产生登录。
+   * 放在最前面，避免下面那一串"请输入用户名"的校验先把它拦住。
+   */
+  if (authMode === 'unlock') return submitUnlock(submitBtn);
   const rememberBox = document.getElementById('auth-remember');
   const username = document.getElementById('auth-username').value.trim();
   const password = document.getElementById('auth-password').value;
@@ -1163,6 +1249,15 @@ App.forceLogout = forceLogout;
 
 /* ------------------------------ 右上角用户菜单 ------------------------------ */
 
+/**
+ * R98：把"重绘账户菜单"暴露给其它模块。
+ *
+ * 「我的资料」页面改完昵称 / 用户名后需要同步右上角 —— 若那里自己再拼一遍抬头文案
+ * （昵称 + 用户名 + 角色），就是第二份格式化逻辑：两份迟早不一致，而界面上会出现
+ * "资料页显示 A、右上角显示 B"。渲染只有这一处。
+ */
+App.renderUserMenu = renderUserMenu;
+
 function renderUserMenu() {
   const wrap = document.getElementById('user-menu-wrap');
   const nameEl = document.getElementById('user-name');
@@ -1178,8 +1273,18 @@ function renderUserMenu() {
     return;
   }
   if (wrap) wrap.hidden = false;
-  if (nameEl) nameEl.textContent = user.username;
-  if (headEl) headEl.textContent = `${user.username}（${roleLabel(user.role)}）`;
+  /**
+   * R98：账户按钮显示**昵称**（没填回退用户名）。
+   *
+   * 菜单抬头刻意把两者都写出来：昵称可重复，光看昵称分不清自己用的是哪个账户；
+   * 而光看用户名又失去了昵称的意义。两者并列最省解释成本。
+   */
+  if (nameEl) nameEl.textContent = displayName(user);
+  if (headEl) {
+    headEl.textContent = user.nickname && user.nickname !== user.username
+      ? `${user.nickname}（${user.username} · ${roleLabel(user.role)}）`
+      : `${user.username}（${roleLabel(user.role)}）`;
+  }
 
   // 「编辑资料」对所有角色可见（普通用户改自己资料的唯一入口）；
   // 「用户管理」仅管理员可见。显式双向赋值，避免上一会话的 hidden 状态残留。
@@ -1292,7 +1397,7 @@ function bindUserMenu() {
   if (profileItem) {
     profileItem.onclick = () => {
       closeMenu();
-      openProfileDialog();
+      openProfilePage();
     };
   }
   const usersItem = document.getElementById('um-users');
@@ -1843,7 +1948,7 @@ function toggleSidebar(force) {
 }
 function closeSidebar() { toggleSidebar(false); }
 
-const MAIN_VIEWS = ['explorer', 'dashboard', 'linkmgr', 'ordermgr', 'ipmgr', 'bucketmgr', 'systemsettings', 'invitemgr', 'couponmgr', 'credmgr'];
+const MAIN_VIEWS = ['explorer', 'dashboard', 'linkmgr', 'ordermgr', 'ipmgr', 'bucketmgr', 'systemsettings', 'profile', 'invitemgr', 'couponmgr', 'credmgr'];
 
 /**
  * 侧栏 / 工具栏里每个区块的**入口元素**。`null` = 无专门入口（explorer 是默认落点）。
@@ -1861,6 +1966,9 @@ const VIEW_ENTRY = {
   ipmgr: 'side-ipmgr',
   bucketmgr: 'side-buckets',
   systemsettings: 'btn-syssettings',
+  // R98：「我的资料」由弹窗改为页面 —— 入口是账户菜单里的那一项，
+  // 登记在册才能让 `#profile` 也走同一套 hash 校验（未登录时它整体不存在，回落到 explorer）
+  profile: 'um-profile',
   // R54③：邀请码设置的管理员专属入口 —— 登记在册才能被门控挡下（`viewFromHash()` 读它的 hidden）
   invitemgr: 'side-invite',
   // R62：优惠券设置 —— 同样是管理员专属，登记在册才能被门控挡下
@@ -1914,6 +2022,7 @@ function switchMainView(v, { syncHash = true } = {}) {
   else if (v === 'ipmgr') ipmgr.refresh();
   else if (v === 'bucketmgr') bucketmgr.refresh();
   else if (v === 'systemsettings') syssettings.refresh();
+  else if (v === 'profile') refreshProfilePage();
   else if (v === 'invitemgr') invitemgr.refresh();
   else if (v === 'couponmgr') couponmgr.refresh();
   else if (v === 'credmgr') credmgr.refresh();

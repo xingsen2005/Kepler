@@ -26,6 +26,15 @@ const path = require('path');
 const providers = require('./providers');
 const paymentProviders = require('./payment-providers');
 /**
+ * 信封加密的密钥环（`data/keyring.json`）。
+ *
+ * 依赖方向是**单向**的：`keyring` 只认 `data-dir` / `atomic-write` / `crypto`，
+ * 不 `require` 本文件 —— 因此这里 `require` 它是安全的。
+ * `keyring` 里那份 KDF 参数与本文件的 `SCRYPT_PARAMS` 必须同值，一致性由
+ * `tests/keyring.test.js` 的断言守住（不是靠"记得同时改"）。
+ */
+const keyring = require('./keyring');
+/**
  * R71：角色语义的唯一事实源（`root` / `admin` / `user`，以及「谁管谁」的判定）。
  * 本文件是**存储层**，只关心两件事：角色**能不能落盘**（读盘归一）、
  * 角色**能不能被写进来**（新建 / 修改 / 删除时的保护）。越权判定在路由层。
@@ -66,6 +75,21 @@ let cachedAt = 0; // 缓存载入时间戳（P13：60 秒 TTL）
 const CACHE_TTL_MS = 60 * 1000;
 let corrupted = false;
 let masterKeyCache = null; // N3：主密钥内存缓存，避免每次加解密同步读盘
+
+/**
+ * R97：锁定主密钥时必须**连解密后的配置缓存一起清掉**。
+ *
+ * `cached` 里装的是 `config.enc` 解密后的完整配置（云厂商密钥、桶、用户口令哈希）。
+ * 只抹 DEK 而留着它，"锁定"就只是名义上的 —— 锁定期内任何一次 `load()` 仍会
+ * 命中这份 60 秒 TTL 的缓存，把敏感内容照常交出去。
+ *
+ * 注册在 `keyring` 上而不是各调用点自己记得清，是因为锁定有多个入口
+ * （前端手动锁定、轮转后强制重登、测试），漏一个就是一个"看起来锁了"的窗口。
+ */
+keyring.setOnLock(() => {
+  cached = null;
+  cachedAt = 0;
+});
 
 function ensureDataDir() {
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
@@ -120,7 +144,28 @@ function unwritableError(file, tag, why) {
   return err;
 }
 
+/**
+ * 取主密钥（DEK）。
+ *
+ * ## R97：从「一个明文密钥文件」改为「信封优先」
+ *
+ * 解析顺序**不能调换**，每一条都有具体后果：
+ *
+ * ① **已解锁的信封** → 直接返回内存里的 DEK。这是启用信封加密之后的**唯一**
+ *    正确来源，也是最热的路径。
+ * ② **容器存在但未解锁** → 调 `keyring.dek()` 让它抛 `KEYRING_LOCKED`。
+ *    ⚠️ 这里绝不能"退回去读 `secret.key`"：迁移之后全部数据已经用 DEK 重加密，
+ *    旧密钥解不开任何东西，退回去只会得到一堆"认证失败"，然后被当成
+ *    **配置损坏** —— 把一次正常的重启变成一次"数据疑似全毁"的事故现场。
+ * ③ **没有容器**（老实例 / 尚未迁移）→ 走原来的 `secret.key` 路径，
+ *    行为与改造前逐字节相同，`masterKeyCache` 也照旧生效。
+ *
+ * 顺序上把 ①② 放在 `masterKeyCache` 之前是**刻意的**：缓存里可能还躺着迁移前
+ * 读进来的旧密钥，而"容器存在"这个事实的优先级高于任何缓存。
+ */
 function getMasterKey() {
+  if (keyring.isUnlocked()) return keyring.dek();
+  if (keyring.exists()) return keyring.dek(); // 抛 KEYRING_LOCKED（②）
   if (masterKeyCache) return masterKeyCache;
   ensureDataDir();
   if (fs.existsSync(KEY_FILE)) {
@@ -664,6 +709,15 @@ function normalize(raw) {
      */
     u.email = normalizeEmail(u.email);
     /**
+     * R98：昵称与注销申请。
+     *
+     * 两者都必须在读盘路径上归一：昵称的控制字符 / 超长会在每次渲染时都要重新处理，
+     * 而注销申请是**会被定时清扫读取的判据** —— 脏结构若不在入口处收敛，
+     * 清扫器就得自己再防一次「字符串不是日期」。
+     */
+    u.nickname = normalizeNickname(u.nickname);
+    u.deletion = normalizeDeletion(u.deletion);
+    /**
      * R33：`u.ban` **刻意不在这里兜底**。
      *
      * 封禁标记的**唯一**读取入口是 `banInfo()`，而它内部无条件跑 `normalizeBan()`
@@ -725,6 +779,29 @@ function load() {
     cachedAt = Date.now();
     return cfg;
   } catch (e) {
+    /**
+     * R97：**锁定态不是损坏**，必须原样抛出去。
+     *
+     * 这是整个改造里最容易写错的一行。`corrupted = true` 的语义是「磁盘上那份
+     * 密文读不出来，它是最后的抢救凭据，绝不许覆盖」—— 而锁定态的意思是
+     * 「密钥还没解锁，稍等就好」。把两者混在一起，后果是具体且严重的：
+     *
+     *   ① `persist()` 会拒绝写入并**复印一份 `config.enc.corrupt-<ts>`**，
+     *      运维第二天看到这个文件名，会以为数据真的坏了；
+     *   ② `requireStore()` 会抛「请先恢复该文件」，把人引向恢复流程；
+     *   ③ 而故障其实只是「重启后没解锁」——排查方向被彻底带偏。
+     *
+     * 所以这里单独识别 `KEYRING_LOCKED`：清掉缓存、保持 `corrupted = false`、
+     * 把错误抛给调用方（由 `/api` 前置中间件转成 503）。抛而不是 `return null`
+     * 同样重要：`null` 的语义是「还没有配置文件」，`requireStore()` 会据此
+     * **初始化一份空配置并落盘** —— 那才是真正的数据死刑。
+     */
+    if (e && e.code === 'KEYRING_LOCKED') {
+      corrupted = false;
+      cached = null;
+      cachedAt = 0;
+      throw e;
+    }
     // 认证失败或格式错误：标记损坏，避免使用被篡改的数据
     corrupted = true;
     cached = null;
@@ -1800,8 +1877,48 @@ function selfTest() {
 }
 
 function isCorrupted() {
-  load();
+  try {
+    load();
+  } catch (e) {
+    // R97：锁定态下 `load()` 会抛 `KEYRING_LOCKED`。那不是损坏 ——
+    // 它的判据是"密文读不出来"，而这里只是"密钥还没解锁"。
+    if (e && e.code === 'KEYRING_LOCKED') return false;
+    throw e;
+  }
   return corrupted;
+}
+
+/**
+ * 是否处于**锁定态**：信封容器存在、但本进程还没有 DEK。
+ *
+ * 与 `isCorrupted()` 是两件事，调用方必须分开判断 —— 前者是正常状态（重启后
+ * 等解锁），后者是故障（要运维介入）。`/api` 前置中间件就是靠它决定回 503
+ * 还是放行。
+ */
+function isLocked() {
+  if (keyring.isUnlocked()) return false;
+  return keyring.exists();
+}
+
+/**
+ * 清掉旧路径的主密钥缓存。
+ *
+ * 只在**迁移刚完成**时调用：迁移前 `getMasterKey()` 可能已经把旧 `secret.key`
+ * 读进 `masterKeyCache`，此后容器已存在，`getMasterKey()` 的前两条判据会盖过
+ * 这份缓存，所以它并不会被误用 —— 但留着既无用处、又会在排查时误导人
+ * （内存里有一把已经不存在的密钥）。清掉更干净。
+ */
+function resetMasterKeyCache() {
+  /**
+   * ⚠️ 只置空引用，**不清零内容**。
+   *
+   * 迁移发生在服务在线时，此刻可能正有别的请求在用这把密钥加密（`getMasterKey()`
+   * 返回的是同一份 Buffer）。就地 `fill(0)` 会让那次加密产出一段用它自己也解不开
+   * 的密文 —— 而这种损坏要等到下次读该文件才暴露。抹内存的收益远小于这个风险。
+   */
+  masterKeyCache = null;
+  cached = null;
+  cachedAt = 0;
 }
 
 /* ============================ 服务商 ============================ */
@@ -3016,12 +3133,129 @@ function clearUserBan(id) {
   return userView(user);
 }
 
+/**
+ * R98：提交注销申请。
+ *
+ * 三条拒绝**各有各的理由**，不能合并成一句通用报错：
+ *  ① 根用户 —— 它不是"一个账户"，而是全实例管理权的载体（本项目里它的口令还是
+ *     主密钥信封的解锁因子）。删掉之后没有"重新注册一个根用户"的路径，只能改配置文件；
+ *  ② 没有邮箱 —— 注销的证据链是「能收到绑定的那封信」，没有邮箱就没有证据；
+ *  ③ 已有申请 —— 重复提交等于把 15 天悄悄续期，用户会以为"我明明点了撤销"。
+ *
+ * 计划时刻由调用方算好传进来（政策常量住在 `account-deletion.js`），本层只做结构校验：
+ * 把「15 天」写死在存储层，会让"调整冷静期"变成一次跨模块改动。
+ */
+function requestAccountDeletion(id, deleteAtIso) {
+  const cfg = requireStore();
+  const user = cfg.users.find((u) => u.id === id);
+  if (!user) throw Object.assign(new Error('用户不存在'), { status: 404 });
+  if (roles.isRoot(user.role)) {
+    throw Object.assign(new Error('根用户账户不可注销'), { status: 403 });
+  }
+  if (!normalizeEmail(user.email)) {
+    throw Object.assign(new Error('请先绑定并验证邮箱，再申请注销'), { status: 400 });
+  }
+  if (normalizeDeletion(user.deletion)) {
+    throw Object.assign(new Error('已提交过注销申请，请先撤销或等待到期'), { status: 409 });
+  }
+  const now = Date.now();
+  const due = Date.parse(String(deleteAtIso || ''));
+  if (!Number.isFinite(due) || due <= now) {
+    throw Object.assign(new Error('注销到期时间不合法'), { status: 400 });
+  }
+  user.deletion = { requestedAt: new Date(now).toISOString(), deleteAt: new Date(due).toISOString() };
+  user.updatedAt = user.deletion.requestedAt;
+  persist(cfg);
+  return userView(user);
+}
+
+/**
+ * R98：撤销注销申请。返回"原本有没有申请"，供调用方记日志。
+ *
+ * 撤销是**收紧**方向（把账户留下来），因此不需要任何验证码 / 密码 ——
+ * 与解绑邮箱不同：那一步会削弱找回能力，这一步只是取消一次删除。
+ */
+function cancelAccountDeletion(id) {
+  const cfg = requireStore();
+  const user = cfg.users.find((u) => u.id === id);
+  if (!user || !normalizeDeletion(user.deletion)) return false;
+  user.deletion = null;
+  user.updatedAt = new Date().toISOString();
+  persist(cfg);
+  return true;
+}
+
+/**
+ * R98：到期待删除的**原始**用户记录。
+ *
+ * 返回原始记录（含口令哈希）是刻意的：清扫器要拿 `username` 去解除分享链接归属，
+ * 而 `userView` 不含哈希、也没必要为它再造一个中间结构。**只允许服务端内部调用** ——
+ * 任何路由都不得把它回传前端（与 `findUserRawById` 同一纪律）。
+ */
+function dueDeletionUsers(nowIso) {
+  const cfg = load();
+  if (!cfg) return [];
+  const now = Date.parse(String(nowIso || new Date().toISOString()));
+  if (!Number.isFinite(now)) return [];
+  return (cfg.users || []).filter((u) => {
+    const d = normalizeDeletion(u.deletion);
+    return Boolean(d) && Date.parse(d.deleteAt) <= now;
+  });
+}
+
+/**
+ * R98：昵称（**展示名**，不是登录凭据）。
+ *
+ * 与用户名刻意分开：用户名用于登录、必须唯一、改动要当前密码；昵称只影响界面显示，
+ * 允许重复、改动不需要任何验证。两者混用的后果很具体 —— 若把昵称当登录名，
+ * 两个「张三」就会互相抢标识；若把用户名当展示名，用户想改个显示名就得改登录凭据。
+ *
+ * 归一化是**判据**的一部分（与邮箱同理）：昵称会进 `textContent` / 模板转义，
+ * 但控制字符会让界面错行、首尾空白会让「看起来没改」变成一次真实写入。
+ * 长度按**码点**截断（`Array.from`）而不是 `slice` —— 后者会把 emoji 的代理对劈开，
+ * 留下半个字符，落盘后再读出来就是乱码。
+ */
+const NICKNAME_MAX = 32;
+function normalizeNickname(v) {
+  const raw = v == null ? '' : String(v);
+  const clean = raw
+    .replace(/[\u0000-\u001f\u007f]/g, ' ') // 控制字符（含换行 / 制表）一律压成空格
+    .replace(/\s+/g, ' ')
+    .trim();
+  return Array.from(clean).slice(0, NICKNAME_MAX).join('');
+}
+
+/**
+ * R98：注销申请的结构。
+ *
+ * 只存两个时刻（申请时间 / 计划删除时间），**不存"谁批准的"** —— 自助注销没有审批人。
+ * 读盘时做有效性判定，非法结构一律归零（= 视为没有申请）：
+ * 宁可让账户留下来（fail-safe），也不能让一个写坏的 `deleteAt` 变成"立刻删除"。
+ * 反过来，`deleteAt` 无效时若猜一个时间继续删，才是真正危险的方向。
+ */
+function normalizeDeletion(d) {
+  if (!d || typeof d !== 'object' || Array.isArray(d)) return null;
+  const from = Date.parse(String(d.requestedAt || ''));
+  const due = Date.parse(String(d.deleteAt || ''));
+  if (!Number.isFinite(from) || !Number.isFinite(due) || due <= from) return null;
+  return { requestedAt: new Date(from).toISOString(), deleteAt: new Date(due).toISOString() };
+}
+
 /** 用户安全视图：绝不回传密码哈希/盐，也不回传 WebAuthn 公钥（仅回传是否启用） */
 function userView(u) {
   const w = normalizeWebauthn(u.webauthn);
   return {
     id: u.id,
     username: u.username,
+    /**
+     * R98：昵称（展示名）。
+     *
+     * 空串 = 未设置 —— 前端应回退显示 `username`。**不在服务端替前端回退**：
+     * 回退是渲染决策（某处要显示真名、某处要显示昵称），服务端只如实说"有没有填"。
+     * 若这里直接回退成用户名，用户就永远无法区分"我设的昵称恰好等于用户名"
+     * 与"我没设昵称"。
+     */
+    nickname: normalizeNickname(u.nickname),
     /**
      * R71：回给前端的 `role` 也要过一遍归一化 —— 它是**判据**而不只是展示：
      * 前端靠它决定「用户管理」里哪些行的按钮可用（管理员不能动管理员/根用户）。
@@ -3047,6 +3281,13 @@ function userView(u) {
      *    永远无法完成验证）。两种来源都成立 ⇒ 加一个恒为真的布尔字段只是噪音。
      */
     email: normalizeEmail(u.email),
+    /**
+     * R98：注销申请（15 天冷静期）。
+     *
+     * `null` = 没有申请。有值时前端显示"将于 X 删除"，并提示"登录即撤销"。
+     * 这个字段**同时**是登录路径的判据：只要非空，登录成功就要撤销（或到期执行）。
+     */
+    deletion: normalizeDeletion(u.deletion),
     createdAt: u.createdAt || '',
     updatedAt: u.updatedAt || '',
   };
@@ -3102,7 +3343,7 @@ function assertEmailFree(cfg, email, excludeId) {
   if (hit) throw Object.assign(new Error('该邮箱已被其他账户使用'), { status: 409 });
 }
 
-async function addUser({ username, password, role, permissions, speedLimit, email }) {
+async function addUser({ username, password, role, permissions, speedLimit, email, nickname }) {
   const name = normalizeUsername(username);
   assertPasswordPolicy(password);
   // R14-04：先把异步工作做完（scrypt 约 50~100ms），再取 store 并**同步**完成全部修改。
@@ -3133,6 +3374,13 @@ async function addUser({ username, password, role, permissions, speedLimit, emai
     webauthn: normalizeWebauthn(null),
     speedLimit: normalizeSpeedLimit(speedLimit), // R37：用户级下载限速（0 = 不限）
     email: mail, // R54②：邮箱（管理员添加时可直接设置；空串 = 未绑定）
+    nickname: normalizeNickname(nickname), // R98：展示名（空串 = 用用户名）
+    /**
+     * R98：注销申请。新用户恒为 `null`，且**必须显式写出来** ——
+     * 历史记录靠读盘兜底补齐，而新记录若缺这个键，`userView` 会回 `null`（无害），
+     * 但备份 / 导出的结构与老库不一致，排查时容易被当成"字段丢了"。
+     */
+    deletion: null,
     createdAt: now,
     updatedAt: now,
   };
@@ -3206,6 +3454,12 @@ async function updateUser(id, patch) {
     user.email = mail;
   }
   if (patch.speedLimit !== undefined) user.speedLimit = normalizeSpeedLimit(patch.speedLimit); // R37：未传即保持
+  /**
+   * R98：昵称（展示名）。`''` 是**合法值**（= 清空，回退显示用户名），
+   * 故判据是 `!== undefined` 而不是真值判断 —— 用 `if (patch.nickname)` 的话
+   * 「清空昵称」会静默失效，而界面上会显示成功（与邮箱解绑同型）。
+   */
+  if (patch.nickname !== undefined) user.nickname = normalizeNickname(patch.nickname);
   user.updatedAt = now;
   persist(cfg);
   return userView(user);
@@ -3334,6 +3588,9 @@ async function verifyUserPassword(id, password) {
 module.exports = {
   load, save, get, flush, flushPending, getLastWriteError, getMasterKey,
   effective, effectiveForBucket, safeView, selfTest, isCorrupted,
+  // R97：锁定态与旧密钥缓存的复位（`isLocked` 供 `/api` 前置中间件判定是否 503；
+  // `resetMasterKeyCache` 只由迁移器在切换完成后调用）
+  isLocked, resetMasterKeyCache,
   encrypt, decrypt, // 供 secure-store 复用同一主密钥与格式（S4）
   unwritableError, // 供 enc-store 等复用「备份 + 拒绝覆盖」语义（FUN-03 / FUN-04）
   // R94（审核 M04-02）：`defaultConfig` 是对外**唯一**的「以默认配置起步」入口；
@@ -3365,6 +3622,10 @@ module.exports = {
   getWebdav, setWebdavEnabled, addWebdavAccount, updateWebdavAccount, removeWebdavAccount,
   revealWebdavPassword, authenticateWebdav,
   listUsers, getUserById, userView, addUser, updateUser, removeUser, authenticateUser,
+  // R98：昵称（展示名）—— 归一化与上限导出给路由层做入参校验，避免"静默截断"变成一次假成功
+  normalizeNickname, NICKNAME_MAX,
+  // R98：注销申请（提交 / 撤销 / 到期查询）。到期查询只返回内部使用的原始记录
+  requestAccountDeletion, cancelAccountDeletion, dueDeletionUsers,
   // R54②：用户邮箱（唯一性判据 + 「用户名或邮箱」查用户）
   assertEmailFree, findUserByIdentifier,
   // Windows Hello（WebAuthn）
@@ -3377,4 +3638,7 @@ module.exports = {
   // R69：口令哈希的唯一实现点（用户口令 / 分享口令 / 加密查看口令 / 备份码共用同一组参数）
   // `verifyPassword` 一并导出：只有它能把「旧参数哈希仍验得过」这条判据真正测出来
   scryptHex, verifyPassword, SCRYPT_PARAMS, normalizeScryptParams,
+  // R97：口令强度的唯一判据（`key-rotate` 要在"重裹"**之前**先验一次 ——
+  // 否则新口令太弱时会先跑两次 scrypt 再回滚，白付一次 CPU）
+  assertPasswordPolicy,
 };

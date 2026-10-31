@@ -106,6 +106,21 @@ function readJson(file, fallback) {
     try {
       return configStore.decrypt(j.data);
     } catch (e) {
+      /**
+       * R97：**锁定态不是损坏**，必须原样抛出去。
+       *
+       * `corruptError()` 会做两件不可逆的事：把文件备份成 `.corrupt-<ts>`，并把
+       * 它加进 `corruptFiles` —— 后者意味着**本进程内永久拒绝写入**该文件。
+       *
+       * 而锁定态（重启后尚未解锁）是个**正常**状态，它的解密失败必然发生，且
+       * 解锁之后一切正常。若在这里判成损坏，后果是：一次普通的重启就把
+       * `enc-meta.json`（密文的唯一凭据）/ `upload-sessions.json` 钉成"损坏、
+       * 只读"，**解锁也救不回来**，只能重启进程。
+       *
+       * 所以这里先认 `KEYRING_LOCKED` 并原样上抛；调用方要么等解锁后再读，
+       * 要么把它当"暂时读不到"而不是"数据坏了"。
+       */
+      if (e && e.code === 'KEYRING_LOCKED') throw e;
       throw corruptError(file, `解密/完整性校验失败（${e.message}）`);
     }
   }

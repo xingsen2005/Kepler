@@ -306,7 +306,10 @@ function utilStub() {
 export { escapeHtml, fmtTime, fmtSize, matchesQuery, previewMoreState, ownerText, propertyBodyHtml, filterUsersByName, USER_PREVIEW_LIMIT, updateNotice, banNotice, uploadPlanNotice, FILE_CONCURRENCY_MIN, FILE_CONCURRENCY_MAX, openAgreementDialog } from '${real}';
 // R71：根用户与管理员同级 —— 桩必须提供真实实现（否则 ESM 链接期就整片变红）
 export function isStaffRole(role) { return role === 'admin' || role === 'root'; }
+export function isRootRole(role) { return role === 'root'; }
 export function roleLabel(role) { return role === 'root' ? '根用户' : (role === 'admin' ? '管理员' : '普通用户'); }
+// R98：展示名（昵称优先）—— main.js / profile.js 会具名导入，桩缺一个导出就会在 ESM 链接期整片变红
+export function displayName(u) { return (u && (String(u.nickname || '').trim() || u.username)) || ''; }
 export const toast = (m, o) => { (globalThis.__toasts = globalThis.__toasts || []).push({ m, o }); };
 export const confirmDialog = async (opts) => {
   (globalThis.__confirms = globalThis.__confirms || []).push(opts);

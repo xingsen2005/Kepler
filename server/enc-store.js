@@ -513,6 +513,42 @@ function getMeta(bucket, key) {
   return m ? JSON.parse(JSON.stringify(m)) : null;
 }
 
+/**
+ * R99：**只读**导出「哪些桶有加密对象」—— 完整性巡检的候选集桶维度。
+ *
+ * 为什么不另建一份索引：`enc-meta.json` 本身就是「本系统加密过哪些对象」的
+ * 唯一权威，巡检关心的正是这批对象**还在不在、长度对不对**。再维护一份清单
+ * 就等于多出「两处都得改」的地方（本项目反复修掉的老毛病）。
+ *
+ * 只读、只做字符串切分，不落盘、不改 `metaCache` —— 巡检绝不触碰密钥与密文，
+ * 也不该因为「看了一眼」而产生写入。
+ */
+function metaBuckets() {
+  const out = new Set();
+  for (const mk of Object.keys(loadMeta().files)) {
+    const i = mk.indexOf('|');
+    if (i > 0) out.add(mk.slice(0, i));
+  }
+  return [...out].sort();
+}
+
+/**
+ * R99：**只读**导出某桶下的全部加密条目 `[{ key, meta }]`。
+ *
+ * 深拷贝是刻意的（与 `getMeta()` 同款）：巡检拿到的是快照，之后云端怎么变、
+ * 别人怎么删都不影响它手上这份；反过来，调用方也改不到 `metaCache`。
+ */
+function metaEntriesFor(bucket) {
+  const files = loadMeta().files;
+  const prefix = String(bucket) + '|';
+  const out = [];
+  for (const mk of Object.keys(files)) {
+    if (!mk.startsWith(prefix)) continue;
+    out.push({ key: mk.slice(prefix.length), meta: JSON.parse(JSON.stringify(files[mk])) });
+  }
+  return out;
+}
+
 function setMeta(bucket, key, entry) {
   loadMeta().files[metaKey(bucket, key)] = entry;
   persistMeta();
@@ -1469,9 +1505,14 @@ function _resetForTest() {
 
 module.exports = {
   MODES, CRYPTO_MAGIC, TOKEN_TTL_MS,
+  // R99：密文布局的尺寸常量 —— 巡检要「按元数据推导云端对象应有长度」，
+  // 公式里的 12 / 16 若各自硬编码，改布局时两边会静默不一致（一边放过、一边报错）
+  IV_LEN, TAG_LEN,
   settingsView, updateSettings, currentMode,
   masterKey, parseMagicInput,
   getMeta, setMeta, removeMeta, removeMetaBatch, reconcileAfterWrite,
+  // R99：完整性巡检要枚举「本系统加密过哪些对象 / 哪些桶」——只读，不触发任何写入
+  metaBuckets, metaEntriesFor,
   renameMeta, migratePrefix, copyMeta, removeBucketMeta, encryptedSetFor,
   findOrphanMeta, metaCountForBucket,
   encryptBuffer, encryptPart, buildFinalMeta, decryptTransform,

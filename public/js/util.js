@@ -12,11 +12,36 @@ export function isStaffRole(role) {
   return role === 'admin' || role === 'root';
 }
 
+/**
+ * R97：是否根用户。
+ *
+ * 与 `isStaffRole()` 是**两档不同**的判据，不能互相替代：密钥轮转 / 迁移影响的是
+ * 全实例的**解密能力**，管理员不该有这个入口。服务端对应 `roles.isRoot` 与
+ * `routes/_shared.js` 的 `requireRoot` —— 前端这里同样只决定"渲不渲染"，
+ * 强制校验永远在服务端。
+ */
+export function isRootRole(role) {
+  return role === 'root';
+}
+
 /** 角色 → 中文标签（与服务端 `server/roles.js` 的 `roleLabel()` 同文案） */
 export function roleLabel(role) {
   if (role === 'root') return '根用户';
   if (role === 'admin') return '管理员';
   return '普通用户';
+}
+
+/**
+ * R98：展示名 —— 昵称优先，没填则回退用户名。
+ *
+ * **只用于界面显示**，绝不能用它做任何判定（`nickname` 可重复、可随时改，而 `username`
+ * 是登录凭据）。服务端也**不做这个回退**（`userView.nickname` 空串就是空串）：
+ * 回退是渲染决策，不同位置可能需要不同答案（账户菜单要昵称，用户管理列表要真名）。
+ */
+export function displayName(u) {
+  if (!u) return '';
+  const nick = String(u.nickname || '').trim();
+  return nick || String(u.username || '');
 }
 
 export function escapeHtml(s) {

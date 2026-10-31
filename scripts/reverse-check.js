@@ -143,8 +143,12 @@ async function runCase({ name, file, anchor, replacement, mutations, testFile, m
  *
  * 注意：这里不再搬整段函数定义（R11-12 把函数抽成 `pruneSessions` 并加了定时器），
  * 只搬**调用点** —— 变异要复现的正是「启动即执行的那一次跑在锁之前」。
+ *
+ * ⚠️ R97：调用点外面多包了一层 `bootUnlock.then(…)`（首次清扫必须等解锁完成，
+ * 否则它会读到锁定态的 `upload-sessions.json`）。锚点随之更新 —— 这正是
+ * 「改共享调用点的形态会老化别处 anchor」那类事故，`invariants` 的锚点自检当场抓到。
  */
-const PRUNE_CALL = 'pruneSessions();\n';
+const PRUNE_CALL = 'bootUnlock.then(() => { try { pruneSessions(); } catch (e) { /* 清扫失败不影响启动 */ } });\n';
 
 /**
  * 全部反向对照用例。**导出**是为了让 `tests/invariants.test.js` 能在测试里
@@ -4767,8 +4771,8 @@ const CASES = [
       // 「仅管理员可见」是这道功能的**第一层**保护：实时码里就是密钥明文。
       name: 'R38-02w · 备份卡片未纳入 ADMIN_ONLY_CARDS（普通用户也能读到实时码）',
       file: 'public/js/syssettings.js',
-      anchor: "'sysset-payment-card', 'sysset-backup-card'];",
-      replacement: "'sysset-payment-card'];",
+      anchor: "'sysset-payment-card', 'sysset-backup-card',",
+      replacement: "'sysset-payment-card',",
       testFile: 'audit38-regressions.test.js',
       minFail: 1,
     },
@@ -7973,10 +7977,11 @@ const CASES = [
     },
     {
       // R54b-03d：邮件正文不区分用途 ⇒ 「验证邮箱」的信里写着"重置密码"，用户会以为账户被人动过。
+      // R98：文案从嵌套三元改成了 `COPY` 表（新增 `delete` 用途），判据锚点跟着换形态。
       name: 'R54b-03d · 验证码邮件不区分用途（绑定邮箱的信写成"重置密码"）',
       file: 'server/email-code.js',
-      anchor: '  const title = purpose === \'reset\' ? \'重置密码\' : \'验证邮箱\';',
-      replacement: '  const title = \'重置密码\';',
+      anchor: '  const copy = COPY[purpose] || COPY.verify;',
+      replacement: '  const copy = COPY.reset;',
       testFile: 'audit54b-regressions.test.js',
       minFail: 1,
     },
@@ -11604,8 +11609,10 @@ const CASES = [
     {
       name: 'R90-06a · 前端改用户名不带 currentPassword（裸奔到服务端才被拦）',
       file: 'public/js/profile.js',
-      anchor: "      if (!currentPw) { showMsg('修改用户名前请先输入当前密码', 'bad'); return; }\n"
-        + '      body.currentPassword = currentPw;',
+      // R98：资料页由弹窗改为页面后，这段的缩进从 6 格变成 8 格（多了一层 bindForm 的参数），
+      // 判据本身（"缺密码就地拦下 + 带上 currentPassword"）一个字都没变
+      anchor: "        if (!currentPw) { showMsg('修改用户名前请先输入当前密码', 'bad'); return; }\n"
+        + '        body.currentPassword = currentPw;',
       replacement: "      if (!currentPw) { showMsg('修改用户名前请先输入当前密码', 'bad'); return; }",
       testFile: 'audit90-regressions.test.js',
       minFail: 1,
@@ -12540,6 +12547,399 @@ const CASES = [
       anchor: "  if (reason === 'already_used') {",
       replacement: '  if (false) {',
       testFile: 'audit96-regressions.test.js',
+      minFail: 1,
+    },
+
+    /* ============================================================== *
+     * R97 · 主密钥信封（登录密钥轮转）
+     *
+     * 这一轮的修复有个共同特征：**错了也不会报错**。
+     * 锁定态被当成"没有密钥"会静默造出一把新密钥；被当成"配置损坏"会把
+     * 唯一可抢救的密文备份走；迁移多包一次会覆盖容器；"解锁"顺带发会话
+     * 就是一条免登录旁路。没有一条会在日志里留下痕迹 —— 全靠下面这些对照。
+     * ============================================================== */
+    {
+      /**
+       * 锁定态被当成「这个实例还没有密钥」⇒ 落进老的 `secret.key` 分支，
+       * **凭空生成一把新密钥**。之后所有密文都用它解 ⇒ 全库打不开，而现场
+       * 多了一个 `secret.key`，看起来像"密钥还在，只是数据坏了"。
+       */
+      name: 'R97-01a · 锁定态退回去生成新 secret.key（把"锁着"当成"没有密钥"）',
+      file: 'server/config-store.js',
+      anchor: '  if (keyring.isUnlocked()) return keyring.dek();\n'
+        + '  if (keyring.exists()) return keyring.dek(); // 抛 KEYRING_LOCKED（②）',
+      replacement: '  if (keyring.isUnlocked()) return keyring.dek();',
+      testFile: 'keyring.test.js',
+      minFail: 2,
+    },
+    {
+      /**
+       * 锁定态被当成「配置损坏」⇒ `corrupted = true` + `return null`。
+       * 前者会让下一次写入复印一份 `.corrupt-*` 并把原文拒绝写入，
+       * 后者会让 `requireStore()` **初始化一份空配置落盘** —— 数据死刑。
+       */
+      name: 'R97-02a · 锁定态被当成"配置损坏"（备份 + 空配置覆盖的起点）',
+      file: 'server/config-store.js',
+      anchor: "    if (e && e.code === 'KEYRING_LOCKED') {\n"
+        + '      corrupted = false;\n'
+        + '      cached = null;\n'
+        + '      cachedAt = 0;\n'
+        + '      throw e;\n'
+        + '    }',
+      replacement: "    if (false) {\n"
+        + '      corrupted = false;\n'
+        + '      cached = null;\n'
+        + '      cachedAt = 0;\n'
+        + '      throw e;\n'
+        + '    }',
+      testFile: 'keyring.test.js',
+      minFail: 2,
+    },
+    {
+      /**
+       * 只抹 DEK、不清解密缓存 ⇒「锁定」只是名义上的：60 秒 TTL 内任何一次
+       * `load()` 照样把云厂商密钥、桶、口令哈希交出去。
+       */
+      name: 'R97-03a · 锁定时不清"解密后的配置缓存"（锁定变成名义上的）',
+      file: 'server/config-store.js',
+      anchor: 'keyring.setOnLock(() => {\n  cached = null;\n  cachedAt = 0;\n});',
+      replacement: 'keyring.setOnLock(() => {\n});',
+      testFile: 'keyring.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R97-04a · 迁移不再幂等（重复包裹 = 覆盖容器 = 全库不可解）',
+      file: 'server/key-rotate.js',
+      anchor: "  if (keyring.exists()) {\n    return { migrated: false, reason: 'already-envelope' };",
+      replacement: "  if (false) {\n    return { migrated: false, reason: 'already-envelope' };",
+      testFile: 'keyrotate.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R97-05a · 迁移成功后不删明文密钥（"不落盘"没有真正生效）',
+      file: 'server/key-rotate.js',
+      anchor: '      fs.unlinkSync(legacyKeyPath());\n      removed = true;',
+      replacement: '      void legacyKeyPath();\n      removed = true;',
+      testFile: 'keyrotate.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R97-06a · 轮转跳过"当前口令"step-up（会话劫持即可换掉解锁因子）',
+      file: 'server/key-rotate.js',
+      anchor: '  const okOld = await configStore.verifyUserPassword(root.id, currentPassphrase);\n'
+        + '  if (!okOld) {',
+      replacement: '  const okOld = true;\n  if (!okOld) {',
+      testFile: 'keyrotate.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * 口令策略校验挪到重裹之后：功能上仍会被 `updateUser` 拒掉并回滚，
+       * 但 `keyring.json` 已被改写成"新口令的包裹"再回滚 —— 中间那段时间里
+       * 容器与登录口令不一致，且每次手抖都白烧两次 scrypt。
+       */
+      name: 'R97-07a · 新口令策略校验挪到重裹之后（容器先被改写再回滚）',
+      file: 'server/key-rotate.js',
+      anchor: '  configStore.assertPasswordPolicy(String(newPassphrase));',
+      replacement: '  void String(newPassphrase);',
+      testFile: 'keyrotate.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R97-08a · 轮转后不踢会话（怀疑泄露时的轮转等于没做）',
+      file: 'server/key-rotate.js',
+      anchor: '    for (const u of users) killed += authSession.destroyUserSessions(u.id);',
+      replacement: '    for (const u of users) killed += 0;',
+      testFile: 'keyrotate.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R97-09a · 匿名 /key/status 直接吐完整状态（泄露版本号与旧密钥存在性）',
+      file: 'server/routes/key.js',
+      anchor: '      return res.json({ envelope: st.envelope, locked: st.locked, unlocked: st.unlocked });',
+      replacement: '      return res.json(st);',
+      testFile: 'audit97-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R97-10a · 解锁顺带签发会话（主口令 = 免登录通道）',
+      file: 'server/routes/key.js',
+      anchor: '    return res.json({ ok: true, kekVersion: info.kekVersion, unlocked: true });',
+      replacement: "    res.setHeader('Set-Cookie', 'sid=leak; Path=/');\n"
+        + '    return res.json({ ok: true, kekVersion: info.kekVersion, unlocked: true });',
+      testFile: 'audit97-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * 放行清单漏掉 `/key/unlock` ⇒ **永久死锁**：锁定态下所有 /api 都 503，
+       * 而唯一能解锁的接口自己也 503。本地跑不出来（本地根本不锁）。
+       */
+      name: 'R97-11a · 锁定态放行清单漏掉 /key/unlock（永久死锁）',
+      file: 'server/index.js',
+      anchor: "const LOCKED_ALLOWED = new Set(['/key/status', '/key/unlock']);",
+      replacement: "const LOCKED_ALLOWED = new Set(['/key/status']);",
+      testFile: 'audit97-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R97-12a · requireRoot 退化成"只要有身份"（管理员也能改解锁因子）',
+      file: 'server/routes/_shared.js',
+      anchor: '  if (!u || !roles.isRoot(u.role)) {\n'
+        + "    return res.status(403).json({ error: '仅根用户可执行该操作' });",
+      replacement: '  if (!u) {\n'
+        + "    return res.status(403).json({ error: '仅根用户可执行该操作' });",
+      testFile: 'audit97-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * 一次普通重启（重启后必然锁定）就把 `enc-meta.json` 备份成 `.corrupt-*`
+       * 并拉进"本进程永久拒写"名单 —— 新密文的元数据写不进去 ⇒ 那些密文不可解，
+       * 而且**解锁也救不回来**，只能重启进程。
+       */
+      name: 'R97-13a · secure-store 把锁定态钉成"文件损坏、永久拒写"',
+      file: 'server/secure-store.js',
+      anchor: "      if (e && e.code === 'KEYRING_LOCKED') throw e;",
+      replacement: '      if (false) throw e;',
+      testFile: 'keyring.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R97-14a · lock() 不回调清缓存（与 R97-03 是同一件事的两个入口）',
+      file: 'server/keyring.js',
+      anchor: '  if (onLock) {\n'
+        + '    try { onLock(); } catch (e) { /* 清缓存失败不该阻止抹密钥 */ }\n'
+        + '  }',
+      replacement: '  if (false) {\n'
+        + '    try { onLock(); } catch (e) { /* 清缓存失败不该阻止抹密钥 */ }\n'
+        + '  }',
+      testFile: 'keyring.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R97-15a · 包裹用固定 IV（同一 KEK/DEK 得同一密文，GCM 下会泄露明文异或）',
+      file: 'server/keyring.js',
+      anchor: '  const iv = crypto.randomBytes(IV_BYTES);\n'
+        + "  const cipher = crypto.createCipheriv('aes-256-gcm', kek, iv);",
+      replacement: '  const iv = Buffer.alloc(IV_BYTES);\n'
+        + "  const cipher = crypto.createCipheriv('aes-256-gcm', kek, iv);",
+      testFile: 'keyring.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R97-16a · 轮转不换盐（重裹了但派生因子没变，等于没轮转）',
+      file: 'server/keyring.js',
+      anchor: '  const salt = crypto.randomBytes(SALT_BYTES).toString(\'hex\');\n'
+        + '  const kekNew = await deriveKek(next, salt, KDF_PARAMS);',
+      replacement: '  const salt = ring.salt;\n'
+        + '  const kekNew = await deriveKek(next, salt, KDF_PARAMS);',
+      testFile: 'keyring.test.js',
+      minFail: 1,
+    },
+    /* ---------------- R98：昵称 + 自助注销 ---------------- */
+    {
+      name: 'R98-01a · 改昵称也要求当前密码（把显示名当成登录凭据）',
+      file: 'server/routes/users.js',
+      anchor: '      patch.nickname = rawNick;\n      nicknameChanged = true;',
+      replacement: '      patch.nickname = rawNick;\n      needsCurrent = true;',
+      testFile: 'audit98-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R98-02a · 昵称超长不拦（归一化静默截断 ⇒ 假成功）',
+      file: 'server/routes/users.js',
+      anchor: '      if (Array.from(rawNick).length > configStore.NICKNAME_MAX) {',
+      replacement: '      if (false) {',
+      testFile: 'audit98-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R98-03a · 重复提交不判 409（拿旧码重提会被告知"验证码不对"，冷静期悄悄续期）',
+      file: 'server/routes/users.js',
+      anchor: "    if (configStore.userView(raw).deletion) {\n"
+        + "      return res.status(409).json({ error: '已提交过注销申请，请先撤销或等待到期' });\n"
+        + '    }\n\n'
+        + "    const code = String((req.body || {}).code == null ? '' : (req.body || {}).code).trim();",
+      replacement: "    const code = String((req.body || {}).code == null ? '' : (req.body || {}).code).trim();",
+      testFile: 'audit98-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R98-04a · 登录不撤销注销申请（冷静期变成单向倒计时，被盗号者一按就删）',
+      file: 'server/routes/auth.js',
+      anchor: '    deletionCancelled = configStore.cancelAccountDeletion(user.id);',
+      replacement: '    deletionCancelled = false;',
+      testFile: 'audit98-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R98-05a · 到期后仍走"撤销"分支（"15 天后自动删除"变成"登录即可续命"）',
+      file: 'server/routes/auth.js',
+      anchor: '    if (Date.parse(user.deletion.deleteAt) <= Date.now()) {',
+      replacement: '    if (false) {',
+      testFile: 'audit98-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R98-06a · 到期清扫不解除分享链接归属（同名新账户继承旧链接，含收款人身份）',
+      file: 'server/account-deletion.js',
+      anchor: '  const links = shareStore.orphanByCreator(username);',
+      replacement: '  const links = 0;',
+      testFile: 'audit98-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R98-07a · 注销校验用 verify 用途（改邮箱的码也能注销，两条政策的信任前提被合并）',
+      file: 'server/routes/users.js',
+      anchor: "    const check = emailCode.check({ purpose: 'delete', email: mail, code });",
+      replacement: "    const check = emailCode.check({ purpose: 'verify', email: mail, code });",
+      testFile: 'audit98-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R98-08a · 冷静期不是 15 天（政策常量被改，界面与文案全部跟着漂移）',
+      file: 'server/account-deletion.js',
+      anchor: 'const COOLING_DAYS = 15;',
+      replacement: 'const COOLING_DAYS = 7;',
+      testFile: 'audit98-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      name: 'R98-09a · 坏 deletion 结构不判"到期早于申请"（脏数据可能立刻删掉账户）',
+      file: 'server/config-store.js',
+      anchor: '  if (!Number.isFinite(from) || !Number.isFinite(due) || due <= from) return null;',
+      replacement: '  if (!Number.isFinite(from) || !Number.isFinite(due)) return null;',
+      testFile: 'account-deletion.test.js',
+      minFail: 1,
+    },
+    {
+      // R99：巡检的「长度判据」少算 IV 与 tag ⇒ 每个对象的期望长度都偏小 28 字节/片，
+      // 于是一整轮把**全部健康对象**报成长度不符（假阳性比漏报更能毁掉一个巡检功能）。
+      name: 'R99-01a · 密文长度公式漏掉 IV / GCM tag（所有健康对象都被判"长度不符"）',
+      file: 'server/integrity.js',
+      anchor: '      total += encStore.IV_LEN + ctLen + encStore.TAG_LEN;',
+      replacement: '      total += ctLen;',
+      testFile: 'audit99-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // magic 模式密文与明文等长；多算一个魔数头就等于给每个对象凭空加了几十字节。
+      name: 'R99-01b · magic 模式给密文长度多加一个魔数头（同样是全员假阳性）',
+      file: 'server/integrity.js',
+      anchor: '    return Number.isFinite(n) && n >= 0 ? n : null;',
+      replacement: '    return Number.isFinite(n) && n >= 0 ? n + encStore.CRYPTO_MAGIC.length : null;',
+      testFile: 'audit99-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 去掉「写完之后又被写过」这条判据 ⇒ 同长度的原位覆盖（勒索软件）彻底隐形。
+      name: 'R99-02a · 摘掉「被改写」判据（同长度原位覆盖不再被发现）',
+      file: 'server/integrity.js',
+      anchor: '  if (Number.isFinite(wroteAt) && cloudAt !== null && cloudAt > wroteAt + CLOCK_SKEW_MS) {',
+      replacement: '  if (false) {',
+      testFile: 'audit99-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 容差归零 ⇒ 正常上传（元数据落盘比 Last-Modified 晚几秒）全被判成被改写。
+      name: 'R99-02b · 时钟容差归零（刚上传完的文件当场被判"被改写"）',
+      file: 'server/integrity.js',
+      anchor: 'const CLOCK_SKEW_MS = 5 * 60 * 1000;',
+      replacement: 'const CLOCK_SKEW_MS = 0;',
+      testFile: 'audit99-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 缺 createdAt 的历史条目若被当成"写于 1970"，一开巡检就是一整屏假警报。
+      name: 'R99-03a · 历史条目缺 createdAt 仍按"被改写"判定（一屏假警报）',
+      file: 'server/integrity.js',
+      anchor: '  if (Number.isFinite(wroteAt) && cloudAt !== null && cloudAt > wroteAt + CLOCK_SKEW_MS) {',
+      replacement: '  if (cloudAt !== null && cloudAt > (Number.isFinite(wroteAt) ? wroteAt : 0) + CLOCK_SKEW_MS) {',
+      testFile: 'audit99-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 「不存在」的口径一放宽（任何错误都算没了），凭据过期 / 网络抖动就变成"文件全被删了"。
+      name: 'R99-04a · 「不存在」放宽到任意错误（凭据过期 = 一屏"文件已丢失"）',
+      file: 'server/integrity.js',
+      anchor: '  if (Number(sc) === 404) return true;',
+      replacement: '  if (sc !== undefined) return true;',
+      testFile: 'audit99-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // ⚠️ 锁定态门必须排在读元数据**之前**：锁定态读 enc-meta.json 会把 metaCorrupt 置真、
+      // 本进程永久拒写元数据 —— 一次巡检就能把全站上传打坏（R97 的三条误判路径之一）。
+      name: 'R99-05a · 摘掉锁定态闸门（锁定期间读加密元数据 ⇒ 元数据被永久判损坏）',
+      file: 'server/integrity.js',
+      anchor: "  if (configStore.isLocked()) return commit('locked');\n  if (encStore.metaIsCorrupt()) return commit('meta-corrupt');",
+      replacement: "  if (encStore.metaIsCorrupt()) return commit('meta-corrupt');",
+      testFile: 'audit99-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 锁定与损坏合成一个原因 ⇒ 界面只能说一句含糊的"跳过"，处置方式（去解锁 / 去修元数据）没法给。
+      name: 'R99-06a · 锁定与元数据损坏合并成同一个原因（界面无法给出不同处置）',
+      file: 'server/integrity.js',
+      anchor: "  if (encStore.metaIsCorrupt()) return commit('meta-corrupt');",
+      replacement: "  if (encStore.metaIsCorrupt()) return commit('locked');",
+      testFile: 'audit99-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 本轮真实踩到的缺陷：明细写进**上一轮**的结果数组 ⇒ 计数说"2 项异常"、列表却是空的。
+      // 这条对照就是把修复退回去，行为护栏必须当场变红。
+      name: 'R99-07a · 明细记进上一轮的结果对象（计数与列表各说各话）',
+      file: 'server/integrity.js',
+      anchor: '  const noteFinding = (f) => {\n    if (result.findings.length >= MAX_FINDINGS) return;\n    result.findings.push(f);\n  };',
+      replacement: '  const noteFinding = (f) => {\n    if (last.findings.length >= MAX_FINDINGS) return;\n    last.findings.push(f);\n  };',
+      testFile: 'audit99-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 403 / 5xx 计成"丢失" ⇒ 一次凭据过期就让巡检刷出一整批"文件被删了"，真正的丢失被淹掉。
+      name: 'R99-08a · 403 / 5xx 计成「已丢失」（真实丢失被假警报淹没）',
+      file: 'server/integrity.js',
+      anchor: "        result.skipped += 1;\n        noteFinding({ ...base, verdict: 'error', detail: `无法确认（${(e && (e.code || e.message)) || '未知错误'}）` });",
+      replacement: "        result.bad += 1;\n        noteFinding({ ...base, verdict: 'missing', detail: '云端已无此对象' });",
+      testFile: 'audit99-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 去掉合流 ⇒ 定时器与「立即巡检」同时触发时跑两轮，云端请求直接翻倍。
+      name: 'R99-09a · 去掉「正在跑」合流（定时器与手动巡检各跑一轮，请求翻倍）',
+      file: 'server/integrity.js',
+      anchor: '  if (running) return running;',
+      replacement: '  if (false) return running;',
+      testFile: 'audit99-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 游标不推进 ⇒ 永远只查字典序最靠前的那 200 个对象，后面的再也不会被体检。
+      name: 'R99-10a · 轮转游标不推进（永远只查前 N 个对象）',
+      file: 'server/integrity.js',
+      anchor: '    cursors.set(bucket, (start + slice.length) % entries.length);',
+      replacement: '    cursors.set(bucket, start);',
+      testFile: 'audit99-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 候选集只允许省请求，不许当判据（它是明确可能过期的清单）。
+      name: 'R99-11a · 候选集命中就跳过长度判定（把过期清单当成"体检结论"）',
+      file: 'server/integrity.js',
+      anchor: '        const r = classify({ meta: ent.meta, cloudSize, lastModified });',
+      replacement: "        const r = sizes && sizes.has(ent.key) ? { verdict: 'ok', expect: null, detail: '' } : classify({ meta: ent.meta, cloudSize, lastModified });",
+      testFile: 'audit99-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 卡片漏登记 ⇒ 普通用户也能看到全部桶名与对象键（账号资产的另一份清单）。
+      name: 'R99-12a · 完整性巡检卡片未纳入 ADMIN_ONLY_CARDS（普通用户可见全部桶名与对象键）',
+      file: 'public/js/syssettings.js',
+      anchor: "'sysset-backup-card', 'sysset-integrity-card',",
+      replacement: "'sysset-backup-card',",
+      testFile: 'audit99-regressions.test.js',
       minFail: 1,
     },
   ];

@@ -758,6 +758,30 @@ const initLimiter = createLimiter({ name: 'auth-init', windowMs: 10 * 60 * 1000,
 // 口令校验类管理动作（Windows Hello 注册、改密码等）：每 IP 每分钟 ≤ 10 次
 const passwordLimiter = createLimiter({ name: 'password', windowMs: 60 * 1000, max: 10 });
 
+/**
+ * R97：主密钥解锁 —— 按 IP 限流 + 失败锁定。
+ *
+ * 为什么必须单列：解锁端点**匿名可达**（锁定态下还没有会话），而每次尝试都要跑
+ * 一次 scrypt(N=2^17)（本机实测约 100~500ms CPU）。它同时是两种攻击的入口 ——
+ * ① **口令爆破**（离线拿到 `keyring.json` 的人本来就能自己算，这里的防线是
+ *   防"在线试"，配合失败锁定把每秒尝试数压到个位数）；
+ * ② **CPU 打满**（每请求一次 scrypt，不设限就是一个免费的 DoS 放大器，
+ *   与 SEC-05 给登录加限流是同一条推理）。
+ *
+ * 阈值取 10 次/分钟与 `initLimiter` 一致：两者都是"匿名 + 每次都要算哈希"的端点。
+ */
+const keyUnlockLimiter = createLimiter({ name: 'key-unlock', windowMs: 60 * 1000, max: 10 });
+const keyUnlockLock = createFailLock({ name: 'key-unlock', maxFails: 5, baseLockMs: 60 * 1000, maxLockMs: 30 * 60 * 1000 });
+
+/**
+ * R97：密钥轮转 —— 按 IP 限流。
+ *
+ * 需要已登录（root）+ 当前口令 step-up，风险远低于匿名解锁，但它同样会跑两次
+ * scrypt（校验旧口令 + 派生新 KEK）。限额放松到 5 次/分钟：正常运维一天也用不到
+ * 三次，而每次都是"改解锁因子"的重操作。
+ */
+const keyRotateLimiter = createLimiter({ name: 'key-rotate', windowMs: 60 * 1000, max: 5 });
+
 // WebDAV 认证：按 **IP** 限流（旧实现只按 IP+用户名锁定，攻击者换用户名即可绕过）
 const webdavAuthLimiter = createLimiter({ name: 'webdav-auth', windowMs: 60 * 1000, max: 30 });
 
@@ -968,6 +992,8 @@ module.exports = {
   shareLimiter, shareLock,
   couponLimiter, // R62：优惠券校验（与 shareLimiter 分开计数）
   initLimiter, passwordLimiter, webdavAuthLimiter, shareDownloadLimiter, webdavRevealLimiter, payNotifyLimiter,
+  // R97：主密钥解锁 / 轮转（前者匿名可达且每次都算 scrypt，必须限流 + 失败锁定）
+  keyUnlockLimiter, keyUnlockLock, keyRotateLimiter,
   payCheckLimiter, payStatusLimiter, shareViewLimiter,
   orderRestoreLimiter, // R64：「恢复购买」按订单号取回（与 shareLimiter 分开计数）
   backupExportLimiter, // R38：备份导出校验账户口令的限流（与 passwordLimiter 刻意分开）

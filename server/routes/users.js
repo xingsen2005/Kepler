@@ -34,7 +34,13 @@ const { requireAdmin, sendError, denyIfCannotManage } = require('./_shared');
 const roles = require('../roles');
 // R37：限速入参合法性的唯一判据（与配额同款——非法值必须 400，不能被归一化成 0 = 不限速）
 // R54②：邮箱的入参判据与归一化（`normalizeEmail` 与 `config-store` 落盘兜底同源）
-const { parseSpeedLimitInput, parseEmailInput, normalizeEmail } = require('../limits');
+const { parseSpeedLimitInput, parseEmailInput, normalizeEmail, EMAIL_CODE_RESEND_MS } = require('../limits');
+/**
+ * R98：注销的**政策与执行**收口在 `account-deletion.js`（15 天冷静期、连带清理、
+ * 到期清扫）。本模块只负责「谁在什么时候可以申请 / 撤销」，不自己算日期、不自己删账户 ——
+ * 否则登录路径与后台清扫会各自维护一份"什么算到期"。
+ */
+const accountDeletion = require('../account-deletion');
 
 const router = express.Router();
 
@@ -123,6 +129,8 @@ router.put('/users/me', async (req, res) => {
     let needsCurrent = false;
     /** 邮箱确实发生了变化（用于日志，以及"成功后核销验证码"） */
     let emailChanged = false;
+    /** R98：昵称是否出现在本次提交里（用于日志；昵称无验证码可核销） */
+    let nicknameChanged = false;
 
     /**
      * R90：**改用户名同样要当前密码**。
@@ -185,6 +193,26 @@ router.put('/users/me', async (req, res) => {
       }
     }
 
+    /**
+     * R98：昵称（展示名）。
+     *
+     * **不要求当前密码**，也不要验证码 —— 它与登录凭据无关，改了也不会让任何人
+     * 更容易接管账户；它唯一的影响是界面上显示的名字。反过来，若把它也纳入
+     * "需二次确认"那一档，用户每次想换个显示名都得输密码，属于无谓的摩擦。
+     *
+     * 入参在这里先按**码点**判长度：`updateUser` 里的归一化会静默截断，
+     * 而"提交了 100 个字、存下来 32 个"是一次**假成功**（用户以为改成功了）。
+     * 判据与存储层共用同一个上限常量，避免两处各写一个数字。
+     */
+    if (b.nickname !== undefined) {
+      const rawNick = String(b.nickname == null ? '' : b.nickname);
+      if (Array.from(rawNick).length > configStore.NICKNAME_MAX) {
+        return res.status(400).json({ error: `昵称最长 ${configStore.NICKNAME_MAX} 个字符` });
+      }
+      patch.nickname = rawNick;
+      nicknameChanged = true;
+    }
+
     if (needsCurrent) {
       /**
        * R87：本端点会做一次**口令哈希校验**，必须按 IP 限流。
@@ -237,6 +265,7 @@ router.put('/users/me', async (req, res) => {
       const parts = ['修改用户名'];
       if (patch.password) parts.push('修改密码');
       if (emailChanged) parts.push(patch.email ? '修改邮箱' : '解绑邮箱');
+      if (nicknameChanged) parts.push('修改昵称');
       statsStore.addLog({ action: 'users.self-update', level: 'warn', detail: `用户「${me.username}」${parts.join('并')}，已强制重新登录` });
       return res.json({ ok: true, user, reauthRequired: true });
     }
@@ -245,6 +274,7 @@ router.put('/users/me', async (req, res) => {
     if (patch.username) parts.push('修改用户名');
     if (patch.password) parts.push('修改密码');
     if (emailChanged) parts.push(patch.email ? '修改邮箱' : '解绑邮箱');
+    if (nicknameChanged) parts.push('修改昵称');
     // SEC-02 同理：改密码后**其它设备**的会话必须立即失效（防「密码已改但仍被旧会话控制」），
     // 当前这台设备保留，避免用户改完密码立刻掉线。
     if (patch.password) {
@@ -252,6 +282,137 @@ router.put('/users/me', async (req, res) => {
     }
     statsStore.addLog({ action: 'users.self-update', detail: `用户「${me.username}」更新了自己的资料（${parts.join('，') || '无变更'}）` });
     res.json({ ok: true, user });
+  } catch (e) {
+    sendError(res, e);
+  }
+});
+
+/* ======================== 注销账户（R98，15 天冷静期） ======================== */
+
+/**
+ * 自助注销的三条接口。
+ *
+ * 分工刻意与「改邮箱」不同：改邮箱是**换一个收件渠道**，注销是**把账户整个删掉**。
+ * 所以：
+ *  ① 验证码发往**已绑定**的邮箱（不是用户临时输入的地址）—— 注销要证明的是
+ *     "我是这个账户的主人"，而不是"我能收到某个地址的信"；
+ *  ② 验证码用途独立（`delete`），不能拿"改邮箱"那枚码来注销，反之亦然；
+ *  ③ 申请提交后**不立即删**，而是进入 15 天冷静期；期间**登录即撤销**（见 auth.js
+ *     的 `completeLogin`）—— 这条是给"账户被盗后被人恶意注销"留的救济通道。
+ */
+
+/**
+ * 发送注销验证码（发往当前绑定邮箱）。
+ *
+ * 限流**复用** `/auth/email/code` 的那两个实例（同一 IP / 同一用户共享预算）：
+ * 若各开一套，"每用户每天能收几封信"就有了两条独立通道，日配额形同虚设 ——
+ * 而这两条通道烧的是同一个 SMTP 账号。
+ */
+router.post('/users/me/deletion/code', async (req, res) => {
+  try {
+    const me = req.authUser;
+    if (!me) return res.status(401).json({ error: '请先登录' });
+    const raw = configStore.findUserRawById(me.id);
+    if (!raw) return res.status(404).json({ error: '用户不存在' });
+    if (roles.isRoot(raw.role)) {
+      return res.status(403).json({ error: '根用户账户不可注销' });
+    }
+    if (configStore.userView(raw).deletion) {
+      return res.status(409).json({ error: '已提交过注销申请，请先撤销或等待到期' });
+    }
+    const mail = normalizeEmail(raw.email);
+    if (!mail) {
+      // 没有邮箱 = 没有验证途径。这里必须明说"先去绑定邮箱"，而不是发一封不可能的邮件
+      return res.status(400).json({ error: '请先绑定并验证邮箱，再申请注销' });
+    }
+
+    const ip = security.clientIp(req) || 'unknown';
+    const rl = security.emailCodeLimiter(ip);
+    if (!rl.ok) {
+      res.setHeader('Retry-After', String(rl.retryAfter));
+      return res.status(429).json({ error: `请求过于频繁，请 ${rl.retryAfter} 秒后重试` });
+    }
+    const url = security.emailCodeUserLimiter('u:' + me.id);
+    if (!url.ok) {
+      res.setHeader('Retry-After', String(url.retryAfter));
+      return res.status(429).json({ error: `该账户近期请求的邮箱验证码过多，请 ${url.retryAfter} 秒后重试` });
+    }
+
+    const r = await emailCode.sendCode({ purpose: 'delete', email: mail, username: raw.username });
+    if (!r.ok) {
+      res.setHeader('Retry-After', String(r.retryAfter));
+      return res.status(429).json({ error: `请求过于频繁，请 ${r.retryAfter} 秒后重试` });
+    }
+    statsStore.addLog({ action: 'users.deletion.request', detail: `已向「${mail}」发送注销验证码（用户：${raw.username}）` });
+    res.json({ ok: true, to: mail, resendAfter: Math.round(EMAIL_CODE_RESEND_MS / 1000) });
+  } catch (e) {
+    sendError(res, e);
+  }
+});
+
+/** 提交注销申请：验证码通过后写入计划删除时刻（15 天后） */
+router.post('/users/me/deletion', async (req, res) => {
+  try {
+    const me = req.authUser;
+    if (!me) return res.status(401).json({ error: '请先登录' });
+    const raw = configStore.findUserRawById(me.id);
+    if (!raw) return res.status(404).json({ error: '用户不存在' });
+    if (roles.isRoot(raw.role)) {
+      return res.status(403).json({ error: '根用户账户不可注销' });
+    }
+    const mail = normalizeEmail(raw.email);
+    if (!mail) return res.status(400).json({ error: '请先绑定并验证邮箱，再申请注销' });
+    /**
+     * 已有申请 ⇒ 409，且**排在验证码校验之前**。
+     *
+     * 顺序很重要：先验码的话，"已经提交过"的人拿一枚过期码来重提会得到
+     * 「验证码不通过」—— 他会以为是邮件出了问题，去重发、去重试，而真相是
+     * 申请早已生效。更糟的是每次都白白消耗一次尝试次数。
+     */
+    if (configStore.userView(raw).deletion) {
+      return res.status(409).json({ error: '已提交过注销申请，请先撤销或等待到期' });
+    }
+
+    const code = String((req.body || {}).code == null ? '' : (req.body || {}).code).trim();
+    if (!code) return res.status(400).json({ error: '请填写邮箱收到的验证码' });
+    const check = emailCode.check({ purpose: 'delete', email: mail, code });
+    if (!check.ok) {
+      statsStore.addLog({
+        action: 'users.deletion.request', level: 'warn',
+        detail: `用户「${raw.username}」提交注销申请失败（验证码不通过：${check.reason}）`,
+      });
+      return res.status(400).json({ error: emailCode.CODE_FAIL_TEXT });
+    }
+
+    const user = configStore.requestAccountDeletion(me.id, accountDeletion.deletionDueAt());
+    // 落库成功之后才核销（与改邮箱同一顺序：失败时不该让用户再收一封信）
+    emailCode.consume({ purpose: 'delete', email: mail });
+    statsStore.addLog({
+      action: 'users.deletion.request', level: 'warn',
+      detail: `用户「${raw.username}」申请注销账户，将于 ${user.deletion.deleteAt} 自动删除（期间登录即撤销）`,
+    });
+    res.json({ ok: true, user });
+  } catch (e) {
+    sendError(res, e);
+  }
+});
+
+/**
+ * 撤销注销申请。
+ *
+ * 登录成功时也会自动撤销（`completeLogin`），这条接口是给"正登录着、想立刻反悔"
+ * 的人用的 —— 否则他得先退出再登录一次，而"退出"在某些单点登录部署下并不容易。
+ */
+router.delete('/users/me/deletion', (req, res) => {
+  try {
+    const me = req.authUser;
+    if (!me) return res.status(401).json({ error: '请先登录' });
+    if (!configStore.cancelAccountDeletion(me.id)) {
+      return res.status(404).json({ error: '当前没有待撤销的注销申请' });
+    }
+    statsStore.addLog({ action: 'users.deletion.cancel', level: 'warn', detail: `用户「${me.username}」撤销了注销申请` });
+    const raw = configStore.findUserRawById(me.id);
+    res.json({ ok: true, user: raw ? configStore.userView(raw) : null });
   } catch (e) {
     sendError(res, e);
   }

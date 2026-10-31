@@ -400,6 +400,36 @@
                 </ul>
               </div>
             </div>
+            <!-- 密钥轮转（R97，仅根用户）：按需求放在「站点设置」与「用户管理」之间。
+                 `hidden` 是初始态 —— 由 syssettings.js 的 refresh() 按角色决定是否显示；
+                 普通用户与管理员都看不到（管理员能看到设置页，但改「解锁因子」是根用户的权力，
+                 服务端 `/api/key/rotate-login` 也会 403）。 -->
+            <div class="dash-card wide sysset-card" id="sysset-key-card" hidden>
+              <h3 class="sysset-h3"><span class="sysset-tag">密钥</span>密钥轮转 <span id="key-version-tag" class="lk-count"></span></h3>
+              <div class="enc-warn">
+                <b>简要说明</b>：本页的「登录密钥」指的是加密 <code>data/config.enc</code>（云厂商密钥、存储桶、用户口令哈希）等<u>全部敏感数据</u>的那把主密钥。启用<b>信封加密</b>后，磁盘上只保存「被主口令包裹的密钥」，<b>明文密钥不再落盘</b>；而<b>轮转</b>只需用新口令重新包裹同一把密钥，<b>数据文件一个字节都不动</b>，因此可以随时在线完成。
+              </div>
+              <div class="form-row">
+                <div class="form-item">
+                  <label>当前状态</label>
+                  <div class="hint" id="key-state-line">加载中…</div>
+                </div>
+                <div class="form-item">
+                  <label>版本与时间</label>
+                  <div class="hint" id="key-time-line">—</div>
+                </div>
+              </div>
+              <div class="form-item">
+                <label>操作</label>
+                <div class="seg-col">
+                  <button id="btn-key-migrate" class="chip" type="button" hidden>启用信封加密</button>
+                  <button id="btn-key-rotate" class="chip" type="button" hidden>轮转登录密钥</button>
+                </div>
+                <div class="hint">
+                  <b>轮转</b>需要先验证<b>当前主口令</b>，再设置<b>新主口令</b>；成功后<b>全部会话立即失效</b>，需要重新登录。<b>主口令 = 根用户登录口令</b>，请勿遗忘 —— 它同时也是解锁数据文件的唯一凭据。
+                </div>
+              </div>
+            </div>
             <!-- 用户管理（仅管理员可见；普通用户此卡片整体隐藏，改由账户菜单「编辑资料」自助） -->
             <div class="dash-card wide sysset-card" id="sysset-user-card">
               <h3 class="sysset-h3"><span class="sysset-tag">用户</span><span id="sysset-user-title">用户管理</span> <span id="user-count" class="lk-count"></span>
@@ -695,6 +725,40 @@
             </div>
           </div>
 
+            <!-- 完整性巡检（R99，仅管理员）：只读体检 —— 不解密、不碰密钥，
+                 只对每个加密对象发一次 HEAD，比对「还在不在 / 长度对不对 / 写完之后有没有被动过」。
+                 位置紧接「文件加密」：它检查的正是那些刚被加密上去的密文在云端还是不是原样。 -->
+            <div class="dash-card wide sysset-card" id="sysset-integrity-card" hidden>
+              <h3 class="sysset-h3"><span class="sysset-tag chk">体检</span>完整性巡检 <span id="integrity-badge" class="lk-count"></span>
+                <button id="btn-integrity-run" class="mini-btn primary sysset-action" type="button">立即巡检</button></h3>
+              <div class="enc-warn">
+                <b>简要说明</b>：本系统把<b>密文</b>放在对象存储上，而云端那份字节是否还是我们写上去的那份，本地原本无从知晓 —— 控制台误操作、生命周期规则、同步工具回写、勒索软件批量覆盖<b>都不会经过本系统</b>，列表缓存也收不到任何信号。最恶劣的一种是<b>静默</b>：文件还在、能列出来、点下载也不报错，内容已经不是自己的了。巡检负责把这件事<b>定期、只读地</b>查出来。
+              </div>
+              <div class="form-row">
+                <div class="form-item">
+                  <label>运行状态</label>
+                  <div class="hint" id="integrity-state-line">加载中…</div>
+                </div>
+                <div class="form-item">
+                  <label>最近一次</label>
+                  <div class="hint" id="integrity-last-line">—</div>
+                </div>
+              </div>
+              <div class="form-item">
+                <label>本轮结果</label>
+                <div class="hint" id="integrity-stat-line">—</div>
+                <div id="integrity-findings" class="integrity-findings"></div>
+              </div>
+              <div class="card-note">
+                <ul class="note-list">
+                  <li><b>抓得到</b>：对象被删或被生命周期规则清掉（<code>missing</code>）、被截断或换成别的文件（<code>size</code>）、写完之后又被写过一次（<code>modified</code> —— <b>同长度的原位覆盖</b>多半就是它）。</li>
+                  <li><b>抓不到</b>：长度与 <code>Last-Modified</code> 都被保持一致的原位篡改 —— 那种只能靠<b>下载时</b>的 GCM 校验 / 明文摘要发现。这是刻意接受的边界，不是遗漏。</li>
+                  <li>候选集来自本地 <code>data/enc-meta.json</code>（「我们加密过哪些对象」的<b>唯一权威</b>），按轮转游标分片，避免一次把云端请求配额吃光；每轮每桶上限 <code>INTEGRITY_BATCH</code>（默认 200）、周期与开关 <code>INTEGRITY_SWEEP_MS</code>（默认 6 小时，<code>0</code> = 关闭）。</li>
+                  <li>进程处于<b>锁定态</b>或元数据损坏时整轮跳过并如实说明 —— 巡检绝不去读一份读不了的加密文件。卡片里保留最近 50 条明细，全量写在「操作日志」里。</li>
+                </ul>
+              </div>
+            </div>
+
             <!-- 上传排除（文件过滤） -->
             <div class="dash-card wide sysset-card" id="sysset-excludes-card">
               <h3 class="sysset-h3"><span class="sysset-tag excl">排除</span>上传排除 <button id="btn-excludes-save" class="mini-btn primary sysset-action">保存设置</button></h3>
@@ -942,7 +1006,7 @@
             <div class="dash-card wide sysset-card">
               <h3 class="sysset-h3"><span class="sysset-tag about">关于</span>关于</h3>
               <div class="about-body">
-                <p><b>Kepler 对象存储管理系统</b> Build 1.9.31</p>
+                <p><b>Kepler 对象存储管理系统</b> Build 2.0.0</p>
                 <ul class="about-list">
                   <li>开发者：邢森</li>
                   <li>项目地址：<a href="https://github.com/xingsen2005/Kepler" target="_blank" rel="noopener noreferrer">https://github.com/xingsen2005/Kepler</a></li>
@@ -954,6 +1018,28 @@
                   <span id="update-result" class="about-update-result" role="status" aria-live="polite"></span>
                 </div>
               </div>
+            </div>
+          </div>
+        </section>
+
+        <!-- 我的资料（R98：由账户菜单的**弹窗**改为独立页面）。
+             页面本体只留容器，内容由 profile.js 现场渲染：
+             两次打开之间用户资料可能已被别处改过（管理员改邮箱、另一个标签页改昵称），
+             写死在 HTML 里就会显示上一轮的旧值。 -->
+        <section id="profile" class="card-view" hidden>
+          <div class="dash-grid">
+            <div class="dash-card wide">
+              <h3>我的资料 <span id="profile-status" class="lk-count"></span></h3>
+              <div class="card-note">
+                这里修改的是<b>你自己的账户</b>。用户名是登录凭据，改动后需要<b>用新用户名重新登录</b>；
+                昵称只是显示名，随便改、允许重复。<br>
+                角色由管理员分配，不能自行修改；邮箱用于<b>找回密码</b>与<b>注销账户</b>的验证。
+              </div>
+              <div id="profile-form"></div>
+            </div>
+            <div class="dash-card wide" id="profile-danger-card">
+              <h3><span class="sysset-tag">危险</span>注销账户</h3>
+              <div id="profile-danger"></div>
             </div>
           </div>
         </section>

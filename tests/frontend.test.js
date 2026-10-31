@@ -279,29 +279,52 @@ test('syssettings.js：用户管理卡片整体归属管理员（普通用户不
   assert(/myId\s*!==\s*usersRenderId/.test(src), '响应回来时应比对序号，过期则丢弃');
 });
 
-test('profile.js：账户菜单「编辑资料」自助弹窗（所有角色可用）', () => {
+test('profile.js：「我的资料」独立页面（R98 由弹窗改为页面，所有角色可用）', () => {
   const src = fs.readFileSync(path.join(JS_DIR, 'profile.js'), 'utf8');
-  assert(/export\s+function\s+openProfileDialog/.test(src), '应导出 openProfileDialog');
+  assert(/export\s+function\s+openProfilePage/.test(src), '应导出 openProfilePage');
+  // R98：页面化之后不该再有「打开弹窗」的调用（confirmDialog 内部用它，但不在本模块里）
+  assert(!/openModal\s*\(/.test(src), '不得再以弹窗承载资料编辑');
   assert(/API\.updateMyProfile/.test(src), '保存资料应走 /users/me（updateMyProfile）');
   assert(/registerWindowsHello/.test(src), '应支持自行启用 Windows Hello');
   assert(/webauthnDisable/.test(src), '取消勾选时应走 webauthnDisable 关闭');
   assert(/reauthRequired/.test(src), '改用户名后应处理 reauthRequired（强制重新登录）');
-  assert(/不能自行修改/.test(src) || /role/.test(src), '应提示角色不可自行修改');
+  assert(/不能自行修改/.test(src), '应提示角色不可自行修改');
   assert(!/from\s*['"][^.'"]/.test(src), 'profile.js 不应引入外部依赖');
+
+  // R98：昵称输入框必须在用户名**之上**（需求原文「填写昵称的编辑框要在用户名之上」）
+  const nickAt = src.indexOf('id="p-f-nickname"');
+  const nameAt = src.indexOf('id="p-f-username"');
+  assert(nickAt > 0 && nameAt > 0, '昵称与用户名的输入框都应存在');
+  assert(nickAt < nameAt, '昵称输入框必须排在用户名之前');
+
+  // R98：注册时间（只读展示）与注销账户（邮箱验证 + 冷静期）都要在页面上
+  assert(/p-f-created|注册时间/.test(src), '页面应显示注册时间');
+  assert(/API\.deleteAccountCode/.test(src), '注销要先发验证码到绑定邮箱');
+  assert(/API\.requestAccountDeletion/.test(src), '提交注销申请必须走独立接口');
+  assert(/API\.cancelAccountDeletion/.test(src), '已提交时应能撤销');
 });
 
-test('main.js 账户菜单接入「编辑资料」入口', () => {
+test('main.js 账户菜单接入「我的资料」页面', () => {
   const src = fs.readFileSync(path.join(JS_DIR, 'main.js'), 'utf8');
   assert(/from\s*['"]\.\/profile\.js['"]/.test(src), 'main.js 应引入 profile.js');
   assert(/getElementById\('um-profile'\)/.test(src), '应绑定 #um-profile 菜单项');
-  assert(/openProfileDialog\s*\(/.test(src), '点击「编辑资料」应调用 openProfileDialog()');
+  assert(/openProfilePage\s*\(/.test(src), '点击「编辑资料」应调用 openProfilePage()');
+  // R98：页面必须登记进主视图白名单，否则 #profile 会被 hash 校验回落到 explorer
+  assert(/MAIN_VIEWS\s*=\s*\[[^\]]*'profile'/.test(src), 'profile 必须列入 MAIN_VIEWS');
+  assert(/profile:\s*'um-profile'/.test(src), 'profile 的入口（角色/存在性门控）应指向账户菜单项');
+  assert(/else if\s*\(v === 'profile'\)\s*refreshProfilePage\(\)/.test(src),
+    '切换进 profile 时必须刷新页面内容（资料可能在别处被改过）');
 });
 
-test('index.html 用户管理卡片与「编辑资料」菜单项就位', () => {
+test('index.html 用户管理卡片、账户菜单与「我的资料」页面就位', () => {
   const src = fs.readFileSync(path.join(ROOT, 'public', 'index.html'), 'utf8');
   assert(/id="sysset-user-card"/.test(src), '应保留 id="sysset-user-card" 供整卡显隐');
   assert(/id="um-profile"[^>]*>\s*编辑资料/.test(src), '账户菜单应含「编辑资料」项');
   assert(/id="um-users"/.test(src), '账户菜单应保留「用户管理」项（仅管理员可见）');
+  // R98：页面容器本身只放骨架，内容由 profile.js 现场渲染
+  assert(/<section id="profile" class="card-view" hidden>/.test(src), '应有 #profile 主视图容器');
+  assert(/id="profile-form"/.test(src) && /id="profile-danger"/.test(src),
+    '页面应包含资料表单与注销卡片两个容器');
 });
 
 /* ==================================================================

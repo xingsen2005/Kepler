@@ -1,6 +1,6 @@
 /** 系统设置 —— 文件加密（隐私保护）：加密方式 / 魔数 / 查看密码 / 用户管理（管理员） */
 import { API } from './api.js';
-import { toast, escapeHtml, confirmDialog, openModal, openAgreementDialog, fmtTime, fmtSize, updateNotice, USER_PREVIEW_LIMIT, filterUsersByName, previewMoreState, uploadPlanNotice, FILE_CONCURRENCY_MIN, FILE_CONCURRENCY_MAX, isStaffRole, roleLabel } from './util.js';
+import { toast, escapeHtml, confirmDialog, openModal, openAgreementDialog, fmtTime, fmtSize, updateNotice, USER_PREVIEW_LIMIT, filterUsersByName, previewMoreState, uploadPlanNotice, FILE_CONCURRENCY_MIN, FILE_CONCURRENCY_MAX, isStaffRole, isRootRole, roleLabel } from './util.js';
 import { openListDialog } from './listdialog.js';
 // R37：「限速」列（四张列表卡片共用的唯一实现点）
 import { openSpeedLimitDialog, speedCellHtml } from './speedlimit.js';
@@ -35,17 +35,31 @@ function isAdmin() {
 }
 
 /**
+ * R97：是否根用户 —— 决定「密钥轮转」卡片渲不渲染。
+ *
+ * 单独一层而不是复用 `isAdmin()`：管理员能看到整个设置页，但改「解锁因子」影响的是
+ * 全实例的解密能力，属于根用户。服务端 `/api/key/rotate-login` 挂的是 `requireRoot`，
+ * 这里只是**不渲染一个注定 403 的入口**。
+ */
+function isRootUser() {
+  return isRootRole(App.state.user && App.state.user.role);
+}
+
+/**
  * 仅管理员可见的卡片。
  *
  * **用户管理卡片（`sysset-user-card`）也在其中** —— 普通用户根本不应该看到它，
- * 其自助资料编辑改由右上角账户菜单的「编辑资料」承载（独立的弹窗，互不干扰）。
+ * 其自助资料编辑改由右上角账户菜单的「编辑资料」承载（R98 起是**独立页面** `#profile`）。
  *
  * 这样设计的关键收益：**同一张卡片不再需要同时服务两种角色**。
  * 此前它要在「用户管理 / 我的资料」之间来回切换，只要有一个分支漏改，
  * 换账号时就会残留上一个角色的 DOM（越权显示用户列表）。整卡按角色显隐之后，
  * 角色切换只是"显示 / 隐藏一个整块"，不存在需要还原的中间状态。
  */
-const ADMIN_ONLY_CARDS = ['sysset-site-card', 'sysset-user-card', 'sysset-restore-card', 'sysset-smtp-card', 'sysset-agreement-card', 'sysset-concurrency-card', 'sysset-lb-card', 'sysset-enc-card', 'sysset-excludes-card', 'sysset-webdav-card', 'sysset-captcha-card', 'sysset-payment-card', 'sysset-backup-card'];
+const ADMIN_ONLY_CARDS = ['sysset-site-card', 'sysset-user-card', 'sysset-restore-card', 'sysset-smtp-card', 'sysset-agreement-card', 'sysset-concurrency-card', 'sysset-lb-card', 'sysset-enc-card', 'sysset-excludes-card', 'sysset-webdav-card', 'sysset-captcha-card', 'sysset-payment-card', 'sysset-backup-card', 'sysset-integrity-card',
+  // R97：密钥轮转是**比管理员更高一档**的卡片 —— 先随管理员一并显示，
+  // 再由 `refresh()` 按 `isRootUser()` 收窄（见那里的注释）。
+  'sysset-key-card'];
 
 /** 隐藏仅管理员可见的卡片（非管理员直接不渲染其内容） */
 function setAdminCardVisible(cardId, visible) {
@@ -87,6 +101,15 @@ export function refresh() {
   const oldTip = sec.querySelector('.sysset-nonadmin');
   if (oldTip) oldTip.remove();
   ADMIN_ONLY_CARDS.forEach((id) => setAdminCardVisible(id, true));
+  /**
+   * R97：密钥轮转**再收窄一档** —— 仅根用户。
+   *
+   * 先按管理员显示（上一行把清单全部打开），再单独关掉这一张：这样"新增一张
+   * 管理员卡片"的默认行为不变，而"只给根用户"这件事只在这一处表达。
+   */
+  const rootUser = isRootUser();
+  setAdminCardVisible('sysset-key-card', rootUser);
+  if (rootUser) loadKeyStatus();
 
   loadUsers();
   // R53：发信设置（SMTP）
@@ -100,6 +123,8 @@ export function refresh() {
   // R48：线程并发（值随 /config 下发，这里只负责把当前值渲染进表单并刷新推导预览）
   renderConcurrency();
   loadLoadBalance();
+  // R99：完整性巡检（仅管理员）。**只读状态**，不触发任何云端请求 —— 想立刻体检要点卡片上的「立即巡检」。
+  loadIntegrity();
   API.encSettings().then((s) => {
     current = s;
     render(s);
@@ -123,6 +148,11 @@ export function refresh() {
 function wire() {
   if (wired) return;
   wired = true;
+  // R97：密钥轮转（仅根用户可见，但事件绑在按钮上，与角色无关 —— 隐藏的按钮收不到点击）
+  const keyRotateBtn = document.getElementById('btn-key-rotate');
+  if (keyRotateBtn) keyRotateBtn.onclick = openRotateKeyDialog;
+  const keyMigrateBtn = document.getElementById('btn-key-migrate');
+  if (keyMigrateBtn) keyMigrateBtn.onclick = openMigrateKeyDialog;
   // R73：锚点高亮跟随滚动。绑在 `#systemsettings` 上而不是 window ——
   // 它自己才是滚动容器（.card-view），绑 window 收不到这个容器的滚动。
   const secEl = document.getElementById('systemsettings');
@@ -156,6 +186,9 @@ function wire() {
   // 负载均衡（仅管理员）：刷新用量
   const lbRefresh = document.getElementById('btn-lb-refresh');
   if (lbRefresh) lbRefresh.onclick = () => loadLoadBalance();
+  // R99：完整性巡检（仅管理员）——「立即巡检」会真的对云端发 HEAD，因此是一个显式动作
+  const integrityRun = document.getElementById('btn-integrity-run');
+  if (integrityRun) integrityRun.onclick = () => runIntegrity();
   // 关于卡片：检查更新（**所有登录用户**可见 —— 关于卡片不属 ADMIN_ONLY_CARDS）
   const btnUpdate = document.getElementById('btn-check-update');
   if (btnUpdate) btnUpdate.onclick = checkUpdate;
@@ -1196,6 +1229,153 @@ async function saveSiteSettings() {
   }
 }
 
+/* ============================ 密钥轮转（仅根用户，R97） ============================ */
+
+/**
+ * 渲染密钥状态卡片。
+ *
+ * 三种状态要能一眼分清，因为它们对应完全不同的处置：
+ *  - **未启用信封** + 有旧密钥 → 明文密钥躺在磁盘上，应尽快「启用」；
+ *  - **已启用但旧明文密钥仍在** → 信封生效了，但迁移时的删除失败了（或运维选了保留），
+ *    此时"不落盘"并未真正成立，必须显式说出来，否则用户以为已经安全；
+ *  - **已启用且无旧密钥** → 目标状态。
+ */
+async function loadKeyStatus() {
+  if (!isRootUser()) return;
+  const stateEl = document.getElementById('key-state-line');
+  const timeEl = document.getElementById('key-time-line');
+  const tagEl = document.getElementById('key-version-tag');
+  const btnMigrate = document.getElementById('btn-key-migrate');
+  const btnRotate = document.getElementById('btn-key-rotate');
+  try {
+    const st = await API.keyStatus();
+    const envelope = Boolean(st.envelope);
+    if (stateEl) {
+      if (!envelope) {
+        stateEl.innerHTML = st.legacyKeyPresent
+          ? '未启用信封加密：主密钥以<b>明文文件</b>（data/secret.key）保存，能读到数据目录的人即可解密全部配置与登录凭据。'
+          : '未启用信封加密（尚未生成主密钥）。';
+      } else if (st.legacyKeyPresent) {
+        stateEl.innerHTML = '已启用信封加密，但<b>旧明文密钥文件仍在磁盘上</b> —— 请手工删除它，否则「密钥不落盘」并未真正生效。';
+      } else {
+        stateEl.innerHTML = '已启用信封加密：磁盘上只保存<b>被主口令包裹</b>的密钥，明文密钥不落盘。';
+      }
+    }
+    if (timeEl) {
+      timeEl.textContent = envelope
+        ? `kekVersion ${st.kekVersion}｜上次轮转 ${st.rotatedAt ? fmtTime(st.rotatedAt) : '—'}`
+        : '—';
+    }
+    if (tagEl) tagEl.textContent = envelope ? `v${st.kekVersion}` : '';
+    // 「启用」只在"有旧密钥、还没启用"时出现：空实例没有可包裹的密钥，
+    // 那种情况下信封会在首次设置口令时自然建立
+    if (btnMigrate) btnMigrate.hidden = envelope || !st.legacyKeyPresent;
+    if (btnRotate) btnRotate.hidden = !envelope;
+  } catch (e) {
+    if (stateEl) stateEl.textContent = '密钥状态读取失败：' + (e.message || '未知错误');
+  }
+}
+
+/** 两步式对话框的共同骨架：当前口令 + 新口令 ×2 */
+function buildKeyDialogBody({ withNew }) {
+  const wrap = document.createElement('div');
+  wrap.innerHTML = `
+    <div class="form-item">
+      <label>${withNew ? '当前主口令' : '根用户登录口令'}</label>
+      <input type="password" class="full" id="key-dlg-cur" autocomplete="current-password" spellcheck="false">
+      <div class="hint">${withNew
+    ? '用于验证身份（防会话被劫持后直接改掉解锁因子）。'
+    : '用于验证身份并派生包裹密钥 —— 主口令 = 根用户登录口令。'}</div>
+    </div>
+    ${withNew ? `
+    <div class="form-item">
+      <label>新主口令</label>
+      <input type="password" class="full" id="key-dlg-new" autocomplete="new-password" spellcheck="false">
+      <div class="hint">至少 8 位，且与登录口令保持一致（轮转后<b>同时</b>更新登录口令）。</div>
+    </div>
+    <div class="form-item">
+      <label>确认新主口令</label>
+      <input type="password" class="full" id="key-dlg-new2" autocomplete="new-password" spellcheck="false">
+    </div>` : ''}
+    <div class="hint" id="key-dlg-msg"></div>`;
+  return wrap;
+}
+
+/** 轮转登录密钥（改写根口令 + 重裹 DEK，数据不动） */
+function openRotateKeyDialog() {
+  if (!isRootUser()) return;
+  const body = buildKeyDialogBody({ withNew: true });
+  const modal = openModal({
+    title: '轮转登录密钥',
+    body,
+    foot: [
+      { text: '取消' },
+      {
+        text: '确认轮转',
+        cls: 'primary',
+        onClick: async () => {
+          const msg = body.querySelector('#key-dlg-msg');
+          const cur = body.querySelector('#key-dlg-cur').value;
+          const nw = body.querySelector('#key-dlg-new').value;
+          const nw2 = body.querySelector('#key-dlg-new2').value;
+          const bad = (t) => { if (msg) { msg.textContent = t; msg.style.color = 'var(--danger, #e5484d)'; } };
+          if (!cur) return bad('请输入当前主口令');
+          if (!nw || nw.length < 8) return bad('新主口令至少 8 位');
+          if (nw !== nw2) return bad('两次输入的新主口令不一致');
+          if (nw === cur) return bad('新主口令不能与当前主口令相同');
+          if (msg) { msg.textContent = '正在轮转，请稍候…'; msg.style.color = ''; }
+          try {
+            await API.keyRotateLogin({ currentPassphrase: cur, newPassphrase: nw });
+            modal.close();
+            toast('密钥已轮转，全部会话已失效，请重新登录', { type: 'success' });
+            // 服务端已销毁全部会话 —— 留在这里点任何东西都只会 401，
+            // 直接回登录页是最诚实的反馈
+            setTimeout(() => window.location.reload(), 1200);
+          } catch (e) {
+            bad(e && e.message ? e.message : '轮转失败');
+          }
+        },
+      },
+    ],
+  });
+}
+
+/** 启用信封加密（迁移：用当前根口令包裹现有密钥） */
+function openMigrateKeyDialog() {
+  if (!isRootUser()) return;
+  const body = buildKeyDialogBody({ withNew: false });
+  const modal = openModal({
+    title: '启用信封加密',
+    body,
+    foot: [
+      { text: '取消' },
+      {
+        text: '启用',
+        cls: 'primary',
+        onClick: async () => {
+          const msg = body.querySelector('#key-dlg-msg');
+          const cur = body.querySelector('#key-dlg-cur').value;
+          if (!cur) { if (msg) msg.textContent = '请输入根用户登录口令'; return; }
+          if (msg) { msg.textContent = '正在建立密钥信封…'; msg.style.color = ''; }
+          try {
+            const r = await API.keyMigrate({ passphrase: cur });
+            modal.close();
+            toast(r && r.legacyKeyRemoved
+              ? '已启用信封加密，旧明文密钥已删除'
+              : '已启用信封加密（旧明文密钥仍保留，请手工删除）', { type: 'success' });
+            loadKeyStatus();
+          } catch (e) {
+            if (msg) {
+              msg.textContent = (e && e.message) || '启用失败';
+              msg.style.color = 'var(--danger, #e5484d)';
+            }
+          }
+        },
+      },
+    ],
+  });
+}
+
 /* ============================ 协议设置（仅管理员，R68） ============================ */
 
 /**
@@ -2106,8 +2286,138 @@ function loadLoadBalance() {
   });
 }
 
-/** 单个桶的进度条（分母 = 该密钥的上限；无限制时用「已用总量」以便表达相对大小） */
-function lbBucketHTML(b, credQuota, credUnlimited, credUsed) {
+/* ---------------------- R99：完整性巡检（只读体检） ---------------------- */
+
+/** 上一次渲染的巡检状态（点「立即巡检」后复用它做增量渲染，避免整块闪烁） */
+let integrityState = null;
+
+/**
+ * 读巡检状态（仅管理员）。
+ *
+ * 这条请求**只读内存里的最近一次结果**，不会触发任何云端 HEAD —— 理由在
+ * `server/routes/integrity.js` 顶部：切角色 / 切卡片 / 刷新都会调它，若这里顺手跑一轮，
+ * 「打开系统设置页」就变成一次真实的云端扫描。
+ */
+function loadIntegrity() {
+  if (!isAdmin()) return;
+  const stateEl = document.getElementById('integrity-state-line');
+  if (stateEl && !integrityState) stateEl.textContent = '加载中…';
+  API.integrityStatus().then((st) => {
+    integrityState = st;
+    renderIntegrity(st);
+  }).catch((e) => {
+    if (e && e.status === 403) return; // 非管理员：卡片本就隐藏，不暴露任何信息
+    if (stateEl) stateEl.textContent = '巡检状态读取失败：' + (e.message || '未知错误');
+  });
+}
+
+/**
+ * 「立即巡检」：**显式**动作，会真的对云端逐个发 HEAD。
+ *
+ * 之所以不做成"进页面就跑"：每轮都要消耗真实请求配额（每桶上限 `INTEGRITY_BATCH`），
+ * 而用户打开设置页的动作里不包含"我同意花掉这些请求"这层意思。
+ */
+async function runIntegrity() {
+  if (!isAdmin()) return;
+  const btn = document.getElementById('btn-integrity-run');
+  const statEl = document.getElementById('integrity-stat-line');
+  if (btn) { btn.disabled = true; btn.textContent = '巡检中…'; }
+  if (statEl) statEl.textContent = '正在按轮转游标逐个 HEAD 校验，请稍候…';
+  try {
+    const st = await API.integrityRun();
+    integrityState = st;
+    renderIntegrity(st);
+    const bad = Number(st && st.bad) || 0;
+    toast(bad > 0 ? `巡检完成：发现 ${bad} 个异常对象` : '巡检完成：本轮未发现异常',
+      { type: bad > 0 ? 'warn' : 'success' });
+  } catch (e) {
+    if (statEl) statEl.textContent = '巡检失败：' + (e.message || '未知错误');
+    toast(e.message || '巡检失败', { type: 'error' });
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '立即巡检'; }
+  }
+}
+
+/** 结论 → 中文（`error` / `unknown` 属于"没查清"，不能与"确实坏了"混在一起显示） */
+const INTEGRITY_VERDICT = {
+  missing: '已丢失', size: '长度不符', modified: '被改写',
+  unknown: '无法判定', error: '无法确认',
+};
+
+/** 整轮被跳过的原因 → 一句话（**锁定与损坏必须分开说**，处置完全不同） */
+const INTEGRITY_SKIP = {
+  locked: '进程处于锁定态：巡检不去读读不了的加密文件，解锁后自动恢复',
+  'meta-corrupt': '本地加密元数据已损坏：巡检暂停，避免在坏数据上得出结论',
+  'meta-unreadable': '本地加密元数据无法读取：本轮跳过',
+};
+
+/** 毫秒 → 「6 小时」这样的粗粒度文案（巡检周期不是秒级参数，没必要精确到秒） */
+function fmtInterval(ms) {
+  const n = Number(ms) || 0;
+  if (n >= 3600000) return `${Math.round(n / 3600000)} 小时`;
+  if (n >= 60000) return `${Math.round(n / 60000)} 分钟`;
+  return `${Math.round(n / 1000)} 秒`;
+}
+
+/**
+ * 渲染巡检卡片。
+ *
+ * 三块信息刻意分开，因为它们的可信度不一样：
+ *  ① **运行状态**（开没开 / 周期 / 每轮上限）—— 来自配置，恒可信；
+ *  ② **最近一次**（时间 / 耗时 / 是否被跳过）—— "有没有真的在跑"的证据，
+ *     没有它，一张写着"巡检中"的卡片可以永远停在昨天；
+ *  ③ **明细**—— 只列异常，正常的不列（否则 200 条"正常"会把 2 条异常淹掉）。
+ */
+function renderIntegrity(st) {
+  if (!st) return;
+  const badge = document.getElementById('integrity-badge');
+  const stateEl = document.getElementById('integrity-state-line');
+  const lastEl = document.getElementById('integrity-last-line');
+  const statEl = document.getElementById('integrity-stat-line');
+  const box = document.getElementById('integrity-findings');
+  const bad = Number(st.bad) || 0;
+
+  if (badge) {
+    badge.textContent = !st.enabled ? '已关闭' : (st.locked ? '锁定态' : (bad > 0 ? `${bad} 项异常` : '正常'));
+  }
+  if (stateEl) {
+    stateEl.innerHTML = !st.enabled
+      ? '后台巡检已<b>关闭</b>（环境变量 <code>INTEGRITY_SWEEP_MS=0</code>）。可以手动点「立即巡检」，结果同样记录在操作日志里。'
+      : `已启用：每 <b>${escapeHtml(fmtInterval(st.intervalMs))}</b> 一轮，每轮每桶最多 <b>${escapeHtml(String(st.batch))}</b> 个对象`
+        + `（共 <b>${escapeHtml(String(st.buckets || 0))}</b> 个桶有加密对象）。`;
+  }
+  if (lastEl) {
+    if (!st.lastRunAt) {
+      lastEl.textContent = '尚未运行（部署后的首轮会在约 1 分钟后开始）';
+    } else {
+      const skip = st.skippedReason ? (INTEGRITY_SKIP[st.skippedReason] || `本轮跳过（${st.skippedReason}）`) : '';
+      lastEl.innerHTML = `${escapeHtml(fmtTime(st.lastRunAt))}｜耗时 ${escapeHtml(String(Math.max(0, Math.round((Number(st.durationMs) || 0) / 100)) / 10))} 秒`
+        + (skip ? `<br><span style="color:var(--warn-fg, #92400e)">${escapeHtml(skip)}</span>` : '');
+    }
+  }
+  if (statEl && !st.skippedReason) {
+    statEl.textContent = st.lastRunAt
+      ? `扫描 ${Number(st.scanned) || 0} 个｜正常 ${Number(st.ok) || 0} 个｜异常 ${bad} 个｜跳过 ${Number(st.skipped) || 0} 个`
+      : '—';
+  }
+  if (box) {
+    const list = Array.isArray(st.findings) ? st.findings : [];
+    if (!list.length) {
+      box.innerHTML = '';
+    } else {
+      box.innerHTML = list.map((f) => {
+        const verdict = INTEGRITY_VERDICT[f.verdict] || f.verdict || '异常';
+        const cls = (f.verdict === 'missing' || f.verdict === 'size' || f.verdict === 'modified') ? 'bad' : 'warn';
+        return `<div class="integrity-find ${cls}">
+          <span class="if-verdict">${escapeHtml(verdict)}</span>
+          <span class="if-body"><span class="if-where">${escapeHtml(f.bucket || '')} / </span><code>${escapeHtml(f.key || '')}</code><br>${escapeHtml(f.detail || '')}</span>
+        </div>`;
+      }).join('');
+    }
+  }
+}
+
+/** 单个桶的进度条（分母 = 该密钥的上限；无限制时用「已用总量」以便表达相对大小） */function lbBucketHTML(b, credQuota, credUnlimited, credUsed) {
   const denom = credUnlimited ? credUsed : credQuota;
   const pct = denom > 0 ? Math.min(100, (b.sizeBytes / denom) * 100) : 0;
   const overBucket = b.quotaBytes > 0 && b.sizeBytes > b.quotaBytes;

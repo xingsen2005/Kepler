@@ -129,6 +129,24 @@ function requireAdmin(req, res, next) {
 }
 
 /**
+ * R97：**仅根用户**。
+ *
+ * 与 `requireAdmin` 是两把不同的锁，不能互相替代：管理员（`admin`）能管站点设置、
+ * 能管普通用户，但**不能**改解锁因子 —— 那一步影响的是全实例的**解密能力**，
+ * 一旦由管理员执行，等于把"谁能让服务解不开数据"的权力下发了一级。
+ *
+ * 判据只引用 `roles.isRoot`（角色语义的唯一事实源），不写字面量比较：
+ * 这行以前在别处写成 `role === 'root'` 的那些，正是 R71 收敛掉的那批。
+ */
+function requireRoot(req, res, next) {
+  const u = req.authUser;
+  if (!u || !roles.isRoot(u.role)) {
+    return res.status(403).json({ error: '仅根用户可执行该操作' });
+  }
+  next();
+}
+
+/**
  * R17-04：把 `async` 处理器的 rejection 交回统一错误中间件。
  *
  * Express 4（本项目 `express@^4.19.2`）**不会**捕获 async handler 抛出的错误 ——
@@ -703,6 +721,8 @@ Object.assign(module.exports, {
   typeOf, baseName, parentOf,
   roleOf, bucketsFor, credentialsFor,
   requireAdmin, requireConfig, validateCredentialFormat,
+  // R97：密钥轮转 / 迁移的入口守卫（与 requireAdmin 分开 —— 改解锁因子仅根用户）
+  requireRoot,
   asyncHandler, apiHandler,
   sessionCookie, clearCookie,
   webauthnContext, splitHostPort,
