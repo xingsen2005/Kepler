@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  网络安全配置：
+  - 允许明文 HTTP：Kepler 支持无证书部署（内网 / 测试环境仅提供 HTTP），
+    客户端需兼容；应用内在检测到 http:// 地址时会明确提示安全风险
+  - 证书校验保持系统默认（不信任用户 CA）：Kepler 生产部署使用 ACME 真实证书
+-->
+<network-security-config>
+    <base-config cleartextTrafficPermitted="true">
+        <trust-anchors>
+            <certificates src="system" />
+        </trust-anchors>
+    </base-config>
+</network-security-config>

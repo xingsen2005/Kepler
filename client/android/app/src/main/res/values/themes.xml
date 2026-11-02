@@ -1,0 +1,11 @@
+<resources xmlns:tools="http://schemas.android.com/tools">
+    <!--
+      应用主题：界面全部由 Jetpack Compose 实现，XML 主题仅需提供
+      NoActionBar 基类与窗口背景；配色由 ui/theme 下的 Compose 主题负责。
+      edge-to-edge（全面屏）在 MainActivity 中通过 enableEdgeToEdge() 开启。
+    -->
+    <style name="Theme.Kepler" parent="Theme.Material3.DayNight.NoActionBar">
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+    </style>
+</resources>

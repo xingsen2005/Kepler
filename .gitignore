@@ -4,9 +4,3 @@ data/
 .workbuddy/
 .tmp-*
 *.reversebak
-
-# 客户端二进制不进仓库：体积（约 160MB）会拖垮 clone，且每台机器都能重新构建。
-# 分发改走 GitHub Releases —— 见 client/readme.txt 与 README「客户端下载」。
-/client/**/*.exe
-/client/**/*.apk
-/client/**/*.aab
