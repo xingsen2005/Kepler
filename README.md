@@ -354,8 +354,8 @@ npm run lint     # 代码检查（ESLint 可选，未安装时给出安装指引
 
 | 平台 | 产物 | 说明 |
 | --- | --- | --- |
-| Windows | `Kepler-Windows.exe` | Node SEA 单文件，内置服务端 + 前端 + 生产依赖。双击即用：自动选端口、就绪后打开浏览器，数据目录默认落在 exe 同级的 `data\`（可整体拷贝迁移）。首次启动会解压内置应用树到 `%LOCALAPPDATA%\Kepler\client\v<版本>\app`，约 1~2 秒 |
-| Android | `Kepler-Android.apk` | Kotlin 原生客户端（**不是 WebView 壳**），因此拿不到 `captchaToken` —— 服务端需开启原生验证码 `NATIVE_CAPTCHA=on`，详见 §「功能特性」的原生客户端验证码 |
+| Windows | `Kepler-Windows-x64-1.7.5.exe` | Node SEA 单文件，内置服务端 + 前端 + 生产依赖。双击即用：自动选端口、就绪后打开浏览器，数据目录默认落在 exe 同级的 `data\`（可整体拷贝迁移）。首次启动会解压内置应用树到 `%LOCALAPPDATA%\Kepler\client\v<版本>\app`，约 1~2 秒。⚠️ 文件名里的版本是该 exe **内置的服务端版本**，可能落后于当前源码 |
+| Android | `Kepler-Android-1.0-debug.apk` | Kotlin 原生客户端（**不是 WebView 壳**），因此拿不到 `captchaToken` —— 服务端需开启原生验证码 `NATIVE_CAPTCHA=on`，详见 §「功能特性」的原生客户端验证码 |
 
 > **为什么要单独发 Release**：两个二进制合计约 160MB。放进仓库等于让每一次 `git clone` 都拖上这 160MB，而 git 对二进制只存一份黑盒，既不可审、也无法与源码版本对应。Releases 是 GitHub 为「构建产物」准备的位置：能挂说明、能记下载量，且不进入 clone。
 >

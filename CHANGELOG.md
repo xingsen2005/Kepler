@@ -22,6 +22,7 @@
 - 用 `git rm --cached` 把两个二进制**移出索引**（历史里的 blob 不动，`git log -- client/` 仍可追）；
 - `.gitignore` 增加 `/client/**/*.exe`、`/client/**/*.apk`、`/client/**/*.aab` —— 挡住的是「下次又手滑提交」，而不是「本机不能用」：文件**仍留在工作区**（未跟踪 + 已忽略），本地照常运行；
 - 新增 GitHub Release 挂载这两个产物，README 增加「五、客户端下载」一节（原「开源协议」顺延为六），`client/readme.txt` 改写为「去 Releases 下载 + 如何自行构建」。
+- Release 的 tag 用**构建日期**而不是版本号：`clients-2026.11.02`，标题「客户端下载（Windows / Android）· 2026-11-02」，资产文件名为 `Kepler-Windows-x64-1.7.5.exe`（85.1MB）与 `Kepler-Android-1.0-debug.apk`（70.0MB），说明里写明**各产物实际内置的版本**与 SHA-256。用日期是因为两个产物内嵌的版本各不相同（exe 内嵌服务端 1.7.5、apk 是客户端 1.0 debug），挂一个 `v2.1.0` 的 tag 等于对外承诺「这两个二进制就是 2.1.0」——那是假的。
 
 **没有做的（以及为什么）**：
 
