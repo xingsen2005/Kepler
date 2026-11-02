@@ -5,7 +5,7 @@
  * R41：两种服务商（reCAPTCHA / Turnstile）的凭证**各自独立保存**，
  * 管理员可以两套都填好，再用 `provider` 选择登录页实际使用哪一套。
  */
-const { express, configStore, statsStore, captcha } = require('./_context');
+const { express, configStore, statsStore, captcha, captchaNative, security } = require('./_context');
 const { requireAdmin } = require('./_shared');
 
 const router = express.Router();
@@ -29,6 +29,31 @@ function providersView(stored) {
 // 仅返回 enabled/provider/siteKey/available；secretKey 任何情况下都不出服务端。
 router.get('/captcha/public', (req, res) => {
   res.json(captcha.publicConfig(configStore));
+});
+
+/**
+ * R100：原生验证码签发（无浏览器客户端专用）。
+ *
+ * 为什么需要一条独立端点：客户端遇到 `needCaptcha` 后拿到的那道题是**一次性**的，
+ * 答题界面上的「换一道」若只能靠再提交一次登录来换，就会白白消耗一次口令尝试预算
+ * （`loginLimiter` 10 次/分钟、失败锁定 5 次）—— 用户点三次「换一道」就把自己锁了。
+ *
+ * 三条边界：
+ *  - **匿名可达**（已登记进 index.js 的 PUBLIC_API）：客户端在这时还没有会话；
+ *  - **开关关闭时回 404**：不暴露「这台机器支持弱验证」这件事，也不签任何题；
+ *  - **按 IP 限流**：本端点每次调用都会往内存表落一条记录（见 `nativeCaptchaLimiter`）。
+ */
+const nativeCaptchaLimit = security.limitMiddleware(
+  security.nativeCaptchaLimiter,
+  (req) => security.clientIp(req) || 'unknown',
+);
+
+router.get('/captcha/native', nativeCaptchaLimit, (req, res) => {
+  if (!captchaNative.enabled()) {
+    return res.status(404).json({ error: '原生验证码未启用' });
+  }
+  const c = captchaNative.issue();
+  return res.json({ ok: true, token: c.token, question: c.question, expiresAt: c.expiresAt });
 });
 
 // 管理端视图：完整配置（secretKey 掩码为布尔值，不回传明文；附环境变量覆盖提示）

@@ -782,6 +782,19 @@ const keyUnlockLock = createFailLock({ name: 'key-unlock', maxFails: 5, baseLock
  */
 const keyRotateLimiter = createLimiter({ name: 'key-rotate', windowMs: 60 * 1000, max: 5 });
 
+/**
+ * R100：原生验证码的**签发**限流。
+ *
+ * `GET /captcha/native` 匿名可达（客户端在登录之前就要拿题），而每次签发都会往
+ * 内存表里落一条记录 —— 不设限就是一条「匿名即可灌内存」的路径，与 R69 给限流器
+ * 加 `LIMITERS_MAX_ENTRIES` 是同一条推理。模块内部另有 `MAX_ENTRIES` 天花板兜底，
+ * 两者是**两道独立的闸**（IP 维度 vs 全局容量），少任何一道都不完整。
+ *
+ * 阈值 20 次/分钟：正常一次登录最多用 1~2 道题（答错换题），留十倍余量；
+ * 而登录本身另有 `loginLimiter`（10 次/分钟）压着，这里不需要更紧。
+ */
+const nativeCaptchaLimiter = createLimiter({ name: 'captcha-native', windowMs: 60 * 1000, max: 20 });
+
 // WebDAV 认证：按 **IP** 限流（旧实现只按 IP+用户名锁定，攻击者换用户名即可绕过）
 const webdavAuthLimiter = createLimiter({ name: 'webdav-auth', windowMs: 60 * 1000, max: 30 });
 
@@ -994,6 +1007,7 @@ module.exports = {
   initLimiter, passwordLimiter, webdavAuthLimiter, shareDownloadLimiter, webdavRevealLimiter, payNotifyLimiter,
   // R97：主密钥解锁 / 轮转（前者匿名可达且每次都算 scrypt，必须限流 + 失败锁定）
   keyUnlockLimiter, keyUnlockLock, keyRotateLimiter,
+  nativeCaptchaLimiter, // R100：原生验证码签发（匿名端点，防内存灌入）
   payCheckLimiter, payStatusLimiter, shareViewLimiter,
   orderRestoreLimiter, // R64：「恢复购买」按订单号取回（与 shareLimiter 分开计数）
   backupExportLimiter, // R38：备份导出校验账户口令的限流（与 passwordLimiter 刻意分开）

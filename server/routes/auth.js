@@ -17,7 +17,7 @@
  *
  * 与验证码共存：验证码属第一步、Windows Hello 属第二步，串联而非互斥，同时开启均生效。
  */
-const { express, security, configStore, statsStore, authSession, captcha, webauthn, emailCode, inviteStore } = require('./_context');
+const { express, security, configStore, statsStore, authSession, captcha, captchaNative, webauthn, emailCode, inviteStore } = require('./_context');
 const { sessionCookie, clearCookie, webauthnContext } = require('./_shared');
 // R54②：邮箱的归一化 / 入参判据（`normalizeEmail` 也是 `config-store` 落盘兜底用的同一个）
 // 重发冷却同时要回给前端（据它做倒计时），所以常量也一并取过来，避免两处各写一个数
@@ -56,6 +56,33 @@ function captchaHosts(req) {
   add(req && req.headers && req.headers.host);
   add(security.SITE_DOMAIN);
   return out;
+}
+
+/**
+ * R100：人机验证拦截时的响应体 —— 登录与注册**共用**这一处。
+ *
+ * 两种形态：
+ *  ① 网页路径（`cap.challenge` 不存在）⇒ 与改动前**逐字一致**：只有 `error` 一句话。
+ *     这条分支必须原样保留 —— 前端 `main.js` 靠 403 + 文案决定「重新勾选验证码」。
+ *  ② 原生客户端路径（带 `challenge`）⇒ 多三个字段：`needCaptcha` / `captcha`（题面）/
+ *     `captchaError`（上一次为什么错）。客户端据此渲染题目、显示错误、重新提交。
+ *
+ * ⚠️ `needCaptcha` 只在**原生**分支出现。它一旦在网页分支里也带上，前端的
+ * 「验证码组件没 ready」提示就会被一句「请完成人机验证」顶掉，且同一个响应
+ * 在两个页面上会引出两种行为 —— 这正是 R94 记过的「同一事实两个说法」。
+ */
+function sendCaptchaReject(res, cap) {
+  const challenge = cap && cap.challenge;
+  if (!challenge) {
+    return res.status(403).json({ error: captcha.publicReason(cap && cap.reason) });
+  }
+  const body = {
+    error: cap.retry ? '验证失败，请重试' : '请完成人机验证',
+    needCaptcha: true,
+    captcha: { token: challenge.token, question: challenge.question },
+  };
+  if (cap.retry) body.captchaError = captchaNative.failText(cap.reason);
+  return res.status(403).json(body);
 }
 
 /**
@@ -178,16 +205,18 @@ router.post('/auth/login', async (req, res) => {
     const pre = await precheckLogin(req, res, username);
     if (!pre) return;
 
-    // 人机验证（服务端回源校验；关闭时直接放行，不引入任何额外校验/依赖）
-    // token 从 body.captchaToken 取（前端由 reCAPTCHA/Turnstile 组件产出），不信任前端自带的结果。
-    // R94（审核 M03-04）：带上「本站允许的域名」，让 captcha.verify 核对服务商应答里的
-    // `hostname` —— 否则同一枚 sitekey 在别的域名上解出的 token 也能过本站的人机验证。
-    const cap = await captcha.verify({
-      token: b.captchaToken, remoteip: pre.ip, expectedHosts: captchaHosts(req),
+    // R100：人机验证入口改为 `captchaNative.guard()` —— 它先判「走哪条分支」：
+    //  · 验证码关闭 / 原生开关未开 / 请求不带客户端标识 ⇒ **原样交给** `captcha.verify()`，
+    //    行为与改动前逐字一致（R94 的 hostname 核对也在这条路径里，未动）；
+    //  · 只有「已开启 + 开关已开 + 客户端标识命中白名单」才走本机算术题，且不出网。
+    // token 仍从 body.captchaToken 取（前端由 reCAPTCHA/Turnstile 组件产出），
+    // 不信任前端自带的结果。
+    const cap = await captchaNative.guard({
+      req, body: b, remoteip: pre.ip, expectedHosts: captchaHosts(req),
     }, configStore);
     if (!cap.passed) {
       statsStore.addLog({ action: 'auth.fail', level: 'warn', detail: `登录被人机验证拦截（原因：${cap.reason}，用户名：${username || '(空)'}）` });
-      return res.status(403).json({ error: captcha.publicReason(cap.reason) });
+      return sendCaptchaReject(res, cap);
     }
     if (cap.degraded) {
       statsStore.addLog({ action: 'auth.captcha.degraded', level: 'warn', detail: `人机验证服务异常已按降级策略放行（原因：${cap.reason}，用户名：${username}）` });
@@ -723,14 +752,16 @@ router.post('/auth/register', async (req, res) => {
       return res.status(400).json({ error: '两次输入的密码不一致' });
     }
 
-    // ③ 人机验证：与登录同源。开启时注册同样是脚本撞的第一道门 —— 而且它比登录更"贵"：
+    // ③ 人机验证：与登录同源（R100 起统一走 `captchaNative.guard()` —— 原生客户端
+    // 拿不到 reCAPTCHA token，若这里仍硬要 `captchaToken`，App 连注册都做不了）。
+    // 开启时注册同样是脚本撞的第一道门 —— 而且它比登录更"贵"：
     // 每一次成功注册都要落一个账户并算一次 scrypt。
-    const cap = await captcha.verify({
-      token: b.captchaToken, remoteip: ip, expectedHosts: captchaHosts(req),
+    const cap = await captchaNative.guard({
+      req, body: b, remoteip: ip, expectedHosts: captchaHosts(req),
     }, configStore);
     if (!cap.passed) {
       statsStore.addLog({ action: 'auth.register', level: 'warn', detail: `注册被人机验证拦截（原因：${cap.reason}；IP：${ip}）` });
-      return res.status(403).json({ error: captcha.publicReason(cap.reason) });
+      return sendCaptchaReject(res, cap);
     }
     if (cap.degraded) {
       statsStore.addLog({ action: 'auth.captcha.degraded', level: 'warn', detail: `人机验证服务异常已按降级策略放行（原因：${cap.reason}；场景：注册）` });

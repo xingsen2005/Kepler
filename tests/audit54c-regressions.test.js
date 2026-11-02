@@ -621,7 +621,11 @@ test('R54c-04e · 注册的三步顺序：模式 → 邀请码**格式** → 核
   const iMode = body.indexOf("mode !== 'open' && mode !== 'invite'");
   const iFormat = body.indexOf('parseInviteCodeInput');
   const iConfirm = body.indexOf('两次输入的密码不一致');
-  const iCaptcha = body.indexOf('captcha.verify');
+  // R100：人机验证的调用点由 `captcha.verify(` 换成 `captchaNative.guard(`（它内部
+  // 再决定走网页还是原生分支）。本条判的是**它与核销的先后**，不是那个函数名 ——
+  // 故判据跟着调用点走，顺序语义一字未动。⚠️ 若哪天又换了调用点，这里必须再次同步，
+  // 否则 `indexOf` 取到 -1 会让 628 行的自证先红（这正是自证存在的意义）。
+  const iCaptcha = body.indexOf('captchaNative.guard(');
   const iConsume = body.indexOf('inviteStore.consume');
   const iAdd = body.indexOf('configStore.addUser');
   const order = { iMode, iFormat, iConfirm, iCaptcha, iConsume, iAdd };

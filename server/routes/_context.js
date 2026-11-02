@@ -24,6 +24,10 @@ module.exports = {
   webdav: require('../webdav-server'),
   authSession: require('../auth-session'),
   captcha: require('../captcha'),
+  // R100：原生验证码（无浏览器客户端专用）。与 `captcha` 是两个独立实现 ——
+  // 前者回源校验第三方 token，后者是本机自出的算术题，唯一的接线点是
+  // `captcha-native.guard()`（由它决定调哪一支）。
+  captchaNative: require('../captcha-native'),
   webauthn: require('../webauthn'),
   smtp: require('../smtp'), // R53：零依赖 SMTP 发信客户端
   emailCode: require('../email-code'), // R54②：邮箱验证码（签发 / 核销 / 发信唯一实现点）

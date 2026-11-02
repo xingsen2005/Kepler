@@ -5,7 +5,47 @@
 > 本文件是**事后重建**的，不是随每次发版逐条维护的发布记录。项目虽托管在 GitHub（`origin` 可用、有提交历史），但提交历史**未按发布切分** —— 提交信息多为「bug fix」这类无信息量占位，也没有留存任何发布记录文档，因此：
 >
 > - **不给出任何发布日期**。版本标题写「日期未归档」，而不是填一个看起来合理的日期；
-> - 版本号的唯一事实源是 `package.json` 的 `version` 字段（当前 `2.0.0`）；
+> - 版本号的唯一事实源是 `package.json` 的 `version` 字段（当前 `2.1.0`）；
+
+## [2.1.0] - 日期未归档
+
+**一次「让不会加载网页的客户端也能登录」的修复，代价是一道显式闸门。** 开了 reCAPTCHA / Turnstile 之后，纯原生 App 拿不到 `captchaToken`，登录永远 `403`；本轮给这类客户端一条自足的人机验证路径（服务端出算术题，客户端用文本框作答），而**默认关闭**。
+
+### 问题
+
+浏览器登录页必须渲染**第三方 Web 组件**才能产出 `captchaToken`。Android 客户端没有 WebView 通道 ⇒ 提交时 `captchaToken` 永远为空 ⇒ `captcha.verify()` 一律判 `captcha_token_missing` ⇒ **客户端永远登不进来**。网页端一切正常，所以这个缺陷只在真机上暴露。
+
+### 做法
+
+服务端识别「这是客户端」，改走**本机出的算术题**：登录/注册的 `captchaToken` 之外，客户端可以提交 `nativeToken` + `nativeAnswer`；服务端把题面放在 `403` 响应体里下发。
+
+| 取舍 | 结论 | 理由 |
+| --- | --- | --- |
+| 默认开启还是默认关闭？ | **默认关闭**（`NATIVE_CAPTCHA=on` 才启用） | 算术题对脚本透明、`X-Kepler-Client` 头也可伪造 ⇒ 开了就等于给所有人一条绕过 reCAPTCHA 的路。与 `captcha.onError` 默认 `block` 同一条原则 |
+| 客户端标识怎么认？ | 请求头前缀白名单（默认 `kepler-android/`），**不认 `*`** | 头可伪造，白名单至少挡住无意识的绕过；通配等于「任何带头即放行」 |
+| 题目怎么防重放？ | 答对即删 + TTL 5 分钟 + 答错满 3 次作废 | 一次性；「已用过的 token」与「没见过的 token」回**同一个** reason，少一条探测面 |
+| 内存表怎么不膨胀？ | 上限 5000 条，先清过期项、满则按插入序淘汰 1/4 | 匿名端点不设天花板就是一条无界内存增长路径（与 R69 给限流器加硬上限同型） |
+| 网页路径要不要跟着改？ | **不改**，一个字节都不动 | `guard()` 三条短路（验证码关闭 / 开关未开 / 不是客户端）全部原样交回 `captcha.verify()` |
+
+### 接口
+
+- `POST /api/auth/login`（及 `/auth/register`）新增可选入参 `nativeToken` / `nativeAnswer`；
+- 需验证码时返回 `403 { error, needCaptcha: true, captcha: { token, question } }`；答错时额外带 `captchaError`；
+- 新增公开接口 `GET /api/captcha/native`（「换一道」用，`NATIVE_CAPTCHA` 未启用时回 **404**，按 IP 限流 20 次/分钟）。
+
+### 升级须知
+
+- **默认行为不变**：不设 `NATIVE_CAPTCHA` 时，一切与 `2.0.0` 完全一致。
+- 要让 Android 客户端能登录：设 `NATIVE_CAPTCHA=on`，并由客户端在所有请求上带 `X-Kepler-Client: kepler-android/<version>`（非安全方法还需 `X-Requested-With: XMLHttpRequest`，这是既有的 CSRF 头）。
+- 若要收紧到只认特定标识：设 `NATIVE_CAPTCHA_CLIENTS=kepler-android/2.,kepler-ios/`（逗号分隔前缀）。
+- ⚠️ **打开它就等于承认「人机验证对脚本不再是屏障」**。这道题挡得住随手写的撞库脚本，挡不住愿意读源码的人。若站点面对的是有组织的攻击，请保持关闭并改用别的客户端鉴权方式。
+
+### 护栏与基线
+
+- 新增测试文件 **2 个**：`captcha-native.test.js` **12 条**（模块契约）、`audit100-regressions.test.js` **10 条**（真 HTTP 接线 + 开关三态）。
+- 反向对照台账 **1063 → 1071**（`R100-01a`~`R100-06b` 共 8 条），逐条实跑确认失败。其中 `R100-04a`（响应体不带 `needCaptcha`）红 4 条、`R100-06b`（登录没接 `guard`）红 6 条。
+- 测试文件 **102 → 104**，用例 **1692 → 1714**；lint 仍 **0 errors / 47 warnings**。
+- 顺手重锚两条被本次改动打老的对照：`R54c-04e` 的 anchor 与 `audit54c` 的顺序判据原先盯 `captcha.verify(`，调用点换成 `captchaNative.guard(` 后前者未命中、后者 `indexOf` 取到 `-1` —— `invariants` 的锚点自检当场抓到，两处都改成跟着**调用点**走（它们判的是「与人机验证的先后」，不是函数名）。
 
 ## [2.0.0] - 日期未归档
 

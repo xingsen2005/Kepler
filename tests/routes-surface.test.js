@@ -51,6 +51,11 @@ const EXPECTED = [
   // R33：账户封禁 / 解封（管理员在「用户管理」中的封禁按钮与本行的时间选择器）
   'POST /users/:id/ban', 'POST /users/:id/unban',
   'GET /captcha/public', 'GET /captcha/config', 'PUT /captcha/config',
+  // R100：原生验证码签发。`GET /captcha/native` **匿名可达**（已登记进 index.js 的
+  // PUBLIC_API）—— 客户端在登录之前、还没有会话时就要拿到一道题；开关未开时回 404。
+  // 它**不在** mustBeAdmin：那是给「无浏览器客户端」用的公开入口，挂了管理员守卫
+  // 就等于把要修的问题原样保留（客户端永远拿不到题）。
+  'GET /captcha/native',
   'GET /payment/config', 'PUT /payment/config/:platform',
   'POST /payment/config/:platform/validate', 'DELETE /payment/config/:platform',
   'PUT /payment/enabled', 'PUT /payment/config/:platform/enabled',

@@ -8522,8 +8522,8 @@ const CASES = [
        */
       name: 'R54c-04e · 核销挪到人机验证之前（限流端点变成邀请码存在性 oracle）',
       file: 'server/routes/auth.js',
-      anchor: '    const cap = await captcha.verify({\n      token: b.captchaToken, remoteip: ip, expectedHosts: captchaHosts(req),\n    }, configStore);',
-      replacement: "    if (mode === 'invite') inviteStore.consume(inviteCode, String(b.username == null ? '' : b.username).trim());\n    const cap = await captcha.verify({\n      token: b.captchaToken, remoteip: ip, expectedHosts: captchaHosts(req),\n    }, configStore);",
+      anchor: '    const cap = await captchaNative.guard({\n      req, body: b, remoteip: ip, expectedHosts: captchaHosts(req),\n    }, configStore);',
+      replacement: "    if (mode === 'invite') inviteStore.consume(inviteCode, String(b.username == null ? '' : b.username).trim());\n    const cap = await captchaNative.guard({\n      req, body: b, remoteip: ip, expectedHosts: captchaHosts(req),\n    }, configStore);",
       testFile: 'audit54c-regressions.test.js',
       minFail: 1,
     },
@@ -12940,6 +12940,87 @@ const CASES = [
       anchor: "'sysset-backup-card', 'sysset-integrity-card',",
       replacement: "'sysset-backup-card',",
       testFile: 'audit99-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * R100：原生验证码（无浏览器客户端专用）。
+       *
+       * 这一轮的红线只有一条：**它只能在「显式开启 + 确实是客户端」时生效**。
+       * 因此每条对照都是在拆这三道闸之一，或在拆「题目只能用一次」。
+       */
+      name: 'R100-01a · 原生验证码开关恒真（默认就给所有人一条绕过 reCAPTCHA 的路）',
+      file: 'server/captcha-native.js',
+      anchor: "  const v = String(process.env[name] == null ? '' : process.env[name]).trim().toLowerCase();\n  return v === 'on' || v === '1' || v === 'true' || v === 'yes';",
+      replacement: "  const v = String(process.env[name] == null ? '' : process.env[name]).trim().toLowerCase();\n  return true || v === 'on';",
+      testFile: 'captcha-native.test.js',
+      minFail: 1,
+    },
+    {
+      // 验证码全局关闭时仍要求客户端答题 ⇒ 用户被要求做「本来不存在」的验证。
+      name: 'R100-02a · guard 不看全局开关（验证码关着仍逼客户端答题）',
+      file: 'server/captcha-native.js',
+      anchor: '  if (!cfg || !cfg.enabled) return web();',
+      replacement: '  if (!cfg) return web();',
+      testFile: 'captcha-native.test.js',
+      minFail: 1,
+    },
+    {
+      // 过期判定一旦失效，题目在内存里永久有效 —— 「挂一晚上再答」也能过。
+      name: 'R100-02b · 不判过期（题目长生不老，挂着慢慢试）',
+      file: 'server/captcha-native.js',
+      anchor: "  if (rec.expiresAt <= now) { store.delete(t); return { ok: false, reason: 'expired' }; }",
+      replacement: "  if (false) { store.delete(t); return { ok: false, reason: 'expired' }; }",
+      testFile: 'captcha-native.test.js',
+      minFail: 1,
+    },
+    {
+      // 答对后不删 ⇒ 同一枚 token 可重放（截获一次即可无限登录）。
+      name: 'R100-03a · 答对后不销毁 token（同一枚可重放）',
+      file: 'server/captcha-native.js',
+      anchor: "    store.delete(t); // 一次性：同一枚 token 不可能通过第二次\n    return { ok: true, reason: 'ok' };",
+      replacement: "    return { ok: true, reason: 'ok' };",
+      testFile: 'captcha-native.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * ⭐ 这一条守的是**响应体形状**：`needCaptcha` 是客户端切到答题界面的唯一信号。
+       * 它一旦消失，客户端只会看到一句「请完成人机验证」而永远不知道该答什么 ——
+       * 那正是本轮要修的那个 bug 的原始症状。
+       */
+      name: 'R100-04a · 拦截响应不带 needCaptcha（客户端永远不知道该答题）',
+      file: 'server/routes/auth.js',
+      anchor: '    needCaptcha: true,',
+      replacement: '    needCaptcha: false,',
+      testFile: 'audit100-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 不看客户端标识 ⇒ 浏览器也被要求做算术题（网页端的验证码组件白渲染）。
+      name: 'R100-05a · guard 不看客户端标识（浏览器也被要求做算术题）',
+      file: 'server/captcha-native.js',
+      anchor: '  if (!isNativeClient(req)) return web();',
+      replacement: '  if (false) return web();',
+      testFile: 'captcha-native.test.js',
+      minFail: 1,
+    },
+    {
+      // 未启用仍发题 ⇒ 对外宣称「本机支持弱验证」，且白送一条内存灌入路径。
+      name: 'R100-06a · 签发端点不判开关（未启用也发题）',
+      file: 'server/routes/captcha.js',
+      anchor: '  if (!captchaNative.enabled()) {',
+      replacement: '  if (false) {',
+      testFile: 'audit100-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 只接了注册、登录没接 ⇒ 用户能注册但登不进来（正是本轮要修的那个 bug 的变体）。
+      name: 'R100-06b · 登录没用上 guard（客户端仍被要 reCAPTCHA token）',
+      file: 'server/routes/auth.js',
+      anchor: '    const cap = await captchaNative.guard({\n      req, body: b, remoteip: pre.ip, expectedHosts: captchaHosts(req),\n    }, configStore);',
+      replacement: '    const cap = await captcha.verify({\n      token: b.captchaToken, remoteip: pre.ip, expectedHosts: captchaHosts(req),\n    }, configStore);',
+      testFile: 'audit100-regressions.test.js',
       minFail: 1,
     },
   ];

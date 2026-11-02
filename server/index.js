@@ -215,6 +215,10 @@ const PUBLIC_API = new Set([
   // 不走这条接口，但未登录访客在主站登录页同样要能读到它。返回值受
   // `agreement-view.publicPayload()` 控制：三页全关时连一份正文都不会下发。
   '/site/agreements',
+  // R100：原生验证码签发（无浏览器客户端专用）。必须匿名可达 —— 客户端在登录**之前**
+  // 就要拿到一道题，此时它还没有会话。开关未开时该端点回 404（见 routes/captcha.js），
+  // 因此它白名单化并不会让默认部署多出一个可被灌内存的入口。
+  '/captcha/native',
   // R97：主密钥解锁。锁定态下**没有任何会话**（连根用户都还没登录），若这两条需要
   // 鉴权就永远走不到 —— 服务会卡在「要解锁才能登录、要登录才能解锁」的死锁里。
   // 暴露面由 `security.keyUnlockLimiter` + `keyUnlockLock` 约束（见 routes/key.js）。
