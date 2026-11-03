@@ -13124,6 +13124,40 @@ const CASES = [
       testFile: 'audit99-regressions.test.js',
       minFail: 1,
     },
+    /* ---------------- R102 · 拉取源码时排除 client/（客户端源码与服务器端无关） ---------------- */
+    {
+      // 「只删临时树、tar 不挡」⇒ 本地源码目录形态下整棵树照旧同步进安装目录。
+      // 该红两条：静态（tar 命令行里没有 --exclude=./client）+ 行为（真跑 install_app 后 client/ 出现了）。
+      name: 'R102-01a · tar 同步不再排除 client/（本地源码目录形态下客户端工程被装进服务器）',
+      file: 'deploy.sh',
+      anchor: '--exclude=./.deploy.conf --exclude=./client -cf - .',
+      replacement: '--exclude=./.deploy.conf -cf - .',
+      testFile: 'deploy-script.test.js',
+      minFail: 2,
+    },
+    {
+      // 「定义了函数但克隆之后不调用」⇒ 克隆下来的临时树里仍有一份 client/。
+      // 替成 `:`（空语句）而不是注释：codeOnly() 会剥掉整行注释，写注释会变成假绿。
+      name: 'R102-02a · 克隆后不再调用 drop_client_from_clone（函数留着、临时树里 client/ 还在）',
+      file: 'deploy.sh',
+      anchor: '  drop_client_from_clone "$SRC_DIR"',
+      replacement: '  :',
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
+    {
+      // 「只不复制、不清理」⇒ 2.1.1 之前装过的目录里那份 client/ 永远留着。
+      // 把判据的目标目录改成一个不存在的名字，等价于把清理整段摘掉，但语法自洽。
+      // ⚠️ minFail 只能是 1：两条判据（目录还在 / 「清理」那句 info 没出现）在**同一条
+      // 用例**里，第一条断言一红就中止该用例，第二条根本没机会执行 —— 要求 2 条是
+      // 把「断言条数」当成了「用例条数」（R49-02 记过同一个坑）。
+      name: 'R102-03a · 不再清理安装目录里历史遗留的 client/（排除只对新机器生效）',
+      file: 'deploy.sh',
+      anchor: '    if [[ -d "${INSTALL_DIR}/client" ]]; then',
+      replacement: '    if [[ -d "${INSTALL_DIR}/client.disabled" ]]; then',
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
   ];
 
 module.exports = { runCase, CASES, parseArgs };

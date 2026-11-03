@@ -2705,3 +2705,164 @@ printf 'END\\n'
   // DOWN 本身就是「失败退出码被如实透传」的行为证据：若 repo_reachable 把失败吞成 0
   // （`|| true` / `return 0`），DOWN 就会等于官方地址 —— 上面那条断言先红。
 });
+
+/* ================================================================== *
+ * R102 · 拉取源码时排除 client/（客户端源码与服务器端无关）
+ * ================================================================== */
+
+/**
+ * 用户提出的（非审计轮，原话）：「修改部署脚本，拉取源码时排除 `client` 文件夹，
+ * 因为 `client` 文件夹中是其它客户端源码。」
+ *
+ * 要防的三种「看起来做了、其实没做」：
+ *   ① 只在 `install_app` 的 `tar` 里加 `--exclude` —— 克隆下来的临时树里仍有一份
+ *      `client/`（`prepare_source` 之后任何遍历 `SRC_DIR` 的代码都会看到它）；
+ *   ② 只在 `prepare_source` 里 `rm -rf` —— 「本地源码目录」形态（`SRC_DIR` 就是
+ *      用户自己的仓库）下**一次都不会被调用**，`client/` 照样整棵树同步进安装目录；
+ *   ③ 只「不复制」，不清理 —— 2.1.1 之前装过的目录里那份 `client/` 会永远留着，
+ *      排除变成「只对新机器生效」的半条规矩。
+ * 故三条各自有一条断言，且都落在**实际执行的那一行**上。
+ */
+test('deploy.sh：拉取与同步两处都要排除 client/，且不得删用户的本地仓库（R102-01）', () => {
+  const src = readDeploy();
+  assert(hasFn(src, 'drop_client_from_clone'),
+    '必须有一个具名函数负责「从克隆下来的临时树里摘掉 client/」：'
+    + '散在两处 if 分支里写两遍 rm，迟早变成「走镜像时装了、走官方时没装」');
+
+  /* ── ① 删的必须是「传进来的那个目录下的 client」，且空路径一律早退 ──────
+   * ⚠️ 空参数落到 `rm -rf "/client"` 上就是一次不可逆事故，故判据要盯住
+   * `${dir}/client` 这个整体，而不是「源码里有 rm -rf」这种谁都能满足的形状。 */
+  const drop = codeOnly(fnBody(src, 'drop_client_from_clone'));
+  assert(/\[\[ -n "\$dir" && -d "\$\{dir\}\/client" \]\] \|\| return 0/.test(drop),
+    '必须先判「目录非空且确实存在 client/」再动手：空参数直接落到 rm -rf /client 上');
+  assert(/rm -rf -- "\$\{dir\}\/client"/.test(drop),
+    '真正被删的必须恰是 `${dir}/client`（带 -- 防止以 - 开头的路径被当成选项）');
+
+  /* ── ② 克隆之后必须真的调用它，且调用点在 SRC_DIR 赋值之后 ───────────── */
+  const prep = codeOnly(fnBody(src, 'prepare_source'));
+  const iAssign = prep.indexOf('SRC_DIR="${tmp}/src"');
+  const iCall = prep.indexOf('drop_client_from_clone "$SRC_DIR"');
+  assert(iAssign !== -1, 'prepare_source 必须把克隆结果落到 SRC_DIR（既有行为，防被机器编辑改形）');
+  assert(iCall !== -1, '克隆成功后必须真的调用 drop_client_from_clone "$SRC_DIR"：'
+    + '只定义函数不调用，等于什么都没做（这正是「护栏比名字弱」的典型）');
+  assert(iCall > iAssign, '调用必须排在 SRC_DIR 赋值之后 —— 提前调用等于把空串递给 rm');
+
+  /* ── ③ tar 同步必须再挡一道，且挡在真正的 tar 命令行里 ──────────────── */
+  const inst = codeOnly(fnBody(src, 'install_app'));
+  const tarLine = /\btar [^\n]*--exclude=\.\/data[^\n]*/.exec(inst);
+  assert(tarLine, 'install_app 里必须仍有一条 tar 同步命令（既有行为）');
+  assert(/--exclude=\.\/client/.test(tarLine[0]),
+    'tar 命令行必须带 --exclude=./client：`prepare_source` 只覆盖「从仓库克隆」这一条路径，'
+    + '本地源码目录形态下 `SRC_DIR` 是用户自己的仓库、一个字节都不能删，只能靠这一道挡住');
+  assert(/已清理安装目录里历史遗留的客户端源码/.test(inst),
+    '同步之后必须清理安装目录里历史遗留的 client/：只「不复制」会让 2.1.1 之前装过的'
+    + '机器永远留着那一份，排除就只对新机器生效');
+});
+
+/* ── ④ 真跑一遍：临时树删得掉，用户的同级目录一个字节不动 ─────────────── */
+test('deploy.sh：drop_client_from_clone 只删 client/，不碰同级文件、可重复调用（R102-02）', async () => {
+  const r = await spawnBashSnippet(`
+set -Eeuo pipefail
+source ./deploy.sh
+trap - ERR
+T="$(mktemp -d)"
+trap 'rm -rf "$T"' EXIT
+# 只替换「日志包装层」：LOG_FILE 是 readonly 且指向不可写的 /var/log，
+# 不换掉会让 run_soft 在**执行命令之前**因重定向失败而放弃（R60 记过同一个坑）。
+run_soft() { "$@" >/dev/null 2>&1 || true; }
+info() { :; }
+mkdir -p "$T/src/client/android" "$T/src/server"
+: > "$T/src/client/android/a.kt"
+: > "$T/src/server/a.js"
+drop_client_from_clone "$T/src"
+[[ -d "$T/src/client" ]] && printf 'CLIENT=%s\\n' 1 || printf 'CLIENT=%s\\n' 0
+[[ -f "$T/src/server/a.js" ]] && printf 'SERVER=%s\\n' 1 || printf 'SERVER=%s\\n' 0
+# 空参数：必须正常返回（不是「删掉了 /client」，而是「什么都不做」）
+if drop_client_from_clone ""; then printf 'EMPTY=%s\\n' 0; else printf 'EMPTY=%s\\n' 1; fi
+# 幂等：第二次调用时 client/ 已不存在
+if drop_client_from_clone "$T/src"; then printf 'AGAIN=%s\\n' 0; else printf 'AGAIN=%s\\n' 1; fi
+printf 'END\\n'
+`);
+  assert(!r.unavailable, `无法运行 bash 片段（这条运行期判据不能跳过）：${r.unavailable}`);
+  const val = (k) => {
+    const mm = new RegExp('^' + k + '=(.*)$', 'm').exec(r.out);
+    assert(mm, `片段未产出 ${k}：${r.out}${r.err}`);
+    return mm[1];
+  };
+  assert.strictEqual(val('CLIENT'), '0', 'client/ 必须真的被删掉（只判「源码里有 rm」会假绿）');
+  assert.strictEqual(val('SERVER'), '1', 'server/ 必须原样保留 —— 删多了就是部署直接崩');
+  assert.strictEqual(val('EMPTY'), '0', '空参数必须走早退分支并返回 0，绝不能落到 rm -rf "/client"');
+  assert.strictEqual(val('AGAIN'), '0', 'client/ 已不存在时必须安静返回，不得因 set -e 让部署中断');
+});
+
+/* ── ⑤ 真跑一遍 install_app：不复制 client/，且清掉旧安装目录里那一份 ──── */
+test('deploy.sh：install_app 不把 client/ 同步进安装目录，并清掉历史遗留的那一份（R102-03）', async () => {
+  const r = await spawnBashSnippet(`
+set -Eeuo pipefail
+source ./deploy.sh
+trap - ERR
+T="$(mktemp -d)"
+trap 'rm -rf "$T"' EXIT
+# 同 R102-02：只换日志包装层，tar / cp 全部真跑（本机 git-bash 自带 tar）
+run() { "$@" >>"$T/log" 2>&1 || return $?; }
+run_soft() { "$@" >>"$T/log" 2>&1 || true; }
+info() { printf 'INFO %s\\n' "$*" >>"$T/log"; }
+warn() { printf 'WARN %s\\n' "$*" >>"$T/log"; }
+ok() { :; }
+
+mk_src() {
+  mkdir -p "$1/client/android" "$1/server"
+  : > "$1/client/android/a.kt"
+  : > "$1/server/s.js"
+  printf 'x\\n' > "$1/README.md"          # 兜底的逐项复制清单里没有它 ⇒ 它出现就证明走了 tar
+  printf '{"version": "9.9.9"}\\n' > "$1/package.json"
+}
+
+SRC_DIR="$T/src"; SRC_TMP_DIR=""; DATA_DIR="$T/data"
+mk_src "$SRC_DIR"
+
+# ① 全新安装目录：client/ 不得出现
+INSTALL_DIR="$T/dst1"
+: > "$T/log"
+install_app >/dev/null 2>&1
+[[ -e "$INSTALL_DIR/client" ]] && printf 'FRESH_CLIENT=%s\\n' 1 || printf 'FRESH_CLIENT=%s\\n' 0
+# 「有没有触发清理」是**独立的**一个判据：tar 已经把 client/ 挡在外面时，
+# 安装目录里根本没有东西可清，那句 info 不该出现。只判最终状态的话，
+# 「tar 没排除、随后被清理掉」与「tar 就排除了」两种世界完全相同。
+grep -q '已清理安装目录里历史遗留的客户端源码' "$T/log" && printf 'FRESH_CLEAN=%s\\n' 1 || printf 'FRESH_CLEAN=%s\\n' 0
+[[ -f "$INSTALL_DIR/README.md" ]] && printf 'FRESH_TAR=%s\\n' 1 || printf 'FRESH_TAR=%s\\n' 0
+[[ -f "$INSTALL_DIR/server/s.js" ]] && printf 'FRESH_SERVER=%s\\n' 1 || printf 'FRESH_SERVER=%s\\n' 0
+
+# ② 升级场景：目录里已经有一份旧 client/，必须被清掉
+INSTALL_DIR="$T/dst2"
+mkdir -p "$INSTALL_DIR/client/old"
+: > "$INSTALL_DIR/client/old/x.kt"
+: > "$T/log"
+install_app >/dev/null 2>&1
+[[ -e "$INSTALL_DIR/client" ]] && printf 'UPGRADE_CLIENT=%s\\n' 1 || printf 'UPGRADE_CLIENT=%s\\n' 0
+grep -q '已清理安装目录里历史遗留的客户端源码' "$T/log" && printf 'UPGRADE_CLEAN=%s\\n' 1 || printf 'UPGRADE_CLEAN=%s\\n' 0
+
+# ③ 用户的本地仓库不得被删：源码树里的 client/ 必须还在
+[[ -f "$SRC_DIR/client/android/a.kt" ]] && printf 'SRC_KEEP=%s\\n' 1 || printf 'SRC_KEEP=%s\\n' 0
+printf 'END\\n'
+`);
+  assert(!r.unavailable, `无法运行 bash 片段（这条运行期判据不能跳过）：${r.unavailable}`);
+  const val = (k) => {
+    const mm = new RegExp('^' + k + '=(.*)$', 'm').exec(r.out);
+    assert(mm, `片段未产出 ${k}：${r.out}${r.err}`);
+    return mm[1];
+  };
+  assert.strictEqual(val('FRESH_TAR'), '1',
+    '前置条件不成立：README.md 没被同步进去说明走的是逐项复制兜底，tar 那条判据等于没测');
+  assert.strictEqual(val('FRESH_SERVER'), '1', 'server/ 必须被同步（排除项不能顺手把正经目录也挡掉）');
+  assert.strictEqual(val('FRESH_CLIENT'), '0', '全新安装目录里不得出现 client/');
+  assert.strictEqual(val('FRESH_CLEAN'), '0',
+    '全新安装时不该走到「清理历史遗留」那一段：它出现就说明 tar 把 client/ 真的复制进来了'
+    + '（先复制、后删掉 = 最终状态相同，只有这一步能区分）');
+  assert.strictEqual(val('UPGRADE_CLIENT'), '0',
+    '升级时必须清掉旧安装目录里那一份 client/：只「不复制」等于让它永远留着');
+  assert.strictEqual(val('UPGRADE_CLEAN'), '1',
+    '升级场景必须**真的**走到清理那一段：只判最终「目录不存在」会被「本来就没复制进来」蒙对');
+  assert.strictEqual(val('SRC_KEEP'), '1',
+    '源码目录（可能是用户自己的仓库）里的 client/ 一个字节都不能动 —— 那是要提交的代码');
+});

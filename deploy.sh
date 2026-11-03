@@ -1844,6 +1844,30 @@ warn_mirror_staleness() {
   warn "  网络恢复后重装即可拿到官方最新版：$(rerun_cmd --repo "${DEFAULT_REPO_URL}" --reinstall)"
 }
 
+# 【R102】拉取阶段就排除客户端源码（`client/`）。
+#
+# `client/` 装的是**另外几个交付形态**的源码（Windows 单文件 exe 的打包脚本、
+# Android 工程），服务器上一个字节也用不到：它不参与 `npm ci`，也不被
+# `server/` / `public/` 引用（`Dockerfile` 早就只 `COPY server` 与 `COPY public`）。
+# 留着它的代价不是体积（入库部分只有 0.2MB），而是**误导** —— 服务器上摆着一份
+# Android 工程，谁都会以为「改这里的 apk 就能更新服务端」。同理它也让备份、迁移、
+# 审计时多出一个永远与线上无关的目录。
+#
+# 两处收口，缺一不可：
+#   ① 克隆下来后从临时树里删掉（官方 / 镜像两条成功路径共用下面那一处调用）；
+#   ② `install_app` 的 `tar` 再加一道 `--exclude=./client` ——「本地源码目录」形态
+#      下 `SRC_DIR` 是**用户自己的仓库**，那里 `client/` 可能正是他要提交的代码，
+#      **绝不能删**，只能不复制。
+# 判据落在「一段具体的临时路径」上：`dir` 为空一律早退，绝不出现 `rm -rf /client`。
+drop_client_from_clone() {
+  local dir="$1"
+  [[ -n "$dir" && -d "${dir}/client" ]] || return 0
+  # 删不掉也不改变正确性（第 ② 道仍会把它挡在安装目录之外），故走 run_soft：
+  # 这里的失败不值得中断一次部署，但也没必要假装成功 —— 日志里会留痕。
+  run_soft rm -rf -- "${dir}/client"
+  info "已排除客户端源码目录：${dir}/client（服务器端不需要它）"
+}
+
 prepare_source() {
   local script_dir; script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
   if [[ "$REINSTALL" != "1" && -f "${script_dir}/package.json" && -d "${script_dir}/server" ]]; then
@@ -1912,6 +1936,11 @@ prepare_source() {
   fi
   SRC_DIR="${tmp}/src"
   SRC_TMP_DIR="$tmp"   # 复制完成后清理
+  # 【R102】拿到源码树后第一件事：把客户端源码摘掉（详见 drop_client_from_clone）。
+  # 刻意放在这里、而不是分别塞进两个 clone 分支 —— 官方与镜像两条成功路径共用
+  # 同一处调用，少一个调用点就会出现「走镜像时装了 client、走官方时没装」这种
+  # 只在一半机器上复现的差异。
+  drop_client_from_clone "$SRC_DIR"
   # 走镜像时说清「可能不是最新版」+ 实际拿到的 commit。
   # 放在这里而不是 install_app：此刻 ${SRC_DIR}/.git 还在（同步时会排除掉），
   # 才能取到真实 commit；两条成功路径（探针直接选镜像 / 官方失败后兜底）共用这一处。
@@ -1932,14 +1961,24 @@ install_app() {
   if [[ -n "$src_real" && "$src_real" == "$dst_real" ]]; then
     info "源码目录即安装目录，无需同步：${INSTALL_DIR}"
   else
-    info "同步源码 → ${INSTALL_DIR}（排除 data/node_modules/.git，绝不覆盖数据目录）"
+    info "同步源码 → ${INSTALL_DIR}（排除 data/node_modules/.git/client，绝不覆盖数据目录）"
     # tar 管道复制：每次覆盖同名文件，保持幂等（重复执行即升级）
-    if ! run bash -c "cd '$SRC_DIR' && tar --exclude=./data --exclude=./node_modules --exclude=./.git --exclude=./.deploy.conf -cf - . | tar -xf - -C '$INSTALL_DIR'"; then
+    # ⚠️ 排除项是**唯一实现点**：这里漏一个，`client/` 就会在「本地源码目录」形态下
+    # 整棵树被同步进安装目录（那条路径上 prepare_source 一个字节都没删过任何东西）。
+    if ! run bash -c "cd '$SRC_DIR' && tar --exclude=./data --exclude=./node_modules --exclude=./.git --exclude=./.deploy.conf --exclude=./client -cf - . | tar -xf - -C '$INSTALL_DIR'"; then
       warn "tar 同步失败（可能是 busybox tar 不支持 --exclude），改用逐项复制…"
       for item in package.json package-lock.json server public scripts Dockerfile; do
         [[ -e "${SRC_DIR}/${item}" ]] || continue
         run cp -a "${SRC_DIR}/${item}" "${INSTALL_DIR}/"
       done
+    fi
+    # 【R102】上一版（≤2.1.1）装出来的目录里还躺着一份 `client/` —— 只「不复制」等于
+    # 让它永远留着，排除就成了「只对新机器生效」的半条规矩。故在确认已往这个目录写过
+    # 东西之后顺手清掉。落在这个 else 分支里是有意的：`SRC_DIR == INSTALL_DIR` 时
+    # 安装目录就是用户自己的仓库，那里一个字节都不能动。
+    if [[ -d "${INSTALL_DIR}/client" ]]; then
+      run_soft rm -rf -- "${INSTALL_DIR}/client"
+      info "已清理安装目录里历史遗留的客户端源码：${INSTALL_DIR}/client"
     fi
   fi
   if [[ -f "${INSTALL_DIR}/package.json" ]]; then
