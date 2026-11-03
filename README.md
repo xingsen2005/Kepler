@@ -127,7 +127,7 @@ npm run lint     # 代码检查（ESLint 可选，未安装时给出安装指引
 | --- | --- |
 | `npm start` | 启动服务（HTTP + HTTPS） |
 | `npm run dev` | 开发模式，`node --watch` 监听文件变更自动重启（Node 内置，无需 nodemon） |
-| `npm test` | 运行 `tests/**/*.test.js` 全部测试（104 个文件 / 1714 条用例，零新增依赖） |
+| `npm test` | 运行 `tests/**/*.test.js` 全部测试（105 个文件 / 1724 条用例，零新增依赖） |
 | `npm run test:watch` | 测试监听模式，代码变更后即时重跑 |
 | `npm run lint` | ESLint 检查；未安装 eslint 时降级提示安装命令，不阻断流程 |
 
@@ -348,16 +348,16 @@ npm run lint     # 代码检查（ESLint 可选，未安装时给出安装指引
 
 ---
 
-客户端（Windows 单文件 exe、Android apk）**不在仓库里**，统一从 **Releases** 页面下载：
+客户端**二进制不在仓库里**，统一从 **Releases** 页面下载：
 
 **https://github.com/xingsen2005/Kepler/releases**
 
 | 平台 | 产物 | 说明 |
 | --- | --- | --- |
-| Windows | `Kepler-Windows-x64-1.7.5.exe` | Node SEA 单文件，内置服务端 + 前端 + 生产依赖。双击即用：自动选端口、就绪后打开浏览器，数据目录默认落在 exe 同级的 `data\`（可整体拷贝迁移）。首次启动会解压内置应用树到 `%LOCALAPPDATA%\Kepler\client\v<版本>\app`，约 1~2 秒。⚠️ 文件名里的版本是该 exe **内置的服务端版本**，可能落后于当前源码 |
-| Android | `Kepler-Android-1.0-debug.apk` | Kotlin 原生客户端（**不是 WebView 壳**），因此拿不到 `captchaToken` —— 服务端需开启原生验证码 `NATIVE_CAPTCHA=on`，详见 §「功能特性」的原生客户端验证码 |
+| Android | `Kepler-Android-1.0-release.apk`（签名版，约 7MB）<br>`Kepler-Android-1.0-debug.apk`（调试版，约 70MB，含完整日志） | Kotlin 原生客户端（**不是 WebView 壳**），因此拿不到 `captchaToken` —— 服务端需开启原生验证码 `NATIVE_CAPTCHA=on`，详见 §「功能特性」的原生客户端验证码。**源码在 `client/android/`**（Kotlin + Jetpack Compose，`versionName 1.0`），构建产物、签名库与 `keystore.properties` 均在 `.gitignore` 里 |
+| Windows | `Kepler-Windows-x64-1.7.5.exe`（旧构建，见 Release `clients-2026.11.02`） | Node SEA 单文件，内置服务端 + 前端 + 生产依赖。双击即用：自动选端口、就绪后打开浏览器，数据目录默认落在 exe 同级的 `data\`（可整体拷贝迁移）。首次启动会解压内置应用树到 `%LOCALAPPDATA%\Kepler\client\v<版本>\app`，约 1~2 秒。⚠️ 文件名里的版本是该 exe **内置的服务端版本**，落后于当前源码，且**源码已不在本仓库**（`client/windows/` 已移除） |
 
-> **为什么要单独发 Release**：两个二进制合计约 160MB。放进仓库等于让每一次 `git clone` 都拖上这 160MB，而 git 对二进制只存一份黑盒，既不可审、也无法与源码版本对应。Releases 是 GitHub 为「构建产物」准备的位置：能挂说明、能记下载量，且不进入 clone。
+> **为什么要单独发 Release**：二进制动辄几十 MB。放进仓库等于让每一次 `git clone` 都拖上它们，而 git 对二进制只存一份黑盒，既不可审、也无法与源码版本对应。Releases 是 GitHub 为「构建产物」准备的位置：能挂说明、能记下载量，且不进入 clone。
 >
 > **客户端版本可能落后于服务端**：客户端是「临时性解决方案」，不纳入审计护栏（见 `client/readme.txt`）。服务端与客户端的版本**各自独立**，Release 标题会注明该构建实际内置的版本。
 

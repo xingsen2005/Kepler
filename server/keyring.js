@@ -157,13 +157,57 @@ function badPassphraseError() {
  * "可人工恢复"，并**拒绝任何写入**。本模块不能 `require('./config-store')`
  * （那是循环依赖），所以这里自带一份最小实现 —— 语义必须保持一致。
  */
+/**
+ * 找出「已经是这份 `keyring.json` 当前状态的副本」的备份文件（R101 / F-07）。
+ *
+ * 判据只有一条：备份的 mtime **不早于** 源文件的 mtime。含义是"这份备份是在源文件
+ * 最后一次被改动之后拍的"，因此它就是源文件现在的样子，不必再复制一份。
+ * 源文件被替换 / 编辑过 ⇒ 它的 mtime 变新 ⇒ 备份 mtime 更早 ⇒ 不复用、重新留档。
+ *
+ * 目录读不出来、没有备份、备份比源文件旧 —— 一律返回 ''（调用方照常新建备份）。
+ */
+function reuseCorruptBackup(file) {
+  try {
+    const src = fs.statSync(file);
+    const dir = path.dirname(file);
+    const base = path.basename(file) + '.corrupt-';
+    let best = '';
+    let bestMs = -1;
+    for (const name of fs.readdirSync(dir)) {
+      if (!name.startsWith(base)) continue;
+      const full = path.join(dir, name);
+      let st;
+      try { st = fs.statSync(full); } catch (e) { continue; }
+      if (!st.isFile()) continue;
+      if (st.mtimeMs > bestMs) { bestMs = st.mtimeMs; best = full; }
+    }
+    return best && bestMs >= src.mtimeMs ? best : '';
+  } catch (e) {
+    return '';
+  }
+}
+
 function corruptError(why) {
   const file = keyringPath();
   let bak = '';
   try {
     if (fs.existsSync(file)) {
-      bak = `${file}.corrupt-${Date.now()}`;
-      fs.copyFileSync(file, bak);
+      /**
+       * R101（F-07）：**同一个损坏文件只备份一次**。
+       *
+       * 旧实现每次走这里都 `copyFileSync` 出一份 `.corrupt-<ts>`。而 `read()` 的
+       * 解析失败会抛本错误，`GET /key/status` 又在 `PUBLIC_API` 里（匿名可达、
+       * 没有自己的限流），它每次都经 `keyRotate.status()` → `info()` → `read()`
+       * 走到这里 —— 于是**一个匿名请求 = 一个新文件**。容器坏掉正是最需要这份
+       * 备份的时刻，却也正好是最容易被灌满磁盘 / inode 的时刻，而每个备份里都
+       * 有一份 `wrappedDek`，数量膨胀同时放大了敏感文件的暴露面。
+       *
+       * 判据用**修改时间**而不是"存在任意备份就复用"：`keyring.json` 一旦被管理员
+       * 动过（时间戳变新），说明这是一次**新的**损坏，必须重新留档；没动过则说明
+       * 那份备份就是它的当前副本，复制第二份只会多占一块磁盘。
+       */
+      bak = reuseCorruptBackup(file) || `${file}.corrupt-${Date.now()}`;
+      if (!fs.existsSync(bak)) fs.copyFileSync(file, bak);
     }
   } catch (e) {
     bak = '';

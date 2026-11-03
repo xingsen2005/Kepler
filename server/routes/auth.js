@@ -18,7 +18,7 @@
  * 与验证码共存：验证码属第一步、Windows Hello 属第二步，串联而非互斥，同时开启均生效。
  */
 const { express, security, configStore, statsStore, authSession, captcha, captchaNative, webauthn, emailCode, inviteStore } = require('./_context');
-const { sessionCookie, clearCookie, webauthnContext } = require('./_shared');
+const { sessionCookie, clearCookie, webauthnContext, rootPasswordBlocked } = require('./_shared');
 // R54②：邮箱的归一化 / 入参判据（`normalizeEmail` 也是 `config-store` 落盘兜底用的同一个）
 // 重发冷却同时要回给前端（据它做倒计时），所以常量也一并取过来，避免两处各写一个数
 const { normalizeEmail, parseEmailInput, EMAIL_CODE_RESEND_MS } = require('../limits');
@@ -981,6 +981,28 @@ router.post('/auth/reset', async (req, res) => {
 
     const r = emailCode.check({ purpose: 'reset', email, code });
     if (!r.ok) return authFail(`验证码不通过（${r.reason}）`);
+
+    /**
+     * R101（F-01）：**根用户不能走「忘记密码」**。
+     *
+     * 这条路径改的只是 `config.enc` 里的登录哈希，不会重裹 `keyring.json`。
+     * 对根用户来说，改完就等于「新口令能登录、旧口令才能解锁」，而"忘记密码"
+     * 恰恰是旧口令已经不可用的场景 —— 一旦走到这里，全部密文就再也解不开了
+     * （除非部署里配了 `KEPLER_MASTER_PASSPHRASE`）。
+     *
+     * 判定放在**验证码核验通过之后**：此时请求方已经证明了邮箱归属，告诉他
+     * 「这个账户是根用户」不构成任何信息泄露；放在前面则会变成一个探测口。
+     * 不核销验证码 —— 这一轮什么都没改，没有理由让那封信失效。
+     */
+    const resetRootBlock = rootPasswordBlocked(raw);
+    if (resetRootBlock) {
+      statsStore.addLog({
+        action: 'auth.reset', level: 'warn',
+        detail: `拒绝用邮箱验证码重置根用户「${raw.username}」的登录口令（已启用密钥信封，`
+          + '改密会让登录口令与主密钥解锁因子分叉）',
+      });
+      return res.status(409).json(resetRootBlock);
+    }
 
     // 密码策略由 `updateUser` 内的唯一判据负责（这里不另写一份）；它抛错时验证码仍未核销
     const user = await configStore.updateUser(raw.id, { password: b.password });

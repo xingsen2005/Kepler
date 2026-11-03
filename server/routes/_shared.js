@@ -6,6 +6,8 @@
  */
 const crypto = require('crypto');
 const roles = require('../roles');
+// R101（F-01）：判断「该实例是否已启用信封加密」—— 根用户改密的闸门要用
+const keyring = require('../keyring');
 const { providers, security, configStore, statsStore, encStore, s3, gitignore } = require('./_context');
 /**
  * R25：`gitignore` 必须在**模块作用域**可见 —— `cachedGitignoreMatcher()` 里用了
@@ -35,6 +37,39 @@ const {
 } = require('../bucket-stats');
 
 exports = module.exports = {};
+
+/**
+ * R101（F-01）：**根用户改登录口令的唯一合法入口是「轮转登录密钥」**。
+ *
+ * 信封加密的核心不变量是「主口令 = 根用户登录口令」：`keyring.json` 里的 `wrappedDek`
+ * 由这个口令派生出的 KEK 包裹，而 `config.enc` 里的 `passwordHash` 是**另一个** scrypt
+ * 值。改登录口令若不重裹 KEK，两个值立刻分叉 —— 而这个分叉在**当前进程**里完全看不
+ * 出来（内存里还握着 DEK，一切照常），只有重启后才现形：
+ *
+ *   · 登录：只用新口令；
+ *   · 解锁：只有旧口令能开。
+ *
+ * 「忘记密码」更糟：它恰恰是"旧口令已经不可用"的场景，改完就等于把全部密文永久锁死
+ * （除非部署里配了 `KEPLER_MASTER_PASSPHRASE`）。
+ *
+ * 所以这里**拒绝**而不是"顺手帮他重裹"：重裹需要当前口令（step-up 的另一半），
+ * 而"忘记密码"路径手上根本没有它。正确做法是引导到轮转接口，那里两条口令都在手。
+ *
+ * @param {object} user 目标用户（需含 `role`）
+ * @returns {{error:string, code:string}|null} null = 允许修改
+ */
+function rootPasswordBlocked(user) {
+  if (!user || !roles.isRoot(user.role)) return null;
+  // 没启用信封加密时，登录口令就只是登录口令，随便改
+  if (!keyring.exists()) return null;
+  return {
+    error: '根用户的登录口令同时也是主密钥的解锁因子，不能用「修改密码」改 —— '
+      + '请使用「系统设置 → 安全 → 轮转登录密钥」，那里会同时更新解锁因子。'
+      + '（若主口令确已遗忘：重置登录口令并不能恢复对密文的访问，唯一途径是用 '
+      + 'KEPLER_MASTER_PASSPHRASE 解锁或恢复数据目录备份）',
+    code: 'USE_KEY_ROTATION',
+  };
+}
 
 /* ============================ 文件类型 / 路径 ============================ */
 
@@ -723,6 +758,8 @@ Object.assign(module.exports, {
   requireAdmin, requireConfig, validateCredentialFormat,
   // R97：密钥轮转 / 迁移的入口守卫（与 requireAdmin 分开 —— 改解锁因子仅根用户）
   requireRoot,
+  // R101：根用户的登录口令 = 主密钥解锁因子 ⇒ 「改密码」必须先被这条拦下
+  rootPasswordBlocked,
   asyncHandler, apiHandler,
   sessionCookie, clearCookie,
   webauthnContext, splitHostPort,

@@ -25,7 +25,7 @@ const { express, configStore, statsStore, authSession, emailCode, security, shar
  * `POST /users/:id/webauthn/disable` 因此一直只挂 `requireAdmin`（管理员可以
  * 静默拆掉根用户的二因素）。判据只能有一份实现，谁需要谁引。
  */
-const { requireAdmin, sendError, denyIfCannotManage } = require('./_shared');
+const { requireAdmin, sendError, denyIfCannotManage, rootPasswordBlocked } = require('./_shared');
 /**
  * R71：角色语义的唯一事实源。本文件**不得**再出现 `role === 'admin'` 这类字面量比较 ——
  * 越权判据一旦散在多个 if 里，漏掉任何一处（例如新加的「强制登出」）都不会报错，
@@ -154,6 +154,13 @@ router.put('/users/me', async (req, res) => {
       if (b.confirmPassword !== undefined && String(b.confirmPassword) !== String(b.password)) {
         return res.status(400).json({ error: '两次输入的密码不一致' });
       }
+      /**
+       * R101（F-01）：根用户在这里改密会**拆开**「登录口令」与「主密钥解锁因子」——
+       * 当前进程看不出问题（DEK 在内存里），重启后新口令能登录、却解不开数据。
+       * 拦在最前面（连 scrypt 都不跑），并指向唯一正确的入口。
+       */
+      const rootBlock = rootPasswordBlocked(me);
+      if (rootBlock) return res.status(409).json(rootBlock);
       patch.password = b.password;
       needsCurrent = true;
     }
@@ -583,7 +590,16 @@ router.put('/users/:id', requireAdmin, async (req, res) => {
     }
     const patch = {};
     if (b.username !== undefined) patch.username = b.username;
-    if (b.password !== undefined && b.password !== '') patch.password = b.password;
+    if (b.password !== undefined && b.password !== '') {
+      /**
+       * R101（F-01）：管理员「重置密码」同样不能落在根用户身上 —— 它改的也只是
+       * 登录哈希，不会重裹 `keyring.json`。在这里放行等于把同一个分裂状态
+       * 从「自助」挪到了「管理」，问题一点没解决。
+       */
+      const rootBlock = rootPasswordBlocked(configStore.findUserRawById(req.params.id));
+      if (rootBlock) return res.status(409).json(rootBlock);
+      patch.password = b.password;
+    }
     if (b.role !== undefined) patch.role = b.role;
     // R69 / L-7：同 `/users` —— 非空 permissions 一律 400（该字段不参与鉴权）
     const permErr = rejectUnsupportedPermissions(b.permissions);

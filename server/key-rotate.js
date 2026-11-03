@@ -39,6 +39,7 @@
  */
 const fs = require('fs');
 const path = require('path');
+const atomic = require('./atomic-write');
 const configStore = require('./config-store');
 const keyring = require('./keyring');
 const roles = require('./roles');
@@ -89,6 +90,185 @@ function status() {
   };
 }
 
+/* ====================== 轮转意图日志（两阶段提交） ====================== */
+
+/**
+ * R101（F-03）：轮转是**跨两个文件**的操作 —— `keyring.json`（KEK）与 `config.enc`
+ * （根口令哈希）。`rewrap()` 是同步原子写，改哈希是异步写队列，两者之间没有任何
+ * 跨文件事务：
+ *
+ * ```
+ *   ① rewrap → 磁盘：新 KEK ✔        ② 改哈希 → 磁盘：旧登录口令 ✘（还没写）
+ *                    ↑ 进程在这里死掉，就永久停在这个状态
+ * ```
+ *
+ * 停在这个状态意味着：**旧口令能通过 step-up 但解不开容器，新口令能解锁但过不了
+ * step-up** —— 两条公开的轮转路径都返回 401，界面没有任何修复入口。
+ *
+ * 解法是把这个窗口变成**可恢复**的：动手之前先把"我要做什么"写进一份意图文件
+ * （含新口令**已经算好的** scrypt 凭据），成功后再删掉它。重启 / 解锁时若发现
+ * 意图还在，按 `kekVersion` 判"做到哪一步了"并补完。
+ *
+ * ⚠️ 意图文件里那份 scrypt 凭据是**明文**落盘的，这看起来像新增暴露面，其实不是：
+ * 同一个目录下的 `keyring.json` 本身就含**同一个口令**派生出的 salt 与 `wrappedDek`
+ * （KDF 参数也相同），能离线爆破意图文件的人，同样能离线爆破 `keyring.json`，
+ * 成本一模一样。真正的机密（DEK、明文口令）一个都没有多写。
+ */
+const INTENT_NAME = 'keyring.rotate-intent.json';
+const INTENT_VERSION = 1;
+
+function intentPath() {
+  return path.join(dataDir(), INTENT_NAME);
+}
+
+function clearIntent() {
+  try { fs.unlinkSync(intentPath()); } catch (e) { /* 已经不存在 */ }
+}
+
+/** 读意图文件；不存在返回 null，读不懂返回 `{bad:true}`（绝不删 —— 留给人工判断） */
+function readIntent() {
+  const file = intentPath();
+  let text;
+  try {
+    text = fs.readFileSync(file, 'utf8');
+  } catch (e) {
+    if (e && e.code === 'ENOENT') return null;
+    return { bad: true };
+  }
+  try {
+    const obj = JSON.parse(text);
+    if (!obj || typeof obj !== 'object' || Number(obj.v) !== INTENT_VERSION) return { bad: true };
+    if (!obj.cred || !obj.cred.salt || !obj.cred.hash) return { bad: true };
+    if (!Number.isFinite(Number(obj.fromKekVersion)) || !Number.isFinite(Number(obj.toKekVersion))) {
+      return { bad: true };
+    }
+    return obj;
+  } catch (e) {
+    return { bad: true };
+  }
+}
+
+function writeIntent(obj) {
+  const file = intentPath();
+  const dir = path.dirname(file);
+  if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+  atomic.writeAtomicSync(file, JSON.stringify(obj, null, 2), { mode: 0o600 });
+}
+
+/**
+ * 补完一次没做完的轮转（启动时 / 解锁后 / 下次轮转之前都会调）。
+ *
+ * 三种结论，只做**确定**的那一种：
+ *  - `kekVersion === toKekVersion`：KEK 已经是新口令 ⇒ 说明 ① 成功了、② 没落盘，
+ *    **把意图里那份凭据补写进配置**（此时手上只有哈希，没有明文口令，所以必须用
+ *    `setPasswordCredential`），然后删意图；
+ *  - `kekVersion === fromKekVersion`：① 根本没发生 ⇒ 删意图，什么都没变；
+ *  - 其它（版本对不上 / 用户没了 / 配置读不出来）：**保留意图**并告警，让人去看。
+ *
+ * @returns {Promise<{repaired:boolean, reason:string, kekVersion?:number}>}
+ */
+async function reconcile() {
+  const it = readIntent();
+  if (!it) return { repaired: false, reason: 'no-intent' };
+  if (it.bad) {
+    audit('key.rotate', 'error',
+      `${INTENT_NAME} 无法解析：可能来自更新的版本或已损坏。已保留该文件，请人工确认后再删除`);
+    return { repaired: false, reason: 'bad-intent' };
+  }
+  if (!keyring.exists()) {
+    // 容器都没了，这份意图失去意义（且绝不在这里凭空造一个）
+    clearIntent();
+    return { repaired: false, reason: 'no-keyring' };
+  }
+  // 锁定态下配置解不开，补写无从谈起 —— 留着意图，等解锁后再来
+  if (!keyring.isUnlocked()) return { repaired: false, reason: 'locked' };
+
+  let ring;
+  try {
+    ring = keyring.info();
+  } catch (e) {
+    return { repaired: false, reason: 'keyring-unreadable' };
+  }
+  const v = Number(ring && ring.kekVersion) || 1;
+  const from = Number(it.fromKekVersion);
+  const to = Number(it.toKekVersion);
+
+  if (v === from) {
+    clearIntent();
+    return { repaired: false, reason: 'not-rotated' };
+  }
+  if (v !== to) {
+    audit('key.rotate', 'error',
+      `发现未完成的轮转意图（期望 kekVersion ${from} → ${to}，实际 ${v}）：无法判断该补还是该退，`
+      + `已保留 ${INTENT_NAME}，请人工核对后处理`);
+    return { repaired: false, reason: 'version-mismatch' };
+  }
+
+  const raw = configStore.findUserRawById(it.userId);
+  if (!raw) {
+    audit('key.rotate', 'error',
+      `未完成的轮转意图指向的用户已不存在（${it.userId}）：已保留 ${INTENT_NAME}，请人工核对`);
+    return { repaired: false, reason: 'no-user' };
+  }
+  const same = String(raw.passwordHash || '') === String(it.cred.hash)
+    && String(raw.passwordSalt || '') === String(it.cred.salt);
+  if (!same) {
+    configStore.setPasswordCredential(it.userId, it.cred);
+    const before = configStore.getLastWriteError();
+    try {
+      await configStore.flushPending();
+    } catch (e) { /* 队列本身不 reject，失败通过 getLastWriteError 体现 */ }
+    const after = configStore.getLastWriteError();
+    if (after && after !== before) {
+      audit('key.rotate', 'error',
+        `补完未完成的轮转时配置写盘失败（${(after && after.message) || after}）：`
+        + `${INTENT_NAME} 已保留，下次解锁会再试一次`);
+      return { repaired: false, reason: 'write-failed' };
+    }
+  }
+  clearIntent();
+  audit('key.rotate', 'warn',
+    `补完一次未完成的密钥轮转（kekVersion=${to}）：KEK 已是新口令、登录口令哈希已同步`);
+  return { repaired: true, reason: 'completed', kekVersion: to };
+}
+
+/**
+ * 轮转互斥（F-09）。
+ *
+ * 两个根会话同时提交轮转时，两边都能通过 step-up、都能基于**同一份旧 ring**
+ * 完成 `rewrap()`，最后 KEK 的"最后写入者"与登录哈希的"最后写入者"是两条独立队列，
+ * 完全可能来自不同请求 —— 结果与崩溃窗口一模一样（KEK 与登录口令分叉）。
+ *
+ * 用进程内标记而不是排队：第二个请求**明确失败**（409）比"静默覆盖前一个"安全得多，
+ * 而且轮转本来就是个位数秒级的操作，让管理员重试一次没有任何成本。
+ */
+let rotating = false;
+
+/** 仅供测试 / 排障：当前是否有轮转在进行 */
+function isRotating() { return rotating; }
+
+/**
+ * 轮转 / 迁移的**唯一**串行化入口（R101 / F-09）。
+ *
+ * 判据在第一个 `await` 之前完成（`async` 函数体在首个 await 前是同步执行的），
+ * 因此两个并发请求不会同时越过这道门 —— 这正是"看起来有锁、其实没有"的常见写法
+ * （先 await 再置标记）必须避免的地方。
+ */
+async function withRotationLock(fn) {
+  if (rotating) {
+    const err = new Error('已有一次密钥轮转正在进行，请稍后重试');
+    err.status = 409;
+    err.code = 'ROTATION_IN_PROGRESS';
+    throw err;
+  }
+  rotating = true;
+  try {
+    return await fn();
+  } finally {
+    rotating = false;
+  }
+}
+
 /** 审计日志。失败不阻断主流程 —— 审计写得下更好，写不下不能因此让轮转失败。 */
 function audit(action, level, detail) {
   try {
@@ -107,6 +287,10 @@ function audit(action, level, detail) {
  * @throws 401 口令错 / 400 尚无根用户 / KEYRING_LOCKED 等
  */
 async function migrate(passphrase, opts) {
+  return withRotationLock(() => migrateInner(passphrase, opts));
+}
+
+async function migrateInner(passphrase, opts) {
   const keep = Boolean(opts && opts.keepLegacyKey)
     || String(process.env[ENV_KEEP_LEGACY] || '') === '1';
 
@@ -228,7 +412,11 @@ async function migrate(passphrase, opts) {
  * @param {string} [p.actor] 操作人（审计用）
  * @returns {Promise<{kekVersion:number, rotatedAt:string, sessionsKilled:number}>}
  */
-async function rotateLogin({ currentPassphrase, newPassphrase, actor }) {
+async function rotateLogin(opts) {
+  return withRotationLock(() => rotateLoginInner(opts));
+}
+
+async function rotateLoginInner({ currentPassphrase, newPassphrase, actor }) {
   if (!keyring.exists()) {
     const err = new Error('该实例尚未启用密钥信封，请先完成迁移');
     err.status = 409;
@@ -243,6 +431,15 @@ async function rotateLogin({ currentPassphrase, newPassphrase, actor }) {
     err.code = 'KEYRING_LOCKED';
     throw err;
   }
+
+  /**
+   * ⓪ R101（F-03）：先补完上一次没做完的轮转。
+   *
+   * 不做这一步的话，「上次崩在改哈希之前」留下的分裂状态会让本次的 step-up 必然失败
+   * （登录口令还是旧的、容器已经是新口令），而管理员从界面上看不出原因。
+   * `reconcile()` 只认三种确定的情形（见其注释），判不了就原样保留意图并告警。
+   */
+  await reconcile();
 
   const cfg = configStore.load();
   const root = rootUserOf(cfg);
@@ -271,29 +468,90 @@ async function rotateLogin({ currentPassphrase, newPassphrase, actor }) {
    */
   configStore.assertPasswordPolicy(String(newPassphrase));
 
-  // ③ 用新口令重裹同一个 DEK（数据不动）
+  /**
+   * ③ **两阶段提交的第一阶段**：先把新口令的 scrypt 凭据算出来，落进意图日志。
+   *
+   * 顺序不能反：意图里必须写明"要做的事"，否则崩溃后没人知道该把登录口令改成什么。
+   * 凭据只算这一次 —— 第二阶段（以及重启后的补写）直接用这份结果，不再重跑 scrypt。
+   */
+  const cred = await configStore.hashPassword(String(newPassphrase));
+  const ringBefore = keyring.info();
+  const fromKekVersion = Number(ringBefore && ringBefore.kekVersion) || 1;
+  const toKekVersion = fromKekVersion + 1;
+  writeIntent({
+    v: INTENT_VERSION,
+    userId: root.id,
+    fromKekVersion,
+    toKekVersion,
+    cred,
+    startedAt: new Date().toISOString(),
+    actor: actor ? String(actor) : '',
+  });
+
+  // ④ 用新口令重裹同一个 DEK（数据不动）
   const info = await keyring.rewrap(currentPassphrase, newPassphrase);
 
-  // ④ 同步根口令哈希。失败则把 KEK 回滚到旧口令，避免"能登录但解不开"
+  /**
+   * ⑤ 同步根口令哈希 —— **必须确认它真的落盘了**（R101 / F-02）。
+   *
+   * 旧实现只调用 `flushPending()` 而不 `await`，且 `writeNow()` 的 `.catch()` 把
+   * 写盘失败吸收成了一个**已解决**的 Promise ⇒ 磁盘满时接口照样回 `ok:true`，
+   * 而磁盘上留下的是「新 KEK + 旧登录口令」：管理员以为轮转完了，旧口令其实还能登录。
+   * 现在三条一起做：显式 `await`、比对 `getLastWriteError()` 的前后值（它可能是
+   * 更早一次失败留下的，不能只看"有没有值"）、失败就回滚 KEK。
+   */
   try {
-    await configStore.updateUser(root.id, { password: newPassphrase });
-    configStore.flushPending();
+    configStore.setPasswordCredential(root.id, cred);
+    const beforeErr = configStore.getLastWriteError();
+    await configStore.flushPending();
+    const afterErr = configStore.getLastWriteError();
+    if (afterErr && afterErr !== beforeErr) {
+      const err = new Error('根口令哈希写入磁盘失败：' + ((afterErr && afterErr.message) || afterErr));
+      err.writeError = afterErr;
+      throw err;
+    }
   } catch (e) {
+    let rolledBack = false;
     try {
       await keyring.rewrap(newPassphrase, currentPassphrase);
+      rolledBack = true;
     } catch (e2) {
       // 回滚也失败：此时 KEK 已是新口令、登录还是旧口令。必须显式告警，
       // 让运维知道"用旧口令登录、但解锁要用新口令"这个临时矛盾状态。
       audit('key.rotate', 'error',
         `轮转时更新根口令失败且 KEK 回滚失败：KEK 已是新口令、登录口令仍是旧的。`
         + `请立即用新口令解锁并重新设置登录口令（${(e2 && e2.message) || e2}）`);
+      /**
+       * R101（F-03）：回滚失败意味着"往前的路"才是正确的 —— KEK 就是新口令。
+       * 把意图里的目标版本改成**当前实际版本**，让下次解锁时的 `reconcile()` 能把
+       * 登录口令补成新口令。不改的话意图还指着旧的目标版本，永远对不上，
+       * 只能人工改数据文件。
+       */
+      try {
+        const now = Number(keyring.info().kekVersion) || 0;
+        if (now > 0) {
+          writeIntent({
+            v: INTENT_VERSION, userId: root.id, fromKekVersion,
+            toKekVersion: now, cred, startedAt: new Date().toISOString(),
+            actor: actor ? String(actor) : '',
+          });
+        }
+      } catch (e3) { /* 意图写不下就只能靠审计日志里那句告警 */ }
     }
-    const err = new Error('更新根口令失败，已回滚密钥轮转：' + ((e && e.message) || e));
+    // 回滚成功 = 状态回到轮转之前，意图失去意义；回滚失败 = 意图要留着让 reconcile 补完
+    if (rolledBack) clearIntent();
+    const err = new Error(
+      (rolledBack ? '更新根口令失败，已回滚密钥轮转：' : '更新根口令失败，且回滚未成功：')
+      + ((e && e.message) || e)
+    );
     err.status = 500;
     err.code = 'KEYRING_ROTATE_FAILED';
     err.cause = e;
     throw err;
   }
+
+  // 两阶段提交完成：意图日志使命结束
+  clearIntent();
 
   /**
    * ⑤ 全部会话失效。
@@ -320,6 +578,10 @@ async function rotateLogin({ currentPassphrase, newPassphrase, actor }) {
 module.exports = {
   LEGACY_KEY_NAME,
   ENV_KEEP_LEGACY,
+  // R101：轮转的两阶段意图日志（`reconcile()` 是补完入口，启动 / 解锁后都会调）
+  INTENT_NAME,
+  reconcile,
+  isRotating,
   legacyKeyPath,
   legacyKeyExists,
   status,

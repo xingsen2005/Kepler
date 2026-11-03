@@ -603,6 +603,31 @@ const bootUnlock = keyring.autoUnlockFromEnv()
     }
     return r;
   })
+  .then(async (r) => {
+    /**
+     * R101（F-03）：解锁之后立刻补完**可能存在的未完成轮转**。
+     *
+     * 轮转横跨 `keyring.json`（同步原子写）与 `config.enc`（异步写队列）两个文件，
+     * 进程恰好死在两者之间时，磁盘上会是「新 KEK + 旧登录口令」：新口令能解锁、
+     * 却过不了 step-up，旧口令能登录、却解不开容器 —— 公开接口两边都修不回来。
+     * 意图日志（`keyring.rotate-intent.json`）把这一步变成可恢复的，而**解锁是唯一
+     * 能补写的时机**（补写要读 `config.enc`，锁定态读不了）。
+     */
+    if (r && r.ok) {
+      try {
+        const rep = await require('./key-rotate').reconcile();
+        if (rep && rep.repaired) {
+          console.warn(
+            `[Storage Manager] 检测到未完成的密钥轮转，已补完（kekVersion=${rep.kekVersion}）：`
+            + '登录口令哈希已与当前 KEK 对齐。'
+          );
+        }
+      } catch (e) {
+        console.warn('[Storage Manager] 补完未完成轮转时出错：', (e && e.message) || e);
+      }
+    }
+    return r;
+  })
   .catch((e) => {
     console.error('[Storage Manager] 主密钥自动解锁异常：', (e && e.message) || e);
     return { ok: false, reason: 'error' };

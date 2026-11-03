@@ -549,6 +549,36 @@ function metaEntriesFor(bucket) {
   return out;
 }
 
+/**
+ * R101（F-04）：标记「这份密文**最近一次被写到云端**的时间」。
+ *
+ * `createdAt` 是「这条明文第一次被加密进来」的时间，而巡检的 `modified` 判据问的是
+ * 另一件事：「云端那个对象**在我们最后一次写它之后**有没有又被写过」。两者在
+ * **正常上传**时相等，在下面三条路径上却不相等 —— 而它们都会让云端产生一个
+ * **新的对象**（新的 `Last-Modified`）：
+ *
+ *   · 复制（`copyMeta` / `reconcileAfterWrite` 的复制分支）：目标对象是新建的；
+ *   · 移动 / 重命名（`renameMeta` / `migratePrefix`）：S3 语义是 copy + delete；
+ *   · 覆盖上传：`reconcileAfterWrite` 会带上新元数据，同时刷新这里。
+ *
+ * 不刷新就会有一整类**稳定复现的假阳性**：任何创建超过 5 分钟的文件，只要被复制或
+ * 移动过一次，下一轮巡检就报「被改写」—— 而它其实一个字节都没被动过。假阳性比漏报
+ * 更贵：用户会立刻学会无视这个功能，那它就等于不存在。
+ *
+ * 为什么不直接改 `createdAt`：那个字段还承担「这个文件是什么时候进来的」这个语义
+ * （界面、元数据导出都在用）。把判断需要的第二个时间点单独记下来，比让一个字段
+ * 兼任两件事要诚实。
+ *
+ * @param {object} entry 元数据条目（**就地**改写）
+ * @param {string} [at] ISO 时间串；缺省取当前时间
+ * @returns {boolean} 是否改写成功（entry 非法时返回 false）
+ */
+function stampCloudWritten(entry, at) {
+  if (!entry || typeof entry !== 'object' || Array.isArray(entry)) return false;
+  entry.cloudWrittenAt = at || iso();
+  return true;
+}
+
 function setMeta(bucket, key, entry) {
   loadMeta().files[metaKey(bucket, key)] = entry;
   persistMeta();
@@ -585,7 +615,9 @@ function removeMeta(bucket, key) {
  * @returns {boolean} 是否改动了元数据
  */
 function reconcileAfterWrite(bucket, key, meta) {
-  if (meta) { setMeta(bucket, key, meta); flushMeta(); return true; }
+  // R101（F-04）：这里同时覆盖了「普通上传」与「复制」（复制走的就是这个入口），
+  // 两者的共同点正是「云端此刻刚出现一份新对象」—— 所以时间戳在这里刷新。
+  if (meta) { stampCloudWritten(meta); setMeta(bucket, key, meta); flushMeta(); return true; }
   if (removeMeta(bucket, key)) { flushMeta(); return true; }
   return false;
 }
@@ -626,6 +658,9 @@ function renameMeta(bucket, fromKey, toKey) {
   const to = metaKey(bucket, toKey);
   if (!files[from]) return false;
   files[to] = files[from];
+  // R101（F-04）：目标是一个**新对象**（云端 Last-Modified 已是现在），
+  // `createdAt` 不能跟着搬 —— 否则巡检会把每个移动过的旧文件报成「被改写」。
+  stampCloudWritten(files[to]);
   delete files[from];
   persistMeta();
   return true;
@@ -681,14 +716,16 @@ function renameMeta(bucket, fromKey, toKey) {
        cleared++;
      }
    }
-   for (const k of Object.keys(files)) {
-     if (k.startsWith(from)) {
-       const nk = to + k.slice(from.length);
-       files[nk] = files[k];
-       delete files[k];
-       n++;
-     }
-   }
+  for (const k of Object.keys(files)) {
+    if (k.startsWith(from)) {
+      const nk = to + k.slice(from.length);
+      files[nk] = files[k];
+      // R101（F-04）：整目录移动同样在云端生成了一批**新对象**，目标侧时间戳要跟上
+      stampCloudWritten(files[nk]);
+      delete files[k];
+      n++;
+    }
+  }
    if (n || cleared) persistMeta();
    return { moved: n, cleared };
  }
@@ -699,6 +736,8 @@ function copyMeta(bucket, fromKey, toKey) {
   const from = metaKey(bucket, fromKey);
   if (!files[from]) return false;
   files[metaKey(bucket, toKey)] = JSON.parse(JSON.stringify(files[from]));
+  // R101（F-04）：深拷贝出来的是「另一份新对象」的凭据，时间戳必须重新落
+  stampCloudWritten(files[metaKey(bucket, toKey)]);
   persistMeta();
   return true;
 }
@@ -1511,6 +1550,8 @@ module.exports = {
   settingsView, updateSettings, currentMode,
   masterKey, parseMagicInput,
   getMeta, setMeta, removeMeta, removeMetaBatch, reconcileAfterWrite,
+  // R101（F-04）：「云端此刻刚出现一份新对象」的唯一时间戳写入点
+  stampCloudWritten,
   // R99：完整性巡检要枚举「本系统加密过哪些对象 / 哪些桶」——只读，不触发任何写入
   metaBuckets, metaEntriesFor,
   renameMeta, migratePrefix, copyMeta, removeBucketMeta, encryptedSetFor,

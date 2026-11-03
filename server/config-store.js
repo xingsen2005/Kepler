@@ -3578,6 +3578,30 @@ function findUserByIdentifier(identifier) {
   return mail ? (byMail || byName) : byName;
 }
 
+/**
+ * R101（F-03）：用**已经算好的**口令凭据直接落库，不再做第二次 scrypt。
+ *
+ * 轮转时必须把"新口令的哈希"提前算出来并写进意图日志 —— 因为一旦 `keyring.rewrap()`
+ * 成功、进程在改哈希之前死掉，磁盘上就是「新 KEK + 旧登录口令」，公开接口再也修不回来。
+ * 有了这份凭据，补写只差一次赋值（重启后 `reconcile` 调用的就是本函数）。
+ *
+ * 为什么不复用 `updateUser({password})`：它内部会重新跑一次 scrypt，而重启补写那一刻
+ * 手上只有哈希、没有明文口令 —— 那是"两阶段"设计的关键点，不是省 CPU。
+ */
+function setPasswordCredential(id, cred) {
+  if (!cred || typeof cred !== 'object' || !cred.salt || !cred.hash) {
+    throw Object.assign(new Error('口令凭据不完整'), { status: 400 });
+  }
+  const cfg = requireStore();
+  const user = cfg.users.find((u) => u.id === id);
+  if (!user) throw Object.assign(new Error('用户不存在'), { status: 404 });
+  user.passwordSalt = String(cred.salt);
+  user.passwordHash = String(cred.hash);
+  user.passwordParams = cred.params || SCRYPT_PARAMS;
+  persist(cfg);
+  return userView(user);
+}
+
 /** 校验密码是否正确（不返回用户对象，供两步登录的第一步单独使用）（SEC-05：async） */
 async function verifyUserPassword(id, password) {
   const user = findUserRawById(id);
@@ -3638,6 +3662,8 @@ module.exports = {
   // R69：口令哈希的唯一实现点（用户口令 / 分享口令 / 加密查看口令 / 备份码共用同一组参数）
   // `verifyPassword` 一并导出：只有它能把「旧参数哈希仍验得过」这条判据真正测出来
   scryptHex, verifyPassword, SCRYPT_PARAMS, normalizeScryptParams,
+  // R101（F-03）：轮转的两阶段提交 —— 先算哈希（`hashPassword`）、后补写（`setPasswordCredential`）
+  hashPassword, setPasswordCredential,
   // R97：口令强度的唯一判据（`key-rotate` 要在"重裹"**之前**先验一次 ——
   // 否则新口令太弱时会先跑两次 scrypt 再回滚，白付一次 CPU）
   assertPasswordPolicy,

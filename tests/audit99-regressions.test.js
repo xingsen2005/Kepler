@@ -86,6 +86,14 @@ async function withIntegrity(opts, fn) {
     }),
     configStore: Object.assign({}, real.configStore, {
       isLocked: () => !!o.locked,
+      /**
+       * R101（F-08）：巡检要读「配置里的桶清单」才能发现**同名桶的歧义**。
+       * 这里给一份确定性的桩 —— 不能用真实配置，否则结果取决于本机 `data/` 里恰好
+       * 存了什么（那正是最典型的"测试在自己机器上绿、在 CI 上红"）。
+       */
+      load: () => ({
+        buckets: (o.cfgBuckets || Object.keys(o.buckets || {}).map((n) => ({ bucket: n }))),
+      }),
     }),
     bucketStats: Object.assign({}, real.bucketStats, {
       // 只替换「桶名 → 客户端」这一步；`mapLimit` 与 `bucketCacheKey` 保持真实实现
@@ -337,15 +345,37 @@ test('R99-10 · 轮转游标：每轮只取 batch 条，下一轮接着上次的
   }
 });
 
-test('R99-11 · 候选集命中时省掉 HEAD，但仍按长度判定（候选集只省请求，不当判据）', async () => {
+/**
+ * ⚠️ R101（F-05）修正了本条的**契约**：候选集只在**同时带着时间戳**时才允许省 HEAD。
+ *
+ * 旧用例断言「候选集命中 ⇒ HEAD 次数 = 0」，那其实是把缺陷写成了契约：命中后
+ * `lastModified` 恒为 `null`，`classify()` 的「被改写」分支因为 `cloudAt === null`
+ * 直接跳过 —— 巡检最强的判据在这条分支上**完全失效**，而"刚搜索完顺手点立即巡检"
+ * 恰恰是最自然的使用路径。现在拆成两段：有戳才省、没戳必须回退。
+ */
+test('R99-11 · 候选集命中时的省 HEAD 与「改写」判据（R101 修正：缺时间戳必须回退 HEAD）', async () => {
+  // ① 候选集**带** lastModified ⇒ 真的省掉 HEAD，且长度判据照常执行
   await withIntegrity({
     buckets: { b1: [{ key: 'hit.bin', meta: { mode: 'magic', origSize: 10, createdAt: '2026-10-01T00:00:00.000Z' } }] },
-    candidateItems: [{ key: 'hit.bin', size: 3 }],
+    candidateItems: [{ key: 'hit.bin', size: 3, lastModified: 'Thu, 01 Oct 2026 00:00:00 GMT' }],
   }, async (m, calls) => {
     const st = await m.runOnce();
-    assertEqual(calls.head.length, 0, '候选集里已有尺寸 ⇒ 不必再 HEAD（省一次云端请求）');
+    assertEqual(calls.head.length, 0, '候选集里已有尺寸与时间戳 ⇒ 不必再 HEAD（省一次云端请求）');
     assertEqual(st.bad, 1, '但判据照样执行：候选集说 3 字节、元数据说 10 字节 ⇒ 长度不符');
     assertEqual(st.findings[0].verdict, 'size', '结论仍是 size');
+  });
+
+  // ② 候选集**只有**尺寸 ⇒ 必须回退 HEAD，否则「同长度原位覆盖」被判成正常
+  await withIntegrity({
+    buckets: { b1: [{ key: 'hit.bin', meta: { mode: 'magic', origSize: 10, createdAt: '2026-01-01T00:00:00.000Z' } }] },
+    candidateItems: [{ key: 'hit.bin', size: 10 }],
+    sizes: { 'hit.bin': 10 },
+    lastModified: { 'hit.bin': 'Mon, 01 Jun 2026 00:00:00 GMT' },
+  }, async (m, calls) => {
+    const st = await m.runOnce();
+    assertEqual(calls.head.length, 1, '缺时间戳就必须 HEAD —— 否则「被改写」判据静默失效');
+    assertEqual(st.bad, 1, '长度一致、但云端时间戳远晚于本地写入 ⇒ 必须报「被改写」');
+    assertEqual(st.findings[0].verdict, 'modified', '结论是 modified，不是 ok');
   });
 });
 

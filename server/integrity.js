@@ -123,7 +123,21 @@ function expectedCloudSize(meta) {
   if (!meta || typeof meta !== 'object') return null;
   if (meta.mode === 'magic') {
     const n = Number(meta.origSize);
-    return Number.isFinite(n) && n >= 0 ? n : null;
+    if (!Number.isFinite(n) || n < 0) return null;
+    /**
+     * R101（F-06）：明文**短于魔数**时，密文长度不是 `origSize`。
+     *
+     * 加密侧是 `Buffer.concat([magic, buf.slice(M)])`：`buf.slice(M)` 在
+     * `origSize < M` 时是**空**，落盘的就是那 9 个字节的魔数本身。此时
+     * `origSize`（0~8）与云端长度（9）必然不等 ⇒ 每一轮都把 `.gitkeep`、
+     * 空文件、几个字节的小配置报成「长度不符」。`magicLen` 本来就写在元数据
+     * 里（加密时记录的），直接取两者较大值即可，不需要猜。
+     *
+     * 老条目（R66 之前）可能没有 `magicLen`：那时按 `origSize` 判 —— 与修复前
+     * 行为一致，属于「无法更准」而不是「又引入一条新判据」。
+     */
+    const ml = Number(meta.magic && meta.magic.magicLen);
+    return Number.isFinite(ml) && ml > n ? ml : n;
   }
   if (meta.mode === 'crypto') {
     const segs = meta.crypto && meta.crypto.segments;
@@ -173,11 +187,19 @@ function classify({ meta, cloudSize, lastModified }) {
   /**
    * 「写完之后又被写过」。
    *
+   * 比较的基准取 **`createdAt` 与 `cloudWrittenAt` 的较大值**（R101 / F-04）：
+   * `createdAt` 是「这份明文第一次被加密」的时间，而复制 / 移动会在云端生成一个
+   * **新对象**、本地元数据却被搬运过来 —— 此时只有 `cloudWrittenAt` 说得清
+   * 「我们最后一次把这份内容写到云端是什么时候」。不取较大值，任何被复制或移动过
+   * 的旧文件都会被稳定地报成「被改写」。
+   *
    * `createdAt` 解析不出来时**跳过这一条**而不是当成篡改：历史条目里存在没有
    * `createdAt` 的记录（R66 之前写入的），把它们全判成"被改写"会制造一整屏假警报，
    * 那比漏检更糟 —— 用户会立刻学会无视这个功能。
    */
-  const wroteAt = Date.parse(String((meta && meta.createdAt) || ''));
+  const t1 = Date.parse(String((meta && meta.createdAt) || ''));
+  const t2 = Date.parse(String((meta && meta.cloudWrittenAt) || ''));
+  const wroteAt = Math.max(Number.isFinite(t1) ? t1 : -Infinity, Number.isFinite(t2) ? t2 : -Infinity);
   const cloudAt = parseHttpDate(lastModified);
   if (Number.isFinite(wroteAt) && cloudAt !== null && cloudAt > wroteAt + CLOCK_SKEW_MS) {
     return {
@@ -237,10 +259,20 @@ function state() {
 /* ============================ 候选集 ============================ */
 
 /**
- * 候选集命中：从「全桶递归搜索」留下的候选集里取出 key → 云端尺寸。
+ * 候选集命中：从「全桶递归搜索」留下的候选集里取出 key → `{ size, lastModified }`。
  *
  * 只用它**省掉 HEAD**，不用它当判据。候选集过期由 TTL 自愈（默认 10 秒），
  * 因此这里只在"刚好热着"时命中，否则老老实实发 HEAD。
+ *
+ * ⚠️ R101（F-05）：**必须连 `lastModified` 一起带出来**。旧实现只存了 `size`，
+ * 于是命中的对象在 `runOnceInner` 里 `lastModified` 恒为 `null`，
+ * `classify()` 的「被改写」分支因为 `cloudAt === null` 直接跳过 ——
+ * 恰好把**巡检最强的那个判据**（同长度原位覆盖）静默关掉了。而"刚搜索完、
+ * 顺手点立即巡检"是最自然的使用路径，撞上它的概率一点也不低。
+ *
+ * 候选集项本身带 `lastModified`（`routes/fs.js` 的搜索映射会把它带上）；
+ * 没有这个字段的项返回 `null`，由调用方回退到 HEAD —— 宁可多一次请求，
+ * 也不能在不知道时间戳的情况下宣布"正常"。
  */
 function cachedSizes(cfg) {
   let key = null;
@@ -253,7 +285,9 @@ function cachedSizes(cfg) {
   if (!cand || !cand.complete || !Array.isArray(cand.items)) return null;
   const m = new Map();
   for (const it of cand.items) {
-    if (it && typeof it.key === 'string') m.set(it.key, Number(it.size) || 0);
+    if (!it || typeof it.key !== 'string') continue;
+    const lm = it.lastModified == null ? '' : String(it.lastModified);
+    m.set(it.key, { size: Number(it.size) || 0, lastModified: lm || null });
   }
   return m;
 }
@@ -324,7 +358,41 @@ async function runOnceInner(now) {
   result.buckets = buckets.length;
   if (!buckets.length) return commit('');
 
+  /**
+   * R101（F-08）：同名桶的歧义必须先判定，不能"取第一个匹配"。
+   *
+   * 多云下 `cfg.buckets` 允许存在**同名**的桶（不同厂商 / 不同凭据），而
+   * `enc-meta.json` 的键只有 `bucket|key`（R7-15 的已知限制）—— 换句话说，
+   * 从元数据这一侧**根本无法区分**某个对象属于哪一个同名桶。旧实现把桶名丢给
+   * `resolveBucketClient()`，它内部 `find()` 取第一个匹配项，于是对第二个桶的对象
+   * 发 HEAD 到第一个桶：结果是**看起来非常确定的错误结论**（假 `missing` / 假 `size`）。
+   *
+   * 宁可跳过：跳过只是"这一轮没查"，而猜错会让人去追一个不存在的数据丢失。
+   */
+  const dupCounts = new Map();
+  try {
+    const cfg = configStore.load();
+    for (const b of ((cfg && cfg.buckets) || [])) {
+      const name = String((b && b.bucket) || '');
+      if (name) dupCounts.set(name, (dupCounts.get(name) || 0) + 1);
+    }
+  } catch (e) {
+    // 读不到配置时不做这条保护：后面 `resolveBucketClient()` 本来就会返回 null
+  }
+
   for (const bucket of buckets) {
+    const dup = dupCounts.get(bucket) || 0;
+    if (dup > 1) {
+      let n = 0;
+      try { n = encStore.metaEntriesFor(bucket).length; } catch (e) { n = 0; }
+      result.skipped += n;
+      noteFinding({
+        bucket, key: '(整桶)', mode: '', verdict: 'ambiguous',
+        detail: `该桶名在配置里出现了 ${dup} 次（不同厂商 / 不同凭据），`
+          + '而加密元数据只按「桶名|对象键」登记，无法判断这些对象属于哪一个 ⇒ 本轮整桶跳过，不猜',
+      });
+      continue;
+    }
     const target = resolveBucketClient({ bucket, region: '' });
     if (!target) {
       // 桶已从配置里移除 / 该厂商没有可用密钥：跳过，不猜
@@ -351,9 +419,15 @@ async function runOnceInner(now) {
     await mapLimit(slice, CONCURRENCY, async (ent) => {
       const base = { bucket, key: ent.key, mode: (ent.meta && ent.meta.mode) || '' };
       try {
-        let cloudSize = sizes ? sizes.get(ent.key) : undefined;
-        let lastModified = null;
-        if (cloudSize === undefined) {
+        const hit = sizes ? sizes.get(ent.key) : undefined;
+        let cloudSize = hit ? hit.size : undefined;
+        let lastModified = hit ? hit.lastModified : null;
+        /**
+         * 候选集命中但**没带时间戳** ⇒ 回退到 HEAD（R101 / F-05）。
+         * 只信尺寸不信时间会让「被改写」判据在这条分支上静默失效，
+         * 而它正是巡检最强的那一条 —— 省一次 HEAD 不值得拿它换。
+         */
+        if (cloudSize === undefined || lastModified === null) {
           const head = await p(target.s3, 'headObject', {
             Bucket: target.cfg.bucket, Region: target.cfg.region, Key: ent.key,
           });

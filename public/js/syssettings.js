@@ -2342,6 +2342,8 @@ async function runIntegrity() {
 const INTEGRITY_VERDICT = {
   missing: '已丢失', size: '长度不符', modified: '被改写',
   unknown: '无法判定', error: '无法确认',
+  // R101（F-08）：同名桶歧义 —— 不是"这个对象有问题"，而是"这一桶没法判"
+  ambiguous: '桶名歧义',
 };
 
 /** 整轮被跳过的原因 → 一句话（**锁定与损坏必须分开说**，处置完全不同） */

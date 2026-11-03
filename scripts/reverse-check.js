@@ -12827,8 +12827,9 @@ const CASES = [
       // magic 模式密文与明文等长；多算一个魔数头就等于给每个对象凭空加了几十字节。
       name: 'R99-01b · magic 模式给密文长度多加一个魔数头（同样是全员假阳性）',
       file: 'server/integrity.js',
-      anchor: '    return Number.isFinite(n) && n >= 0 ? n : null;',
-      replacement: '    return Number.isFinite(n) && n >= 0 ? n + encStore.CRYPTO_MAGIC.length : null;',
+      // R101（F-06）把这一行改成了「origSize 与 magicLen 取大」，锚点随源码更新。
+      anchor: '    return Number.isFinite(ml) && ml > n ? ml : n;',
+      replacement: '    return (Number.isFinite(ml) && ml > n ? ml : n) + encStore.CRYPTO_MAGIC.length;',
       testFile: 'audit99-regressions.test.js',
       minFail: 1,
     },
@@ -13021,6 +13022,106 @@ const CASES = [
       anchor: '    const cap = await captchaNative.guard({\n      req, body: b, remoteip: pre.ip, expectedHosts: captchaHosts(req),\n    }, configStore);',
       replacement: '    const cap = await captcha.verify({\n      token: b.captchaToken, remoteip: pre.ip, expectedHosts: captchaHosts(req),\n    }, configStore);',
       testFile: 'audit100-regressions.test.js',
+      minFail: 1,
+    },
+    /* ---------------- R101 · 密钥轮转的分叉 / 崩溃窗口 / 并发 + 巡检四缺陷 ---------------- */
+    {
+      // 根用户改密不再被拦 ⇒ 登录口令与 KEK 当场分叉（重启后才现形）
+      name: 'R101-01a · 根用户「我的资料」改密不再被拦（登录口令与主密钥解锁因子分叉）',
+      file: 'server/routes/users.js',
+      anchor: '      const rootBlock = rootPasswordBlocked(me);\n      if (rootBlock) return res.status(409).json(rootBlock);',
+      replacement: '',
+      testFile: 'audit101-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 管理员重置根用户口令同样绕过闸门
+      name: 'R101-01b · 管理员重置根用户口令不再被拦（同一分裂状态的另一条入口）',
+      file: 'server/routes/users.js',
+      anchor: '      const rootBlock = rootPasswordBlocked(configStore.findUserRawById(req.params.id));\n      if (rootBlock) return res.status(409).json(rootBlock);',
+      replacement: '',
+      testFile: 'audit101-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 写盘失败被当成成功 ⇒ 磁盘上是「新 KEK + 旧登录口令」，而接口回 ok
+      name: 'R101-02a · 轮转不检查配置写盘错误（返回成功但登录口令没落盘）',
+      file: 'server/key-rotate.js',
+      anchor: '    const afterErr = configStore.getLastWriteError();\n    if (afterErr && afterErr !== beforeErr) {',
+      replacement: '    const afterErr = null;\n    if (afterErr && afterErr !== beforeErr) {',
+      testFile: 'audit101-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 崩溃窗口不可修复：意图日志在，但没人补写
+      name: 'R101-03a · reconcile 不再补写登录口令（崩溃窗口永久留成分叉状态）',
+      file: 'server/key-rotate.js',
+      anchor: '    configStore.setPasswordCredential(it.userId, it.cred);',
+      replacement: '    void it.cred;',
+      testFile: 'audit101-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 并发轮转不再被拦 ⇒ 两个请求都能成功，KEK 与登录哈希来自不同请求
+      name: 'R101-04a · 轮转互斥失效（两个并发请求都能重裹成功）',
+      file: 'server/key-rotate.js',
+      anchor: '  if (rotating) {\n    const err = new Error(\'已有一次密钥轮转正在进行，请稍后重试\');',
+      replacement: '  if (false) {\n    const err = new Error(\'已有一次密钥轮转正在进行，请稍后重试\');',
+      testFile: 'audit101-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 损坏备份放大：每次取状态都复制一份（匿名接口可无限请求）
+      name: 'R101-05a · 损坏的 keyring.json 每次都复制新备份（匿名 status 请求放大磁盘占用）',
+      file: 'server/keyring.js',
+      anchor: '      bak = reuseCorruptBackup(file) || `${file}.corrupt-${Date.now()}`;',
+      replacement: '      bak = `${file}.corrupt-${Date.now()}-${Math.random()}`;',
+      testFile: 'audit101-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 复制不刷新云端写入时间 ⇒ 任何被复制过的旧文件都被巡检报成「被改写」
+      name: 'R101-06a · 复制/上传后不刷新 cloudWrittenAt（正常搬运被报成篡改）',
+      file: 'server/enc-store.js',
+      anchor: '  if (meta) { stampCloudWritten(meta); setMeta(bucket, key, meta); flushMeta(); return true; }',
+      replacement: '  if (meta) { setMeta(bucket, key, meta); flushMeta(); return true; }',
+      testFile: 'audit101-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 移动不刷新 ⇒ 同上（另一条路径）
+      name: 'R101-06b · 移动/重命名后不刷新 cloudWrittenAt（移动过的旧文件全成假警报）',
+      file: 'server/enc-store.js',
+      anchor: '  stampCloudWritten(files[to]);',
+      replacement: '',
+      testFile: 'audit101-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // magic 短文件按 origSize 比长度 ⇒ 0~8 字节的文件每轮都被报「长度不符」
+      name: 'R101-07a · magic 短文件仍按 origSize 判长度（每轮稳定假报警）',
+      file: 'server/integrity.js',
+      anchor: '    const ml = Number(meta.magic && meta.magic.magicLen);\n    return Number.isFinite(ml) && ml > n ? ml : n;',
+      replacement: '    return n;',
+      testFile: 'audit101-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 同名桶不再跳过 ⇒ 对第二个桶的对象发 HEAD 到第一个桶，给出一份"确定"的错误结论
+      name: 'R101-08a · 同名桶不再判定歧义（HEAD 打到另一个同名桶）',
+      file: 'server/integrity.js',
+      anchor: '    if (dup > 1) {',
+      replacement: '    if (false) {',
+      testFile: 'audit101-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 候选集缺时间戳仍不 HEAD ⇒ 「被改写」判据静默失效（巡检最强的一条）
+      name: 'R101-09a · 候选集缺时间戳时仍不 HEAD（同长度原位覆盖被判成正常）',
+      file: 'server/integrity.js',
+      anchor: '        if (cloudSize === undefined || lastModified === null) {',
+      replacement: '        if (cloudSize === undefined) {',
+      testFile: 'audit99-regressions.test.js',
       minFail: 1,
     },
   ];

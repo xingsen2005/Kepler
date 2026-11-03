@@ -93,6 +93,19 @@ router.post('/key/unlock', async (req, res) => {
 
     const info = await keyring.unlock(passphrase);
     security.keyUnlockLock.reset(ip);
+    /**
+     * R101（F-03）：解锁是**补完未完成轮转**的唯一时机（补写要读 `config.enc`）。
+     * 失败不阻断解锁 —— 解不开的是"补写"，不是"解锁本身"；把解锁也一起判死会让
+     * 一次写盘故障变成"谁也进不去"。
+     */
+    try {
+      const rep = await keyRotate.reconcile();
+      if (rep && rep.repaired) {
+        audit('key.rotate', 'warn', `解锁时补完了一次未完成的轮转（kekVersion=${rep.kekVersion}）`);
+      }
+    } catch (e) {
+      audit('key.rotate', 'error', `解锁时补完未完成轮转失败：${(e && e.message) || e}`);
+    }
     audit('key.unlock', 'info', `主密钥已解锁（kekVersion=${info.kekVersion}，IP：${ip}）`);
     return res.json({ ok: true, kekVersion: info.kekVersion, unlocked: true });
   } catch (e) {

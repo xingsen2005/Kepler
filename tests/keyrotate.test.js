@@ -202,13 +202,32 @@ test('R97-18 · 轮转：KEK 用新口令重裹、登录口令同步换掉、DEK
     const ctx = await envelopeInstance(dir);
     const configEncBefore = fs.readFileSync(path.join(dir, 'config.enc'));
 
+    /**
+     * R101（F-02 / F-03）修正：这条断言原先写的是「`config.enc` 字节不变」，它之所以
+     * 在旧实现下成立，恰恰是因为那次 `flushPending()` **没有被 await** —— 轮转返回时
+     * 新的登录哈希还在去抖队列里没落盘。也就是说，旧断言把「写盘被吞掉」当成了契约。
+     *
+     * 现在的口径：**除 `config.enc` 以外的数据文件**一个字节都不能动（那才是「只重裹、
+     * 不重加密用户数据」），而 `config.enc` **必须**已经变了（哈希确实落盘）。
+     */
+    const otherFiles = () => fs.readdirSync(dir)
+      .filter((f) => fs.statSync(path.join(dir, f)).isFile() && f !== 'config.enc');
+    const before = new Map(otherFiles().map((f) => [f, fs.readFileSync(path.join(dir, f))]));
+
     const r = await ctx.keyRotate.rotateLogin({
       currentPassphrase: ROOT_PW, newPassphrase: 'NewRootPass456', actor: 'root',
     });
     assertEqual(r.kekVersion, 2, '轮转后 kekVersion 递增');
     assert(ctx.keyring.dek().equals(ctx.dek), '轮转只重裹，DEK 不变');
-    assert(configEncBefore.equals(fs.readFileSync(path.join(dir, 'config.enc'))),
-      '轮转不得改动任何数据文件');
+
+    for (const [f, buf] of before) {
+      if (f === 'keyring.json') continue;   // 它才是本次唯一该变的那份（重裹）
+      assert(buf.equals(fs.readFileSync(path.join(dir, f))), `轮转不得改动数据文件：${f}`);
+    }
+    assert(configEncBefore.equals(fs.readFileSync(path.join(dir, 'config.enc'))) === false,
+      '登录口令哈希必须已经落盘 —— 返回成功时 `config.enc` 不能还是旧的那一份');
+    assert(!fs.existsSync(path.join(dir, 'keyring.rotate-intent.json')),
+      '轮转成功后必须清掉意图日志（留着会被下次 reconcile 误判）');
 
     /**
      * 「登录口令 = 主口令」这件事的判据是**两边同时生效**：

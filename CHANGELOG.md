@@ -5,7 +5,7 @@
 > 本文件是**事后重建**的，不是随每次发版逐条维护的发布记录。项目虽托管在 GitHub（`origin` 可用、有提交历史），但提交历史**未按发布切分** —— 提交信息多为「bug fix」这类无信息量占位，也没有留存任何发布记录文档，因此：
 >
 > - **不给出任何发布日期**。版本标题写「日期未归档」，而不是填一个看起来合理的日期；
-> - 版本号的唯一事实源是 `package.json` 的 `version` 字段（当前 `2.1.0`）；
+> - 版本号的唯一事实源是 `package.json` 的 `version` 字段（当前 `2.1.1`）；
 
 ## 仓库整理 · 客户端二进制移出仓库，改由 Releases 分发
 
@@ -28,6 +28,52 @@
 
 - **没有改写历史**。`git filter-repo` / BFG 能把 160MB 从历史里彻底抹掉、让 clone 真正变小，但那要 `push --force` 重写 `main`，所有已有克隆全部失效，而且这个仓库的提交历史本身没有按发布切分（见本文件开头）。收益（一次性的体积）与代价（破坏性、不可逆）不成比例。真要清理，应单独决策、单独备份。
 - **没有让客户端版本号跟服务端同步**。两者发布节奏不同，硬绑只会制造「服务端 2.1.0 就该配客户端 2.1.0」的假承诺。Release 标题注明该构建**实际内置**的版本。
+
+---
+
+## [2.1.1] - 日期未归档
+
+**一次「把不变量补成不变量」的修复。** 外部审计（9 条，F-01~F-09）全部成立，全部修掉：根用户改密能把「登录口令」与「解锁因子」拆成两套；轮转的写盘失败被吞掉、崩溃窗口没有恢复路径、并发没有串行化；巡检在复制 / 移动 / 短文件 / 候选集 / 同名桶五处给出稳定误报或稳定漏报。没有新功能，只有不变量的补齐与判据的收窄。
+
+### 问题（按审计编号）
+
+| 编号 | 缺陷 | 修法 | 代价 / 边界 |
+| --- | --- | --- | --- |
+| F-01 | 根用户走「我的资料」改密、管理员重置、邮箱找回三条路径都只改哈希、不重裹 `keyring.json` ⇒ 重启后「新口令能登录、旧口令才能解锁」 | 三道入口统一过 `rootPasswordBlocked()`：**已启用信封 + 目标就是根用户** ⇒ 400 `USE_KEY_ROTATION`，文案指向「系统设置 → 安全 → 轮转登录密钥」，并提示「忘了旧口令时只能改回数据文件」 | 未启用信封的实例**不拦**（老部署的改密行为一个字节没变）；锁定态下也不拦（那条路径根本读不到配置，由轮转自己 503） |
+| F-02 | `writeNow()` 的 `.catch()` 吞掉写盘错误 ⇒ `flushPending()` 返回已 fulfilled 的 Promise ⇒ 轮转返回「成功」，磁盘上却是新 KEK + 旧哈希 | `await flushPending()` 后比对 `getLastWriteError()` 的**前后值**（它可能是更早一次失败的残留）；失败 ⇒ 回滚 KEK + 500 `KEYRING_ROTATE_FAILED` | 没有把写队列改成 reject：`persist()` 有大量 fire-and-forget 调用点，改 reject 会让「磁盘满」变成满屏 `unhandledRejection`（Node ≥15 直接终止进程） |
+| F-03 | `rewrap()`（同步原子写）与 `config.enc`（异步队列）之间没有跨文件事务 ⇒ 崩溃窗口留下「新 KEK + 旧哈希」，两条公开轮转路径都走不通 | 两阶段提交：动手前写 `data/keyring.rotate-intent.json`（已算好的凭据 + `fromKekVersion` / `toKekVersion`），成功即删；`reconcile()` 在**启动 / 解锁 / 下次轮转**三处补完 | 只对三种确定情形动手（`=== from` 丢弃、`=== to` 补写、其余**保留 + 告警**）；坏 intent / 锁定态 / `keyring` 读不出来一律早退 —— 不猜 |
+| F-04 | 复制 / 移动在云端产生**新对象**（新 `Last-Modified`），本地元数据原样搬运 ⇒ 任何超过 5 分钟的旧文件一经搬运就稳定误报 `modified` | 新增 `cloudWrittenAt`（`createdAt` 语义不变：仍是「明文第一次被加密」），在 `reconcileAfterWrite` / `renameMeta` / `migratePrefix` / `copyMeta` **四处**刷新；`classify()` 取两者较大值 | 老元数据没有这个字段 ⇒ 退化成 `createdAt`，与修复前一致；不会因为升级就把历史对象判成「被改写」 |
+| F-05 | 候选集只存 `size` ⇒ 命中后 `lastModified` 恒为 `null` ⇒ `modified` 判据在「刚搜索完顺手巡检」这条最常见路径上**完全失效** | `cachedSizes()` 改成 `Map(key → {size, lastModified})`；缺时间戳就回退 HEAD | 省 HEAD 从「无条件」收窄成「有时间戳才省」；HEAD 上限与判定结果都没放松 |
+| F-06 | magic 模式 `Buffer.concat([magic, buf.slice(M)])` 在 `origSize < M` 时 `slice` 为空 ⇒ 密文恒为 M 字节，巡检却按 `origSize` 判 | `expectedCloudSize()` 取 `max(origSize, magic.magicLen)` | 缺 `magicLen` 的历史条目（R66 之前）回退 `origSize`：无法更准，但不引入新判据 |
+| F-07 | `corruptError()` 每次都 `copyFileSync` 一份 `.corrupt-<ts>`，而 `GET /key/status` 匿名可达且无独立限流 ⇒ 一个匿名请求 = 一个新文件 | `reuseCorruptBackup()`：找 mtime **不早于**源文件的既有备份复用；源文件被改过（mtime 变新）才重新留档 | 没有加限流桶：放大倍数已经压到 1，再加一道限流要动限流表与前端的 429 处理，收益小于改动面 |
+| F-08 | `enc-meta` 的键只有 `bucket\|key` ⇒ 同名桶无法区分，`cfg.buckets.find()` 取第一个 ⇒ HEAD 打到另一个桶，产出**看起来非常确定的错误结论** | 先统计 `dupCounts`，`dup > 1` 的桶**整桶跳过**（计 `skipped`、记一条 `verdict: 'ambiguous'` 明细、**一个 HEAD 都不发**），界面显示「桶名歧义」 | 需要迁移才能根治（把 `provider` / `secretId` 并进键）⇒ 留作 feature request；「不猜」比「猜对了」更安全，改名后自愈 |
+| F-09 | 两个并发轮转都能重裹成功，KEK 的「最后写入者」与登录哈希的「最后写入者」可能来自不同请求 | `withRotationLock()`：`migrate` 与 `rotateLogin` 共用一个进程内标记，在**第一个 await 之前**置位 ⇒ 第二请求 409 `ROTATION_IN_PROGRESS`，`finally` 里释放 | 进程内互斥，不是跨进程锁：多实例部署本来就靠 `instance-lock` 排他，两者叠加已足够 |
+
+### 接口变化
+
+- `PUT /api/users/me`、`PUT /api/users/:id`、`POST /api/auth/reset` 在「已启用信封 + 根用户」时可能返回 **400 `USE_KEY_ROTATION`**（此前是 200）；
+- 轮转失败新增 **500 `KEYRING_ROTATE_FAILED`**（此前是「200 但只成功了一半」）；
+- 并发轮转新增 **409 `ROTATION_IN_PROGRESS`**；
+- 巡检明细新增 `verdict: 'ambiguous'`（前端显示「桶名歧义」），`skipped` 会把它算进去。
+
+### 升级须知
+
+- **不需要迁移**。`cloudWrittenAt` 是**新增可选字段**，历史条目没有它就退回旧判据；`keyring.rotate-intent.json` 只在轮转的那一瞬间存在。
+- 根用户的「我的资料」里改密入口在启用信封后会给出明确指引，**这不是功能回退**：那条路径从来就没能同时换掉解锁因子。
+- 如果实例正处于「新 KEK + 旧哈希」的分叉状态（`2.1.0` 及更早版本可能留下）：升级后**解锁一次**（或启动时用 `KEPLER_MASTER_PASSPHRASE` 自动解锁）即会自动补完，不必手工改数据文件。
+
+### 护栏与基线
+
+- 新增测试文件 **1 个**：`audit101-regressions.test.js` **10 条**（每个用例独占临时数据目录 —— `keyring` 的解锁态是模块级且绑定路径，共用目录会让上一个用例把下一个锁在门外）。
+- 反向对照台账 **1071 → 1082**（`R101-01a`~`R101-09a` 共 11 条），逐条实跑确认失败。
+- **两条既有用例被改写**（都是「把缺陷写成了契约」，不是放松判据）：`R99-11`（候选集命中 ⇒ HEAD 0 次，正是 F-05 的症状）、`R97-18`（轮转后 `config.enc` 字节不变，它之所以成立恰恰因为 `flushPending()` 没被 await）。
+- 测试文件 **104 → 105**，用例 **1714 → 1724**；lint 仍 **0 errors / 47 warnings**。
+- `Audit_illusion_report.md` 补到 **23 条**：21 号记录「这份审计零误报」及其三处口径偏差（`writeNow` 不该改 reject / 缺 `magicLen` 没说怎么退 / 并发复现是手工交错），22 号记录三条「存在但不必修」的建议，23 号记录 `R99-11` 的契约固化。
+
+### 客户端
+
+- Android 客户端源码在 `client/android/`（Kotlin / Jetpack Compose，`versionName 1.0`）。构建产物**不入库**（`/app/build`、`*.jks`、`keystore.properties` 均在 `.gitignore` 里），随本版本以 **Release 资产**分发：`app-release.apk`（签名版）与 `app-debug.apk`（调试版，含完整日志）。
+- 客户端登录需要服务端 `NATIVE_CAPTCHA=on` 且带 `X-Kepler-Client` 头，见 `[2.1.0]`。
 
 ---
 
