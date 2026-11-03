@@ -2,11 +2,14 @@
 <!--
   网络安全配置：
   - 允许明文 HTTP：Kepler 支持无证书部署（内网 / 测试环境仅提供 HTTP），
-    客户端需兼容；应用内在检测到 http:// 地址时会明确提示安全风险
+    客户端需兼容；应用内在检测到 http:// 地址时会明确提示安全风险，
+    并且此时**不会持久化密码**（见 AuthRepository）
   - 证书校验保持系统默认（不信任用户 CA）：Kepler 生产部署使用 ACME 真实证书
+  - lint 的 InsecureBaseConfiguration 告警因此被有意抑制：全局放开 cleartext 是本产品
+    支持内网 HTTP 部署的前提，不是疏漏
 -->
-<network-security-config>
-    <base-config cleartextTrafficPermitted="true">
+<network-security-config xmlns:tools="http://schemas.android.com/tools">
+    <base-config cleartextTrafficPermitted="true" tools:ignore="InsecureBaseConfiguration">
         <trust-anchors>
             <certificates src="system" />
         </trust-anchors>

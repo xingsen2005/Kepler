@@ -1,5 +1,12 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!--
+  圆形图标变体：与 ic_launcher 共用同一套三层资源。
+  启动器会按自身形状（圆形 / 方形 / 水滴）对 background+foreground 做遮罩，
+  因此无需单独提供圆形的 legacy PNG（旧实现提供的是圆角方形，反而触发
+  lint IconLauncherShape「round icon did not have a circular shape」）。
+-->
 <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
     <background android:drawable="@drawable/ic_launcher_background" />
-    <foreground android:drawable="@drawable/ic_launcher_foreground" />
+    <foreground android:drawable="@drawable/ic_launcher_fg" />
+    <monochrome android:drawable="@drawable/ic_launcher_mono" />
 </adaptive-icon>

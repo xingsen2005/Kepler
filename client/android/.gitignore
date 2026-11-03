@@ -13,3 +13,19 @@
 .externalNativeBuild
 .cxx
 local.properties
+/.workbuddy
+
+# Release 签名凭据与密钥库（禁止提交到版本库）
+keystore.properties
+keystore/
+*.jks
+*.keystore
+
+# 构建/日志产物
+/build_debug.log
+/build
+/app/build
+.kotlin/
+*.log
+*.hprof
+/captures

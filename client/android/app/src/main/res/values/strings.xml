@@ -1,15 +1,19 @@
 <resources>
     <string name="app_name">Kepler</string>
+
     <!-- 通知渠道 -->
     <string name="channel_download_name">文件下载</string>
     <string name="channel_download_desc">显示文件下载进度与完成状态</string>
+
     <!-- 下载通知 -->
+    <string name="notification_title_preparing">准备下载</string>
+    <string name="notification_title_done">下载完成</string>
+    <string name="notification_title_end">下载结束</string>
     <string name="notification_download_progress">正在下载 %1$s</string>
-    <string name="notification_download_done">已下载 %1$s</string>
-    <string name="notification_download_done_text">保存至 下载/Kepler 目录，点击打开</string>
+    <string name="notification_download_progress_multi">正在下载 %1$d/%2$d：%3$s</string>
+    <string name="notification_download_done">已下载 %1$d 个文件至 下载/Kepler</string>
+    <string name="notification_download_canceled">下载已取消（已完成 %1$d 个）</string>
+    <string name="notification_download_partial">完成 %1$d 个，失败 %2$d 个（%3$s）</string>
     <string name="notification_download_failed">下载失败：%1$s</string>
-    <string name="notification_action_open">打开</string>
     <string name="notification_action_cancel">取消</string>
-    <!-- 权限说明 -->
-    <string name="perm_notification_rationale">需要通知权限以下载完成时提醒您</string>
 </resources>

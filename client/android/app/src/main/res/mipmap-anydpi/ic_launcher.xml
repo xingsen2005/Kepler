@@ -1,5 +1,14 @@
 <?xml version="1.0" encoding="utf-8"?>
+<!--
+  自适应图标（标准三层结构）：
+   - background：纯品牌底色 #FFD251
+   - foreground：居中符号（66dp 视觉尺寸，位于安全区内，任意遮罩都不会裁切）
+   - monochrome：同形状白色剪影，供 Android 13+「主题图标」着色
+
+  不再提供 legacy PNG：minSdk=34 下所有设备均使用本自适应图标。
+-->
 <adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
     <background android:drawable="@drawable/ic_launcher_background" />
-    <foreground android:drawable="@drawable/ic_launcher_foreground" />
+    <foreground android:drawable="@drawable/ic_launcher_fg" />
+    <monochrome android:drawable="@drawable/ic_launcher_mono" />
 </adaptive-icon>

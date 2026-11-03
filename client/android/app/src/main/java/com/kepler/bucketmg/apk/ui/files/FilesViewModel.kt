@@ -12,7 +12,11 @@ import com.kepler.bucketmg.apk.data.net.ApiException
 import com.kepler.bucketmg.apk.service.DownloadService
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.joinAll
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
 import kotlinx.coroutines.withContext
 import java.util.UUID
 
@@ -91,11 +95,16 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
                 activeBucketId.value = r.activeBucketId
                 if (r.buckets.isEmpty()) {
                     error.value = "没有可访问的存储桶，请联系管理员分配"
+                    loading.value = false
+                    refreshing.value = false
                 } else {
                     load(prefix.value)
                 }
             } catch (e: Exception) {
                 error.value = e.displayMessage()
+                // 失败也必须复位，否则下拉刷新的进度圈会永久旋转
+                loading.value = false
+                refreshing.value = false
             }
         }
     }
@@ -122,16 +131,7 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
         }
     }
 
-    private fun sortEntries(list: List<FsEntry>): List<FsEntry> {
-        val folders = list.filter { it.isFolder }
-        val files = list.filter { !it.isFolder }
-        val sortedFiles = when (sortMode.value) {
-            SortMode.NAME -> files.sortedBy { it.name.lowercase() }
-            SortMode.SIZE -> files.sortedByDescending { it.size }
-            SortMode.TIME -> files.sortedByDescending { it.lastModified }
-        }
-        return folders.sortedBy { it.name.lowercase() } + sortedFiles
-    }
+    private fun sortEntries(list: List<FsEntry>): List<FsEntry> = sortEntries(list, sortMode.value)
 
     fun setSortMode(mode: SortMode) {
         sortMode.value = mode
@@ -199,7 +199,12 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
     }
 
     fun selectAll() {
-        selectedKeys.value = entries.value.map { it.key }.toSet()
+        val all = entries.value.map { it.key }.toSet()
+        if (all.isEmpty()) return
+        selectedKeys.value = all
+        // 进入多选态：否则顶栏不切换、列表不显示复选框，
+        // 且此时点击条目会走「打开文件夹 / 文件操作」分支而非切换选中。
+        selectionMode.value = true
     }
 
     fun clearSelection() {
@@ -228,10 +233,11 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
     fun paste() {
         val keys = clipboard.value ?: return
         if (keys.isEmpty()) return
-        clipboard.value = null
         viewModelScope.launch {
             try {
                 api.copy(keys, prefix.value)
+                // 仅成功后才清空：失败时保留剪贴板，便于用户换目录或重试
+                clipboard.value = null
                 load(prefix.value, showSpinner = false)
                 message.value = "已复制 ${keys.size} 项到当前目录"
             } catch (e: Exception) {
@@ -287,9 +293,14 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
                 newTasks += UploadTask(uri = uri, name = name, key = key, totalBytes = size)
             }
             uploads.value = uploads.value + newTasks
-            for (t in newTasks) {
-                runUpload(t)
-            }
+            // 有限并发：最多 MAX_CONCURRENT_UPLOADS 个任务同时上传。
+            // 原先 for 循环逐个 await 是纯串行，多选 N 个文件耗时线性叠加。
+            val semaphore = Semaphore(MAX_CONCURRENT_UPLOADS)
+            newTasks.map { task ->
+                launch {
+                    semaphore.withPermit { runUpload(task) }
+                }
+            }.joinAll()
         }
     }
 
@@ -335,8 +346,18 @@ class FilesViewModel(app: Application) : AndroidViewModel(app) {
         uploads.value = uploads.value.filter { it.state == UploadState.RUNNING || it.state == UploadState.PENDING }
     }
 
+    /**
+     * 原子地更新单个上传任务。
+     * 并发上传时多个协程会同时调用，必须用 update{} 的 CAS 语义，
+     * 否则「读 value → map → 写回」会互相覆盖，导致进度/状态丢失。
+     */
     private fun updateTask(id: String, transform: (UploadTask) -> UploadTask) {
-        uploads.value = uploads.value.map { if (it.id == id) transform(it) else it }
+        uploads.update { list -> list.map { if (it.id == id) transform(it) else it } }
+    }
+
+    private companion object {
+        /** 同时进行的上传任务上限：兼顾吞吐与服务端压力 */
+        const val MAX_CONCURRENT_UPLOADS = 3
     }
 }
 

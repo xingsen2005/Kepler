@@ -36,7 +36,7 @@ import androidx.compose.ui.unit.dp
 
 /** 全屏加载态 */
 @Composable
-fun LoadingBox(text: String = "加载中…", modifier: Modifier = Modifier) {
+fun LoadingBox(modifier: Modifier = Modifier, text: String = "加载中…") {
     Box(modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
         Column(horizontalAlignment = Alignment.CenterHorizontally) {
             CircularProgressIndicator()
@@ -51,8 +51,8 @@ fun LoadingBox(text: String = "加载中…", modifier: Modifier = Modifier) {
 @Composable
 fun ErrorBox(
     message: String,
-    onRetry: (() -> Unit)? = null,
     modifier: Modifier = Modifier,
+    onRetry: (() -> Unit)? = null,
 ) {
     Box(modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
         Column(
@@ -88,9 +88,9 @@ fun ErrorBox(
 @Composable
 fun EmptyBox(
     title: String,
+    modifier: Modifier = Modifier,
     subtitle: String = "",
     icon: ImageVector = Icons.Filled.FolderOpen,
-    modifier: Modifier = Modifier,
 ) {
     Box(modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
         Column(

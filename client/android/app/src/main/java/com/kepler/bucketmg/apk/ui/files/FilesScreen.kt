@@ -2,7 +2,6 @@ package com.kepler.bucketmg.apk.ui.files
 
 import android.Manifest
 import android.content.pm.PackageManager
-import android.os.Build
 import androidx.activity.compose.BackHandler
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
@@ -12,6 +11,7 @@ import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxSize
@@ -138,8 +138,8 @@ fun FilesScreen(
     ) { /* 无论是否授权，下载均继续；仅影响通知展示 */ }
 
     fun requestDownload(items: List<FsEntry>) {
-        if (Build.VERSION.SDK_INT >= 33 &&
-            ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) !=
+        // minSdk 34 ⇒ POST_NOTIFICATIONS 一定存在（API 33 引入），无需再做版本判断
+        if (ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) !=
             PackageManager.PERMISSION_GRANTED
         ) {
             notifLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
@@ -357,7 +357,12 @@ fun FilesScreen(
                         },
                         modifier = Modifier.fillMaxSize(),
                     ) {
-                        LazyColumn(state = listState, modifier = Modifier.fillMaxSize()) {
+                        LazyColumn(
+                            state = listState,
+                            modifier = Modifier.fillMaxSize(),
+                            // 底部留出悬浮按钮高度，避免「上传」FAB 盖住列表最后一项
+                            contentPadding = PaddingValues(bottom = 88.dp),
+                        ) {
                             items(entries, key = { it.key }) { entry ->
                                 FileRow(
                                     entry = entry,

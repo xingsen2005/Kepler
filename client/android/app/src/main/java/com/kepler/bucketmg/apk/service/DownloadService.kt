@@ -14,12 +14,14 @@ import android.provider.MediaStore
 import androidx.core.app.NotificationCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.app.ServiceCompat
+import androidx.core.content.ContextCompat
 import com.kepler.bucketmg.apk.KeplerApp
 import com.kepler.bucketmg.apk.R
 import com.kepler.bucketmg.apk.data.SessionManager
 import com.kepler.bucketmg.apk.data.net.ApiClient
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
@@ -43,15 +45,22 @@ class DownloadService : Service() {
 
         /** @param items 对象键 → 文件名 */
         fun start(context: Context, items: List<Pair<String, String>>) {
+            if (items.isEmpty()) return
             val intent = Intent(context, DownloadService::class.java).apply {
                 putStringArrayListExtra(EXTRA_KEYS, ArrayList(items.map { it.first }))
                 putStringArrayListExtra(EXTRA_NAMES, ArrayList(items.map { it.second }))
             }
-            context.startService(intent)
+            // 必须用 startForegroundService：本 Service 在 onCreate 即转入前台。
+            // 若用 startService()，应用处于后台时（Android 8+）会抛
+            // IllegalStateException: Not allowed to start service。
+            ContextCompat.startForegroundService(context, intent)
         }
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+
+    /** 当前下载任务；新任务开始前先取消旧任务，避免多个循环共用通知与取消标志 */
+    private var job: Job? = null
 
     @Volatile
     private var canceled = false
@@ -61,7 +70,7 @@ class DownloadService : Service() {
     override fun onCreate() {
         super.onCreate()
         ServiceCompat.startForeground(
-            this, NOTIF_ID, buildNotification("准备下载", 0, 0, false),
+            this, NOTIF_ID, buildNotification(getString(R.string.notification_title_preparing), 0, 0, false),
             ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC,
         )
     }
@@ -77,7 +86,13 @@ class DownloadService : Service() {
             stopSelf()
             return START_NOT_STICKY
         }
-        scope.launch {
+
+        // 每次新任务重置取消标志（旧实现从不复位，导致取消过一次后
+        // 再次下载会立刻 break，表现为「秒取消 / 文件被删」）
+        canceled = false
+        job?.cancel()
+
+        job = scope.launch {
             var done = 0
             var failed = 0
             var lastError = ""
@@ -183,13 +198,19 @@ class DownloadService : Service() {
         lastMime: String,
     ) {
         val text = when {
-            wasCanceled -> "下载已取消（已完成 $done 个）"
-            failed == 0 -> "已下载 $done 个文件至 下载/Kepler"
-            else -> "完成 $done 个，失败 $failed 个（$lastError）"
+            wasCanceled -> getString(R.string.notification_download_canceled, done)
+            failed == 0 -> getString(R.string.notification_download_done, done)
+            done == 0 -> getString(R.string.notification_download_failed, lastError)
+            else -> getString(R.string.notification_download_partial, done, failed, lastError)
+        }
+        val title = if (failed == 0 && !wasCanceled) {
+            getString(R.string.notification_title_done)
+        } else {
+            getString(R.string.notification_title_end)
         }
         val builder = NotificationCompat.Builder(this, KeplerApp.CHANNEL_DOWNLOAD)
             .setSmallIcon(R.drawable.ic_stat_download)
-            .setContentTitle(if (failed == 0 && !wasCanceled) "下载完成" else "下载结束")
+            .setContentTitle(title)
             .setContentText(text)
             .setOngoing(false)
             .setAutoCancel(true)
@@ -231,7 +252,7 @@ class DownloadService : Service() {
             )
             .setOngoing(true)
             .setOnlyAlertOnce(true)
-            .addAction(0, "取消", cancelIntent)
+            .addAction(0, getString(R.string.notification_action_cancel), cancelIntent)
             .build()
     }
 
@@ -242,7 +263,11 @@ class DownloadService : Service() {
         index: Int,
         totalCount: Int,
     ) {
-        val title = if (totalCount > 1) "正在下载 ${index + 1}/$totalCount：$name" else "正在下载 $name"
+        val title = if (totalCount > 1) {
+            getString(R.string.notification_download_progress_multi, index + 1, totalCount, name)
+        } else {
+            getString(R.string.notification_download_progress, name)
+        }
         notify(buildNotification(title, progress, total, total <= 0))
     }
 
