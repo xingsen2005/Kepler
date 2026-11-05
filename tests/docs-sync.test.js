@@ -21,7 +21,7 @@
  *   调试小节也写着 `data/config.json` —— 而当时所有护栏都是绿的，因为它们只看
  *   目录结构那一个围栏块。**旧文件名不会有任何运行期症状，只能靠断言拦住。**
  * - 审计编号（`SEC-*` / `FUN-*` / `PERF-*` / `LOW-*` / `P*` / `S*`）的含义登记在
- *   开发文档的「六、审计发现台账（合并存档）」。原始台账曾因意外**整体遗失**（代码里 180 余处引用一度无处可查），
+ *   根目录的 `Audit_Ledger.md`。原始台账曾因意外**整体遗失**（代码里 180 余处引用一度无处可查），
  *   故这里断言「引用 ⊆ 登记」，让台账不可能再被静默删除或漏更新。
  */
 const fs = require('fs');
@@ -198,7 +198,7 @@ const TREE_EXEMPT = new Set([]);
 
 /* ============================ 审计编号台账 ============================ */
 
-const AUDIT_LEDGER_SECTION = '六、审计发现台账（合并存档）';
+const AUDIT_LEDGER_FILE = 'Audit_Ledger.md';
 
 /**
  * 审计编号的两种写法：
@@ -264,23 +264,21 @@ function collectAuditRefs(targets) {
 const LEDGER_ID_RE = /`((?:FUN|SEC|PERF|LOW)-\d+[a-z]?|[PS]\d{1,2})`/g;
 
 const auditRefs = collectAuditRefs(['server', 'tests', 'public', DOC, README]);
-/** 台账正文：审计编号台账已从根目录 `AUDIT_FINDINGS.md` 合并进开发文档「六、审计发现台账」章节，读不到就让整个 docs-sync 失败 */
+/**
+ * 台账正文：审计编号台账因篇幅过大，已从 `Develop_Document.md` 拆到根目录的独立文件。
+ * 读不到就让整个 docs-sync 失败（它是编号含义的**唯一正本**）。
+ */
 const ledgerText = (() => {
-  const doc = readDoc(DOC);
-  // 用完整标题标签定位正文标题：纯标题文字会先命中「目录」里的同名条目
-  const i = doc.indexOf('>' + AUDIT_LEDGER_SECTION + '<');
-  if (i < 0) {
-    throw new Error(`开发文档中缺失「${AUDIT_LEDGER_SECTION}」章节\n`
-      + '该章节登记了代码里 SEC-* / FUN-* / PERF-* / LOW-* / S* / P* 编号的含义与闭合依据，'
-      + '并被 180 余处代码注释引用（原为根目录 AUDIT_FINDINGS.md，现已合并进文档）。'
+  const p = path.join(ROOT, AUDIT_LEDGER_FILE);
+  if (!fs.existsSync(p)) {
+    throw new Error(`仓库根目录缺失「${AUDIT_LEDGER_FILE}」\n`
+      + '该文件登记了代码里 SEC-* / FUN-* / PERF-* / LOW-* / S* / P* 编号的含义与闭合依据，'
+      + '并被 180 余处代码注释引用（原为根目录 AUDIT_FINDINGS.md，后并入开发文档，现独立为本文件）。'
       + '它曾经因意外**整体遗失**一次（早期审计报告随之不可考），'
       + '所以这里宁可让整个 docs-sync 文件直接失败，也不要静默跳过校验。'
       + '若确要移除，请连同本文件的编号护栏与代码注释里的引用一并处理。');
   }
-  // 截到下一个 h1 标题（表格与编号登记全在本章内）
-  const rest = doc.slice(i);
-  const next = rest.indexOf('\n<h1 ', 1);
-  return next > 0 ? rest.slice(0, next) : rest;
+  return fs.readFileSync(p, 'utf8');
 })();
 
 const ledgerIds = new Set([...ledgerText.matchAll(LEDGER_ID_RE)].map((m) => m[1]));
@@ -434,7 +432,7 @@ test('代码与文档引用的审计编号都已在台账中登记', () => {
     return `${id}（${hits.slice(0, 3).join(' / ')}${hits.length > 3 ? ` …共 ${hits.length} 处` : ''}）`;
   }).join('；');
   assertEqual(missing.length, 0,
-    `以下审计编号被引用但未登记在「${AUDIT_LEDGER_SECTION}」：${detail}`);
+    `以下审计编号被引用但未登记在「${AUDIT_LEDGER_FILE}」：${detail}`);
 });
 
 test('台账里的编号都能在代码或测试中找到引用（防止登记笔误）', () => {
@@ -543,7 +541,7 @@ test('目录（TOC）与正文标题一一对应，锚点编号连续', () => {
 /* ============================ 文档措辞漂移护栏（第 7 轮 D 段） ============================ */
 
 /**
- * 第 7 轮审计查出 4 处「文档声称、代码没有」的措辞漂移（D1~D4，见开发文档「六、审计发现台账 6.4」），
+ * 第 7 轮审计查出 4 处「文档声称、代码没有」的措辞漂移（D1~D4，见 `Audit_Ledger.md` 6.4），
  * 措辞已按代码修正。这里是**防回潮**：被证伪的说法一旦写回 README 就立刻报错。
  *
  * 每条都写明「为什么它是错的」—— 将来若真的实现了该能力，必须同时改文档与这条清单。

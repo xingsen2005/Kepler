@@ -1097,6 +1097,8 @@ export const __modal = (globalThis.__r51Modal = []);
 export function openModal(o) { globalThis.__r51Modal.push(o); return { close() {} }; }
 export function escapeHtml(s) { return String(s).replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
 export function fmtSize(n) { return n + ' B'; }
+// R103：ops.js 具名导入了它（「随机生成」按钮）—— 桩缺一个导出，ESM 链接期整片变红
+export function randomSharePassword(len) { return 'a1b2'.slice(0, len || 4); }
 export function fmtTime(t) { return 'T(' + t + ')'; }
 `);
   fs.writeFileSync(path.join(dir, 'main.js'), `

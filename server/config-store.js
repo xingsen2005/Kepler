@@ -331,6 +331,20 @@ function defaultConfig() {
     from: '', fromName: '',
     updatedAt: '',
   },
+  /**
+   * R103：完整性巡检的**异常通知**（邮件）。
+   *
+   * 默认关闭、地址为空 —— 巡检会自己出网发 HEAD，但"发现异常后该不该再往外发一封
+   * 邮件"是管理员的选择，不能默认替他做。通知复用同一份 SMTP 设置（`smtp`），
+   * 不另开一套发信配置：两份配置并存时，迟早出现「测试信收得到、告警收不到」。
+   */
+  integrity: {
+    notify: {
+      enabled: false,
+      email: '', // 收件人（固定一个地址，不支持列表 —— 见 `integrity-notify.js`）
+      updatedAt: '',
+    },
+  },
   webdav: { enabled: false, accounts: [] }, // WebDAV 服务（开关 + 账户，密码字段级加密）
   users: [], // 登录用户（username / passwordHash / passwordSalt / role）
   captcha: {
@@ -510,6 +524,32 @@ function normalizeSmtpInto(cfg) {
 }
 
 /**
+ * 就地归一 `cfg.integrity`（唯一实现点）。
+ *
+ * 与 `normalizeSmtpInto()` 同一套路数，四处都调它：
+ *  - `normalize()`（**读盘**时）—— 历史配置没有这一段，升级后补齐为「关闭 + 空地址」；
+ *  - `save()`（**部分写入**时）—— `save(partial)` 是顶层键替换；
+ *  - `saveIntegrityNotify()`（**唯一写入口**）；
+ *  - `getIntegrityNotify()` —— 磁盘上已是半截结构时，读出来的仍是完整对象。
+ *
+ * `email` **不在这里做合法性校验**（那件事在路由层用 `limits.parseEmailInput`）：
+ * 归一化只补结构，不负责驳回入参 —— 否则「磁盘上的脏值」会让整个配置读不出来。
+ * 真发信时 `smtp.sendMail()` 与路由层各自再判一次。
+ */
+function normalizeIntegrityInto(cfg) {
+  const src = (cfg && cfg.integrity && typeof cfg.integrity === 'object') ? cfg.integrity : {};
+  const n = (src.notify && typeof src.notify === 'object') ? src.notify : {};
+  cfg.integrity = {
+    notify: {
+      enabled: n.enabled === true,
+      email: typeof n.email === 'string' ? n.email.trim() : '',
+      updatedAt: typeof n.updatedAt === 'string' ? n.updatedAt : '',
+    },
+  };
+  return cfg;
+}
+
+/**
  * 就地归一 `cfg.site`（唯一实现点）。
  *
  * 与 `normalizeSmtpInto()` 同一套路数，四处都调它：
@@ -661,6 +701,8 @@ function normalize(raw) {
   // R53：发信设置（SMTP）。历史配置没有这一段 —— 读盘时补齐为关闭状态，
   // 绝不因为「配置里没有 smtp」就让发信功能处于未定义行为。
   normalizeSmtpInto(cfg);
+  // R103：完整性巡检的异常通知（历史配置没有这一段 ⇒ 补齐为「关闭 + 空地址」）
+  normalizeIntegrityInto(cfg);
   // R54：站点设置。同理 —— 历史配置没有这一段，读盘时补齐为「默认站点名 + 关闭注册」。
   normalizeSiteInto(cfg);
   // R65：订单取回的两个上限。历史配置没有这一段 —— 补齐为默认值（3 次 / 5 次），
@@ -959,6 +1001,10 @@ function save(partial) {
   normalizeCaptchaInto(cur);
   // R53：smtp 同理（顶层键替换 ⇒ 半截对象会让发信时端口变成 undefined）
   normalizeSmtpInto(cur);
+  // R103：integrity 同理 —— 一次 `save({ integrity: { notify: { email } } })`
+  // 若不做就地归一，会留下缺 `enabled` 的半截对象（读侧回退成「关闭」，
+  // 表现为「明明填了地址，巡检却不发信」）。
+  normalizeIntegrityInto(cur);
   // R54：site 同理（顶层键替换 ⇒ 半截对象会让站点名变成 undefined，标题栏与邮件都受影响）
   normalizeSiteInto(cur);
   // R68：agreements 同理（顶层键替换 ⇒ 只写 terms 的一次保存会让 privacy 变成 undefined，
@@ -2032,6 +2078,52 @@ function saveSmtp(patch) {
   cfg.smtp = shadow.smtp;
   persist(cfg);
   return getSmtp();
+}
+
+/**
+ * 读取完整性巡检的异常通知设置（R103）。
+ *
+ * 返回 `{ enabled, email, updatedAt }`，**永远结构完整**（归一化在
+ * `normalizeIntegrityInto()` 里统一做）：磁盘上没有这一段时得到「关闭 + 空地址」。
+ * 这三个字段都不是机密，可以原样下发给管理员界面 —— 但它**不是**发信判据，
+ * 真正的判据在 `integrity-notify.js`（还要看 SMTP 配没配）。
+ */
+function getIntegrityNotify() {
+  const cfg = load();
+  const shadow = { integrity: cfg ? cfg.integrity : undefined };
+  normalizeIntegrityInto(shadow);
+  return shadow.integrity.notify;
+}
+
+/**
+ * 保存异常通知设置（部分更新）。
+ *
+ * ⚠️ **刻意不走 `save()`**：`save(partial)` 是顶层键替换，一次只带 `email` 的写入
+ * 会把 `enabled` 一并抹掉（归一化再把它补成 `false`），表现为「填了地址，
+ * 开关自己关了」。这里先在旧值上合并，再归一。
+ *
+ * 地址合法性由调用方（`routes/integrity.js`）用 `limits.parseEmailInput` 判 —— 
+ * 本函数只落盘，不做业务校验（与 `normalizeSmtpInto()` 的分工一致）。
+ *
+ * @param {{enabled?:boolean,email?:string}} patch 省略的字段保持原值
+ */
+function saveIntegrityNotify(patch) {
+  const cfg = requireStore();
+  const prev = getIntegrityNotify();
+  const p = (patch && typeof patch === 'object') ? patch : {};
+  const shadow = {
+    integrity: {
+      notify: {
+        enabled: p.enabled !== undefined ? p.enabled === true : prev.enabled,
+        email: p.email !== undefined ? p.email : prev.email,
+        updatedAt: new Date().toISOString(),
+      },
+    },
+  };
+  normalizeIntegrityInto(shadow);
+  cfg.integrity = shadow.integrity;
+  persist(cfg);
+  return getIntegrityNotify();
 }
 
 /**
@@ -3630,6 +3722,8 @@ module.exports = {
   // R53：发信设置（SMTP）—— getSmtp 含明文口令，仅供服务端内部；对外走 smtpView
   // ⚠️ 发信（验证码 / 重置密码 / 测试邮件）一律走 smtpSendConfig()：smtpView 里没有口令
   getSmtp, saveSmtp, smtpView, smtpSendConfig, smtpConfigured,
+  // R103：完整性巡检的异常通知（收件地址 + 开关）。无机密，整段下发管理员
+  getIntegrityNotify, saveIntegrityNotify,
   // R54：站点设置（站点名称 / 公开注册 / 新用户身份）—— 无机密，siteView 整段下发
   getSite, saveSite, siteView,
   // R65：订单取回（同一订单号可成功取回几次 / 同一 IP 连续输错几次封 24 小时）

@@ -720,3 +720,66 @@ export function drawHBars(canvas, rows, { color = '#4f8ef7', failColor = '#e5484
     ctx.fillText(`${total} 次 · 成功率 ${rate}%`, padL + bw + 10, y + 13);
   });
 }
+
+/* ---------------------- R103：分享链接的随机访问口令 ---------------------- */
+
+/**
+ * 分享口令的字符集 —— **去掉易混字符**：`0`/`O`、`1`/`I`/`l`。
+ *
+ * 与邀请码（`server/limits.js` 的 `INVITE_CODE_ALPHABET`）同一个理由：这串东西是
+ * 给人念、给人抄、给人手打的。4 位口令本来就只有 4 个字符可以出错，再留着两组
+ * 同形字符，用户会得到一句「密码错误」而完全不知道错在哪一位。
+ */
+const SHARE_PW_LETTERS = 'abcdefghjkmnpqrstuvwxyz';
+const SHARE_PW_DIGITS = '23456789';
+const SHARE_PW_ALL = SHARE_PW_LETTERS + SHARE_PW_DIGITS;
+
+/**
+ * 无模偏差的随机索引。
+ *
+ * ⚠️ **不用 `Math.random`**：这是一枚访问凭据，可预测就等于没有。也**不做**
+ * `random % n`（`n` 不能整除 256 时部分字符概率偏高，白折损熵）——
+ * 用拒绝采样：落在 `[0, floor(256/n)*n)` 之外就重抽。
+ */
+function sharePwRand(n) {
+  const buf = new Uint8Array(1);
+  const limit = Math.floor(256 / n) * n;
+  for (;;) {
+    crypto.getRandomValues(buf);
+    if (buf[0] < limit) return buf[0] % n;
+  }
+}
+
+/**
+ * 生成分享链接的随机访问口令（默认 **4 位**，字母 + 数字，且两类都至少出现一次）。
+ *
+ * ## 为什么是 4 位
+ *
+ * 需求就是「短到能口头 / 短信转达」。代价必须写清楚：4 位、31 字符集 ≈ **19.8 位熵**
+ * （约 92 万种），远低于服务端建议的 6 位。它之所以还能接受，是因为密码校验入口
+ * 有两道**按 IP + 链接**计的护栏（`security.shareLimiter` 20 次/10 分钟、
+ * `security.shareLock` 连错 5 次冻结 30 分钟）—— 分布式来源下仍不划算，
+ * 但**明显弱于 6 位**。因此界面提示里写明「适合短期分享」，长期链接建议自己填长口令。
+ *
+ * ## 强制两类都有 + 洗牌
+ *
+ * 「字母和数字的组合」如果只是从并集里抽 4 次，约有 13% 的概率**抽不到数字**
+ * （(23/31)^4），用户会得到一个纯字母口令 —— 与需求不符。所以先各塞一个，
+ * 再用 Fisher-Yates 洗开：不洗的话前两位永远是"任意"、后两位永远是"字母/数字"，
+ * 位置规律既折损熵、也让人一眼看出是生成的。
+ *
+ * @param {number} [len=4] 位数（2~12，越界按边界处理）
+ * @returns {string} 形如 `k7mq`
+ */
+export function randomSharePassword(len = 4) {
+  const n = Math.max(2, Math.min(12, Math.floor(Number(len)) || 4));
+  const chars = [];
+  for (let i = 0; i < n - 2; i++) chars.push(SHARE_PW_ALL[sharePwRand(SHARE_PW_ALL.length)]);
+  chars.push(SHARE_PW_LETTERS[sharePwRand(SHARE_PW_LETTERS.length)]);
+  chars.push(SHARE_PW_DIGITS[sharePwRand(SHARE_PW_DIGITS.length)]);
+  for (let i = chars.length - 1; i > 0; i--) {
+    const j = sharePwRand(i + 1);
+    const t = chars[i]; chars[i] = chars[j]; chars[j] = t;
+  }
+  return chars.join('');
+}

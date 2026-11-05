@@ -1,6 +1,6 @@
 /** 文件操作 —— 新建 / 重命名 / 移动 / 删除 / 下载 / 复制链接 */
 import { API } from './api.js';
-import { toast, confirmDialog, promptDialog, openModal, escapeHtml, fmtSize, fmtTime, isStaffRole } from './util.js';
+import { toast, confirmDialog, promptDialog, openModal, escapeHtml, fmtSize, fmtTime, isStaffRole, randomSharePassword } from './util.js';
 import { App } from './main.js';
 import { openDownload } from './enc.js';
 // R37：文件分享的「下载限速」与「链接管理」是**同一份字段**（同一条分享记录上的
@@ -301,8 +301,11 @@ export const ops = {
           <div class="hint">允许的最大下载次数，达到上限后链接自动关闭；填 0 表示不限制。</div></div>
         <div class="form-item"><label>访问密码</label>
           <label class="check-line"><input id="lk-pw-on" type="checkbox">  启用密码保护</label>
-          <input id="lk-pw" type="text" maxlength="64" placeholder="访问者需输入此密码才能下载" disabled autocomplete="off">
-          <div class="hint">启用后，访问者需输入正确密码方可下载。</div></div>
+          <div style="display:flex;gap:8px;margin-top:6px">
+            <input id="lk-pw" type="text" maxlength="64" placeholder="访问者需输入此密码才能下载" disabled autocomplete="off" style="flex:1;min-width:0">
+            <button id="lk-pw-gen" class="mini-btn" type="button" title="随机生成 4 位字母数字口令">随机生成</button>
+          </div>
+          <div class="hint">启用后，访问者需输入正确密码方可下载。<b>「随机生成」</b>给的是 <b>4 位字母+数字</b> 口令（已去掉 <code>0/O</code>、<code>1/I/l</code> 这类易混字符），便于口头或短信转达；它<b>强度低于 6 位</b>，适合短期分享 —— 长期链接建议自己填更长的口令（最少 4 位）。</div></div>
         <div class="form-item"><label>付费下载</label>
           <label class="check-line"><input id="lk-paid-on" type="checkbox">  需要付费后才能下载</label>
           <div id="lk-paid-row" style="display:none;margin-top:8px">
@@ -329,6 +332,21 @@ export const ops = {
     const speedInput = wrap.querySelector('#lk-speed');
     const speedCeil = wrap.querySelector('#lk-speed-ceil');
     pwOn.addEventListener('change', () => { pwInput.disabled = !pwOn.checked; if (pwOn.checked) pwInput.focus(); });
+    /**
+     * R103：「随机生成」。
+     *
+     * 未勾选「启用密码保护」时先替用户勾上并解锁输入框 —— 否则点一下按钮
+     * 只是往一个 disabled 的框里塞了值，界面看起来什么都没发生。
+     */
+    const pwGen = wrap.querySelector('#lk-pw-gen');
+    if (pwGen) {
+      pwGen.addEventListener('click', () => {
+        if (!pwOn.checked) { pwOn.checked = true; pwInput.disabled = false; }
+        pwInput.value = randomSharePassword(4);
+        pwInput.focus();
+        pwInput.select();
+      });
+    }
     paidOn.addEventListener('change', () => {
       paidRow.style.display = paidOn.checked ? '' : 'none';
       if (paidOn.checked) paidAmount.focus();
@@ -407,7 +425,10 @@ export const ops = {
               const pw = pwInput.value;
               if (!pw) return toast('已启用密码保护，请填写访问密码', { type: 'error' });
               // R94（审核 M08-05）：下界与服务端同日提到 6（单字符口令等于没有保护）
-              if (pw.length < 6) return toast('访问密码至少 6 个字符', { type: 'error' });
+              // R103：下界回到 **4**，与「随机生成 4 位口令」这个需求对齐（服务端同口径）。
+              //       代价：4 位字母数字 ≈ 92 万种，弱于 6 位；护栏是服务端按
+              //       「IP + 链接」计的限流与 5 次失败冻结。判决写在 `routes/links.js`。
+              if (pw.length < 4) return toast('访问密码至少 4 个字符', { type: 'error' });
               if (pw.length > 64) return toast('密码长度不能超过 64 个字符', { type: 'error' });
               body.password = pw;
             }

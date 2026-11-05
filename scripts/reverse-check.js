@@ -13158,6 +13158,79 @@ const CASES = [
       testFile: 'deploy-script.test.js',
       minFail: 1,
     },
+    /* ---------------------- R103：巡检异常通知 + 随机 4 位口令 ---------------------- */
+    {
+      // 「只改地址」的一次保存把开关抹掉 —— `save()` 是顶层键替换的经典事故。
+      name: 'R103-01a · 通知设置不做合并（只改地址就把开关关掉）',
+      file: 'server/config-store.js',
+      anchor: '        enabled: p.enabled !== undefined ? p.enabled === true : prev.enabled,',
+      replacement: '        enabled: p.enabled === true,',
+      testFile: 'audit103-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 去掉「本轮必须真的查出异常」这道闸门 ⇒ 空结果也会发一封「问安信」。
+      name: 'R103-02a · 没有异常也照样发通知',
+      file: 'server/integrity-notify.js',
+      anchor: "    if (!result || !(Number(result.bad) > 0)) return { sent: false, reason: 'no-bad' };",
+      replacement: "    if (!result) return { sent: false, reason: 'no-bad' };",
+      testFile: 'audit103-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 去掉冷却 ⇒ 同一批异常每 6 小时一封，一周后收件地址进垃圾箱（新异常也一起丢）。
+      name: 'R103-03a · 去掉同一批异常的冷却（每轮都发一模一样的信）',
+      file: 'server/integrity-notify.js',
+      anchor: '    if (sameBatch && lastSentAt && (now - lastSentAt) < COOLDOWN_MS) {',
+      replacement: '    if (false) {',
+      testFile: 'audit103-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 去掉失败退避 ⇒ SMTP 挂着时每轮都去连一次，巡检被 15 秒超时拖长。
+      name: 'R103-04a · 去掉发信失败后的退避（SMTP 挂掉时每轮重连）',
+      file: 'server/integrity-notify.js',
+      anchor: '    if (lastFailAt && (now - lastFailAt) < FAIL_COOLDOWN_MS) {',
+      replacement: '    if (false) {',
+      testFile: 'audit103-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 前端下界回到 6 ⇒ 「随机生成 4 位」自己存不进去（生成器与校验自相矛盾）。
+      name: 'R103-05a · 前端口令下界回到 6（4 位随机口令被自己拦下）',
+      file: 'public/js/ops.js',
+      anchor: "              if (pw.length < 4) return toast('访问密码至少 4 个字符', { type: 'error' });",
+      replacement: "              if (pw.length < 6) return toast('访问密码至少 6 个字符', { type: 'error' });",
+      testFile: 'audit103-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 不再强制含数字 ⇒ 约 13% 的口令是纯字母，与「字母和数字的组合」不符。
+      name: 'R103-06a · 随机口令不再强制包含数字（约 13% 是纯字母）',
+      file: 'public/js/util.js',
+      anchor: '  chars.push(SHARE_PW_DIGITS[sharePwRand(SHARE_PW_DIGITS.length)]);',
+      replacement: '  chars.push(SHARE_PW_ALL[sharePwRand(SHARE_PW_ALL.length)]);',
+      testFile: 'audit103-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 服务端下界回到 6 ⇒ 前端 4 位口令提交即 400（两个口径分叉）。
+      name: 'R103-07a · 服务端口令下界回到 6（4 位口令提交即 400）',
+      file: 'server/routes/links.js',
+      anchor: "      if (pw.length < 4 || pw.length > 64) throw badRequest('访问密码长度须为 4-64 个字符');",
+      replacement: "      if (pw.length < 6 || pw.length > 64) throw badRequest('访问密码长度须为 6-64 个字符');",
+      testFile: 'audit103-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 开了开关却不填地址也放行 ⇒ 界面显示「已开启」，实际一封都不会发。
+      name: 'R103-08a · 开启通知时不校验收件地址（假生效）',
+      file: 'server/routes/integrity.js',
+      anchor: "  if (enabled && !email) throw badRequest('已开启异常通知，请填写接收通知的邮箱地址');",
+      replacement: "  if (false) throw badRequest('已开启异常通知，请填写接收通知的邮箱地址');",
+      testFile: 'audit103-regressions.test.js',
+      minFail: 1,
+    },
   ];
 
 module.exports = { runCase, CASES, parseArgs };

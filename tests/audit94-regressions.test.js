@@ -1076,7 +1076,11 @@ test('R94-55 · M08-01 / M08-02 / M08-05：多条目不因单对象缺失整条�
     'POST 是「下载选中」的正解 —— 勾选项塞查询串会顶爆 Node 的 16KB 请求行上限（431，且连 Express 都进不来）');
 
   const links = stripComments(readSrc('server', 'routes', 'links.js'));
-  assert(links.indexOf("if (pw.length < 6 || pw.length > 64) throw badRequest('访问密码长度须为 6-64 个字符');") > 0,
+  // R103：下界从 6 调到 4（需求要求「随机生成 4 位字母+数字口令」）。
+  // 这条断言守的仍然是**「下界必须存在且不是 1」**，而不是那个具体数字 ——
+  // 具体取值的理由与代价写在 `server/routes/links.js` 的注释里（4 位纯数字仍不可接受，
+  // 4 位字母数字靠 `shareLock` 的 5 次/30 分钟冻结兜底）。调数字可以，删掉这一行不行。
+  assert(links.indexOf("if (pw.length < 4 || pw.length > 64) throw badRequest('访问密码长度须为 4-64 个字符');") > 0,
     '下界 1 等于没保护：口令校验入口匿名可达，而爆破预算只按 IP 计');
 });
 

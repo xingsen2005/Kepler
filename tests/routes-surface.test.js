@@ -153,7 +153,9 @@ const EXPECTED = [
   'GET /key/status', 'POST /key/unlock', 'POST /key/migrate', 'POST /key/rotate-login',
   // R99：完整性巡检（只读体检）。两条都仅管理员：结果里含全部桶名与对象键，
   // 而 `POST /integrity/run` 还会**真的**对云端逐个发 HEAD（消耗真实请求配额）。
-  'GET /integrity', 'POST /integrity/run',
+  // R103：`PUT /integrity/notify` 存的是「发现异常时往哪个邮箱发信」——
+  // 地址本身就是一份不该给普通用户的运维信息，同样仅管理员。
+  'GET /integrity', 'POST /integrity/run', 'PUT /integrity/notify',
   // R34：「关于」卡片的「检查更新」（服务端代理 GitHub，见 server/update-check.js）
   'GET /update/check',
 ];
@@ -266,7 +268,8 @@ test('敏感接口均挂载 requireAdmin', () => {
     'POST /coupons/delete', 'PUT /coupons/:id',
     // R99：巡检结果里有**全部桶名与对象键**（账号资产的另一份清单），
     // 且 `POST /integrity/run` 会让服务端真的出网 —— 与「连接验证」同级。
-    'GET /integrity', 'POST /integrity/run',
+    // R103：通知地址同理（改它等于改「异常告警发给谁」）。
+    'GET /integrity', 'POST /integrity/run', 'PUT /integrity/notify',
   ];
   const unprotected = mustBeAdmin.filter((r) => !adminGuarded.includes(r));
   assertEqual(unprotected.length, 0,

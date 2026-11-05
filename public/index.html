@@ -749,6 +749,22 @@
                 <div class="hint" id="integrity-stat-line">—</div>
                 <div id="integrity-findings" class="integrity-findings"></div>
               </div>
+              <!-- R103：异常通知。巡检的结果原本只有「打开这一页」才看得见，而它防的正是
+                   「没人看的那段时间里云端被动了」—— 于是发现与被告知之间可以相隔几天。 -->
+              <div class="form-row">
+                <div class="form-item">
+                  <label>异常通知</label>
+                  <label class="check-line"><input type="checkbox" id="integrity-notify-on"> 巡检发现异常时发送邮件通知</label>
+                  <input id="integrity-notify-email" type="email" maxlength="254" placeholder="接收通知的邮箱，例如 admin@example.com" autocomplete="off" spellcheck="false">
+                  <div class="hint" id="integrity-notify-hint">发送用的是「发信设置（SMTP）」里那套服务器，收件地址固定为这里填的一个。只在<b>真的查出异常</b>（丢失 / 长度不符 / 被改写）时发信：同一批异常不重复轰炸（12 小时内最多复述一次），<b>出现新的异常立刻发</b>。邮件正文含<b>桶名与文件名</b>，SMTP 未启用 TLS 时这些内容在链路上是明文。</div>
+                </div>
+                <div class="form-item">
+                  <label>&nbsp;</label>
+                  <button id="btn-integrity-notify-save" class="mini-btn primary" type="button">保存通知设置</button>
+                  <div class="hint" id="integrity-notify-state">—</div>
+                </div>
+              </div>
+
               <div class="card-note">
                 <ul class="note-list">
                   <li><b>抓得到</b>：对象被删或被生命周期规则清掉（<code>missing</code>）、被截断或换成别的文件（<code>size</code>）、写完之后又被写过一次（<code>modified</code> —— <b>同长度的原位覆盖</b>多半就是它）。</li>
@@ -1006,7 +1022,7 @@
             <div class="dash-card wide sysset-card">
               <h3 class="sysset-h3"><span class="sysset-tag about">关于</span>关于</h3>
               <div class="about-body">
-                <p><b>Kepler 对象存储管理系统</b> Build 2.1.2</p>
+                <p><b>Kepler 对象存储管理系统</b> Build 2.1.3</p>
                 <ul class="about-list">
                   <li>开发者：邢森</li>
                   <li>项目地址：<a href="https://github.com/xingsen2005/Kepler" target="_blank" rel="noopener noreferrer">https://github.com/xingsen2005/Kepler</a></li>

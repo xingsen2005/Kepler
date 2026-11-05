@@ -60,6 +60,15 @@ const { resolveBucketClient, mapLimit, bucketCacheKey } = require('./bucket-stat
 const candidates = require('./search-candidates');
 const { p } = require('./s3');
 const statsStore = require('./stats-store');
+/**
+ * R103：异常通知（邮件）。
+ *
+ * ⚠️ 它**不在巡检的判据链路上**：`commit()` 只是在结论算完之后顺手递一个结果过去，
+ * 发信成功与否都不改本轮结论（`maybeNotify()` 自己吞掉所有异常、永不 reject）。
+ * 反过来把「发信成功」写成巡检成功的前置条件，会让一次 SMTP 故障表现为
+ * 「巡检失败」—— 而巡检其实已经查出问题了。
+ */
+const notify = require('./integrity-notify');
 
 /** 每轮默认巡检对象数（每桶）。给「一次巡检别把云端配额吃光」一个硬上限。 */
 const DEFAULT_BATCH = 200;
@@ -253,6 +262,14 @@ function state() {
     locked: configStore.isLocked(),
     metaCorrupt: encStore.metaIsCorrupt(),
     findings: last.findings.slice(),
+    /**
+     * R103：异常通知的当前设置与上一次投递结果。
+     *
+     * 与「本轮结果」并列而不是塞进 `findings`：通知是**投递状态**，
+     * 它失败了不代表云端有问题，混在一起会让界面把「邮件没发出去」
+     * 显示成一条数据异常。
+     */
+    notify: notify.status(),
   };
 }
 
@@ -338,6 +355,13 @@ async function runOnceInner(now) {
           + result.findings.slice(0, 5).map((f) => `${f.bucket}/${f.key}（${f.verdict}）`).join('、')
           + (result.bad > 5 ? ' 等' : ''),
       });
+      /**
+       * R103：异常通知。**不 await** —— `commit()` 是同步收尾（`runOnce()` 的
+       * 返回值必须立刻可用），而发信最长要 15 秒（`smtp.DEFAULT_TIMEOUT_MS`）。
+       * 等它等于让「立即巡检」按钮卡在 15 秒上，且定时器下一轮可能被拖到重叠。
+       * `maybeNotify()` 内部已经吞掉所有异常，这里的 `catch` 只是防御性兜底。
+       */
+      Promise.resolve(notify.maybeNotify(result)).catch(() => {});
     }
     return state();
   };
@@ -460,6 +484,8 @@ async function runOnceInner(now) {
 function _resetForTest() {
   cursors.clear();
   running = null;
+  // R103：通知的签名 / 冷却也是内存态 —— 不一起清，用例之间会互相「以为刚发过」
+  notify._resetForTest();
   last = {
     at: null, durationMs: 0, scanned: 0, ok: 0, bad: 0, skipped: 0, buckets: 0,
     findings: [], skippedReason: '',

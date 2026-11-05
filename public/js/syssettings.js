@@ -189,6 +189,19 @@ function wire() {
   // R99：完整性巡检（仅管理员）——「立即巡检」会真的对云端发 HEAD，因此是一个显式动作
   const integrityRun = document.getElementById('btn-integrity-run');
   if (integrityRun) integrityRun.onclick = () => runIntegrity();
+  // R103：异常通知（仅管理员）—— 勾选后才允许填地址，避免「填了地址却没生效」的错觉
+  const integrityNotifyOn = document.getElementById('integrity-notify-on');
+  const integrityNotifyEmail = document.getElementById('integrity-notify-email');
+  if (integrityNotifyOn && integrityNotifyEmail) {
+    const sync = () => {
+      integrityNotifyEmail.disabled = !integrityNotifyOn.checked;
+      if (integrityNotifyOn.checked) integrityNotifyEmail.focus();
+    };
+    integrityNotifyOn.addEventListener('change', sync);
+    sync();
+  }
+  const integrityNotifySave = document.getElementById('btn-integrity-notify-save');
+  if (integrityNotifySave) integrityNotifySave.onclick = () => saveIntegrityNotify();
   // 关于卡片：检查更新（**所有登录用户**可见 —— 关于卡片不属 ADMIN_ONLY_CARDS）
   const btnUpdate = document.getElementById('btn-check-update');
   if (btnUpdate) btnUpdate.onclick = checkUpdate;
@@ -2327,6 +2340,14 @@ async function runIntegrity() {
     const st = await API.integrityRun();
     integrityState = st;
     renderIntegrity(st);
+    /**
+     * R103：巡检**不等**发信（`commit()` 不 await，见 `server/integrity.js`），
+     * 所以这次返回的 `notify` 还看不到投递结果。隔几秒再取一次状态 ——
+     * 这次 GET 只读内存，不碰云端，代价可以忽略。
+     */
+    if (st && st.notify && st.notify.enabled) {
+      setTimeout(() => { if (isAdmin()) loadIntegrity(); }, 5000);
+    }
     const bad = Number(st && st.bad) || 0;
     toast(bad > 0 ? `巡检完成：发现 ${bad} 个异常对象` : '巡检完成：本轮未发现异常',
       { type: bad > 0 ? 'warn' : 'success' });
@@ -2335,6 +2356,76 @@ async function runIntegrity() {
     toast(e.message || '巡检失败', { type: 'error' });
   } finally {
     if (btn) { btn.disabled = false; btn.textContent = '立即巡检'; }
+  }
+}
+
+/**
+ * 渲染「异常通知」这一小块（R103）。
+ *
+ * 与巡检结果**分开渲染**：通知是投递状态，它失败不代表云端有问题。
+ * 三种「发不出去」的原因必须分别说清楚，否则管理员只能看到「没收到信」：
+ *   ① 开关没开；② 地址没填；③ SMTP 没配（这一条最容易被漏 —— 两张卡片是分开配的）。
+ */
+function renderIntegrityNotify(n) {
+  const on = document.getElementById('integrity-notify-on');
+  const email = document.getElementById('integrity-notify-email');
+  const stateEl = document.getElementById('integrity-notify-state');
+  const hintEl = document.getElementById('integrity-notify-hint');
+  if (!on || !email || !stateEl) return;
+  const v = n || {};
+  on.checked = Boolean(v.enabled);
+  email.value = v.email || '';
+  email.disabled = !on.checked;
+
+  const bits = [];
+  if (v.enabled && !v.smtpConfigured) bits.push('「发信设置」未配置，暂时发不出去');
+  if (v.enabled && !v.email) bits.push('尚未填写收件邮箱');
+  if (v.lastError) {
+    bits.push(`上次发送失败：${v.lastError}`);
+  } else if (v.lastSentAt) {
+    bits.push(`上次通知：${fmtTime(v.lastSentAt)}`);
+  } else if (v.enabled) {
+    bits.push('尚未发送过通知');
+  } else {
+    bits.push('未开启');
+  }
+  stateEl.textContent = bits.join('｜');
+  stateEl.style.color = (v.lastError || (v.enabled && !v.smtpConfigured))
+    ? 'var(--warn-fg, #92400e)' : '';
+  if (hintEl) hintEl.style.opacity = v.enabled ? '' : '0.72';
+}
+
+/**
+ * 保存通知设置（R103）。
+ *
+ * 前端只做「开关打开就必须填地址」这一条当场校验 —— 地址的合法性一律由服务端判
+ * （`limits.parseEmailInput`，那是唯一实现点，浏览器里再写一份必然分叉）。
+ */
+async function saveIntegrityNotify() {
+  const on = document.getElementById('integrity-notify-on');
+  const email = document.getElementById('integrity-notify-email');
+  const btn = document.getElementById('btn-integrity-notify-save');
+  const stateEl = document.getElementById('integrity-notify-state');
+  if (!on || !email) return;
+  const enabled = Boolean(on.checked);
+  const value = email.value.trim();
+  if (enabled && !value) {
+    toast('已勾选「发送邮件通知」，请填写接收通知的邮箱地址', { type: 'error' });
+    email.focus();
+    return;
+  }
+  if (btn) { btn.disabled = true; btn.textContent = '保存中…'; }
+  try {
+    const r = await API.integrityNotifySave({ enabled, email: value });
+    if (integrityState) integrityState.notify = r.notify;
+    renderIntegrityNotify(r.notify);
+    if (r.warning) toast(r.warning, { type: 'warn' });
+    else toast('通知设置已保存', { type: 'success' });
+  } catch (e) {
+    if (stateEl) stateEl.textContent = '保存失败：' + (e.message || '未知错误');
+    toast('保存失败：' + (e.message || '未知错误'), { type: 'error' });
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = '保存通知设置'; }
   }
 }
 
@@ -2417,6 +2508,8 @@ function renderIntegrity(st) {
       }).join('');
     }
   }
+  // R103：通知是**独立**的一块 —— 投递失败不代表云端有问题，两者不能混着显示
+  renderIntegrityNotify(st.notify);
 }
 
 /** 单个桶的进度条（分母 = 该密钥的上限；无限制时用「已用总量」以便表达相对大小） */function lbBucketHTML(b, credQuota, credUnlimited, credUsed) {

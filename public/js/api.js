@@ -454,6 +454,9 @@ export const API = {
   // 因此是 POST —— 它消耗请求配额，且会推进服务端的轮转游标，不是只读查询。
   integrityStatus: () => request('GET', '/api/integrity'),
   integrityRun: () => request('POST', '/api/integrity/run'),
+  // R103：异常通知（开关 + 收件地址）。PUT 而不是 POST —— 整段替换、幂等；
+  // 发信是巡检在后台的副作用，不在这个请求里发生。
+  integrityNotifySave: (b) => request('PUT', '/api/integrity/notify', b),
 
   // IP 访问屏蔽
   ipGuard: () => request('GET', '/api/ipguard'),
