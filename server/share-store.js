@@ -85,6 +85,15 @@ function load() {
       return cache;
     }
   } catch (e) {
+    /**
+     * R104（F-01）：锁定态借出空表但**不缓存**。
+     *
+     * 旧实现把 `KEYRING_LOCKED` 也丢进「损坏」分支，`cache = { links: [] }`。
+     * 而 `writer` 的快照取的是 `cache || null` —— `{links:[]}` 是真值，解锁后
+     * 第一次链接写操作就把 `links.json` 整份覆盖，全部托管 / 付费链接消失。
+     * 锁定态只是一个尚未解锁的正常状态，不该有任何写盘后果。
+     */
+    if (secureStore.isLockedError(e)) return { links: [] };
     // SEC-09：损坏时不静默重建 —— 打出告警；secure-store 已锁定该文件写入，
     // 磁盘上的损坏文件（及其 .corrupt-* 备份）不会被空表覆盖。
     console.error('[share-store] 分享链接文件损坏，已降级为空列表并锁定写入：', e.message);

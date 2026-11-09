@@ -64,6 +64,29 @@ function corruptError(file, why) {
 }
 
 /**
+ * 这次读取失败是不是「主密钥还没解锁」（R104 / F-01）。
+ *
+ * ## 为什么必须有这个唯一判据
+ *
+ * `readJson()` 已经把 `KEYRING_LOCKED` 原样抛出（R97：锁定 ≠ 损坏）。但**抛出只是
+ * 上半句**：调用方拿到异常后原本一律按「文件坏了」处理 —— 缓存空表、置
+ * `loadFailed` / `metaCorrupt` / `settingsUnavailable` 之类的进程级标志，注释还写着
+ * 「secure-store 已锁定该文件写入，磁盘不会被空表覆盖」。
+ *
+ * 这句话在锁定这条路径上是**假的**：锁定态不会进 `corruptFiles`，所以磁盘并没有被
+ * 保护起来；解锁之后，那份空表会被下一次写入原样覆盖到磁盘上 —— 分享链接 / 上传
+ * 会话（含分片 IV/TAG）/ IP 黑名单 / 订单流水，全部不可逆。
+ *
+ * 判据只认 `code`（不看 message、不看 status）：`lockedError()` 是唯一构造点。
+ *
+ * @param {*} e 捕获到的异常
+ * @returns {boolean} true = 暂时读不到（等解锁），false = 真的坏了
+ */
+function isLockedError(e) {
+  return Boolean(e && e.code === 'KEYRING_LOCKED');
+}
+
+/**
  * 读取 JSON 文件（自动识别加密封装与历史明文）。
  *
  * ⚠️ SEC-09：必须区分两种情况 ——
@@ -293,6 +316,8 @@ function upgrade(file) {
 
 module.exports = {
   readJson, writeJson, writeJsonStrict, writeJsonAsync, flush, upgrade,
+  // R104（F-01）：锁定态读盘失败的**唯一**判据（上层 store 不得各自判 message/status）
+  isLockedError,
   // R94：写入失败必须让调用方看见的入口（enc-meta / enc-settings 这类"写丢就等于数据丢"的文件用）
   // R11-07：退出路径「只写不建」的共用判据（upload-sessions / enc-store / config-store）
   exitPathWritable,

@@ -128,6 +128,13 @@ function load() {
       return cache;
     }
   } catch (e) {
+    /**
+     * R104（F-01）：锁定态不是损坏 —— 借出空表但不缓存。
+     *
+     * 缓存下来的后果比券表更重：解锁后任意一次生成 / 停用 / 核销都会把整份邀请码表
+     * 覆盖成空，而「邀请码」本身就是注册准入凭据 —— 已发出的码全部失效。
+     */
+    if (secureStore.isLockedError(e)) return { invites: [] };
     // SEC-09：损坏时不静默重建 —— 打出告警；secure-store 已锁定该文件写入，
     // 磁盘上的损坏文件（及其 .corrupt-* 备份）不会被空表覆盖。
     console.error('[invite-store] 邀请码文件损坏，已降级为空列表并锁定写入：', e.message);
@@ -154,6 +161,8 @@ function load() {
  * 一次全量加密 + 原子替换在毫秒以内。异步写省下的那点事件循环时间毫无收益。
  */
 function persist() {
+  // R104（F-01）：从未成功读盘时不得写（写下去是密文里的 `null`，整表不可恢复）
+  if (!cache) return;
   ensureDataDir();
   secureStore.writeJson(FILE, cache);
 }

@@ -503,6 +503,19 @@ function load() {
   try {
     j = secureStore.readJson(GUARD_FILE, null);
   } catch (e) {
+    /**
+     * R104（F-01）：锁定态**不是**损坏，也绝不能把空规则集缓存下来。
+     *
+     * 旧实现把 `KEYRING_LOCKED` 一并降级成 `{ rules: [] }` 并置 `loadDegraded`，
+     * 而 `persist()` 没有 `loadDegraded` 守卫 ⇒ 解锁后任意一次规则变更/命中计数
+     * 落盘，就把 `ipguard.json` 里管理员配的全部黑名单与「屏蔽海外 IP」**永久抹掉**；
+     * 而失效的那段时间里，被拉黑的 IP 是可以正常访问的。这是本条里最具安全属性
+     * 的后果，也是它不能被当成「服务降级」处理的原因。
+     *
+     * 这里只借出一份临时空规则（回环豁免、静态页、解锁页都得能继续走），
+     * 不赋值给 `guard`、不置 `loadDegraded`：解锁后第一次 `load()` 会重新读盘。
+     */
+    if (secureStore.isLockedError(e)) return { rules: [], updatedAt: '' };
     loadDegraded = true; // R78：降级要可见，见变量声明处
     console.error('[ip-guard] IP 屏蔽规则文件损坏，已降级为空规则并锁定写入：', e.message);
   }
@@ -564,6 +577,15 @@ function persistView(g) {
 }
 
 function persist() {
+  /**
+   * R104（F-01）：`guard` 为空表示**规则从未成功读过**（锁定态）—— 此时一个字都不写。
+   *
+   * 为什么不用 `loadDegraded` 当写守卫：那是「文件真的坏了」的状态，写入会经
+   * `assertWritable()` 抛 500，让管理员看见「规则写不进去，请先恢复文件」。
+   * 把它换成静默 return，等于把一次可诊断的故障变成「点了保存、什么也没发生」。
+   * 旧实现真正的洞在锁定态：那条路径不进 `corruptFiles`，于是空规则集会被写回磁盘。
+   */
+  if (!guard) return;
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
   guard.updatedAt = new Date().toISOString();
   secureStore.writeJson(GUARD_FILE, persistView(guard));

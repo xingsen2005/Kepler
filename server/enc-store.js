@@ -24,6 +24,7 @@ const fs = require('fs');
 const path = require('path');
 const { Transform } = require('stream');
 const secureStore = require('./secure-store');
+const keyring = require('./keyring');
 // R94（审核 M09-04）：元数据表改用与其它高频 store 同款的去抖合并写
 const coalesce = require('./coalesce');
 const atomicWrite = require('./atomic-write');
@@ -178,6 +179,18 @@ function loadSettings() {
   try {
     j = secureStore.readJson(SETTINGS_FILE, null);
   } catch (e) {
+    /**
+     * R104（F-01）：锁定态与「文件坏了」必须分开。
+     *
+     * 两者在**写路径**上要求一致（都 fail-closed，绝不按 `mode:'none'` 把明文写云），
+     * 但在**缓存**上完全相反：损坏要一直挡写入直到人工恢复；锁定只是「等解锁」——
+     * 若把 `defaultSettings()` 缓存下来（`:172` 此后永不重读），解锁后整站仍按
+     * 「不加密、没设查看密码」运行，新上传全部明文落云。
+     */
+    if (secureStore.isLockedError(e)) {
+      settingsUnavailable = true; // 写路径 fail-closed（与损坏同口径）
+      return defaultSettings();   // 但不缓存：解锁后必须重新读盘
+    }
     // R94（审核 M09-02）：标记「设置不可用」—— 写路径 503、读门禁 fail-closed（见 settingsUnavailable）
     settingsUnavailable = true;
     console.error('[enc-store] 加密设置文件损坏：已锁定写入并暂停上传写入（见 /api/health）：', e.message);
@@ -199,6 +212,9 @@ function loadSettings() {
 }
 
 function persistSettings() {
+  // R104（F-01）：设置从未成功读盘（锁定态）时不得写 —— 写下去的是默认设置，
+  // 等于把「加密方式 / 查看密码」整份抹成默认值（解锁后不可逆）。
+  if (!settings) return;
   if (!fs.existsSync(DATA_DIR)) fs.mkdirSync(DATA_DIR, { recursive: true });
   settings.updatedAt = iso();
   // R94（审核 M09-05）：同样换成会抛错的写入口 —— 加密方式 / 查看密码的变更
@@ -316,6 +332,19 @@ let metaCache = null;
 /** SEC-09：加密元数据是否处于「损坏」状态（读取失败）—— 损坏时禁止写入，防不可逆覆盖 */
 let metaCorrupt = false;
 
+/**
+ * R104（F-01）：解锁（DEK 可用）后清掉两个「不可用」标志。
+ *
+ * 只清标志、清缓存 —— 数据表本身不在这里重建：`load()` / `loadMeta()` 在锁定态
+ * 只**借出**临时空表，从不写入 `settings` / `metaCache`，所以解锁后的下一次读
+ * 天然会落回磁盘。反过来，标志必须在这里清：`settingsUnavailable` 一旦留着，
+ * 解锁后整站仍按「设置坏了」运行（写路径 503、查看密码永远校验不过）。
+ */
+keyring.addResetHook(() => {
+  settingsUnavailable = false;
+  metaCorrupt = false;
+});
+
 function loadMeta() {
   if (metaCache) return metaCache;
   // S4：加密存储（兼容历史明文文件）
@@ -327,6 +356,14 @@ function loadMeta() {
   try {
     j = secureStore.readJson(META_FILE, null);
   } catch (e) {
+    /**
+     * R104（F-01）：锁定态借出空表但**不缓存、不置 `metaCorrupt`**。
+     *
+     * `enc-meta.json` 是解密的唯一凭据。旧实现在锁定态把它缓存成 `{ files: {} }`
+     * 并置 `metaCorrupt`：解锁后本进程永久拒写元数据（新密文的 IV/TAG 写不进去），
+     * 而访问既有密文时又读不到条目 —— 表现为「云端明明有文件，下载全报错」。
+     */
+    if (secureStore.isLockedError(e)) return { files: {} };
     metaCorrupt = true;
     console.error('[enc-store] 加密元数据文件损坏，已锁定写入以防不可逆覆盖：', e.message);
   }
@@ -392,7 +429,12 @@ let metaSeqAtSnapshot = 0;
 const metaWriter = coalesce.debouncedPersist(
   META_FILE,
   () => {
-    if (metaCorrupt) return null;
+    /**
+     * R104（F-01）：`!metaCache` = 元数据从未成功读过（锁定态）。此时 `loadMeta()`
+     * 返回的是一份**临时**空表，写下去就把解密凭据整份覆盖掉了 —— 必须返回 null
+     * （`coalesce` 对 null 快照不写）。
+     */
+    if (metaCorrupt || !metaCache) return null;
     metaSeqAtSnapshot = metaSeq;
     return loadMeta();
   },
@@ -455,6 +497,12 @@ function persistMetaSync(opts = {}) {
     err.corrupt = true;
     throw err;
   }
+  /**
+   * R104（F-01）：`metaCache` 为空 = 元数据从未成功读过（锁定态）。
+   * 返回 false 表示「本轮没写」（与退出路径不建目录同一契约：调用方不得推进序号），
+   * 绝不能拿 `loadMeta()` 借出的临时空表去覆盖磁盘。
+   */
+  if (!metaCache) return false;
   /**
    * R11-07：退出阶段绝不建目录（只写不建）。
    * R12-03：判据改用**唯一实现点** `secureStore.exitPathWritable()` —— 此前这里是
@@ -1455,14 +1503,32 @@ function decryptTransform(meta) {
 /* ============================ 查看密码（权限验证）与令牌 ============================ */
 
 function passwordSet() {
-  // R94（审核 M09-02）：设置不可用时 fail-closed —— 读不到设置不等于「没设密码」
+  /**
+   * R104（F-04）：**先触发一次读盘，再判标志**。
+   *
+   * 旧写法把 `settingsUnavailable` 判在前面 —— 而它只会被 `loadSettings()` 置真，
+   * 于是「第一次调用」永远先看到 false，然后才去读、才失败，最后拿
+   * `defaultSettings().passwordHash`（空串）回答「没设密码」。也就是说 R94 想做的
+   * fail-closed 在首调用这一路径上**从未生效**：门禁认为不需要密码，而
+   * `checkPassword()` 也认为不需要（同一个空缓存）—— 两道门一起开。
+   */
+  const s = loadSettings();
   if (settingsUnavailable) return true;
-  return !!loadSettings().passwordHash;
+  return !!s.passwordHash;
 }
 
 /** 校验加密文件查看密码（SEC-05：async —— 该入口在 /enc/unlock 上，是攻击者可达路径） */
 async function checkPassword(pw) {
   const s = loadSettings();
+  /**
+   * R104（F-04）：设置读不出来时**必须 fail-closed**。
+   *
+   * `passwordSet()`（门禁形态）早就是 fail-closed 的，而这里恰恰相反：`loadSettings()`
+   * 失败后缓存里是 `passwordHash: ''`，于是「没有密码」这一支直接 `return true` ——
+   * **任意口令都能换到一枚全局加密访问令牌**。门禁要求令牌、校验却放行任何输入，
+   * 这是同一个状态在两个方向上被解释，不是「降级」。
+   */
+  if (settingsUnavailable) return false;
   if (!s.passwordHash) return true; // 未设置密码 → 不拦截
   const params = configStore.normalizeScryptParams(s.passwordParams);
   const h = await scryptHex(pw, s.passwordSalt, params);
@@ -1503,6 +1569,15 @@ async function checkPassword(pw) {
  */
 function tokenSecret() {
   const s = loadSettings();
+  /**
+   * R104（F-04）：设置不可用时**拒绝派生**。
+   *
+   * 旧实现用空 `passwordHash` / `passwordSalt` 继续派生：签出的令牌与「本来就没设
+   * 查看密码」完全同形，而 `verifyToken()` 用同一份空缓存校验，必然认票 —— 于是
+   * 一个「设置文件读不出来」的本地故障，升级成「加密门禁整体失效」。
+   * 抛错后 `verifyToken()` 走 catch 返回 false，`issueToken()` 如实回 503。
+   */
+  if (settingsUnavailable) throw settingsUnavailableError();
   return crypto.createHash('sha256')
     .update(masterKey())
     .update('enc-token-v1')

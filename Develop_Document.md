@@ -6,7 +6,7 @@
 
 以上。
 
-1. **适用版本**：v2.1.3（取自 `package.json` 的 `version`，由 `tests/docs-sync.test.js` 护栏校验）  
+1. **适用版本**：v2.1.4（取自 `package.json` 的 `version`，由 `tests/docs-sync.test.js` 护栏校验）  
 2. **渲染前提与目录兜底**：本文标题为手写 HTML（`<h1 id="develop_document-sectionN">`），目录依赖这些 `id`。若目标渲染器清洗原始 HTML 并剥离 `id`，**目录链接会失效，但目录本身仍然可用**，请按下述方式定位：
    - 目录条目本身是一份完整的章节清单，条目文字与正文标题严格一致（由 `docs-sync` 双向断言保证），按标题文字在页面内搜索即可跳到对应章节；
    - 章节编号 `develop_document-sectionN` 从 1 起**连续递增**（同样由护栏断言），因此「第 N 章」的表述在标题被剥离后仍可换算；
@@ -125,9 +125,9 @@ main/
 │   ├── payment-providers.js# 【支付】平台凭证字段定义 + 校验引擎（可扩展为真实校验）
 │   ├── payment-rules.js    # 【支付】业务规则纯函数：金额 / 渠道开关约束 / 付费是否生效
 │   ├── payment-orders.js   # 【支付】付费订单状态机与已支付票据（pending→paid|failed）
-│   ├── order-no.js         # 【R64】订单号编解码**唯一实现点**：36 位「13 位毫秒时间戳 + 9 位链接 UID + 9 位用户 UID + 5 位随机串」，base62、区分大小写；两个 UID 由 `sha256('kepler:link:'+id)` / `sha256('kepler:user:'+id)` **确定性派生**（同一链接 / 同一账号恒定），随机串用 `crypto.randomInt` 取（不用 `randomBytes % 62`，避免分布偏斜）。⚠️ 它**不是**网关商户单号：`order.id`（16 位 base64url）仍是 `out_trade_no`，因为微信支付 v3 对 `out_trade_no` 有 **≤ 32 位**硬限制
+│   ├── order-no.js         # 【R64】订单号编解码**唯一实现点**：36 位「13 位毫秒时间戳 + 9 位链接 UID + 9 位用户 UID + 5 位随机串」，base62、区分大小写；两个 UID 由 `sha256('kepler:link:'+id)` / `sha256('kepler:user:'+id)` **确定性派生**（同一链接 / 同一账号恒定），随机串用 `crypto.randomInt` 取（不用 `randomBytes % 62`，避免分布偏斜）。⚠️ 它**不是**网关商户单号：微信 / 支付宝 / PayPal 仍用 `order.id`（16 位 base64url）作 `out_trade_no` / 商户订单号（微信支付 v3 对 `out_trade_no` 有 **≤ 32 位**硬限制）；**银联全渠道例外**——R91 起改用 36 位 `orderNo` 作 `orderId`（银联要求 8~40 位字母数字）
 │   ├── payment-gateway.js  # 【支付】真实支付网关：支付宝 RSA2 / 微信 APIv3 / 云闪付（银联全渠道）/ PayPal Orders v2（查单确认，零依赖）
-│   ├── payment-logos.js    # 【R91】渠道品牌图形的**唯一实现点**（内联 SVG + `SHAPES` 表 + `logoSvg()` / `logo()`）。后台「支付设置」的标签由 `clientSchema()` 经接口下发它、前台分享页由 `share-routes.js` 直接内联 —— 两处渲染的是**同一份字节**。⚠️ 不要在前端另存一份图形数据：两份必然漂移（原先的 `public/js/payment-logos.js` 已删除）
+│   ├── payment-logos.js    # 【R91】渠道品牌图形的**唯一实现点**（内联 SVG + `SHAPES` 表 + `logoSvg()` / `logo()`）。后台「支付设置」的标签经 `GET /api/payment/logos` 下发（R92；`clientSchema()` 已不再带图形字段）、前台分享页由 `share-routes.js` 直接内联 —— 两处渲染的是**同一份字节**。⚠️ 不要在前端另存一份图形数据：两份必然漂移（原先的 `public/js/payment-logos.js` 已删除）
 │   ├── pem-key.js          # 【R79】PEM / DER 密钥结构判定**唯一实现点**（ADR-0006）：**真解析**而不猜前缀 —— 裸体依次试 PKCS#8 / PKCS#1 / SEC1（公钥试 SPKI / PKCS#1），`classify()` 区分「公钥解得开」与「确实是公钥」（OpenSSL 能从私钥导出公钥，顺序反了会把每把私钥都判成公钥），`explain()` 按真实出错频率给出可照做的中文诊断（贴错框 / 有口令 / 粘贴不全 / 非 RSA）；保存校验器与签名归一化共用，解不出来时返回 `''` 由调用方决定报什么
 │   ├── qrcode.js           # 【支付】自研二维码生成（输出 SVG，零依赖）
 │   ├── s3.js              # 【多云】客户端工厂：按 provider 分派 S3Client / AzureBlobClient + 错误翻译（R49 起全厂商同一路径）
@@ -150,7 +150,7 @@ main/
 │   ├── atomic-write.js     # 临时文件 + rename 原子写入 + 启动孤儿 tmp 清扫
 │   ├── coalesce.js         # 异步原语：去抖合并写 + 并发合并读（退出收口只注册一个处理器）
 │   ├── enc-store.js        # 文件加密核心（三种方式 / 解密流 / 查看令牌 / 元数据迁移）
-│   ├── integrity.js        # 【R99】完整性巡检 / 防勒索校验：**只读体检**，不解密、不碰密钥。三个判据只靠一次 HEAD —— `missing`（404 / NoSuchKey）/ `size`（`Content-Length` ≠ 由 `enc-meta` 推导的密文长度）/ `modified`（云端 `Last-Modified` 晚于本地 `createdAt`，带 5 分钟时钟容差），后者是**同长度原位覆盖**（勒索软件 / 同步工具回写）唯一能被抓到的信号。候选集 = `enc-meta.json` 的键（「我们加密过哪些对象」的唯一权威），轮转游标 + 每轮上限摊平成本，命中 `search-candidates` 时连 HEAD 都省。⚠️ **第一条判据是「锁定态」**：锁定期间读 `enc-meta.json` 会把 `metaCorrupt` 置真、本进程永久拒写元数据（R97 的三条误判路径之一）
+│   ├── integrity.js        # 【R99】完整性巡检 / 防勒索校验：**只读体检**，不解密、不碰密钥。三个判据只靠一次 HEAD —— `missing`（404 / NoSuchKey）/ `size`（`Content-Length` ≠ 由 `enc-meta` 推导的密文长度）/ `modified`（云端 `Last-Modified` 晚于 `max(createdAt, cloudWrittenAt)`，带 5 分钟时钟容差），后者是**同长度原位覆盖**（勒索软件 / 同步工具回写）唯一能被抓到的信号。候选集 = `enc-meta.json` 的键（「我们加密过哪些对象」的唯一权威），轮转游标 + 每轮上限摊平成本，命中 `search-candidates` 时连 HEAD 都省。⚠️ **第一条判据是「锁定态」**：锁定期间读 `enc-meta.json` 会把 `metaCorrupt` 置真、本进程永久拒写元数据（R97 的三条误判路径之一）
 │   ├── integrity-notify.js # 【R103】巡检的**异常通知**（邮件）：只对 `missing`/`size`/`modified` 三种「真异常」发信（`unknown`/`error` 是「没查清」，整轮跳过是本系统自己的状态问题，都不发）；按**签名 + 冷却**去重 —— 签名变（新增坏对象）立刻发、同一批每 12 小时复述一次；发信失败只记 `lastError` 且**不推进签名**（下一轮继续重试，另有 30 分钟退避）；`commit()` **不 await** 它（发信最长 15 秒，等它会让「立即巡检」卡住），复用同一套 SMTP 设置
 │   ├── enc-xor.js          # 【R48】纯 `crypto` 原语：magic 的密钥流生成与异或（无副作用，可安全被工作线程 require）
 │   ├── enc-pool.js         # 【R48】`worker_threads` 加密线程池（入口即本文件；小负载走本地、停机就地算完、出错永久降级）
@@ -204,7 +204,7 @@ main/
 │   ├── css/style.css
 │   └── js/
 │       ├── main.js           # 应用骨架、状态、桶/设置弹窗
-│       ├── provider-logos.js # 【多云】7 家厂商元数据与 LOGO（内联 SVG）
+│       ├── provider-logos.js # 【多云】12 家厂商元数据与 LOGO（内联 SVG）
 │       ├── paysettings.js    # 【支付】支付设置卡片（表单渲染 / 校验 / 保存，规则全部取自服务端）
 │       ├── ordermgr.js       # 【支付】订单管理页（订单流水与对账）
 │       ├── credmgr.js        # 访问密钥卡片（厂商选择器 + 服务商列）
@@ -336,6 +336,7 @@ main/
 │   ├── audit100-regressions.test.js # 【R100】原生验证码的接线层（10 条，**真 HTTP**）：默认关闭时客户端行为与改动前完全一致（403 且**无** `needCaptcha`）/ 验证码全局关闭时客户端也不答题 / 开启后客户端拿到 `needCaptcha` + 题面 / **答对后用「401 用户名或密码错误」作证**已越过人机验证（刻意用不存在的账户，避免把用例变成「注册 + 登录」的复合测试）/ 答错换新题并给 `captchaError` / 浏览器不受影响 / **关掉开关立刻失效**（旧题也不能再用）/ `GET /captcha/native` 开启时发题、关闭时 404 / 静态接线（两个调用点 + 匿名白名单 + 路由 + 限流）/ 注册同样可用（用「400 密码长度至少 8 位」作证走到了 `addUser()`）
 │   ├── audit101-regressions.test.js # 【R101】《密钥轮转与完整性巡检审计报告》9 条（**全部成立**，10 条）：改密闸门三态（未启用信封放行 / 已启用且非根放行 / 根用户拦下 `USE_KEY_ROTATION`）+ 三个入口接线 / 根口令哈希写盘失败 ⇒ 轮转必须失败并回滚 KEK（`rewrap` 回滚会使 `kekVersion` **+2**，用例里写明）/ 崩溃窗口由意图日志补完 + 三种「判不了就不猜」 / 并发轮转第二个拿 409 且锁会释放 / 损坏的 `keyring.json` 反复取状态只留一份备份（源文件被改过才重新留档）/ 复制·上传落库·移动三处都刷新 `cloudWrittenAt` 且 `createdAt` 不变 / magic 短文件四档边界（0 / M-1 / M / 100 字节 + 缺 `magicLen` 的历史条目）/ 同名桶歧义整桶跳过且**一个 HEAD 都不发**。每个用例独占临时数据目录（`keyring` 的解锁态是模块级且绑定路径，共用目录会让上一个用例把下一个锁在门外）
 │   ├── audit103-regressions.test.js # 【R103】巡检异常通知 + 随机 4 位口令（8 条）：设置默认关闭 / 「只改地址不得把开关关掉」（顶层替换事故）/ 四种「不该发」（bad=0、只有 error、开关关、地址空）/ SMTP 没配不发但配好后正文含中文结论与对象位置 / 同一批不重复轰炸、签名变化立刻发、冷却到期复述 / 发信失败不影响巡检结论且不推进签名（含失败退避）/ 路由三条校验（坏地址 400、开开关没地址 400、SMTP 未配给 warning）/ 生成器 4 位·字母数字都出现·无易混字符·不用 `Math.random` / 前后端下界同为 4
+│   ├── audit104-regressions.test.js # 【R104】《Kepler v2.1.3 安全审计报告》6 条（**全部成立**，8 条）：**锁定态读盘不得污染**（真 `keyring` + 真重启 + 解锁后核对 + 再重启核对，断言 4 个数据文件字节不变）/ 支付宝同步响应切片（同名节点 0 个 / 切不成 / 2 个三个边界 + 单节点对照）/ 端到端**真 RSA 签名 + 追加的伪造 `TRADE_SUCCESS`** 不得让订单变已付 / `Host: evil.com` 不进人机验证允许域名（桩 `captchaNative.guard` 断言 `expectedHosts`）/ 真坏 `enc-settings.json` 下任意口令不得换访问令牌 / 真写盘失败时导入必须 500 / **轮转进行中不得删意图日志**（互斥内部驱动 + 外部对照）/ 启动清扫必须等解锁**成功**（静态判据判「紧邻」，防被前面那处 `/api` 锁定门满足）。每个用例独占临时数据目录 + 清 `require.cache`，否则测出来的是「同一进程里锁了又开」的假形态
 │   ├── captcha-native.test.js    # 【R100】原生验证码的模块契约（12 条）：默认关闭 ⇒ 客户端仍走 reCAPTCHA 分支（不签题）/ 全局关闭 ⇒ 直接放行 / 非客户端请求一律走原路径 / 首次发题 `retry=false`、答错 `retry=true` 且换新 token / **答对即删**（重放与「过期」同形，少一条探测面）/ TTL 按 `now` 判定 / 同一枚 token 答错满 3 次作废 / 全角数字与空白的归一化 / 超长答案不受理 / 客户端前缀白名单（不认通配 `*`）/ 内存表**过期先清、满则按插入序淘汰**
 │   └── invariants.test.js        # 跨模块不变量的静态护栏（退出路径 / 删除判据 / 缓存键 …）
 
@@ -435,15 +436,15 @@ enc.key    ───直接─→ 云端对象里的 crypto / magic 密文（文�
 
 结论不变：`enc-meta.json` 与 `enc.key` 必须**同等备份**，二者缺其一，crypto 密文在操作层面即永久不可解。反向的顾虑（元数据膨胀）由「孤儿元数据巡检」处理，它会列出候选但**不自动删除**（见「核心模块实现 → 孤儿元数据巡检」）。
 
-**密钥轮换：当前版本不可轮换（设计层面的硬约束）**
+**密钥轮换：DEK 与 `enc.key` 不可轮换（设计层面的硬约束）**
 
-`secret.key` 与 `enc.key` 都是「文件不存在就新生成一把」，代码里**没有任何 rekey 路径**。由此产生两条必须写进运维手册的后果：
+R97 起 `secret.key` 已由信封加密取代：**主口令与包裹 DEK 的 KEK 可以轮换**（`keyring.rewrap()` / `key-rotate.rotate()`，只重裹、不重加密）；但 **DEK 与 `enc.key` 仍没有 rekey 路径**，两者的语义都是「文件不存在就新生成一把」。由此产生两条必须写进运维手册的后果：
 
 - **不能靠「删掉密钥文件让它重新生成」来轮换**——那等于丢弃旧密钥，旧密文与旧配置立即永久不可读。
-- **`secret.key` 泄露**：只能在各厂商控制台吊销并重建子账号访问密钥、重设 WebDAV 口令、重设用户密码（`config.enc` 里的口令哈希随之整体作废）。
+- **`keyring.json` 与主口令同时泄露（或迁移前的 `secret.key` 泄露）**：只能在各厂商控制台吊销并重建子账号访问密钥、重设 WebDAV 口令、重设用户密码（`config.enc` 里的口令哈希随之整体作废）。
 - **`enc.key` 泄露**：只能走「全量下载 → 用新密钥重加密 → 重新上传」。顺序是 ① 备份现有 `enc.key` + `enc-meta.json`；② 逐个下载解密出明文（**这一步依赖老元数据，先动密钥就再也解不开**）；③ 停服、移除 `enc.key`（下次启动生成新密钥）；④ 重新上传，由服务端用新密钥加密并写入新元数据。**全程服务不可用，且产生双倍流量与存储费用**。
 
-> 引入密钥版本（`keyId`）+ 平滑轮换需要给每个密文对象与每个敏感 JSON 加版本标记并保留多代密钥，改动面覆盖 `config-store` / `enc-store` / `enc-meta` 索引，风险显著——目前**没有计划**，请按「不可轮换」来做容量与应急预案。
+> 引入密钥版本（`keyId`）+ DEK 的平滑轮换需要给每个密文对象与每个敏感 JSON 加版本标记并保留多代密钥，改动面覆盖 `config-store` / `enc-store` / `enc-meta` 索引，风险显著——目前**没有计划**，请按「DEK 不可轮换」来做容量与应急预案。（主口令 / KEK 的轮换不在此列：R97 已支持，且不触碰任何数据文件。）
 
 <h2 id="develop_document-section3">2. 环境变量</h2>
 
@@ -485,7 +486,7 @@ enc.key    ───直接─→ 云端对象里的 crypto / magic 密文（文�
 | `KEPLER_MASTER_PASSPHRASE` | 未设置 | 【R97】主口令（= 根用户登录口令）：**只**用于「进程启动时自动解锁」。无头部署（容器 / systemd）重启后没有人能点界面的解锁页，没有它就必须人工介入；设了它，`keyring.autoUnlockFromEnv()` 在启动阶段就把 DEK 解进内存。⚠️ 它等价于把这个实例的**解密能力**写进 `.env`，与 `secret.key` 落盘的风险同级 —— 只在「本机 `.env` 与 `data/` 同等受控」的前提下使用。**不设置**时进程以锁定态启动，由前端解锁页接管 |
 | `KEPLER_KEEP_LEGACY_KEY` | 未设置 | 【R97】设为 `1` 时迁移**保留** `data/secret.key`（逃生阀：想先观察一段时间再删的运维）。默认删除 —— 留着它等于留着一份能直接解密全部数据的明文，改造本身失去意义。保留时 `/key/status` 的 `legacyKeyPresent` 如实为 `true`（界面会显示「落盘风险仍在」） |
 | `INTEGRITY_SWEEP_MS` | `21600000`（6 小时） | 【R99】完整性巡检的周期；**设为 `0` 即整体关闭**（有的实例把对象存储当备份盘，不希望后台产生任何额外请求）。取 6 小时的理由：它防的是「云端被人动了而我们不知道」，不需要分钟级；而 6 小时 × 200 个对象/轮 ≈ 一天 800 个对象，让「被发现」的延迟与「被抓到之前损失多少」都落在可接受区间。**每次读**而不是启动时读一次，便于线上止血与测试驱动 |
-| `INTEGRITY_BATCH` | `200` | 【R99】每轮、每桶最多巡检多少个对象（`0` / 非法值退回默认）。它是「一次巡检别把云端请求配额吃光」的硬上限，与上面的周期共同决定「多久能覆盖全部对象」：一万个对象、每轮 200、每小时一轮 ≈ 两天覆盖一遍，请求量约等于一次浏览 |
+| `INTEGRITY_BATCH` | `200` | 【R99】每轮、每桶最多巡检多少个对象（`0` / 非法值退回默认）。它是「一次巡检别把云端请求配额吃光」的硬上限，与上面的周期共同决定「多久能覆盖全部对象」：一万个对象、每轮 200、每 6 小时一轮 ≈ 12.5 天覆盖一遍，请求量约等于一次浏览 |
 | `CAPTCHA_ENABLED` · `CAPTCHA_PROVIDER` · `CAPTCHA_SITE_KEY` · `CAPTCHA_SECRET_KEY` | 未设置 | 登录验证码的预设值；**仅当环境变量真实存在时**才写入配置，用于无界面部署时预设，不会用空值覆盖已保存的配置。`CAPTCHA_PROVIDER` 决定用哪一套，`CAPTCHA_SITE_KEY` / `CAPTCHA_SECRET_KEY` **只作用在被选中的那一套**上（两套凭证各自独立保存，见 §7.1 的 `/captcha/config`） |
 | `NATIVE_CAPTCHA` | 未设置（= 关） | 【R100】原生验证码分支的总开关，`on` / `1` / `true` / `yes` 才算开（**拼错一律当关闭**）。开着的意思是「带 `X-Kepler-Client` 头的请求改答一道本机算术题，不再要 reCAPTCHA token」。**默认关闭是刻意的**：算术题对脚本透明、请求头也可伪造，打开它等于给所有知道这个头的人一条绕过 reCAPTCHA 的路。仅当「确实有原生 App 要登录」且「愿意用弱验证换可用性」时才开 |
 | `NATIVE_CAPTCHA_CLIENTS` | `kepler-android/` | 【R100】允许走原生分支的客户端标识**前缀**，逗号分隔（按 `X-Kepler-Client` 头的值做前缀匹配）。刻意不支持通配 `*` —— 那等于「任何带头即放行」，白名单至少能挡住无意识的绕过。留空回落到默认值 |
@@ -572,7 +573,7 @@ s3-client.js（内置）              azure-client.js（内置）
 
 | 取向 | 说明 |
 | --- | --- |
-| **不强行统一字段名** | 三家平台各自沿用官方文档命名：支付宝 `app_id` / `private_key` / `alipay_public_key` / `sign_type`；微信支付 `mchid` / `appid` / `api_v3_key` / `serial_no` / `private_key`；PayPal `client_id` / `client_secret` / `mode`。界面在每个字段旁标注官方字段名，可直接对照其控制台填写 |
+| **不强行统一字段名** | 四家平台各自沿用官方文档命名：支付宝 `app_id` / `private_key` / `alipay_public_key` / `sign_type`；微信支付 `mchid` / `appid` / `api_v3_key` / `serial_no` / `private_key`；云闪付 `merId` / `certId` / `privateKey` / `unionpayPublicKey` / `signMethod`；PayPal `client_id` / `client_secret` / `mode`。界面在每个字段旁标注官方字段名，可直接对照其控制台填写 |
 | **校验规则集中** | 全部 `pattern` 与专用校验器（PEM 私钥 / 公钥、https URL）都写在 `server/payment-providers.js` 一处；前端拿到的是同一份规则的可序列化副本，用于即时提示，**最终裁定永远在服务端** |
 | **可扩展为真实校验** | 提供 `registerValidator(platformId, fn)` 扩展点。接入 SDK 后登记联机校验即可将「本地格式校验」升级为「凭证有效性校验」，路由与前端无需改动 |
 | **敏感字段不外泄** | 密钥 / 证书 / Secret 任何接口都不回传明文，只返回「是否已配置」；保存时留空 = 保持现有值不变，避免界面保存误清空 |
@@ -603,7 +604,7 @@ s3-client.js（内置）              azure-client.js（内置）
 
 直接收集、传输或存储卡号（PAN）、有效期、CVV 属于 **PCI-DSS 的合规范围**（不是「接个 SDK 就自动合规」，而是整套网络分段、日志脱敏与年度评估）。当前架构偏向轻量级，若在服务端或前端明文处理卡信息，将直接面临法律合规风险与数据泄露隐患。
 
-欧美及多数地区强制要求强客户身份验证。这需要前端集成动态挑战流程（iframe / 重定向），后端维护验证会话状态。当前 `payment-gateway.js` 的 `createCharge` 只回一个收银台跳转链接或二维码（`{ ok, payUrl | qrCode }`），没有处理 3DS 挑战所需的异步状态机。
+欧美及多数地区强制要求强客户身份验证。这需要前端集成动态挑战流程（iframe / 重定向），后端维护验证会话状态。当前 `payment-gateway.js` 的 `createCharge` 回 `{ ok, kind?, url?, codeUrl?, svg?, tradeNo?, error? }`（`kind` 区分跳转 / 二维码，`url` / `codeUrl` / `svg` 视渠道给出），没有处理 3DS 挑战所需的异步状态机。
 
 项目本身方面，当前 `payment-rules.js` 的计费与交付逻辑未设计「预授权冻结」「部分捕获」「长周期状态轮询」等机制，强行接入会导致「发货后资金未实际结算」或「退款状态不同步」。系统强依赖公网可达的 `notify_url`。信用卡支付网关会推送数十种事件类型（成功、失败、部分退款、争议发起、仲裁结果）。若当前回调路由未实现严格的幂等性校验、事件签名验签、多状态并发处理，极易引发重复发货、对账错乱或安全漏洞。Visa / Mastercard 仅对持牌金融机构或大型商户开放直连，通常必须通过聚合网关（Stripe、Adyen、PayPal Advanced、Checkout.com）间接接入。当前 `payment-providers.js` 只定义了四家现有平台（支付宝 / 微信支付 / 云闪付 / PayPal）**直连**所需的凭据字段（如 `appId` / `privateKey` / `mchId` / `apiV3Key` / `clientId` / `clientSecret` / `merchantId`），并未设计「SDK 托管模式」或「前端 Token 化」接口，需重构网关层以适配聚合网关的 PaymentIntent、Customer、Source 等现代支付对象模型。
 
@@ -806,21 +807,19 @@ s3-client.js（内置）              azure-client.js（内置）
 | `safe-buffer@5.2.1` | 无抛错的 Buffer API |
 | `safer-buffer@2.1.2` | iconv-lite 使用的 Buffer 安全层 |
 
-<h5>J. ECMAScript 规范垫片（intrinsic 抽象层，15 个）</h5>
+<h5>J. ECMAScript 规范垫片（intrinsic 抽象层，13 个）</h5>
 
-> 这组不实现业务功能，而是按 ECMA-262 规范安全访问 JS 内建能力，兼容老引擎并防原型污染。
+> 这组不实现业务功能，而是按 ECMA-262 规范安全访问 JS 内建能力，兼容老引擎并防原型污染（清单按当前 `package-lock.json` 的运行时闭包）。
 
 | 包 | 作用 |
 | --- | --- |
 | `get-intrinsic@1.3.0` | 按规范名获取原始内建（`%Object.prototype%`） |
-| `call-bind@1.0.4` | 安全 `Function.prototype.call/bind`（拒绝原始值 this） |
 | `call-bind-apply-helpers@1.0.2` | call / apply / bind 的分实现 |
 | `call-bound@1.0.4` | `callBind(intrinsic)` 的简写（绑定好的方法） |
 | `function-bind@1.1.2` | `Function.prototype.bind` 实现 |
 | `es-define-property@1.0.1` | 规范语义的 `[[DefineOwnProperty]]` |
 | `es-object-atoms@1.1.2` | `ToObject` / `RequireObjectCoercible` 原语 |
 | `es-errors@1.3.0` | 规范错误类型构造器 |
-| `es-set-prototypeof@1.2.0` | 规范语义的 `[[SetPrototypeOf]]` |
 | `get-proto@1.0.1` | 获取 `[[Prototype]]`（含跨 realm） |
 | `dunder-proto@1.0.1` | 通过 `__proto__` 访问器读原型 |
 | `gopd@1.2.0` | `Object.getOwnPropertyDescriptor` 兜底 |
@@ -967,16 +966,16 @@ Shamir 秘密分享（SSS）把一把密钥切成 `n` 份、任 `k` 份可重构
 
 - 本项目为个人项目，未经企业级安全审计，请勿直接用于企业生产环境。
 - WebDAV 的 **PUT 写入**为全量缓冲（整份文件进内存后才加密上传），属设计权衡，暂不优化；**读取侧支持 HTTP Range 断点续传**，二者不冲突——前者是写入路径，后者是读取路径。
-- **`magic` 加密模式有硬性性能上限**：它的密钥流是纯位置函数（每 32 字节做一次 SHA-256），生成成本与数据量线性相关，且**在单线程里同步生成**。48MB 的分片会把事件循环阻塞约 3 秒，期间全站（含 WebDAV 与所有下载）失去响应。因此分片上传在 `magic` 模式下把单片上限压到 **5MB**（`MAGIC_CHUNK_MAX`），代价是同样的文件产生更多分片与更多请求。**这个值不能继续下调**：AWS S3 要求「除最后一片外」每片 ≥ 5MB，再小会在合并时报 `EntityTooSmall`（腾讯云 COS 允许 1MB、阿里云 OSS / 华为云 OBS 允许 100KB，但必须取各厂商中最严的那个）。**该上限同时约束三条入口**：分片上传的 `chunkSize`、直传（`/fs/upload/simple`，`express.raw` 上限 64MB）与 WebDAV PUT（全量缓冲后一次性加密）——后两者由加密入口 `encryptBuffer` 自身按模式拒绝，不再依赖调用方各自计算；此外「会话创建时为非 magic、上传中途管理员切到 magic」的续传路径会被**如实拒绝**（409），因为分片偏移由 `chunkSize` 决定，中途改小会与已传分片边界错位（涉及已落盘数据语义的参数不可中途变更）。彻底解决需要把密钥流换成可并行 / 可预计算的构造，那会改动密文格式并影响存量数据，**当前不做**。启用 `magic` 前请评估单文件大小与并发上传数；对性能敏感的场景请用 `crypto`（AES-256-GCM 走原生实现，无此问题）。
+- **`magic` 加密模式有硬性性能上限**：它的密钥流是纯位置函数（每 32 字节做一次 SHA-256），生成成本与数据量线性相关，且**在单线程里同步生成**。48MB 的分片会把事件循环阻塞约 3 秒，期间全站（含 WebDAV 与所有下载）失去响应。因此分片上传在 `magic` 模式下把单片上限压到 **5MB**（`MAGIC_CHUNK_MAX`），代价是同样的文件产生更多分片与更多请求。**这个值不能继续下调**：AWS S3 要求「除最后一片外」每片 ≥ 5MB，再小会在合并时报 `EntityTooSmall`。实际单片大小由 `magicChunkCap(provider)` 给出 = `max(5MB, providers.fixedPartBytes(provider))` —— 对分片长度有硬性约定的厂商（如 UCloud US3 定长 8MB）取该厂商的固定值，其余厂商才是 5MB。**该上限同时约束三条入口**：分片上传的 `chunkSize`、直传（`/fs/upload/simple`，`express.raw` 上限 64MB）与 WebDAV PUT（全量缓冲后一次性加密）——后两者由加密入口 `encryptBuffer` 自身按模式拒绝，不再依赖调用方各自计算；此外「会话创建时为非 magic、上传中途管理员切到 magic」的续传路径会被**如实拒绝**（409），因为分片偏移由 `chunkSize` 决定，中途改小会与已传分片边界错位（涉及已落盘数据语义的参数不可中途变更）。彻底解决需要把密钥流换成可并行 / 可预计算的构造，那会改动密文格式并影响存量数据，**当前不做**。启用 `magic` 前请评估单文件大小与并发上传数；对性能敏感的场景请用 `crypto`（AES-256-GCM 走原生实现，无此问题）。
 - **加密对象的 HTTP Range 有 32MB 分界**：读取侧对加密对象是「完整下载 → 内存解密 → 切片」，因此**明文超过 `MAX_RANGE_BUFFER`（32MB）时会退化为全量流式解密并忽略 Range**，返回 200 + 全量长度。此时 WebDAV 的 HEAD **也不会宣告 206 + `Content-Range`**（R10-07）——否则续传客户端会按区间建多个连接、每个却收到整份内容，拼装出损坏文件。
 - **WebDAV 挂载写入不支持分片上传**：资源管理器里往挂载盘写大文件时走的是 PUT（全量缓冲），没有分片通道。因此在 `magic` 模式下写入超过 5MB 的文件会被明确拒绝（413），提示中会给出可执行出路（改用 `AES-256-GCM` 加密模式，或改用管理界面的文件上传——那里会自动按上限切分）。这不是 bug，而是「写入路径没有分片」这一设计事实的外显。
 - 会话令牌滚动续期涉及底层改动，暂不实现。
 - 子用户规模通常较小，不考虑多实例 / 集群部署。
-- CSRF Origin 校验目前以同源自定义头实现，更严格的 Origin 白名单校验计划在正式版提供。
+- CSRF 以同源自定义头（`X-Requested-With`）为主，并在其之上做 Origin / Referer 与 Host 同源比对（R24-06），`Origin: null` 直接拒绝。
 - **attestation 不做完整性链校验**：仅覆盖 ES256 签名算法，不处理 `packed` / `tpm` 等 attestation 格式的证书链验证（本系统信任首次注册的凭据，不做认证器厂商背书）。
 - 为安全起见，修改回源设置、跨域设置、修改访问权限等操作需前往服务商控制台，本程序不提供此类功能。
 - **审计日志不是取证级证据**：`data/logs.jsonl` 为**明文**、上限 5000 条且会轮转重写（高负载下可能只覆盖很短的时间窗），本机有权限的用户可随意编辑。它能回答「刚才发生了什么、谁在什么时候做了什么」，但**不具备抗篡改能力，不能用于抗抵赖**。需要长期留存请把日志外发到独立的日志系统。
-- **密钥不可轮换**：`secret.key` 与 `enc.key` 都没有 rekey 路径，两者的语义都是「文件不存在就新生成一把」。因此**删掉密钥文件再重启不是轮换，是销毁**——旧密文与旧配置立即永久不可读。`enc.key` 一旦泄露，处置只有「全量下载 → 用新密钥重加密 → 重新上传」，且必须**先保住老的 `enc-meta.json`**（否则连第一步的解密都做不了）。完整步骤见「目录结构 → 密钥轮换：当前版本不可轮换」。
+- **DEK 与 `enc.key` 不可轮换**：R97 起主口令 / KEK 可轮换（重裹同一 DEK），但 DEK 与 `enc.key` 都没有 rekey 路径，语义仍是「文件不存在就新生成一把」。因此**删掉密钥文件再重启不是轮换，是销毁**——旧密文与旧配置立即永久不可读。`enc.key` 一旦泄露，处置只有「全量下载 → 用新密钥重加密 → 重新上传」，且必须**先保住老的 `enc-meta.json`**（否则连第一步的解密都做不了）。完整步骤见「目录结构 → 密钥轮换：DEK 与 `enc.key` 不可轮换」。
 
 **关于 Windows Hello 的技术约束**：
 
@@ -1008,7 +1007,7 @@ Shamir 秘密分享（SSS）把一把密钥切成 `n` 份、任 `k` 份可重构
 | 浏览器侧被控（恶意扩展、XSS） | 会话可被冒用。CSP 与「默认纯文本渲染」只降低概率，不声称可防 |
 | 平台认证器被伪造 / 设备丢失 | 见上文 Windows Hello：`signCount` 在平台认证器上通常恒为 0，克隆检测在该场景不生效 |
 | 云端密文被删除或截断 | 完整性校验只能「检出」，不能「恢复」。答案在备份，见「目录结构」的备份清单 |
-| 内网对象存储的域名被 DNS 劫持 | 端点守卫刻意**不做** DNS 解析（见「服务端点守卫」），只拦截 IP 字面量与元数据地址 |
+| 内网对象存储的域名被 DNS 劫持 | 端点守卫在**保存端点时**做一次 DNS 解析复判，但**连接期不复判** —— 解析后地址漂移（TOCTOU）的缺口仍在，只是被显著收窄（见「服务端点守卫」） |
 | 合规 / 国密 / 等保要求 | 未做算法合规性评估。支付宝的 SM2 仅为其平台侧的签名算法选项，本系统的文件加密不使用国密。SM4 未引入的**实测依据与三条阻断理由**见「1.7 为何不引入 SM4 作为文件加密算法」（唯一权威定义） |
 
 **magic 模式的明确定位**：它是**混淆级**保护，用于对抗「有人顺手打开云盘控制台、看到一堆文件就想点开看看」这类弱动机窥探（密文文件头被魔数覆写，直接双击无法打开）。它**不**用于对抗有动机的攻击者：异或密钥流不具备语义安全——同一主密钥 + 同一盐下相同明文必产生相同密文，且只要知道任意一段明文就能反推出该段的密钥流，进而还原对象其余部分。需要真正的保密性请使用 crypto 模式。
@@ -1121,12 +1120,12 @@ Shamir 秘密分享（SSS）把一把密钥切成 `n` 份、任 `k` 份可重构
 
 
 - **密钥加密存储**：配置写入 `data/config.enc`，AES-256-GCM（随机 IV + 认证标签）；访问密钥不回传浏览器，界面仅显示掩码。**【R97】主密钥改为信封加密派生的「锁定态」模型**（详见 §「主密钥信封与登录密钥轮转」）：`data/keyring.json` 只存 `wrappedDek` + `salt`，明文密钥**永不落盘**；进程启动时处于锁定态，由主口令（= 根用户登录口令）经 scrypt 派生 KEK 解包 DEK。老实例的 `data/secret.key` 由一次显式的迁移动作取代（迁移成功即删除该文件）。
-- **账号口令存储**：登录口令以 **scrypt** 派生后只存盐与摘要——16 字节随机盐（32 位十六进制）、32 字节输出、代价参数取 Node 默认（N=16384 / r=8 / p=1）；校验用 `timingSafeEqual` 做定长比较，避免时序侧信道。必须使用**异步** scrypt（理由见「文件加密与元数据」）：同步版本会占满单线程事件循环，几十个并发请求就能让全站（含正在进行的下载与 WebDAV）一起卡死。WebDAV 口令因协议限制只能可恢复加密，与登录口令完全隔离（见「设计背景与刻意取舍」）。
+- **账号口令存储**：登录口令以 **scrypt** 派生后只存盐与摘要——16 字节随机盐（32 位十六进制）、32 字节输出、代价参数为 `N=2^17`（131072）/ `r=8` / `p=1`（R69 起新建哈希；`N=16384` 仅作为存量哈希的兼容回退值）；校验用 `timingSafeEqual` 做定长比较，避免时序侧信道。必须使用**异步** scrypt（理由见「文件加密与元数据」）：同步版本会占满单线程事件循环，几十个并发请求就能让全站（含正在进行的下载与 WebDAV）一起卡死。WebDAV 口令因协议限制只能可恢复加密，与登录口令完全隔离（见「设计背景与刻意取舍」）。
 - **文件加密**：加解密只在本机服务内发生，云端为密文；crypto 主密钥存于 `data/enc.key`、解密参数（IV / TAG / 盐 / 原始文件头）存于 `data/enc-meta.json`——**二者缺其一即永久不可解，必须同等备份**（完整清单见「目录结构」中的备份表）；查看密码以 scrypt 哈希存储、与加密密钥独立；加密对象禁止预签名直链，防止绕过查看密码。
 - **部署强制 HTTPS**：`HOST` 非回环时明文 HTTP 一律 301 跳转 HTTPS，会话 Cookie 自动附加 `Secure`；WebDAV 仅提供 HTTPS。
 - **暴力破解防护**：登录、加密查看密码、分享密码、WebDAV 认证均有 IP / 用户名级速率限制，连续失败触发指数退避锁定（上限 30 分钟）。
 - **CSRF 与安全头**：非安全方法必须携带同源自定义头 `X-Requested-With`；统一下发 CSP、`X-Content-Type-Options`、`Referrer-Policy`、`frame-ancestors` 等响应头。
-- **敏感数据加密落盘**：`enc-settings.json`、`enc-meta.json`、`links.json`、`ipguard.json`、`upload-sessions.json` 均经 `secret.key` 派生密钥加密（自动兼容并升级历史明文文件）；`enc.key` 写入后收紧为仅当前用户可读。
+- **敏感数据加密落盘**：`enc-settings.json`、`enc-meta.json`、`links.json`、`ipguard.json`、`upload-sessions.json` 均用主密钥直接做 AES-256-GCM 加密（`secure-store.js`，非二次派生；R97 起主密钥来自 `keyring.dek()`，迁移前为 `secret.key`），并自动兼容、升级历史明文文件；`enc.key` 写入后收紧为仅当前用户可读。
 - **原子写入**：所有持久化文件采用「临时文件 + rename」，避免进程被强制结束时截断；临时文件名带随机量（防同毫秒重名覆盖），启动时自动清扫历史遗留的孤儿临时文件（仅清理进程已不存在的）。
 - **单实例保护**：启动时获取 `data/.instance.lock` 独占锁，检测到另一个活跃实例即拒绝启动，避免两个进程交替整体覆盖 `config.enc`；崩溃残留的脏锁自动接管。
 - **错误消息脱敏**：对象存储错误被翻译为分类化中文提示（如「签名错误：请检查 AccessKey / SecretKey 是否正确」「网络连接异常」），SDK 原始信息仅写入服务端日志。
@@ -1145,7 +1144,7 @@ server/routes/
 ├── _context.js   # 依赖汇聚：统一 re-export 全部 server 模块（单一 DI 点）
 ├── _shared.js    # 共享工具与中间件：requireAdmin / requireConfig / 桶解析与统计缓存 / 错误响应
 ├── auth.js       # 登录 / 登出 / 当前用户 / 初始化（匿名白名单，最先挂载）
-├── users.js      # 用户 CRUD（全部管理员）
+├── users.js      # 用户 CRUD（管理接口全部管理员）+ `/users/me/*` 自助接口（改资料 / 昵称 / 注销，本人可达）
 ├── captcha.js    # 验证码与验证码配置
 ├── config.js     # 系统配置 / 访问密钥 / 连通性验证
 ├── buckets.js    # 本地桶增删改启停 + ACL 检查 + 容量统计 / 碎片 / 彻底删除（云端桶列表走 config.js 的 /config/verify）
@@ -1163,7 +1162,10 @@ server/routes/
 ├── webdav.js     # WebDAV 账户与服务控制（含明文密码接口，全部管理员）
 ├── links.js      # 分享链接（按创建者隔离）
 ├── fs.js         # 文件列表 / 搜索 / 上传 / 下载 / 重命名 / 移动 / 删除 / 目录树
-└── stats.js      # 测速 / 容量 / 概览 / 审计日志 / 健康检查
+├── stats.js      # 测速 / 容量 / 概览 / 审计日志 / 健康检查
+├── webauthn.js   # 【R97】Windows Hello（WebAuthn）凭据注册 / 关闭
+├── key.js        # 【R97】主密钥解锁 / 迁移 / 轮转（迁移与轮转仅根用户；解锁匿名可达）
+└── integrity.js  # 【R99】完整性巡检 / 防勒索校验（仅管理员；只读、不碰密钥）
 ```
 
 约定：
@@ -1296,7 +1298,7 @@ curl -i -c cookie.txt -X POST http://127.0.0.1:3000/api/auth/login \
   "webauthnRequired": true,
   "challenge": "vJ8dQ2lRbXk...（base64url，服务端一次性）",
   "rpId": "storage.example.com",
-  "timeout": 60000,
+  "timeout": 300000,
   "username": "admin",
   "remember": false,
   "credentialId": "AQIDBAUGBwg..."
@@ -1448,7 +1450,7 @@ curl -s -b cookie.txt 'http://127.0.0.1:3000/api/fs/search?prefix=photos/&q=shan
     { "key": "photos/2026/shanghai.jpg", "name": "shanghai.jpg", "size": 248192, "isFolder": false, "type": "image", "lastModified": "2026-09-10" }
   ],
   "scanned": 137,
-  "limit": 200,
+  "limit": 500,
   "cursor": "photos/2026/shanghai.jpg",
   "truncated": true,
   "hint": "该目录下还有未扫描的对象（本轮已扫描 137 个），可继续搜索。"
@@ -1502,7 +1504,7 @@ curl -s -b cookie.txt -X POST http://127.0.0.1:3000/api/fs/upload/init \
 | `multipart` | 走分片 | `{ mode, sessionId, chunkSize, uploadedParts, key }` |
 
 - **直传上限是随加密模式变化的（R10-05）**：未开启加密 / `AES-256-GCM` 模式为 **8MB**；「文件头魔数（magic）」模式为 **5MB**（`LIMITS.MAGIC_SYNC_MAX`）。magic 模式的同步加密有 5MB 上限，若 `init` 仍按 8MB 分界，`(5MB, 8MB]` 的文件会被判为 `simple` → 直传必然 413，而前端拿到 `simple` 又不会改走分片 —— 是一条死路。客户端**不要自己写死 8MB**，一律按响应的 `mode` 分支。
-- `chunkSize` 由服务端计算：`min(48MB, max(8MB, ceil(size/10000/1MB)·1MB))`，magic 模式再压一道 `min(·, 5MB)`（R8-02：单片同步阻塞上限；同时它是 AWS S3「除末片外每片 ≥ 5MB」的协议下限，两者在此重合，不可再往下调）。
+- `chunkSize` 由服务端计算：`min(48MB, max(8MB, ceil(size/10000/1MB)·1MB))`，magic 模式再压一道 `min(·, 5MB)`；但若厂商声明了固定分片长度（`providers.fixedPartBytes()`，如 UCloud US3 为 8MB），则取 `max(5MB, 固定值)`（R45；R8-02 的 5MB 是同步阻塞上限，同时是 AWS S3「除末片外每片 ≥ 5MB」的协议下限）。
 - `uploadedParts` 非空即**命中断点续传**：按「Key + Size + 创建者 + 目标桶」匹配到未完成会话且远端 `uploadId` 仍有效，客户端应跳过这些分片。
 - 会话 `provider` 随会话落盘（R7-01），后续 `chunk` / `complete` / `abort` 都按**会话自身**的厂商与桶解析凭据——上传中途切桶不会让已传分片作废。
 
@@ -1527,7 +1529,7 @@ curl -s -b cookie.txt -X POST http://127.0.0.1:3000/api/fs/upload/init \
 | POST | `/pay/notify/:platform` | 异步通知（**仅作触发器**，结果以服务端查单为准） |
 | GET/POST | `/s/:id/restore` | 【R64】**恢复购买**（匿名 + 已登录都可用）：填订单号取回下载权限。判定收敛到唯一实现点 `paymentOrders.claimForLink(no, linkId)` —— 订单**存在且属于本链接且状态为 `paid`** 才放行；成功时签发的是与真实支付**完全相同的**票据 Cookie `sp_<linkId>_pay`，因此页面判定、`GET /s/:id/dl`、`HEAD /s/:id/dl` 三处**一行都不用改**。<br>⚠️ 「订单号不存在」与「订单号不属于本链接」共用**同一条文案**（否则这个端点就成了订单号存在性预言机）；单独限流 `orderRestoreLimiter`（10 分钟 20 次） |
 | GET | `/s/:id/history` | 【R64】**查看历史订单**（需登录）：列出本账号在该链接下的付费订单（含已退款，如实标注）与**免费下载记录**（`data/downloads.json`，只记**首次**、重复下载不新增条目）。渲染时为每笔 `paid` 且链接仍存在的订单**补发**对应票据 Cookie，因此点「重新下载」不会再被送回付费墙。<br>⚠️ 只按订单上的 `userId` 快照归集，**绝不按 IP 归集**（同一出口 IP 背后可能是一整个办公室） |
-| POST | `/s/:id/logout` | 【R64】分享页右上角「退出登录」：销毁当前会话 + 清 `kepler_sid` Cookie 后 303 回原分享页。刻意是 **POST**（GET 会让任何一张 `<img src>` 都能替访客退出登录） |
+| POST | `/s/:id/logout` | 【R64】分享页右上角「退出登录」：销毁当前会话 + 清 `s3mgr_session` Cookie 后 303 回原分享页。刻意是 **POST**（GET 会让任何一张 `<img src>` 都能替访客退出登录） |
 | GET | `/api/payment/orders` | 订单列表（管理员） |
 | POST | `/api/payment/orders/:id/refund` | 标记订单为已退款（管理员；仅作记账，不发起网关退款） |
 | DELETE | `/api/payment/orders/failed` | **批量删除失效订单**（仅「支付失败」；管理员；「已支付」「已退款」与支付中的订单不受影响） |
@@ -1545,12 +1547,12 @@ curl -s -b cookie.txt -X POST http://127.0.0.1:3000/api/fs/upload/init \
 | POST | `/ipguard/restore-bans/unban` | 【R65】解封「取回下载权限」的连击封禁（**仅管理员**，请求体 `{ ip }`，回 `{ ok, ip, removed, restoreBans }`）。⚠️ 与上面的**规则表**是两张独立的表：规则是管理员自己配的拦截规则，而「取回封禁」由 `server/restore-guard.js` 在取回端点输错达上限时自动落盘（`data/restore-bans.json`），**只拦「用订单号取回下载权限」这一件事** —— 分享页浏览、`GET /s/:id/dl` 下载、上传、后台全部不受影响。到期（24 小时）自动解除，此接口用于管理员提前解封 |
 | GET | `/throttle/ceiling` | 查「上层已设的下载限速」（R37）：参数 `scope` + `id`/`bucket`，回 `{ limit, source, sourceLabel, layers }`。**不挂管理员守卫**——普通用户新建分享链接时也要能看到自己被上层限到多少 |
 | GET | `/backup/status` · `/backup/code` | 【R38】备份状态（是否允许导入 + 已配置项数 / 备份范围）与当前**实时备份码**（是「当前配置内容」的纯函数：改了设置才变，没改就不变）。两条**均仅管理员**——实时码里含 API Key / 支付凭证 / WebDAV 口令的**明文** |
-| POST | `/backup/export` | 【R38】导出配置：请求体 `{ password, backupPassword }`。`password` 是**当前账户口令**（权限验证，走 scrypt 校验 + 独立的导出限流器），`backupPassword` 是导出时**当场设置的独立备份密码**（用它把备份码密封，导入时必须原样输入）。回 `{ code, fingerprint, sections }`；账户口令错误回 403 |
+| POST | `/backup/export` | 【R38】导出配置：请求体 `{ password, backupPassword }`。`password` 是**当前账户口令**（权限验证，走 scrypt 校验 + 独立的导出限流器），`backupPassword` 是导出时**当场设置的独立备份密码**（用它把备份码密封，导入时必须原样输入）。回 `{ code, fingerprint, plainFingerprint, summary }`（`sections` 属于 `GET /backup/status`）；账户口令错误回 403 |
 | POST | `/backup/import` | 【R38】导入配置：请求体 `{ code, backupPassword }`。**仅当实例仍处于「首次初始化、尚未配置过任何可备份项」时才允许**，否则回 409。这条闸门**在解密之前**判定——在已配置实例上先解密再看结果，会把「备份密码对不对」从响应差异里泄成一条口令预言机。导入是**整批覆盖**语义（原有设置全部丢失） |
 | PUT | `/buckets/local/:id/block-overseas` | 按桶开关海外 IP 屏蔽 |
 | GET | `/smtp/config` · `PUT /smtp/config` | 【R53】发信设置（SMTP）读取 / 保存（**均仅管理员**）。读取回的是**安全视图**：`{ enabled, host, port, secure, user, from, fromName, hasPassword, configured, updatedAt }` —— **口令明文永不出服务端**，界面只能看到 `hasPassword` 布尔值。保存是 **PATCH 语义**：缺省字段保持原值；口令三态（`null` = 清除 / `''` 或省略 = 保持不变 / 其它 = 覆盖）。入参非法一律 **400 显式报错**，不静默改写。⚠️ `enabled` 是**系统自动发信**（验证码 / 重置密码）的总闸门：停用后这类邮件一律不发（`server/email-code.js` 的 `sendCodeMail()` 抛 503，文案写明是「**已停用**」而不是「未配置」）。它与 `configured` 回答的是**两个不同的问题** —— `configured` = 「配没配」，`enabled` = 「开没开」；停用**不会**让 `configured` 变假（否则卡片会显示成「未配置」，而配置其实还在） |
 | POST | `/smtp/test` | 【R53】发送测试邮件（**仅管理员**）。请求体可带**尚未保存**的字段（按 PATCH 语义覆盖已保存配置后发信），`to` 留空 = 发给发件人自己。⚠️ **不受 `enabled` 开关限制** —— 它是管理员手动触发的一次性动作；若加以限制，管理员就必须「先开启、才能验证」，而开启之后配置若有误，所有依赖发信的功能都会一起受影响 |
-| GET | `/site/info` | 【R54】公开的站点名称（**匿名可达**，已登记进 `index.js` 的匿名白名单 `PUBLIC_API`）：**只回** `{ ok, siteName }` 两个字段。登录页在**拿到会话之前**就要用它设置浏览器标题栏，故不能挂管理员守卫，也刻意不多回任何一个字段 |
+| GET | `/site/info` | 【R54】公开的站点名称（**匿名可达**，已登记进 `index.js` 的匿名白名单 `PUBLIC_API`）：**只回** `{ ok, siteName, registration }` 三个字段（`registration` 供登录页判断是否开放注册）。登录页在**拿到会话之前**就要用它设置浏览器标题栏，故不能挂管理员守卫；键数由 `tests/audit54-regressions.test.js` 断言，刻意不多回任何一个字段 |
 | GET · PUT | `/site/config` | 【R54】站点设置读取 / 保存（**均仅管理员**）：`{ siteName, registration, defaultRole, notices, updatedAt }`。`registration` 为 `open`（可随意注册）/ `invite`（注册时必须填写邀请码）/ `closed`（不开放注册，需管理员添加用户），`defaultRole` 是新注册用户直接赋予的身份。保存是 **PATCH 语义**（缺省字段保持原值），`siteName` **留空即恢复默认站点名**；入参非法一律 **400 显式报错**，不静默改写。⚠️ **没有启用开关** —— 该功能默认开启。<br>【R68】`notices` 是**三页协议提示**（`login` / `register` / `share`，每页 `{ enabled, text }`）：`enabled` 只认布尔真值（字符串 `"false"` **不算开**）；`text` 是**单行**文案（含 `<a>` 也合法，**含换行即 400**，≤300 字），留空表示用内置的默认句。保存时**逐页逐字段合并** —— 只提交 `register` 一页不会把另外两页清掉；不认识的页名一律 400（否则拼错的 `loging` 会静默存进去、页面上什么也不会发生） |
 | GET | `/site/agreements` | 【R68】公开的协议提示与正文（**匿名可达**，已登记进 `index.js` 的 `PUBLIC_API`）：回 `{ ok, show, notices, docs }`。`show[page]` 是**实际会不会显示**（开关打开 **且** 至少有一份正文写了，两件事都成立），不是开关本身 —— 前端拿它决定显隐，不必自己再算一遍；`notices[page]` 是渲染好的 HTML（不显示时为空串）；`docs` **只含这段文案真正引用到的**协议（三页全关时是空对象，一条正文都不跟着发出去）。⚠️ 与 `/site/info` 同一条纪律：匿名接口能少给就少给 |
 | GET · PUT | `/agreements/config` | 【R68】协议设置读取 / 保存（**均仅管理员**）：`{ terms, privacy, updatedAt }`，两份协议正文的**源文本**（Markdown，各 ≤20000 字，**允许换行**，`\r\n` 一律归一成 `\n`）。保存是**严格 PATCH**：只写给出的那一份（`terms` / `privacy` 都不给即 400「请至少提交一份协议正文」），空串合法并**就是「清空这一份」的语义**（此时所有指向它的链接退化成纯文字）。⚠️ 长度判据落在**路由层**（非法一律 400）而不是落盘时静默截断 —— 截断会让管理员以为保存成功、实际只存进前半份 |
@@ -1627,7 +1629,7 @@ curl -s -b cookie.txt http://127.0.0.1:3000/api/links
 | `path` | string | ✔ | **字段名是 `path`，不是 `key`**。必须指向文件——以 `/` 结尾（目录）一律 400「不支持分享文件夹」 |
 | `expiresHours` | number / null | ✘ | 缺省 **168**（7 天）。`0` / `null` / `''` 表示**永久有效**；否则须为正数，上限 `24 × 3650`（10 年） |
 | `maxDownloads` | integer | ✘ | 缺省 `0` = 不限制。须为 ≥ 0 的整数，上限 1e9 |
-| `password` | string / null | ✘ | 缺省 `null`。长度 1–64 字符；传 `null` / `''` 表示不启用或**清除**已有密码 |
+| `password` | string / null | ✘ | 缺省 `null`。长度 **4–64** 字符（R94 起下界为 4）；传 `null` / `''` 表示不启用或**清除**已有密码 |
 | `paid` | object / null | ✘ | `null` = 关闭付费下载。否则为 `{ required, amount }`——**`amount` 单位是「元」**，与响应里的 `amountFen`（分）不同。`required: true` 而金额 ≤ 0 → 400；`required: false` 时金额**仍会保留**，便于下次直接打开开关 |
 | `resetCount` | boolean | ✘ | 仅 `PUT` 有效：是否把已下载次数清零。非布尔值 → 400 |
 
@@ -1747,7 +1749,7 @@ curl -s -b cookie.txt -X POST http://127.0.0.1:3000/api/payment/orders/po_1d3f5a
 
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
-| `GET` | `/api/payment/config` | 总开关 + 三家平台表单定义 + 已保存配置 + 可用渠道（敏感字段仅回传是否已配置） |
+| `GET` | `/api/payment/config` | 总开关 + 四家平台表单定义（支付宝 / 微信 / 云闪付 / PayPal）+ 已保存配置 + 可用渠道（敏感字段仅回传是否已配置） |
 | `PUT` | `/api/payment/enabled` | 总开关；无任何渠道开启时拒绝启用 |
 | `PUT` | `/api/payment/site-url` | 站点地址（回跳 / 回调基准），必须以 `http(s)://` 开头 |
 | `GET` | `/api/payment/orders` | 订单列表（含文件名、链接、商户单号、付款时间、是否已下载） |
@@ -1792,7 +1794,7 @@ curl -s -b cookie.txt -X POST http://127.0.0.1:3000/api/payment/orders/po_1d3f5a
 | 标记为已退款 | `status=refunded` + `refundedAt` | 仅「已支付」订单可标记；管理员操作，走二次确认 | 不可逆：`markPaid` / `markFailed` 一律拒绝改写；重复标记保持幂等（第二次返回 400） |
 | 分享者改价 | 只改 `link.paid.amountFen` | 同上金额规则 | **已支付订单仍有效**（按支付时的金额快照）；新订单按新价 |
 
-> **币种语义**：`currency` 恒为 `CNY`——它是 `payment-rules.js` 中的常量，写入分享链接时由 `normalisePaid` 强制归一，接口不接受其他取值。PayPal 本身支持多币种，但本系统不开放：各币种的最小单位并不相同（JPY 无小数位、KWD 为三位小数），「以分为整数」这一金额语义只对人民币成立，放开币种等于引入一整类舍入错误。
+> **币种语义**：`currency` 恒为 `CNY`——它是 `payment-rules.js` 中的常量，写入分享链接时由 `normalizePaid` 强制归一，接口不接受其他取值。PayPal 本身支持多币种，但本系统不开放：各币种的最小单位并不相同（JPY 无小数位、KWD 为三位小数），「以分为整数」这一金额语义只对人民币成立，放开币种等于引入一整类舍入错误。
 
 <h3 id="develop_document-section35">8.6 已支付凭证</h3>
 
@@ -1840,8 +1842,8 @@ curl -s -b cookie.txt -X POST http://127.0.0.1:3000/api/payment/orders/po_1d3f5a
 
 规则同「设计背景与刻意取舍 → [支付结果仅限服务端查单返回](#develop_document-section10)」（**权威定义，此处不重复**）。支付侧的两个具体落点：
 
-- **三个触发点**：同步回跳 `/s/:id/pay/return`、前端轮询 `/s/:id/pay/check`、异步通知 `POST /pay/notify/:platform`。三者都只负责**触发一次查单**，成功与否一律以查单结果为准。
-- **两处限流**：轮询最小间隔 3 秒，且查单接口本身挂限流器。该端点匿名可达，且会携带真实商户凭据向平台查单——缺少限流时任何人扫到回调地址即可反复触发查单、刷光平台的查单配额。
+- **四个触发点**：同步回跳 `/s/:id/pay/return`、前端轮询 `/s/:id/pay/status`、异步通知 `POST /pay/notify/:platform`，以及「我已完成支付」按钮的 `POST /s/:id/pay/check`。四者都只负责**触发一次查单**，成功与否一律以查单结果为准。
+- **三层限流**：订单级最小间隔 3 秒，`payCheckLimiter`（手动查单）与 `payStatusLimiter`（轮询）各自按 IP 限额。该端点匿名可达，且会携带真实商户凭据向平台查单——缺少限流时任何人扫到回调地址即可反复触发查单、刷光平台的查单配额。
 
 **新增一家支付平台的步骤**：① 在 `server/payment-providers.js` 定义 `fields`（含 `official` 官方字段名、`pattern` / `validator` / `secret` 标记、`maxLength`）；② 需要联机校验时用 `registerValidator(platformId, fn)` 登记，路由与前端无需改动；③ 在 `server/payment-gateway.js` 实现 `createCharge` / `queryCharge`——**查单必须 fail-closed**（异常即视为未支付，不放行）；④ 前端 `paysettings.js` 的表单由服务端下发的同一份字段定义渲染，通常无需改动，只需在 `server/payment-logos.js` 的 `SHAPES` 表追加图形（前台与后台同时生效 —— 前端不再持有图形副本）。
 
@@ -1944,21 +1946,21 @@ R22-04：本库「解密下发」共三个出口 —— 管理端 `/api/fs/downl
 | --- | --- | --- |
 | `missing` | HEAD 返回 404 / `NoSuchKey` | 对象被删、被生命周期规则清掉、桶被换 |
 | `size` | `Content-Length` ≠ 由 `enc-meta` 推导的密文长度 | 截断、拼接、被换成别的文件、上传中断 |
-| `modified` | 云端 `Last-Modified` 晚于本地 `createdAt`（5 分钟容差） | **同长度的原位覆盖**（勒索软件 / 同步工具回写） |
+| `modified` | 云端 `Last-Modified` 晚于 `max(createdAt, cloudWrittenAt)`（R101；5 分钟容差） | **同长度的原位覆盖**（勒索软件 / 同步工具回写） |
 
 密文长度的推导公式（与 `enc-store` 的加密实现逐字节对应，常量共用 `CRYPTO_MAGIC` / `IV_LEN` / `TAG_LEN`，不各写一份）：
 
 - `crypto` 模式：`[COSCENC01][iv(12)][ct][tag(16)]`，分片上传时**只有首片**带魔数头 ⇒ 总长 = 魔数长 + Σ(12 + ctLen + 16)。
-- `magic` 模式：覆写文件头 + 流式异或，密文**与明文等长**。
+- `magic` 模式：覆写文件头 + 流式异或，密文长度 = `max(origSize, magicLen)`：明文不短于魔数时与明文等长；明文短于魔数（空文件 / `.gitkeep` 等）时恒为魔数长度（R101）。
 
 <h4>1.6.2 边界、成本与执行顺序</h4>
 
 - **不重算 `enc-meta` 里的 sha256**。那些摘要是**明文**的，重算必须先把密文解出来，而巡检的红线是「不碰密钥」：不解锁、不读 DEK、不做任何解密。它必须在「进程锁定」时也能安全地什么都不做，而不是变成一条「必须解锁才能跑」的后台任务。
 - **抓不到什么（写清楚，不是遗漏）**：长度与 `Last-Modified` 都被保持一致的原位篡改。那种只能靠**下载时**的 GCM tag / 明文摘要发现。攻击者若能连对象时间戳都保持一致，本地就没有任何离线证据可用。
-- **候选集与成本**：候选集 = `enc-meta.json` 的键（「我们加密过哪些对象」的唯一权威），不是列举云端的结果 —— 列举回答的是「桶里有什么」，既证明不了「我们那份还在」，也解释不了「少了一个对象」是删了还是改名了。轮转游标 + 每轮上限（`INTEGRITY_BATCH`，默认 200）把成本摊平：一万个对象、每 6 小时一轮、每轮 200 ≈ 两天覆盖一遍，云端请求量约等于一次浏览。命中 `search-candidates`（全桶递归搜索留下的候选集）时连 HEAD 都省掉 —— 但它是一份明确可能过期的清单，**只许省请求、不许当判据**。
+- **候选集与成本**：候选集 = `enc-meta.json` 的键（「我们加密过哪些对象」的唯一权威），不是列举云端的结果 —— 列举回答的是「桶里有什么」，既证明不了「我们那份还在」，也解释不了「少了一个对象」是删了还是改名了。轮转游标 + 每轮上限（`INTEGRITY_BATCH`，默认 200）把成本摊平：一万个对象、每 6 小时一轮、每轮 200 ≈ 12.5 天覆盖一遍，云端请求量约等于一次浏览。命中 `search-candidates`（全桶递归搜索留下的候选集）时连 HEAD 都省掉 —— 但它是一份明确可能过期的清单，**只许省请求、不许当判据**。
 - **「不存在」的口径必须比「出错了」窄**：只认 404 / `NoSuchKey` / `NotFound`；403（凭据缺 HeadObject 权限）、5xx、网络超时一律计「跳过」。把探测失败当成「对象没了」，凭据一过期就是整屏假警报，而**真正的丢失会被淹没** —— 在这个功能里，假阳性的代价高于漏报（用户会立刻学会无视它）。
 - **第一条判据是「锁定态」**：`enc-meta.json` 是加密文件，锁定期间读它会把 `metaCorrupt` 置真并让本进程永久拒写元数据 —— 一次巡检就能把全站上传打坏。锁定则一步都不往下走（不枚举桶、不读元数据、不发任何云端请求），且「锁定」与「元数据损坏」报**两个不同的原因**（处置完全不同：去解锁 vs 去修数据）。
-- **不自动跑**：`GET /integrity` 只读内存里的最近一次结果，`POST /integrity/run` 才是显式动作 —— 每次巡检都是真实的云端请求，而「打开系统设置页」这个动作里不包含「我同意花掉这些请求」的意思。
+- **会定时自动跑，也可手动触发**：启动 60 秒后跑首轮，此后按 `INTEGRITY_SWEEP_MS`（默认 6 小时）周期执行，两个定时器都 `unref()`；`GET /integrity` 只读内存里的最近一次结果，`POST /integrity/run` 是显式立即执行（与定时器撞车时合流为同一次）。自动跑之所以成立，是因为成本已由「轮转游标 + 每轮上限」摊平，而不是每轮全量扫。
 
 <h4>1.6.3 异常通知：把「查出来了」变成「被告知」（R103）</h4>
 
@@ -2108,7 +2110,7 @@ R22-04：本库「解密下发」共三个出口 —— 管理端 `/api/fs/downl
 - 仅接受 http / https 协议；非回环地址一律要求 https，否则访问密钥将以明文暴露在链路上；
 - 回环地址与私网 / 链路本地 / 保留 IP 字面量默认拒绝，可用 `ALLOW_LOOPBACK_ENDPOINT=1`、`ALLOW_PRIVATE_ENDPOINT=1` 显式放开内网对象存储场景；
 - 云平台实例元数据地址永远拒绝，不受上述开关影响；
-- **不对域名做 DNS 解析后再判定**：解析会引入新的解析面与 TOCTOU 问题，且内网对象存储常以内部域名暴露。只判定 IP 字面量与元数据主机名，是在不破坏既有内网部署前提下的务实边界。
+- **两层判据**：同步判据（IP 字面量 / 元数据主机名 / 协议 / 私网开关）**始终生效**；在**保存端点时**额外做一次 DNS 解析复判（`assertSafeEndpointResolved()`，`routes/config.js` 四处落库前与备份导入各复核一次）。**连接期不再复判**，因此「解析后地址漂移」（TOCTOU）的缺口仍然存在、只是被显著收窄 —— 既不把它写成「完全没有这层防护」，也不假装它是完整闭环。
 
 <h2 id="develop_document-section65">12. 上传过滤匹配器</h2>
 
@@ -2125,12 +2127,12 @@ R22-04：本库「解密下发」共三个出口 —— 管理端 `/api/fs/downl
 - 日志类追加改用 `appendFile` 而非「读全文件 + 整体替换」，消除 O(n) 写放大；代价是崩溃时可能只损坏最后一行，对日志场景可以接受。配置类文件仍走原子写入。
 - 敏感 JSON 统一以 AES-256-GCM 加密落盘，主密钥复用配置主密钥；兼容历史明文文件，读取时自动识别、写入时自动升级。写入按文件维度串行化，避免并发交错导致文件损坏。
 - 单实例锁基于独占创建的锁文件，锁内记录 pid；持有者进程已不存在时自动接管。其目的在于避免两个进程各自持有配置缓存并交替整体覆盖 `config.enc`。
-- 优雅关闭顺序：停止接收新请求 → 刷出日志缓冲 → 等待敏感数据异步写完成 → 配置落盘 → 停止 WebDAV → 退出，并设置兜底超时。
+- 优雅关闭按顺序收摊以下状态（`server/index.js` 的 `done()`），最后退出并设兜底超时：① 刷日志缓冲（`flushLogsSync`）→ ② 刷统计（`flushStatsSync`）→ ③ 上传会话落盘（`uploadSessions.flush`）→ ④ 加密元数据同步落盘（`encStore.flushMetaSync`）→ ⑤ 支付订单落盘（`paymentOrders.flush`）→ ⑥ 取回封禁落盘（`restoreGuard.flush`）→ ⑦ 关闭加密线程池（`encPool.shutdown`）→ ⑧ 等待 `secureStore.flush` 与 `configStore.flush` 完成；随后关闭 WebDAV、释放单实例锁、`process.exit(0)`。漏掉 ③~⑥ 任一项，进程重启后就会丢上传会话 / 加密元数据 / 订单状态 / 取回封禁。
 
 <h2 id="develop_document-section67">14. 前端模块与渲染约定</h2>
 
 - 前端为原生 ES Module，无构建步骤；模块按职责划分，管理端能力按角色物理分离（动机见「设计背景与刻意取舍」）。
-- **唯一的非 ESM 例外是 `pay-poll.js`**：它服务于服务端渲染的分享页，需要从 `<script data-link-id>` 属性上取参数，而 `document.currentScript` 在 `type="module"` 脚本里恒为 `null`，因此写成普通脚本。它曾经是页面里的内联 `<script>`——CSP 移除 `script-src 'unsafe-inline'` 后那段脚本被浏览器静默拒绝执行，「支付成功后自动放行」的承诺随之失效；抽成同源静态文件即落回 `script-src 'self'` 之内。**分享页与主站共用同一套 CSP**，因此分享页模板里同样不允许出现内联脚本或内联事件处理器。
+- **非 ESM 例外共有 4 个：`pay-poll.js`、`theme.js`、`share-list.js`、`share-order.js`**（`tests/frontend.test.js` 逐个断言它们是普通脚本）。它们都服务于服务端渲染的分享页 / 首屏，需要从 `<script data-…>` 属性或 `document.currentScript` 取参数，而 `document.currentScript` 在 `type="module"` 脚本里恒为 `null`，因此写成普通脚本。`pay-poll.js` 曾经是页面里的内联 `<script>`——CSP 移除 `script-src 'unsafe-inline'` 后那段脚本被浏览器静默拒绝执行，「支付成功后自动放行」的承诺随之失效；抽成同源静态文件即落回 `script-src 'self'` 之内。**分享页与主站共用同一套 CSP**，因此分享页模板里同样不允许出现内联脚本或内联事件处理器。
 - **请求序号**：文件区所有异步加载共用一个计数器，发起前自增，响应到达时若自身已不是最新一次则丢弃结果。在途时直接返回会把用户的后续操作静默丢弃，比不互斥更糟。自增必须落在「确认会发起请求」之后——早退分支同样自增会把在途请求判为过期而无人收尾，加载态将永久卡住。
 - 序号只解决「旧结果不该覆盖新结果」，解决不了「服务端那一轮仍在空转扫描」，因此另配 `AbortController`：发起新一轮前取消上一轮，服务端检测到连接断开即停止翻页。主动取消必须原样抛出，不可被改写成「无法连接本地服务」这类误导性提示。
 - 渲染必须幂等。登出与登录成功两个时点都要重置主视图并清空各模块的渲染缓存，否则下一个账号会看到上一个账号停留的区块。
@@ -2187,15 +2189,13 @@ R22-04：本库「解密下发」共三个出口 —— 管理端 `/api/fs/downl
 
 > 文件名中的轮次编号（1 / 3 / 5 / 6 / 7 / 8 / 9 / 10 / 11 / 12 / 13 / 14 / 16 / 17 / 21 / 22 / 25 / 26 / 27 / 28 / 29 / 31 / 32 / 33 / 34 / 35 / 36 / 37 / 38 / 40 / 41 / 42 / 43 / 44 / 45 / 47 / 48 / 49 / 50 / 51 / 52 / 53 / 54 / 89）沿用审计当时的命名：若干轮次（第 2、4、15、18～20、23、24、30、39、46 轮）没有各自的独立护栏文件，其结论已并入相邻轮次或既有护栏文件，因此编号不连续——**这并不表示存在护栏缺口**。`invariants.test.js` 不属于任何一轮，它是跨轮次不变量的常驻护栏。同一轮可以有两个文件（第 14 轮即 `audit14-regressions` 管正确性、`audit14-perf` 管性能与新增原语；第 54 轮按用户确认的**三步走**拆分，第①步 `audit54-regressions` 管「站点设置」卡片、第②步 `audit54b-regressions` 管登录页注册 / 记住密码 / 忘记密码与邮箱验证码体系）。各轮护栏也不按版本切分：任何一次部署都应让全部护栏通过，不存在「某个版本只需跑其中几条」。
 
-> 共 **106 个测试文件、1735 条用例**（计数口径：第 37 轮新增 `audit37-regressions.test.js` **26 条**、第 38 轮新增 `audit38-regressions.test.js` **31 条**；第 39 轮**没有**新的护栏文件，5 条版本对齐护栏落在既有的 `deploy-script.test.js` 内；第 40 轮新增 `audit40-regressions.test.js` **7 条**，另有 3 条「不能编辑自己」护栏并入既有的 `audit35-regressions.test.js`；第 41 轮新增 `audit41-regressions.test.js` **14 条**，前端侧另有 3 条「两套配置各自独立」护栏并入既有的 `audit31-regressions.test.js`；第 42 轮新增 `audit42-regressions.test.js` **9 条**；第 43 轮新增 `audit43-regressions.test.js` **8 条**；第 44 轮新增 `audit44-regressions.test.js` **14 条**；第 45 轮新增 `audit45-regressions.test.js` **12 条**；第 46 轮是小型修复、**未新增**护栏文件（1 条护栏并入既有的 `audit42-regressions.test.js`）；第 47 轮新增 `audit47-regressions.test.js` **20 条**；第 48 轮新增 `audit48-regressions.test.js` **22 条**；第 49 轮新增 `audit49-regressions.test.js` **9 条**（移除自签名证书 + 移除 COS 原生 API，配套 10 条反向对照）；第 50 轮新增 `audit50-regressions.test.js` **17 条**（分享页文件类型图标 / 左键框选多选 / 「链接创建成功」弹窗改版，配套 18 条反向对照）；第 51 轮新增 `audit51-regressions.test.js` **34 条**（「链接创建成功」弹窗加宽、链接一行显示完；多文件 / 文件夹分享的列表 + 勾选 + 50/页分页 + 打包 `.tar.gz`，配套 40 条反向对照）；第 52 轮新增 `audit52-regressions.test.js` **19 条**（多选（文件+文件夹）分享入口 /「移动」报成功实际没动 / 复制粘贴与冲突逐项询问 / 分享页默认全选与展示路径脱敏 / 链接结果弹窗左右等高，配套 22 条反向对照）；第 53 轮新增 `audit53-regressions.test.js` **32 条**（「发信设置」卡片与零依赖 SMTP 客户端，配套 17 条反向对照）；第 54 轮新增 `audit54-regressions.test.js` **22 条**（第①步「站点设置」卡片：站点名称 / 公开注册 / 新用户身份，配套 13 条反向对照）与 `audit54b-regressions.test.js` **30 条**（第②步：登录页注册 / 记住密码 / 忘记密码 + 邮箱验证码体系，配套 22 条反向对照）、`audit54c-regressions.test.js` **24 条**（第③步：邀请码系统 —— `side-foot`「邀请码设置」+ 批量生成 / 删除 / 导出 txt + 单独与批量设置使用次数 / 过期时间 / 身份，并把注册的 `invite` 模式改成真核销，配套 33 条反向对照）、第 68 轮新增 `agreement-settings.test.js` **25 条**、第 69 轮新增 `audit69-regressions.test.js` **26 条**（《安全漏洞分析报告》的 2 高 / 5 中 / 12 低逐条修复，配套 17 条反向对照）（三页协议提示 + 两份协议正文：渲染口径 / XSS / 权限 / 预览不落盘 / 备份往返 / 分享页零脚本 `:target` 弹窗）、第 77 轮新增 `audit77-regressions.test.js` **4 条**（外部加密审计 F-E1：缺 IV/TAG 的历史元数据 fail-closed，配套 3 条反向对照）；第 79 轮新增 `audit79-regressions.test.js` **7 条**（L1/L2 支付密钥真实解析 + 等待页「点了没反应」，配套 7 条反向对照）；第 80 轮新增 `audit80-regressions.test.js` **11 条**（「点击立即支付没有任何反应」的六条成因：静默 303 / 表单收到裸 JSON / SM2 静默降级 / 网关地址片段 / 无收银台静默降级 / 提交无反馈，配套 10 条反向对照）；第 81 轮新增 `audit81-regressions.test.js` **9 条**（出站超时只管到响应头 ⇒ 读响应体可挂到 undici 的 300 秒兜底；提交看门狗把「没跳去支付平台」误报成「订单没建成」，配套 8 条反向对照）；第 82 轮新增 `audit82-regressions.test.js` **9 条**（三条用户要求的行为变更：换渠道即新单 + 退券 / SM2 保存时即拒绝 / 历史在途订单一次性标失败，配套 8 条反向对照 + R21-06 重述）；第 83 轮新增 `audit83-regressions.test.js` **7 条**（表单 POST 之后不许再跨域 3xx —— Chrome/Safari 会把 CSP 的 `form-action` 施加到「表单提交后的重定向目标」上，跨域 302 被整条拦掉，页面一动不动而订单已建好；改用同源「正在跳转」中转页由页面自身发起导航，配 meta refresh + 可点链接双通道，收银台地址另加 http(s) 协议白名单，配套 6 条反向对照）；第 84 轮新增 `audit84-regressions.test.js` **13 条**（《支付模块检查报告》七条逐条复核、**全部成立**：支付宝查单响应验签（按 JSON 原文切片验，重新序列化即失效）/ 轮询推进放宽到任何 pending 订单 / 账本读不出来时 fail-closed（拒收 + 管理端横幅 + 接口 `degraded`）/ `fenFromYuan('')` 不得是 0 / 换券即新单（含「旧券必须退回」）/ 5 秒内同参数重复提交合并 / PayPal 回调事件类型白名单，配套 13 条反向对照，另重锚 4 条 R82 对照）；第 85 轮新增 `audit85-regressions.test.js` **5 条**（「支付宝页面上显示的订单号与实际订单号不符」—— 结论是**订单系统没有残留旧号**：`out_trade_no` 一直是内部 16 位 `id`，36 位 `orderNo` 从未也**不能**发给网关（微信 v3 上限 32 位），真正的缺陷是**短号在界面上完全不可见**；故本轮只补可见性、不动支付链路：中转页 / 等待页 / 二维码页 / 状态页四处并列出「订单号」与「商户单号」+ 订单管理页新增「商户单号」列（可复制），配套 4 条反向对照）；第 86 轮新增 `audit86-regressions.test.js` **13 条**（订单号取回新增「账号归属」限制：**登录态成交**的订单只能由购买时的同一个账号取回，**游客成交**的订单任何情况下都能取回；闸门排在取回额度之前、失败不消耗额度、拒绝时不回传订单快照，路由给「去登录 / 切换账号」按钮且这两类不计入连续输错，配套 7 条反向对照）；第 88 轮新增 `coupon-threshold.test.js` **6 条**（优惠券「满 xx 减 xx」门槛，配套 6 条反向对照）；第 89 轮新增 `audit89-regressions.test.js` **10 条**（存储空间隔离：桶内 `u/<userId>/` 前缀命名空间 + 两个收口点 + `/fs` 全部端点收支方向 + 分享快照绝对 key + WebDAV 账户绑定用户 + 删用户连带吊销账户，配套 14 条反向对照）；第 90~94 轮新增的护栏见 `CHANGELOG.md` 对应小节（第 94 轮为 62 条）；第 95 轮新增 `audit95-regressions.test.js` **4 条**，另在 `qrcode.test.js` 补 **1 条**独立解码器（《支付系统检查报告》2 条结论全部成立：二维码格式信息位置、改价后复用在途订单）；第 96 轮新增 `audit96-regressions.test.js` **6 条**（《支付系统支付链路复检》新增的那条同源分叉：券路径下「页面价 = 实扣价」，含停用 / 过期 / 改价 / 扫码页四种形态与一组对照）；第 97 轮新增 `keyring.test.js` **13 条**、`keyrotate.test.js` **10 条**、`audit97-regressions.test.js` **9 条**（主密钥信封与登录密钥轮转：包裹/解开契约、"锁定 ≠ 损坏"的**三条**独立路径（取密钥 / 读配置 / 读加密数据文件）、迁移只重裹不重加密、轮转的两边一致性（KEK 与登录口令）与会话失效、解锁通道的权限档与失败锁）；第 98 轮新增 `audit98-regressions.test.js` **12 条**（昵称与自助注销的 HTTP 面：昵称免密码 / 超长拒绝 / 清空语义、根用户与无邮箱的拒绝档、验证码用途隔离、15 天冷静期、重复提交 409、登录即撤销、到期当场删除、清扫解除链接归属）与 `account-deletion.test.js` **4 条**（存储层契约：坏 `deletion` 一律归零、未到期不进待删列表、昵称按码点截断、冷静期常量单一事实源）；第 99 轮新增 `audit99-regressions.test.js` **12 条**（完整性巡检 / 防勒索校验：**判据层**密文长度公式与三个结论、**行为层**用「桩被调用几次」证明锁定态一步都不往下走 / 403 与 5xx 不算丢失 / 合流 / 轮转游标、**接线层**卡片与两条路由的守卫，配套 14 条反向对照 `R99-01a`~`R99-12a`）；第 100 轮新增 `captcha-native.test.js` **12 条**（模块契约）与 `audit100-regressions.test.js` **10 条**（真 HTTP 接线 + 开关三态，配套 8 条反向对照 `R100-01a`~`R100-06b`）；第 101 轮新增 `audit101-regressions.test.js` **10 条**（《密钥轮转与完整性巡检审计报告》9 条全部成立：改密闸门三态与三个入口、写盘失败必须回滚、意图日志补完与三种「不猜」、并发 409、损坏备份去重、复制 / 上传落库 / 移动三处刷新 `cloudWrittenAt`、magic 短文件四档、同名桶零 HEAD，配套 11 条反向对照 `R101-01a`~`R101-09a`）；第 102 轮**未新增**护栏文件（3 条「部署脚本排除 client/」护栏并入既有的 `deploy-script.test.js` —— 静态 1 条 + **真跑** `drop_client_from_clone` / **真跑** `install_app` 各 1 条，配套 3 条反向对照 `R102-01a`~`R102-03a`）；**确切条数与通过情况请以 `npm test` 结尾的汇总行为准**）。环境性红/跳过一并说明，避免被误读成回归：`RE-03` / `R7-07` 依赖 `spawnSync`，在部分 Windows 环境恒返回 `status=null`（EBUSY）；`audit16-regressions` 有 4 条要靠 `bash` 驱动 `deploy.sh` 的 Nginx 模板断言，无 `bash` 的机器上会以「bash 不可用（ENOENT）」失败；`SCAN-SKIPLIST.md` 不在工作区时另有一条清单一致性用例按设计跳过。全部零依赖，可直接 `npm test` 运行。修改路由、前端模块或 WebAuthn 相关代码后请先运行。文件数由 `docs-sync` 护栏校验；**用例总数没有护栏**——静态统计（`grep -rhE '^\s*test\(' tests/*.test.js | wc -l`）与 runner 实际计数口径不同（后者含 `t.test()` 子测试），无法用静态方式锁定，故此处给的是**本版发布时的实测值**（以 CI 与本地全量运行结尾的汇总行为准），它随每次改动而变，请勿当作长期基线。
+> 共 **107 个测试文件、1743 条用例**（计数口径：第 37 轮新增 `audit37-regressions.test.js` **26 条**、第 38 轮新增 `audit38-regressions.test.js` **31 条**；第 39 轮**没有**新的护栏文件，5 条版本对齐护栏落在既有的 `deploy-script.test.js` 内；第 40 轮新增 `audit40-regressions.test.js` **7 条**，另有 3 条「不能编辑自己」护栏并入既有的 `audit35-regressions.test.js`；第 41 轮新增 `audit41-regressions.test.js` **14 条**，前端侧另有 3 条「两套配置各自独立」护栏并入既有的 `audit31-regressions.test.js`；第 42 轮新增 `audit42-regressions.test.js` **9 条**；第 43 轮新增 `audit43-regressions.test.js` **8 条**；第 44 轮新增 `audit44-regressions.test.js` **14 条**；第 45 轮新增 `audit45-regressions.test.js` **12 条**；第 46 轮是小型修复、**未新增**护栏文件（1 条护栏并入既有的 `audit42-regressions.test.js`）；第 47 轮新增 `audit47-regressions.test.js` **20 条**；第 48 轮新增 `audit48-regressions.test.js` **22 条**；第 49 轮新增 `audit49-regressions.test.js` **9 条**（移除自签名证书 + 移除 COS 原生 API，配套 10 条反向对照）；第 50 轮新增 `audit50-regressions.test.js` **17 条**（分享页文件类型图标 / 左键框选多选 / 「链接创建成功」弹窗改版，配套 18 条反向对照）；第 51 轮新增 `audit51-regressions.test.js` **34 条**（「链接创建成功」弹窗加宽、链接一行显示完；多文件 / 文件夹分享的列表 + 勾选 + 50/页分页 + 打包 `.tar.gz`，配套 40 条反向对照）；第 52 轮新增 `audit52-regressions.test.js` **19 条**（多选（文件+文件夹）分享入口 /「移动」报成功实际没动 / 复制粘贴与冲突逐项询问 / 分享页默认全选与展示路径脱敏 / 链接结果弹窗左右等高，配套 22 条反向对照）；第 53 轮新增 `audit53-regressions.test.js` **32 条**（「发信设置」卡片与零依赖 SMTP 客户端，配套 17 条反向对照）；第 54 轮新增 `audit54-regressions.test.js` **22 条**（第①步「站点设置」卡片：站点名称 / 公开注册 / 新用户身份，配套 13 条反向对照）与 `audit54b-regressions.test.js` **30 条**（第②步：登录页注册 / 记住密码 / 忘记密码 + 邮箱验证码体系，配套 22 条反向对照）、`audit54c-regressions.test.js` **24 条**（第③步：邀请码系统 —— `side-foot`「邀请码设置」+ 批量生成 / 删除 / 导出 txt + 单独与批量设置使用次数 / 过期时间 / 身份，并把注册的 `invite` 模式改成真核销，配套 33 条反向对照）、第 68 轮新增 `agreement-settings.test.js` **25 条**、第 69 轮新增 `audit69-regressions.test.js` **26 条**（《安全漏洞分析报告》的 2 高 / 5 中 / 12 低逐条修复，配套 17 条反向对照）（三页协议提示 + 两份协议正文：渲染口径 / XSS / 权限 / 预览不落盘 / 备份往返 / 分享页零脚本 `:target` 弹窗）、第 77 轮新增 `audit77-regressions.test.js` **4 条**（外部加密审计 F-E1：缺 IV/TAG 的历史元数据 fail-closed，配套 3 条反向对照）；第 79 轮新增 `audit79-regressions.test.js` **7 条**（L1/L2 支付密钥真实解析 + 等待页「点了没反应」，配套 7 条反向对照）；第 80 轮新增 `audit80-regressions.test.js` **11 条**（「点击立即支付没有任何反应」的六条成因：静默 303 / 表单收到裸 JSON / SM2 静默降级 / 网关地址片段 / 无收银台静默降级 / 提交无反馈，配套 10 条反向对照）；第 81 轮新增 `audit81-regressions.test.js` **9 条**（出站超时只管到响应头 ⇒ 读响应体可挂到 undici 的 300 秒兜底；提交看门狗把「没跳去支付平台」误报成「订单没建成」，配套 8 条反向对照）；第 82 轮新增 `audit82-regressions.test.js` **9 条**（三条用户要求的行为变更：换渠道即新单 + 退券 / SM2 保存时即拒绝 / 历史在途订单一次性标失败，配套 8 条反向对照 + R21-06 重述）；第 83 轮新增 `audit83-regressions.test.js` **7 条**（表单 POST 之后不许再跨域 3xx —— Chrome/Safari 会把 CSP 的 `form-action` 施加到「表单提交后的重定向目标」上，跨域 302 被整条拦掉，页面一动不动而订单已建好；改用同源「正在跳转」中转页由页面自身发起导航，配 meta refresh + 可点链接双通道，收银台地址另加 http(s) 协议白名单，配套 6 条反向对照）；第 84 轮新增 `audit84-regressions.test.js` **13 条**（《支付模块检查报告》七条逐条复核、**全部成立**：支付宝查单响应验签（按 JSON 原文切片验，重新序列化即失效）/ 轮询推进放宽到任何 pending 订单 / 账本读不出来时 fail-closed（拒收 + 管理端横幅 + 接口 `degraded`）/ `fenFromYuan('')` 不得是 0 / 换券即新单（含「旧券必须退回」）/ 5 秒内同参数重复提交合并 / PayPal 回调事件类型白名单，配套 13 条反向对照，另重锚 4 条 R82 对照）；第 85 轮新增 `audit85-regressions.test.js` **5 条**（「支付宝页面上显示的订单号与实际订单号不符」—— 结论是**订单系统没有残留旧号**：`out_trade_no` 一直是内部 16 位 `id`，36 位 `orderNo` 从未也**不能**发给网关（微信 v3 上限 32 位），真正的缺陷是**短号在界面上完全不可见**；故本轮只补可见性、不动支付链路：中转页 / 等待页 / 二维码页 / 状态页四处并列出「订单号」与「商户单号」+ 订单管理页新增「商户单号」列（可复制），配套 4 条反向对照）；第 86 轮新增 `audit86-regressions.test.js` **13 条**（订单号取回新增「账号归属」限制：**登录态成交**的订单只能由购买时的同一个账号取回，**游客成交**的订单任何情况下都能取回；闸门排在取回额度之前、失败不消耗额度、拒绝时不回传订单快照，路由给「去登录 / 切换账号」按钮且这两类不计入连续输错，配套 7 条反向对照）；第 88 轮新增 `coupon-threshold.test.js` **6 条**（优惠券「满 xx 减 xx」门槛，配套 6 条反向对照）；第 89 轮新增 `audit89-regressions.test.js` **10 条**（存储空间隔离：桶内 `u/<userId>/` 前缀命名空间 + 两个收口点 + `/fs` 全部端点收支方向 + 分享快照绝对 key + WebDAV 账户绑定用户 + 删用户连带吊销账户，配套 14 条反向对照）；第 90~94 轮新增的护栏见 `CHANGELOG.md` 对应小节（第 94 轮为 62 条）；第 95 轮新增 `audit95-regressions.test.js` **4 条**，另在 `qrcode.test.js` 补 **1 条**独立解码器（《支付系统检查报告》2 条结论全部成立：二维码格式信息位置、改价后复用在途订单）；第 96 轮新增 `audit96-regressions.test.js` **6 条**（《支付系统支付链路复检》新增的那条同源分叉：券路径下「页面价 = 实扣价」，含停用 / 过期 / 改价 / 扫码页四种形态与一组对照）；第 97 轮新增 `keyring.test.js` **13 条**、`keyrotate.test.js` **10 条**、`audit97-regressions.test.js` **9 条**（主密钥信封与登录密钥轮转：包裹/解开契约、"锁定 ≠ 损坏"的**三条**独立路径（取密钥 / 读配置 / 读加密数据文件）、迁移只重裹不重加密、轮转的两边一致性（KEK 与登录口令）与会话失效、解锁通道的权限档与失败锁）；第 98 轮新增 `audit98-regressions.test.js` **12 条**（昵称与自助注销的 HTTP 面：昵称免密码 / 超长拒绝 / 清空语义、根用户与无邮箱的拒绝档、验证码用途隔离、15 天冷静期、重复提交 409、登录即撤销、到期当场删除、清扫解除链接归属）与 `account-deletion.test.js` **4 条**（存储层契约：坏 `deletion` 一律归零、未到期不进待删列表、昵称按码点截断、冷静期常量单一事实源）；第 99 轮新增 `audit99-regressions.test.js` **12 条**（完整性巡检 / 防勒索校验：**判据层**密文长度公式与三个结论、**行为层**用「桩被调用几次」证明锁定态一步都不往下走 / 403 与 5xx 不算丢失 / 合流 / 轮转游标、**接线层**卡片与两条路由的守卫，配套 14 条反向对照 `R99-01a`~`R99-12a`）；第 100 轮新增 `captcha-native.test.js` **12 条**（模块契约）与 `audit100-regressions.test.js` **10 条**（真 HTTP 接线 + 开关三态，配套 8 条反向对照 `R100-01a`~`R100-06b`）；第 101 轮新增 `audit101-regressions.test.js` **10 条**（《密钥轮转与完整性巡检审计报告》9 条全部成立：改密闸门三态与三个入口、写盘失败必须回滚、意图日志补完与三种「不猜」、并发 409、损坏备份去重、复制 / 上传落库 / 移动三处刷新 `cloudWrittenAt`、magic 短文件四档、同名桶零 HEAD，配套 11 条反向对照 `R101-01a`~`R101-09a`）；第 102 轮**未新增**护栏文件（3 条「部署脚本排除 client/」护栏并入既有的 `deploy-script.test.js` —— 静态 1 条 + **真跑** `drop_client_from_clone` / **真跑** `install_app` 各 1 条，配套 3 条反向对照 `R102-01a`~`R102-03a`）；第 103 轮新增 `audit103-regressions.test.js` **8 条**（巡检异常通知 + 随机 4 位口令：通知只对真异常发信、签名 + 冷却去重、**发信失败不推进签名**、路由三条校验、生成器字符集与前后端同下界，配套 8 条反向对照 `R103-01a`~`R103-08a`）；第 104 轮新增 `audit104-regressions.test.js` **8 条**（《Kepler v2.1.3 安全审计报告》6 条全部成立：锁定态读盘不得把空表钉进缓存、支付宝同步响应「验签对象 = 业务对象」、人机验证允许域名不得采信请求 `Host`、设置文件读不出来时任意口令不得换访问令牌、导入必须比对写盘结果、轮转进行中不得删意图日志、启动清扫必须等解锁**成功**，配套 15 条反向对照 `R104-01a`~`R104-07b`）；**确切条数与通过情况请以 `npm test` 结尾的汇总行为准**）。环境性红/跳过一并说明，避免被误读成回归：`RE-03` / `R7-07` 依赖 `spawnSync`，在部分 Windows 环境恒返回 `status=null`（EBUSY）；`audit16-regressions` 有 4 条要靠 `bash` 驱动 `deploy.sh` 的 Nginx 模板断言，无 `bash` 的机器上会以「bash 不可用（ENOENT）」失败；`SCAN-SKIPLIST.md` 不在工作区时另有一条清单一致性用例按设计跳过。全部零依赖，可直接 `npm test` 运行。修改路由、前端模块或 WebAuthn 相关代码后请先运行。文件数由 `docs-sync` 护栏校验；**用例总数没有护栏**——静态统计（`grep -rhE '^\s*test\(' tests/*.test.js | wc -l`）与 runner 实际计数口径不同（后者含 `t.test()` 子测试），无法用静态方式锁定，故此处给的是**本版发布时的实测值**（以 CI 与本地全量运行结尾的汇总行为准），它随每次改动而变，请勿当作长期基线。
 >
 > **本节是全文唯一的用例计数口径**：其他章节提到用例条数时一律写「见「四、测试 → 1. 测试与 CI」」而**不得另写数字**——曾经「测试与 CI」写 480+、「服务端调试」写 300+，两处都是手抄数字，没有护栏，于是静静地漂移了若干个版本。散落的数字必然失同步，收敛成一个入口才不会。
 
-**当前仓库不提供 CI 工作流**（无 `.github/` 目录）：下方描述的多平台矩阵**尚未落地为自动化**，提交前请在本机执行 `npm test` 与 `npm run lint`。
+**CI 已落地**（`.github/workflows/ci.yml`，R66）：矩阵为 `ubuntu-latest` / `windows-latest` × Node `24`，步骤依次为 `npm ci` → `npm audit --omit=dev --audit-level=high` → `npm run lint` → 逐文件 `node --test`。`tests/repo-hygiene.test.js` 断言该工作流必须存在、内容与上述一致且真的会执行。提交前仍建议在本机执行 `npm test` 与 `npm run lint`。
 
-> **R23-05：这一处曾经是文档漂移的标本。** 本节旧版声称「CI（`.github/workflows/ci.yml`）在 Linux（Node 18/20/22）与 Windows（Node 22）上运行测试，并额外构建 Docker 镜像做容器健康检查冒烟」，目录结构树里也列着该文件 —— 而仓库里根本没有 `.github` 目录。既有 `docs-sync` 校验了模块清单、TOC、环境变量表，**唯独不校验「文档提到的仓库文件是否存在」**，所以这条声明可以长期漂移而不报红。同一类问题比「缺少 CI」本身更伤信任：读者会按文档去等一个永远不会出现的红灯。
->
-> 现在两侧都已闭合：① 树里的条目已删除、本段改为如实描述；② `tests/docs-sync.test.js` 新增「目录结构代码块里列出的仓库文件必须真实存在」断言（`data/` 运行期子树与显式豁免项除外），此后**任何**在树里登记一个不存在文件的改动都会立刻变红。CI 本身仍是待办（见 `Audit_Ledger.md` 的 R23 行）。
+> **R23-05（历史事件，已于 R66 闭合）：** 本节旧版曾声称 CI 在 Linux / Windows 上运行测试并构建 Docker 镜像，而当时仓库里并没有 `.github` 目录 —— 那是「文档提到的仓库文件是否存在」尚未被校验的年代，这类声明可以长期漂移而不报红。R66 落地了 `.github/workflows/ci.yml` 与 `tests/repo-hygiene.test.js`（断言该文件存在且真的会执行），`tests/docs-sync.test.js` 也补上了「目录结构代码块里列出的仓库文件必须真实存在」的断言（`data/` 运行期子树与显式豁免项除外）。此后在树里登记一个不存在的文件会立刻变红。
 
 <h2 id="develop_document-section70">2. 测试护栏编写约定</h2>
 
@@ -2209,7 +2209,7 @@ R22-04：本库「解密下发」共三个出口 —— 管理端 `/api/fs/downl
   - 判断「退出阶段能否落盘」→ 起**真实子进程**（`spawnSync` + `S3_DATA_DIR` 指向临时目录），父进程读回文件比对。
 - **静态分析器（读源码的护栏）必须自带样例自测**，且判定窗口要由**结构**决定，不能用魔数长度：有分析器曾用 400 字符的固定窗口，而目标函数的守卫前导约 480 字符 → 退回旧实现后照样全绿。同理，抽取方法体要**配平花括号**（先跳过参数括号），不能截到下一个 `},`——search 内部有 try/catch/finally 嵌套，按缩进截会让断言范围缩水；样例自身也要花括号配平，否则解析提前收尾、自测先假红。
 - **测「连接断开后停止工作」这类时序行为，用挂起的假依赖而不是 sleep**：让假 `getBucket` 把回调存起来，测试端先 `destroy()`、再手动放行首页，之后是否发起第 2 次调用就完全由被测代码的判断决定，与机器快慢无关（放行后仍需一个宽限期让事件循环推进，但那是等待而非断言）。
-- 所有审计回归护栏均经**反向对照**验证检出能力：退回旧实现必须 FAIL。变异脚本要**先断言锚点命中**（静默变异失败会伪装成「护栏没抓住」），并做到崩溃安全（登记 + `exit`/`SIGINT`/`SIGTERM`/`uncaughtException` 强制还原 + `data/` 快照）。
+- 所有审计回归护栏均经**反向对照**验证检出能力：退回旧实现必须 FAIL。变异脚本要**先断言锚点命中**（静默变异失败会伪装成「护栏没抓住」），并做到崩溃安全（登记 + `exit`/`SIGINT`/`SIGTERM`/`uncaughtException` 强制还原源码备份；**不含** `data/` 快照）。
 
 <h1 id="develop_document-section71">五、开始二次开发</h1>
 
@@ -2234,12 +2234,12 @@ R22-04：本库「解密下发」共三个出口 —— 管理端 `/api/fs/downl
 ▼
 [ 入口层 ]  server/index.js
 │  挂载：/ 静态资源 · /api/** 业务接口 · /s/:id 公开分享页（匿名）
-│        /pay/notify/:platform 支付异步通知 · /webdav WebDAV 服务
+│        /pay/notify/:platform 支付异步通知 · /dav WebDAV 服务（独立 8443 端口）
 │  端口：PORT=3000（HTTP）· HTTPS_PORT=3443（内置 HTTPS，仅当自备证书就绪时监听）
-│  中间件链（顺序有语义）：请求日志 → 会话解析 → CSRF 校验
-│                        → IP 守卫 → 限流 / 失败锁定 → 路由分发
+│  中间件链（顺序有语义）：请求日志 → IP 守卫（全局最前）→ CSRF 校验
+│                        → 会话解析 → 限流 / 失败锁定（路由内）→ 路由分发
 ▼
-[ 路由层 ]  server/routes.js（只负责挂载）→ server/routes/*.js（13 个领域子模块）
+[ 路由层 ]  server/routes.js（只负责挂载）→ server/routes/*.js（25 个模块文件：23 个领域子模块 + `_context.js` / `_shared.js`）
 │  _context.js 依赖汇聚（唯一 DI 点）· _shared.js 中间件与工具
 │  每个子模块导出一个 express.Router，子模块之间互不 require
 ▼
@@ -2276,7 +2276,7 @@ R22-04：本库「解密下发」共三个出口 —— 管理端 `/api/fs/downl
 **一次 `GET /api/fs/list` 的完整链路**——照着这条线读一遍代码，是最快的入门路径：
 
 1. 前端 `explorer.js` 调 `API.list(prefix, marker)` → `api.js` 带上 Cookie 与 `X-Requested-With` 发请求；
-2. `index.js` 的会话中间件解析 `s3mgr_session`，并**用实时用户记录**（不是登录时的快照）判定角色；随后 IP 守卫、限流依次放行；
+2. `index.js` 先过全局 IP 守卫（`app.use(ipGuard.middleware)`，最前）→ `/api` 的 CSRF 校验 → 再解析 `s3mgr_session`，并**用实时用户记录**（不是登录时的快照）判定角色；限流在路由内执行；
 3. `routes.js` 命中 `routes/fs.js` 注册的 `GET /fs/list`；
 4. 路由先用 `requireConfig()` 确认已配置密钥与桶，再由 `s3.js` 的 `getClient()` 取得客户端；
 5. `listCache` 命中就直接返回（同目录重复刷新不访云端）；未命中才调云端 `getBucket`，并用 `encStore.encryptedSetFor()` 标出哪些对象是密文；
@@ -2290,12 +2290,16 @@ R22-04：本库「解密下发」共三个出口 —— 管理端 `/api/fs/downl
 
 1. 注册 `SIGINT` / `SIGTERM`（Windows 还有 `SIGBREAK`）→ 优雅停机，`flush` 后关端口；
 2. **单实例锁**：两个进程同时操作同一份 `data/` 会交替整体覆盖加密配置，因此检测到活跃实例直接拒绝启动（崩溃残留的脏锁会被自动接管，真卡住时删 `data/.instance.lock`）；
-3. 清扫 atomic-write 留下的孤儿 `*.tmp`（条件：pid 已死 + mtime 超 10 分钟）；
-4. 起 HTTP（`PORT`，默认 3000）；**再按自备证书（`TLS_CERT_FILE` / `TLS_KEY_FILE`）决定是否起 HTTPS**（`HTTPS_PORT`，默认 3443）—— 没有证书就只提供 HTTP，并向日志打印缺哪个文件（R49 起不再生成自签名证书；WebDAV 同样因此不会启动）；
-5. 把历史遗留的明文数据文件升级为加密存储；
-6. 配置损坏（`isCorrupted()`）时打印警告——**不静默回落**；
-7. 按已保存配置启动 WebDAV；
-8. 注册 `uncaughtException`：记录后优雅退出（认为进程已进入未定义状态，继续服务会把故障放大到用户数据上）。调试时可用 `NO_RESTART_ON_UNCAUGHT=1` 关闭该行为。
+3. **主密钥自动解锁**（`keyring.autoUnlockFromEnv()`）：用 `KEPLER_MASTER_PASSPHRASE` 尝试解锁；口令错 / 未设置时**不退出**，以锁定态继续启动（前端解锁页接管），避免容器形成「起不来 → 看不到日志 → 改不对变量」的循环；
+4. 清扫 atomic-write 留下的孤儿 `*.tmp`（条件：pid 已死 + mtime 超 10 分钟）；
+5. 注册三组后台定时器（均 `unref()`）：上传会话清扫、注销到期清扫（R98，每小时）—— 这两组等自动解锁后再读加密配置；完整性巡检（R99，启动 60 秒后首轮 + 周期）的定时器**不等解锁**，由 `runOnce()` 把「锁定态」作为第一条判据直接返回；
+6. **预生成安装令牌**（`primeSetupToken()`，`listen` 之前）：部署脚本随后立刻读它，先有文件才不会打印空令牌；
+7. **清理历史「支付中」订单**（`sweepStalePending()`，`listen` 之前，只跑一次）：先把脏状态清干净再对外服务；
+8. 起 HTTP（`PORT`，默认 3000）；**再按自备证书（`TLS_CERT_FILE` / `TLS_KEY_FILE`）决定是否起 HTTPS**（`HTTPS_PORT`，默认 3443）—— 没有证书就只提供 HTTP，并向日志打印缺哪个文件（R49 起不再生成自签名证书；WebDAV 同样因此不会启动）；
+9. 把历史遗留的明文数据文件升级为加密存储；
+10. 配置损坏（`isCorrupted()`）时打印警告——**不静默回落**；
+11. 按已保存配置启动 WebDAV；
+12. 注册 `uncaughtException`：记录后优雅退出（认为进程已进入未定义状态，继续服务会把故障放大到用户数据上）。调试时可用 `NO_RESTART_ON_UNCAUGHT=1` 关闭该行为。
 
 <h2 id="develop_document-section75">2. 本地启动与调试</h2>
 
@@ -2411,7 +2415,7 @@ curl -s -b cookie.txt http://127.0.0.1:3000/api/demo/ping
 
 如果只想验证「接口真的挂上了 `requireAdmin`」，可以照 `tests/config-verify-permission.test.js` 的写法：起一个真实 express 应用，用普通用户与管理员的会话各打一次，断言 403 / 200。**不要写「源码里 grep 到 `requireAdmin` 这四个字」这类断言**——它抓不到「挂错了路由」和「条件写反了」。
 
-最后把新接口补进 `7. HTTP API` 的表格（否则文档与代码分叉，`docs-sync` 不会发现这一点）。
+最后把新接口补进 `7. HTTP API` 的表格（否则文档与代码分叉 —— `tests/routes-surface.test.js` 会断言每条路由的完整路径能在开发文档中搜到，漏写即变红）。
 
 <h2 id="develop_document-section83">4. 最小示例 B：新增一个前端卡片</h2>
 
@@ -2443,10 +2447,11 @@ curl -s -b cookie.txt http://127.0.0.1:3000/api/demo/ping
 3. **`public/js/main.js`**：登记视图 + 接上入口按钮：
    ```js
    const MAIN_VIEWS = ['explorer', /* … */, 'democard'];            // ① 必须登记，否则 resetMainView 复位不到
-   else if (v === 'democard') democard.refresh();                    // ② switchMainView 分支
+   const VIEW_ENTRY = { /* … */, democard: 'side-demo' };            // ② 必须登记：viewFromHash() 用它读入口按钮的 hidden 做角色门控
+   else if (v === 'democard') democard.refresh();                    // ③ switchMainView 分支
    $('side-demo').onclick = () => { switchMainView('democard'); closeSidebar(); };
    ```
-   若这块内容仅管理员可见：把它加进 `syssettings.js` 的 `ADMIN_ONLY_CARDS` 一类机制——**整卡隐藏 + `refresh()` 在隐藏时提前 return**，避免「看得见拒绝操作」。
+   若这块内容仅管理员可见：把它加进 `syssettings.js` 的 `ADMIN_ONLY_CARDS` 一类机制——**整卡隐藏 + `refresh()` 在隐藏时提前 return**，避免「看得见拒绝操作」。若该模块会跨会话缓存敏感数据，还要在 `resetMainView()` 里补上它的 `reset()`。
 
 前端改动执行 `npm test` 也会覆盖一部分：`tests/frontend.test.js` 会校验所有前端模块的 ESM 语法、`import` 路径是否存在、主视图列表与 DOM 是否一致。改动后应将 `1. 目录结构` 里的模块清单补上（`docs-sync` 会进行检查）。
 
@@ -2455,10 +2460,10 @@ curl -s -b cookie.txt http://127.0.0.1:3000/api/demo/ping
 - [1] **落盘使用 `atomic-write`**？直接 `writeFile` 会先截断，进程中断就留下 0 字节文件。
 - [2] **权限判定用的是实时用户记录**（`findUserRawById()`）而不是会话快照？降权 / 删户 / 改密后是否主动销毁了对方会话？
 - [3] **服务端点经过 `endpoint-guard`**？任何来自用户输入的 URL 都可能是一次盲 SSRF。
-- [4] **新增路由登记进 `tests/routes-surface.test.js`**，敏感接口进 `mustBeAdmin`。
-- [5] **新增文件 / 环境变量 / 模块补进 `1. 目录结构` 与 `2. 环境变量`**——`tests/docs-sync.test.js` 会校验文件清单与环境变量表，漏了直接红。
+- [4] **新增路由登记进 `tests/routes-surface.test.js`**，敏感接口进 `mustBeAdmin`；**匿名可达**的还要登记 `server/index.js` 的 `PUBLIC_API`（否则会被会话闸门直接拦掉）。
+- [5] **新增文件 / 环境变量 / 模块补进 `1. 目录结构` 与 `2. 环境变量`**——`tests/docs-sync.test.js` 会校验文件清单与环境变量表，漏了直接红。新增前端主视图还要登记 `main.js` 的 `VIEW_ENTRY`（含入口按钮 `id`，否则地址栏直达与角色门控失效）；跨会话缓存敏感数据的模块另在 `resetMainView()` 补 `reset()`。
 - [6] **文档同步**：`7. HTTP API` 表格、以及涉及的章节；若插 / 删了一节，记得目录锚点会整体位移（改完用 `docs-sync` 里的目录护栏确认目录与标题仍然一一对应）。
-- [7] **护栏是行为断言而不是源码 grep**：写完把实现退回旧版，确认测试真的会 FAIL。
+- [7] **护栏是行为断言而不是源码 grep**：写完把实现退回旧版，确认测试真的会 FAIL；并登记 `tests/invariants.test.js` 的 `CANONICAL_IMPLS` 与 `scripts/reverse-check.js` 的 `CASES`（否则反向对照不会被 CI 跑到）。
 - [8] **改动触及某个审计编号时**（代码里的 `SEC-*` / `FUN-*` / `PERF-*` / `LOW-*` / `S*` / `P*` 注释），先查同目录的 `Audit_Ledger.md`：它登记每个编号的含义与闭合依据，并由 `docs-sync` 护栏保证不遗漏。**注意编号不是全局唯一的**：已确证 11 个编号存在同号异义，且 `S4` 与 `SEC-04`、`P3` 与 `PERF-03` 是两套独立系列——因此**新引用必须带轮次或日期限定**（如 `audit6/PERF-01`、`SEC-04（2026-09-14）`）；需要无歧义指代时请用 `6.5` 的限定别名（如 `FUN-12@unbounded-map`）。
 - [9] **同一事实只在一处展开细节**：凡文档标注「唯一权威定义」的内容（如「下载放行判定顺序」在 `4.3 下载配额与来源判定`），**其余引用处只写「结论 + 指向」，不复述步骤、顺序或阈值**。复述一次就多一处同步负担，而这类内容恰恰是最容易只改一半的（改了顺序却漏改复述处，读者按旧顺序实现就是错的）。当前两处「唯一权威定义」已按此纪律收口；新增同类内容时请沿用。
 

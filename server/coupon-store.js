@@ -326,6 +326,11 @@ function load() {
       return cache;
     }
   } catch (e) {
+    /**
+     * R104（F-01）：锁定态不是损坏 —— 借出空表但不缓存。
+     * 缓存下来 + 解锁后 `persist()` 就足以把整份券表覆盖成空（券被静默清空）。
+     */
+    if (secureStore.isLockedError(e)) return { coupons: [] };
     // 与 invite-store 同：损坏时打告警并降级为空表，secure-store 已锁定该文件写入，
     // 磁盘上的损坏文件不会被空表覆盖。
     console.error('[coupon-store] 优惠券文件损坏，已降级为空列表并锁定写入：', e.message);
@@ -342,6 +347,11 @@ function load() {
  * 核销是低频动作（每笔订单至多一次），全量加密写在这个数据量下是毫秒级。
  */
 function persist() {
+  /**
+   * R104（F-01）：`cache` 为空表示从未成功读盘（锁定态）。此时写下去的是密文里的
+   * 一个 `null` —— 解锁后券表就再也读不回来了。锁定期间的一切变更都不该落盘。
+   */
+  if (!cache) return;
   ensureDataDir();
   secureStore.writeJson(FILE, cache);
 }

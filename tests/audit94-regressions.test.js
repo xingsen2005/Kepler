@@ -1161,8 +1161,9 @@ test('R94-58 · M09-02 / M09-04：设置不可用要被标记；元数据表走�
     '管理员必须能从接口上把设置救回来（否则只能手改磁盘）');
   assert(enc.indexOf('const metaWriter = coalesce.debouncedPersist(') > 0,
     'M09-04：每次元数据变更都做一次全表序列化 + 全表 AES-GCM + 全量写是 O(N²) 写放大');
-  assert(enc.indexOf('if (metaCorrupt) return null;') > 0,
-    '去抖快照在损坏状态下必须返回 null（= 本次不写），与 coalesce 的契约一致');
+  // R104（F-01）：`!metaCache` = 元数据从未成功读过（锁定态），同样不得落盘
+  assert(enc.indexOf('if (metaCorrupt || !metaCache) return null;') > 0,
+    '去抖快照在「损坏」或「从未读到」时必须返回 null（= 本次不写），与 coalesce 的契约一致');
 });
 
 test('R94-59 · M09-03：分片上传必须记下**本片密文**对应的加密元数据', () => {

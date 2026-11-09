@@ -165,9 +165,26 @@ function writeIntent(obj) {
  *  - `kekVersion === fromKekVersion`：① 根本没发生 ⇒ 删意图，什么都没变；
  *  - 其它（版本对不上 / 用户没了 / 配置读不出来）：**保留意图**并告警，让人去看。
  *
+ * R104（F-06）：**必须与轮转互斥**。
+ *
+ * 最危险的一行是 `v === from ⇒ clearIntent()`：它删掉的是「下一次崩溃之后唯一能
+ * 补完轮转的凭据」。而轮转 A 在 `writeIntent()` 之后、`keyring.rewrap()` 之内
+ * （`kekVersion` 还是旧值、`config.enc` 还没写）的亚秒窗口里，任何一次持**当前旧口令**
+ * 的成功解锁（`POST /api/key/unlock` 匿名可达）都会调到这里：看见「还没轮转」⇒ 删意图；
+ * 若 A 随后在写 `config.enc` 前崩溃，就回到「新 KEK + 旧登录口令」的死局，
+ * **而且没有意图日志可供下次补完**。
+ *
+ * 写法：先在**第一个 `await` 之前**判 `rotating`（与 `withRotationLock()` 同一条纪律），
+ * 判过之后整段跑在互斥里 —— 中途启动的新轮转只会拿到 409，不会插进来写意图。
+ *
  * @returns {Promise<{repaired:boolean, reason:string, kekVersion?:number}>}
  */
 async function reconcile() {
+  if (rotating) return { repaired: false, reason: 'rotating' };
+  return withRotationLock(() => reconcileInner());
+}
+
+async function reconcileInner() {
   const it = readIntent();
   if (!it) return { repaired: false, reason: 'no-intent' };
   if (it.bad) {
@@ -582,6 +599,9 @@ module.exports = {
   INTENT_NAME,
   reconcile,
   isRotating,
+  // R104（F-06）：轮转互斥原语。导出是为了让护栏能**在互斥内部**调用 `reconcile()`，
+  // 直接证明「轮转进行中不删意图日志」—— 否则只能靠时序碰运气（那样的护栏会假绿）。
+  withRotationLock,
   legacyKeyPath,
   legacyKeyExists,
   status,

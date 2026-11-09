@@ -63,6 +63,8 @@ function load() {
     }
     throw new Error('内容结构不是预期的 { records: [] }');
   } catch (e) {
+    // R104（F-01）：锁定态借出空表但不缓存、不置 loadFailed
+    if (secureStore.isLockedError(e)) return { records: [] };
     loadFailed = true;
     console.error('[download-log] 读取下载记录失败，已锁定写入：', (e && e.stack) || e);
   }

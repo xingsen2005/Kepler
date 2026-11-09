@@ -667,7 +667,19 @@ const pruneSessions = () => {
  * 定时器照常注册（一小时一次），不必等 —— 那时多半早已解锁；万一仍未解锁，
  * 它会和首次清扫一样读到 `KEYRING_LOCKED` 并跳过。
  */
-bootUnlock.then(() => { try { pruneSessions(); } catch (e) { /* 清扫失败不影响启动 */ } });
+bootUnlock.then((r) => {
+  /**
+   * R104（F-01）：**必须判 `r.ok`**。
+   *
+   * `autoUnlockFromEnv()` 在「没有主口令」时也是 resolve（`{ok:false,
+   * reason:'no-passphrase'}`）—— 只挂 `.then()`，等于把「等解锁完成」写成了
+   * 「等解锁**尝试**完成」：进程其实还锁着，清扫照跑，而 `prune()` 会把锁定态的
+   * 读盘失败当成空会话表缓存下来（解锁后被覆盖 ⇒ 分片 IV/TAG 全丢）。
+   * 口径与上面 `:616` 的 `if (r && r.ok)` 完全一致 —— 同一个 Promise 两处用法不能各说一套。
+   */
+  if (!r || !r.ok) return;
+  try { pruneSessions(); } catch (e) { /* 清扫失败不影响启动 */ }
+});
 const pruneTimer = setInterval(pruneSessions, PRUNE_INTERVAL_MS);
 if (typeof pruneTimer.unref === 'function') pruneTimer.unref();
 
@@ -685,7 +697,12 @@ const DELETION_SWEEP_MS = 60 * 60 * 1000;
 const sweepDeletions = () => {
   try { accountDeletion.purgeDue(); } catch (e) { /* 单条失败已在内部逐条吞掉，这里兜底 */ }
 };
-bootUnlock.then(() => { sweepDeletions(); });
+bootUnlock.then((r) => {
+  // R104（F-01）：与 prune 同口径 —— 锁定态（`r.ok === false`）下用户表根本读不到，
+  // 「清扫」在这一刻没有语义，跑的只是一次注定失败的读盘。
+  if (!r || !r.ok) return;
+  sweepDeletions();
+});
 const deletionTimer = setInterval(sweepDeletions, DELETION_SWEEP_MS);
 if (typeof deletionTimer.unref === 'function') deletionTimer.unref();
 
@@ -768,7 +785,17 @@ try {
  * 失败不影响启动（最坏结果是这页继续显示「支付中」，不影响收付款）。
  */
 try {
-  const swept = paymentOrders.sweepStalePending();
+  /**
+   * R104（F-01）：锁定态**一步都不往下走**（与 `integrity.runOnce()` 的第一条判据同款）。
+   *
+   * 旧实现无条件调用：`sweepStalePending()` → `load()` 读到 `KEYRING_LOCKED` →
+   * 旧代码把这次失败置成**进程级永久**的 `loadFailed` ⇒ 解锁后订单表在本进程余生
+   * 恒为空：回调与查单定位不到目标、已付款用户拿不到文件、新订单不落盘。
+   * 起点是「没设 env 主口令的普通重启」，代价却是收入流水。
+   */
+  const swept = configStore.isLocked()
+    ? { swept: 0, skipped: true }
+    : paymentOrders.sweepStalePending();
   if (swept.swept > 0) {
     console.log(`[Storage Manager] 已把 ${swept.swept} 笔历史在途订单标记为支付失败（一次性清理，仅本版执行）`);
     try {

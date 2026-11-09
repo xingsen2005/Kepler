@@ -5,7 +5,7 @@
 > 本文件是**事后重建**的，不是随每次发版逐条维护的发布记录。项目虽托管在 GitHub（`origin` 可用、有提交历史），但提交历史**未按发布切分** —— 提交信息多为「bug fix」这类无信息量占位，也没有留存任何发布记录文档，因此：
 >
 > - **不给出任何发布日期**。版本标题写「日期未归档」，而不是填一个看起来合理的日期；
-> - 版本号的唯一事实源是 `package.json` 的 `version` 字段（当前 `2.1.3`）；
+> - 版本号的唯一事实源是 `package.json` 的 `version` 字段（当前 `2.1.4`）；
 
 ## 仓库整理 · 客户端二进制移出仓库，改由 Releases 分发
 
@@ -28,6 +28,67 @@
 
 - **没有改写历史**。`git filter-repo` / BFG 能把 160MB 从历史里彻底抹掉、让 clone 真正变小，但那要 `push --force` 重写 `main`，所有已有克隆全部失效，而且这个仓库的提交历史本身没有按发布切分（见本文件开头）。收益（一次性的体积）与代价（破坏性、不可逆）不成比例。真要清理，应单独决策、单独备份。
 - **没有让客户端版本号跟服务端同步**。两者发布节奏不同，硬绑只会制造「服务端 2.1.0 就该配客户端 2.1.0」的假承诺。Release 标题注明该构建**实际内置**的版本。
+
+---
+
+## [2.1.4] - 日期未归档
+
+**六条全部成立，其中五条是「修到一半」。** 《Kepler v2.1.3 安全审计报告》报的 6 条漏洞，本轮逐条复核后确认
+全部存在、全部修复。真正值得记的不是严重度，而是**每一条都只差一句话**：R97 已经在 `secure-store` 里把
+「锁定态 ≠ 损坏」写对了，缺的是上层 10 个 `catch`；R84 已经给支付宝响应加了验签，缺的是「验签读原文切片、
+业务读 `JSON.parse`」这一处分叉；R94 已经写了 fail-closed，缺的是「先读盘再判标志」这个顺序；R101 已经让
+写盘失败可见，缺的是「比对前后值」；R101 已经建了轮转互斥，缺的是把 `reconcile()` 收进去。
+**差一句的共同后果是不可逆**：解锁后空表覆盖磁盘、一份真签名给伪造节点背书、任意口令换到全局令牌、
+导入显示「完成」但没落盘、崩溃恢复的唯一凭据被删。
+
+### 改了什么
+
+| 位置 | 改动 | 为什么在这里 |
+| --- | --- | --- |
+| `server/secure-store.js` | 新增 `isLockedError(e)`（`e.code === 'KEYRING_LOCKED'`）并导出 | 锁定态的判据必须只有一处。R97 只保证了「下层不把它判成损坏」，上层 10 个 `catch` 各自 `cache = 空表` 就把它重新变回了「文件坏了」 |
+| `share-store` / `upload-sessions` / `ip-guard` / `coupon-store` / `invite-store` | catch 首行识别锁定态：**借出空表 + 不写 `cache` + 不置损坏标志**；`persist()` 加「快照为空即不写」 | 「读不到」是正常状态，「读到空」不是。缓存下来就把「暂时看不见」升级成「磁盘上真的没有」—— 解锁后第一次写入即覆盖，不可逆 |
+| `payment-orders` / `restore-guard` / `download-log` | 同型：借出空表且**不置** `loadFailed` | `loadFailed` 是**进程级永久**标志，一次锁定就能让票据校验整个失效、直到重启才恢复 |
+| `server/enc-store.js` | `loadSettings()` 锁定态置 `settingsUnavailable`、`loadMeta()` 不缓存也不置 `metaCorrupt`；四个写入口加空快照早退；`passwordSet()` 改为**先读盘再判标志**；`checkPassword()` 不可用时 `return false`、`tokenSecret()` 抛错 | 这两个标志是 fail-closed 的开关。顺序写反（先判标志后读盘）意味着**首调用永远 fail-open** —— 标志要等读盘失败才会被置真 |
+| `server/keyring.js` | 新增 `addResetHook()`：`lock()` / `unlock()` / `create()` 末尾各触发一次 | 解锁后必须有人清掉那些「因为锁定才置真」的标志。反向注册（`enc-store` 挂到 `keyring`）避免 `keyring` ↔ `config-store` 成环 |
+| `server/index.js` | 三处启动任务改为 `bootUnlock.then(r => r.ok)` 才跑；启动期订单清扫在锁定态直接跳过 | `autoUnlockFromEnv()` 在没配口令时**也 resolve** `{ok:false}` ⇒ 只挂 `.then()` 等于「等解锁**尝试**完成」。而这三处扫的正是加密数据文件（会话 / 注销 / 订单） |
+| `server/payment-gateway.js` | 新增 `alipayNodeText()` / `alipayMatchBrace()` / `alipaySyncNode()`；`alipayQuery` / `alipayPrecreate` / `alipayClose` / `alipayProbe` 四处改为「验签与业务取**同一段切片**」，同名节点 ≥2 个直接拒绝 | `JSON.parse` 遇重复键取**最后**一个，`indexOf` 切片取**第一个** ⇒ 一份真签名可以给一个伪造的业务节点背书 |
+| `server/routes/auth.js` | `captchaHosts()` 去掉「请求 `Host` 自证」 | `isOwnSiteHost(host, extra)` 的 `extra` 本就在注释里声明**不是安全判据**；用请求头给自己发准入证等于没有准入 |
+| `server/backup.js` | `apply()` 比对 `getLastWriteError()` 的**前后值** | `flush()` 不 reject（写失败被吞成 `lastWriteError`）。只判「非空」会把上一次失败的残留当成本次失败 |
+| `server/key-rotate.js` | `reconcile()` 拆外层（`rotating` 早退）+ `reconcileInner()`，后者进 `withRotationLock()` | 意图日志是崩溃恢复的唯一凭据；轮转进行中删掉它，等于把两阶段提交退化成猜 |
+
+### 「借出空表」与「缓存空表」是两件事
+
+锁定态下读不到数据**是设计内的正常状态**，所以修法不是「抛错让上层崩」，也不是「一律当作没这回事」：
+
+- **返回一份空表**，让调用方安全降级（分享页显示「链接不存在」比 500 好）；
+- **但不写进 `cache`**，解锁后再读一次自然就对；
+- **也不置损坏标志**（`loadFailed` / `loadDegraded` / `metaCorrupt`）—— 那些标志的语义是「这份数据坏了，别再写」，
+  用在一时的锁定上，会让整个进程**永久**拒写。
+
+同理，所有 `persist*()` 都加了「快照为空即不写」：`coalesce.debouncedPersist` 的 `null` 语义本就是「本次不写」，
+漏判这一句就等于亲手把空表落盘。
+
+### 启动闸门要等的是「解锁成功」，不是「解锁尝试完成」
+
+`autoUnlockFromEnv()` 在**没配** `KEPLER_MASTER_PASSPHRASE` 时同样 resolve，只是 `{ok:false}`。因此
+`bootUnlock.then(() => pruneSessions())` 这种写法在默认重启形态下**必然**让清扫跑在锁定态 —— 这正是
+F-01 从「理论可能」变成「每次重启都发生」的原因。三处一律改成先判 `r.ok`；启动期的订单清扫则直接看
+`configStore.isLocked()` 早退（`integrity.js` 的 R99 ④ 范式）。
+
+### 一处被护栏抓出来的顺序错误
+
+`R104-04` 首版断言「`enc-settings.json` 坏了 ⇒ `passwordSet()` 返回 true」（fail-closed），实跑拿到 `false`。
+原因是 `settingsUnavailable` 被判在 `loadSettings()` **之前** —— 而那个标志要等读盘失败才会被置真，于是
+**首调用路径上 R94 的 fail-closed 从未生效过**。改成先读盘再判标志，并补一条反向对照 `R104-04b` 专钉这个顺序。
+这是本轮唯一一条「读代码看不出来、写用例才现形」的缺陷。
+
+### 验收
+
+`tests/audit104-regressions.test.js` **8 条**（含「真 `keyring` + 真重启 + 解锁后核对 + 再重启核对」的锁定态
+往返、**真 RSA 签名 + 追加伪造节点**的端到端、真坏设置文件、真写盘失败），`scripts/reverse-check.js` 新增
+**15 条**反向对照（`R104-01a`~`R104-07b`，台账 1093 → **1108**）。另重锚 4 条被本次改动打老的旧对照
+（`PRUNE_CALL` / `R82-08a` / `R38-02x` / `R94-58a`）—— 其中 `R104-07b` 首版因「文件前面那处 `/api` 锁定门」
+而假绿（`fail=0`），改成判**紧邻**才真正变红，这条教训照旧记在台账里。
 
 ---
 

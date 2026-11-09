@@ -326,9 +326,11 @@ async function alipayPrecreate(cfg, { order, subject, notifyUrl }, deadline) {
   const raw = String(r.body == null ? '' : r.body);
   let json = null;
   try { json = raw ? JSON.parse(raw) : null; } catch (e) { json = null; }
-  const node = json && json.alipay_trade_precreate_response;
+  // R104（F-02）：与验签共用同一段原文（重复节点 ⇒ 拒绝，防「真签名 + 假 qr_code」）
+  const parsed = alipaySyncNode(raw, 'alipay_trade_precreate_response');
+  const node = parsed.node;
   if (!node) {
-    throw new Error(`支付宝当面付返回内容无法识别（HTTP ${r.status}）`);
+    throw new Error(`支付宝当面付${alipayNodeError(parsed.error)}（HTTP ${r.status}）`);
   }
   /**
    * 验签在**读业务字段之前** —— 与 `alipayQuery` 同一条铁律。
@@ -405,31 +407,84 @@ function checkPaidAmount(order, actualFen, actualLabel) {
 }
 
 /**
- * 从支付宝**同步响应原文**里取出 `<key>` 节点的原始子串（大括号配对）。
+ * 从支付宝**同步响应原文**里取出业务节点，并数一数它出现了几次。
  *
- * 为什么对着原文切、而不是 `JSON.parse` 后 `JSON.stringify(node)`：
- * 支付宝的同步响应签名是对 `alipay_trade_query_response` 这段 JSON 的**原始字节**
- * 做的。重新序列化会变 —— 数字被重新格式化（`5.00` → `5`）、`\uXXXX` 被解码成字符、
- * 键序可能不同 —— 任意一个字节不同，签名就恒定对不上。
- * 所以这里按「跳过字符串字面量 + 配对大括号」从原文里切，保证逐字节一致。
+ * ## 为什么必须数次数（R104 / F-02）
+ *
+ * `JSON.parse` 对**重复键取最后一个**，而原来的 `indexOf('"key":')` 取的是**第一个**：
+ * 两条路径读的不是同一份数据。于是「真节点在前（可用真签名验过）+ 假节点在后」的
+ * 响应能同时满足「验签通过」与「业务字段来自假节点」—— 一份真实的
+ * `ACQ.TRADE_NOT_EXIST` 签名配一条伪造的 `TRADE_SUCCESS`，就能让未付款订单变已付。
+ *
+ * 修法不是「再加一层校验」，而是让**验签与取值落到同一份字节**上：这里只认
+ * 「根对象下该键恰好出现一次」的响应，调用方再 `JSON.parse` **这段切片**取业务字段。
+ * 出现 0 次（缺失）或 ≥2 次（分叉）一律 `content: ''`，调用方据此 fail-closed。
+ *
+ * 扫描器必须自己走一遍（不能正则、不能 `indexOf`）：
+ *  · 键名可能出现在**字符串值**里（`"msg":"alipay_trade_query_response"`）——
+ *    只有「在根对象深度 1 上、作为键出现」才算；
+ *  · 键名的引号内九成没有转义，但要有确定的处理，不能靠「大概不会有」。
+ *
+ * @param {string} raw 响应原文
+ * @param {string} key 业务节点名（如 `alipay_trade_query_response`）
+ * @returns {{content: string, count: number}} `count === 1` 时 `content` 是逐字节切片
  */
-function alipayRawNode(raw, key) {
+function alipayNodeText(raw, key) {
   const s = String(raw == null ? '' : raw);
-  const marker = `"${key}":`;
-  const at = s.indexOf(marker);
-  if (at < 0) return '';
-  let i = at + marker.length;
-  while (i < s.length && /\s/.test(s[i])) i += 1;
-  if (s[i] !== '{') return '';
-  const start = i;
+  const want = JSON.stringify(String(key == null ? '' : key));
+  if (want === '""' || !s) return { content: '', count: 0 };
+  const hits = [];
+  let depth = 0;
+  for (let i = 0; i < s.length; i += 1) {
+    const ch = s[i];
+    if (ch === '"') {
+      // 读一个完整的字符串字面量（含转义），`token` 保留两侧引号
+      let j = i + 1;
+      let esc = false;
+      let closed = false;
+      for (; j < s.length; j += 1) {
+        const c = s[j];
+        if (esc) { esc = false; continue; }
+        if (c === '\\') { esc = true; continue; }
+        if (c === '"') { closed = true; break; }
+      }
+      if (!closed) return { content: '', count: hits.length };
+      const token = s.slice(i, j + 1);
+      if (depth === 1 && token === want) {
+        let k = j + 1;
+        while (k < s.length && /\s/.test(s[k])) k += 1;
+        if (s[k] === ':') {
+          k += 1;
+          while (k < s.length && /\s/.test(s[k])) k += 1;
+          if (s[k] === '{') {
+            const end = alipayMatchBrace(s, k);
+            if (end < 0) return { content: '', count: hits.length };
+            hits.push(s.slice(k, end + 1));
+            i = end; // 跳过整个节点：节点内部即便有同名键也不算（那是嵌套，不是分叉）
+            continue;
+          }
+        }
+      }
+      i = j; // 普通字符串：整段跳过，里面的 `"key":` 不会被误认成键
+      continue;
+    }
+    if (ch === '{' || ch === '[') depth += 1;
+    else if (ch === '}' || ch === ']') depth -= 1;
+  }
+  if (hits.length !== 1) return { content: '', count: hits.length };
+  return { content: hits[0], count: 1 };
+}
+
+/** 从 `start`（指向 `{`）开始找配对的大括号，返回 `}` 的下标；不够配对返回 -1 */
+function alipayMatchBrace(s, start) {
   let depth = 0;
   let inStr = false;
-  let escape = false;
-  for (; i < s.length; i += 1) {
+  let esc = false;
+  for (let i = start; i < s.length; i += 1) {
     const ch = s[i];
     if (inStr) {
-      if (escape) escape = false;
-      else if (ch === '\\') escape = true;
+      if (esc) esc = false;
+      else if (ch === '\\') esc = true;
       else if (ch === '"') inStr = false;
       continue;
     }
@@ -437,10 +492,60 @@ function alipayRawNode(raw, key) {
     if (ch === '{') depth += 1;
     else if (ch === '}') {
       depth -= 1;
-      if (depth === 0) return s.slice(start, i + 1);
+      if (depth === 0) return i;
     }
   }
-  return '';
+  return -1;
+}
+
+/**
+ * 从支付宝**同步响应原文**里取出 `<key>` 节点的原始子串（大括号配对）。
+ *
+ * 为什么对着原文切、而不是 `JSON.parse` 后 `JSON.stringify(node)`：
+ * 支付宝的同步响应签名是对 `alipay_trade_query_response` 这段 JSON 的**原始字节**
+ * 做的。重新序列化会变 —— 数字被重新格式化（`5.00` → `5`）、`\uXXXX` 被解码成字符、
+ * 键序可能不同 —— 任意一个字节不同，签名就恒定对不上。
+ * 所以这里按「跳过字符串字面量 + 配对大括号」从原文里切，保证逐字节一致。
+ *
+ * R104（F-02）：**该键在根对象下必须只出现一次**，否则返回空串（调用方 fail-closed）。
+ * 这条判据同时守住「验签对象 = 业务对象」—— 业务字段一律从本函数切出的这段字节解析。
+ *
+ * @returns {string} 逐字节切片；缺失 / 重复 / 结构不完整时为空串
+ */
+function alipayRawNode(raw, key) {
+  return alipayNodeText(raw, key).content;
+}
+
+/**
+ * 取业务节点：`content` 是验签用的那段原文，`node` 是**从同一段原文解析出来**的对象。
+ *
+ * 调用方必须用 `node` 读业务字段（而不是 `json[nodeKey]`）——否则又回到「验签的是一份、
+ * 用的是另一份」。返回的 `error` 用来给出可诊断的文案（缺失 / 重复 / 解析失败）。
+ *
+ * @returns {{content: string, node: object|null, error: ''|'absent'|'duplicate'|'unparsable'}}
+ */
+function alipaySyncNode(raw, key) {
+  const t = alipayNodeText(raw, key);
+  if (t.count === 0) return { content: '', node: null, error: 'absent' };
+  if (t.count > 1) return { content: '', node: null, error: 'duplicate' };
+  let node = null;
+  try {
+    node = JSON.parse(t.content);
+  } catch (e) {
+    return { content: '', node: null, error: 'unparsable' };
+  }
+  if (!node || typeof node !== 'object' || Array.isArray(node)) {
+    return { content: '', node: null, error: 'unparsable' };
+  }
+  return { content: t.content, node, error: '' };
+}
+
+/** 同步响应「取不到唯一业务节点」时的统一文案（三处调用点共用，避免各写一套） */
+function alipayNodeError(why) {
+  if (why === 'duplicate') {
+    return '支付宝响应中出现多个同名业务节点，已拒绝（响应可能被篡改）';
+  }
+  return '支付宝返回内容无法识别';
 }
 
 /**
@@ -495,8 +600,19 @@ async function alipayQuery(cfg, order) {
   const raw = String(r.body == null ? '' : r.body);
   let json = null;
   try { json = raw ? JSON.parse(raw) : null; } catch (e) { json = null; }
-  const node = json && json.alipay_trade_query_response;
-  if (!node) return { paid: false, state: 'error', tradeNo: '', failReason: '支付宝返回内容无法识别' };
+  /**
+   * R104（F-02）：业务字段必须从**验签用的那段原文**解析出来。
+   *
+   * 旧实现读 `json.alipay_trade_query_response`（`JSON.parse` 取**最后一个**同名键），
+   * 而验签取的是**第一个** —— 恶意网关把真节点（带真签名）放前面、伪造节点放后面，
+   * 就能「验签通过 + 业务字段来自伪造节点」。现在两者共用 `alipaySyncNode()`：
+   * 该键不唯一 ⇒ 判 `error`，一行都不采信。
+   */
+  const parsed = alipaySyncNode(raw, 'alipay_trade_query_response');
+  const node = parsed.node;
+  if (!node) {
+    return { paid: false, state: 'error', tradeNo: '', failReason: alipayNodeError(parsed.error) };
+  }
   /**
    * 验签在**读任何业务字段之前**。顺序很重要：先看 `trade_status` 再看签名，
    * 就等于先相信了不可信的输入（"检查前先使用"）。
@@ -1193,8 +1309,10 @@ async function alipayClose(cfg, order) {
   const raw = String(r.body == null ? '' : r.body);
   let json = null;
   try { json = raw ? JSON.parse(raw) : null; } catch (e) { json = null; }
-  const node = json && json.alipay_trade_close_response;
-  if (!node) return { ok: false, state: 'error', error: '支付宝返回内容无法识别' };
+  // R104（F-02）：与验签共用同一段原文（重复节点 ⇒ 拒绝，防「真签名 + 假 code」）
+  const parsed = alipaySyncNode(raw, 'alipay_trade_close_response');
+  const node = parsed.node;
+  if (!node) return { ok: false, state: 'error', error: alipayNodeError(parsed.error) };
   if (!alipayVerifySync(raw, json, cfg, 'alipay_trade_close_response')) {
     return {
       ok: false, state: 'error',
@@ -1587,7 +1705,9 @@ async function alipayProbe(cfg) {
   const raw = String(r.body == null ? '' : r.body);
   let json = null;
   try { json = raw ? JSON.parse(raw) : null; } catch (e) { json = null; }
-  const node = json && json.alipay_trade_query_response;
+  // R104（F-02）：自检同样「验签对象 = 业务对象」（否则自检可能对着伪造节点判「凭据可用」）
+  const parsed = alipaySyncNode(raw, 'alipay_trade_query_response');
+  const node = parsed.node;
   if (!node) {
     return probeFail('net', '支付宝返回内容无法识别，请检查网关地址是否为 https://openapi.alipay.com/gateway.do',
       raw.slice(0, 200));
@@ -1704,6 +1824,9 @@ module.exports = {
   alipaySignPayload, alipayBuildUrl, alipayTimestamp, alipayVerify,
   // R84：同步响应验签（M-1）—— 导出以便直接驱动「原文切片」与「验签口径」这两处纯函数
   alipayRawNode, alipayVerifySync, fenFromYuan,
+  // R104（F-02）：节点切片的「唯一性 + 同源解析」是验签对象 = 业务对象的唯一实现点，
+  // 导出是为了让护栏能直接喂「双同名节点」的报文（而不必伪造一个能签名的网关）
+  alipayNodeText, alipaySyncNode,
   // R84（L-1）：金额对账的文案分叉（「查不到金额」vs「金额不符」）要能被直接断言
   checkPaidAmount,
   wechatSignPayload, wechatAuthorization, wechatDecryptResource,

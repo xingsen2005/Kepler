@@ -118,6 +118,38 @@ function setOnLock(fn) {
   onLock = typeof fn === 'function' ? fn : null;
 }
 
+/**
+ * 「DEK 状态变了」的清理钩子（R104 / F-01）。
+ *
+ * `onLock` 只够 `config-store` 一个模块用（它是单槽，且语义是「锁定前清缓存」）。
+ * 但 `secure-store` 之上还有 10 个模块各自缓存着**解密后的**数据表
+ * （分享链接 / 上传会话 / IP 规则 / 订单 / 券 / 邀请码 / 下载记录 / 取回封禁 /
+ * 加密设置与元数据）。它们与 DEK 的关系比 config-store 更弱，却同样必须遵守一条：
+ *
+ *   **内存里那份表，必须与「当前 DEK 能读到的磁盘内容」同步。**
+ *
+ * 锁定态的读盘必然失败（`KEYRING_LOCKED`）。若某个模块把这次失败当成「空表」缓存
+ * 下来，解锁之后它仍然拿着空表 —— 下一次写入就把整份数据覆盖成空（不可逆）。
+ * 所以：解锁 / 加锁 / 新建信封之后，一律丢掉这些缓存，让下一次读重新落到磁盘上。
+ *
+ * 用注册表而不是再开一个单槽：条数不确定（未来还会加 store），单槽必然被后注册者
+ * 覆盖，而那正是「看起来接了钩子、其实只接了一个」的假绿。
+ */
+const resetHooks = [];
+
+function addResetHook(fn) {
+  if (typeof fn === 'function' && resetHooks.indexOf(fn) < 0) resetHooks.push(fn);
+}
+
+/** 依次调用清理钩子；任何一条抛错都不影响其余（清理失败不该让解锁失败） */
+function runResetHooks() {
+  for (const fn of resetHooks) {
+    try { fn(); } catch (e) {
+      console.error('[keyring] 密钥状态变化后清理缓存失败：', (e && e.message) || e);
+    }
+  }
+}
+
 function keyringPath() {
   return path.join(dataDir(), KEYRING_NAME);
 }
@@ -374,6 +406,13 @@ function lock() {
   if (Buffer.isBuffer(state.dek)) state.dek.fill(0);
   state.dek = null;
   state.path = '';
+  /**
+   * R104（F-01）：锁定后**内存里不该再留着任何解密过的数据表**。
+   *
+   * 放在抹密钥**之后**：钩子的语义是「现在是锁定态，缓存一律作废」，而不是
+   * 「趁 DEK 还在清一次缓存」。清理失败只能记日志 —— 它不该让一次锁定失败。
+   */
+  runResetHooks();
 }
 
 /**
@@ -403,6 +442,14 @@ async function unlock(passphrase) {
   if (Buffer.isBuffer(state.dek)) state.dek.fill(0);
   state.dek = plain;
   state.path = keyringPath();
+  /**
+   * R104（F-01）：解锁后**必须**让锁定期被读空的缓存重新落回磁盘。
+   *
+   * 锁定期各 store 的读盘会拿到 `KEYRING_LOCKED`（它们已不再把这次失败缓存成
+   * 空表，见 `addResetHook` 的说明）；但「当时代码路径已经把某份旧缓存留在内存里」
+   * 的情形只能在这里一次性作废 —— 否则解锁只是「能解密了」，并不会让任何人**去**解密。
+   */
+  runResetHooks();
   return info(ring);
 }
 
@@ -449,6 +496,7 @@ async function create(passphrase, dekBuffer) {
   if (Buffer.isBuffer(state.dek)) state.dek.fill(0);
   state.dek = Buffer.from(dekBuffer2); // 存副本：调用方的 Buffer 可能被它自己改
   state.path = keyringPath();
+  runResetHooks(); // R104（F-01）：与 unlock() 同一口径（DEK 换了就必须重读）
   return info(ring);
 }
 
@@ -565,6 +613,8 @@ module.exports = {
   info,
   autoUnlockFromEnv,
   setOnLock,
+  // R104（F-01）：DEK 状态变化后的缓存作废钩子（secure-store 之上的 store 自注册）
+  addResetHook,
   // 供迁移器 / 测试复用
   deriveKek,
   sealDek,

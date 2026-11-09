@@ -150,6 +150,15 @@ function load() {
     // 文件存在且能解析，但结构不是预期的 { orders: [...] } —— 同样视为不可信
     throw new Error('内容结构不是预期的 { orders: [] }');
   } catch (e) {
+    /**
+     * R104（F-01）：锁定态借出空表，但**不缓存、不置 `loadFailed`**。
+     *
+     * `loadFailed` 是进程级永久的（下面那行注释解释了它为什么必须这么硬）。
+     * 把它用在「主密钥还没解锁」上，后果是：一次普通重启（不设 env 主口令）
+     * 就让订单表在本进程余生恒为空 —— 回调与查单定位不到目标、已付款用户拿不到
+     * 文件、新订单不落盘（收入流水丢失），而重启前一切正常。
+     */
+    if (secureStore.isLockedError(e)) return { orders: [] };
     loadFailed = true;
     // 非「文件损坏」的异常（代码缺陷）额外打出堆栈，避免再被当成"文件坏了"误导排障
     if (e && e.corrupt) console.error('[payment-orders] 订单文件损坏，已降级为空列表并锁定写入：', e.message);

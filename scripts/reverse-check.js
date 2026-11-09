@@ -147,8 +147,12 @@ async function runCase({ name, file, anchor, replacement, mutations, testFile, m
  * ⚠️ R97：调用点外面多包了一层 `bootUnlock.then(…)`（首次清扫必须等解锁完成，
  * 否则它会读到锁定态的 `upload-sessions.json`）。锚点随之更新 —— 这正是
  * 「改共享调用点的形态会老化别处 anchor」那类事故，`invariants` 的锚点自检当场抓到。
+ *
+ * ⚠️ R104（F-01）：`.then()` 里又加了 `if (!r || !r.ok) return;`（解锁失败就不清扫），
+ * 于是只锚**那一行调用**。变异语义不变：启动路径不再执行 prune，由第二条变异把它
+ * 挪到单实例锁之前。
  */
-const PRUNE_CALL = 'bootUnlock.then(() => { try { pruneSessions(); } catch (e) { /* 清扫失败不影响启动 */ } });\n';
+const PRUNE_CALL = '  try { pruneSessions(); } catch (e) { /* 清扫失败不影响启动 */ }\n';
 
 /**
  * 全部反向对照用例。**导出**是为了让 `tests/invariants.test.js` 能在测试里
@@ -4782,8 +4786,8 @@ const CASES = [
       // 没还原」，而是把系统导成**零管理员** —— 管理页打不开、也没有自助恢复通道。
       name: 'R38-02x · 导入顺手写了用户表（把系统导成零管理员 → 永久锁死）',
       file: 'server/backup.js',
-      anchor: '  await configStore.flush();\n  const sum = summarize(collect());',
-      replacement: '  configStore.save({ users: Array.isArray(data.users) ? data.users : [] });\n  await configStore.flush();\n  const sum = summarize(collect());',
+      anchor: '  const beforeWrite = configStore.getLastWriteError();\n  await configStore.flush();\n  const afterWrite = configStore.getLastWriteError();',
+      replacement: '  configStore.save({ users: Array.isArray(data.users) ? data.users : [] });\n  const beforeWrite = configStore.getLastWriteError();\n  await configStore.flush();\n  const afterWrite = configStore.getLastWriteError();',
       testFile: 'audit38-regressions.test.js',
       minFail: 1,
     },
@@ -10886,7 +10890,9 @@ const CASES = [
        */
       name: 'R82-08a · 服务启动不再执行清理（升级后没人跑迁移）',
       file: 'server/index.js',
-      anchor: '  const swept = paymentOrders.sweepStalePending();',
+      // R104（F-01）：启动清扫前面多了一道「锁定态跳过」⇒ 锚点带上它，
+      // 变异语义不变：不执行清理。
+      anchor: '  const swept = configStore.isLocked()\n    ? { swept: 0, skipped: true }\n    : paymentOrders.sweepStalePending();',
       replacement: '  const swept = { swept: 0, skipped: true }; // R82 反向变异：不执行清理',
       testFile: 'audit82-regressions.test.js',
       minFail: 1,
@@ -12424,7 +12430,11 @@ const CASES = [
     {
       name: 'R94-58a · M09-02：元数据损坏时照样把快照写出去',
       file: 'server/enc-store.js',
-      anchor: '    if (metaCorrupt) return null;',
+      /**
+       * R104（F-01）：判据从「损坏」扩到「损坏或从未读到」—— 锚点随源码同步。
+       * 变异语义不变：把这道守卫改成恒假，快照就会把临时空表写出去。
+       */
+      anchor: '    if (metaCorrupt || !metaCache) return null;',
       replacement: '    if (false) return null;',
       testFile: 'audit94-regressions.test.js',
       minFail: 1,
@@ -13229,6 +13239,159 @@ const CASES = [
       anchor: "  if (enabled && !email) throw badRequest('已开启异常通知，请填写接收通知的邮箱地址');",
       replacement: "  if (false) throw badRequest('已开启异常通知，请填写接收通知的邮箱地址');",
       testFile: 'audit103-regressions.test.js',
+      minFail: 1,
+    },
+
+    /* ================= R104 · 《Kepler v2.1.3 安全审计报告》六条修复 ================= */
+    {
+      /**
+       * F-01 的形状：锁定态读盘失败被当成「文件坏了」⇒ 空表进缓存 ⇒ 解锁后一次写入
+       * 就把 links.json 整份覆盖。变异：让锁定分支消失，退回「缓存空表」。
+       */
+      name: 'R104-01a · F-01 · 分享表在锁定态被缓存成空表（解锁后整份链接被覆盖）',
+      file: 'server/share-store.js',
+      anchor: '    if (secureStore.isLockedError(e)) return { links: [] };',
+      replacement: '    /* mutated：锁定态照旧把空表缓存下来 */',
+      testFile: 'audit104-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 同型：上传会话表。丢了它等于分片 IV/TAG/盐全失 —— 已传分片永久不可解且继续计费。
+      name: 'R104-01b · F-01 · 会话表在锁定态被缓存成空表（分片元数据全丢）',
+      file: 'server/upload-sessions.js',
+      anchor: '    if (secureStore.isLockedError(e)) return {};',
+      replacement: '    /* mutated：锁定态照旧缓存空表 */',
+      testFile: 'audit104-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 同型，且是这条里最具安全属性的后果：全部黑名单 / 屏蔽海外 IP 被抹掉。
+      name: 'R104-01c · F-01 · IP 规则在锁定态被缓存成空表（全部黑名单失效并被写空）',
+      file: 'server/ip-guard.js',
+      anchor: "    if (secureStore.isLockedError(e)) return { rules: [], updatedAt: '' };",
+      replacement: '    /* mutated：锁定态照旧缓存空规则集 */',
+      testFile: 'audit104-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 加密设置：缓存了 defaultSettings() ⇒ 解锁后整站按「不加密 / 没设查看密码」运行。
+      name: 'R104-01d · F-01 · 锁定态把默认加密设置缓存下来（解锁后新上传明文落云）',
+      file: 'server/enc-store.js',
+      anchor: '      settingsUnavailable = true; // 写路径 fail-closed（与损坏同口径）\n      return defaultSettings();   // 但不缓存：解锁后必须重新读盘',
+      replacement: '      settingsUnavailable = true; // 变异：把默认设置缓存下来\n      return (settings = defaultSettings());',
+      testFile: 'audit104-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 加密元数据：缓存空表 = 解密的唯一凭据丢失（云端有密文、本地没有 IV/TAG）。
+      name: 'R104-01e · F-01 · 元数据在锁定态被缓存成空表（既有密文失去解密凭据）',
+      file: 'server/enc-store.js',
+      anchor: '    if (secureStore.isLockedError(e)) return { files: {} };',
+      replacement: '    /* mutated：锁定态照旧缓存空元数据 */',
+      testFile: 'audit104-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 解锁后不清「设置不可用」标志 ⇒ 本进程余生都按「设置坏了」运行（写 503、门禁永远要密码）。
+      name: 'R104-01f · F-01 · 解锁后不清 settingsUnavailable（整站按「设置坏了」运行）',
+      file: 'server/enc-store.js',
+      anchor: 'keyring.addResetHook(() => {\n  settingsUnavailable = false;\n  metaCorrupt = false;\n});',
+      replacement: '/* mutated：解锁后不清「不可用」标志 */',
+      testFile: 'audit104-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // F-02 的形状：同名业务节点出现两次时必须切不出内容（否则验签看第一个、取值看最后一个）。
+      name: 'R104-02a · F-02 · 允许「两个同名业务节点」各取所需（验签取第一个、业务取最后一个）',
+      file: 'server/payment-gateway.js',
+      anchor: "  if (hits.length !== 1) return { content: '', count: hits.length };",
+      replacement: "  if (false) return { content: '', count: hits.length }; // 变异：允许重复键",
+      testFile: 'audit104-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      /**
+       * F-02 的完整旧形态，两步一起还原：
+       *  ① 切片重新允许重复键（验签取第一个）；
+       *  ② 业务字段退回 `json[nodeKey]`（`JSON.parse` 取最后一个）。
+       * 单做 ① 会被 `alipaySyncNode()` 的 duplicate 分支挡住，所以必须成对施加。
+       */
+      name: 'R104-08a · F-02 · 业务字段退回 JSON.parse 的同名键（真签名给伪造节点背书）',
+      file: 'server/payment-gateway.js',
+      mutations: [
+        {
+          anchor: "  if (hits.length !== 1) return { content: '', count: hits.length };",
+          replacement: "  if (false) return { content: '', count: hits.length }; // 变异：允许重复键",
+        },
+        {
+          anchor: "  const parsed = alipaySyncNode(raw, 'alipay_trade_query_response');\n  const node = parsed.node;\n  if (!node) {\n    return { paid: false, state: 'error', tradeNo: '', failReason: alipayNodeError(parsed.error) };",
+          replacement: "  const parsed = alipaySyncNode(raw, 'alipay_trade_query_response');\n  const node = json && json.alipay_trade_query_response; // 变异：业务读最后一个同名键\n  if (!node) {\n    return { paid: false, state: 'error', tradeNo: '', failReason: alipayNodeError(parsed.error) };",
+        },
+      ],
+      testFile: 'audit104-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // F-03：请求 Host 无条件进允许集 ⇒ 在 evil.com 上解出的 token 直接放行。
+      name: 'R104-03a · F-03 · captchaHosts 无条件采信请求 Host（hostname 核对被架空）',
+      file: 'server/routes/auth.js',
+      anchor: '  if (reqHost && security.isOwnSiteHost(reqHost)) add(reqHost);',
+      replacement: '  add(reqHost); // 变异：请求 Host 直接进白名单',
+      testFile: 'audit104-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // F-04：设置读不出来时「任意口令都对」——门禁要密码、校验却放行任何输入。
+      name: 'R104-04a · F-04 · 设置不可用时查看密码校验 fail-open（任意口令换令牌）',
+      file: 'server/enc-store.js',
+      anchor: '  if (settingsUnavailable) return false;',
+      replacement: '  if (false) return false; // 变异：读不到设置时放行任意口令',
+      testFile: 'audit104-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // F-04 的另一半：`passwordSet()` 先判标志再读盘 ⇒ 第一次调用永远 fail-open。
+      name: 'R104-04b · F-04 · passwordSet 先判标志后读盘（首调用永远「没设密码」）',
+      file: 'server/enc-store.js',
+      anchor: '  const s = loadSettings();\n  if (settingsUnavailable) return true;',
+      replacement: '  if (settingsUnavailable) return true; // 变异：先判标志\n  const s = loadSettings();',
+      testFile: 'audit104-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // F-05：只 await flush() 不知道写失败 ⇒ 界面「导入完成」、磁盘还是旧配置。
+      name: 'R104-05a · F-05 · 导入不再比对写盘结果（失败也回「导入完成」）',
+      file: 'server/backup.js',
+      anchor: '  if (afterWrite && afterWrite !== beforeWrite) {',
+      replacement: '  if (false) { // 变异：不看写盘结果',
+      testFile: 'audit104-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // F-06：reconcile 不在轮转互斥里 ⇒ 并发解锁会删掉「唯一能补完轮转」的意图日志。
+      name: 'R104-06a · F-06 · 轮转进行中照样执行 reconcile（意图日志被提前删除）',
+      file: 'server/key-rotate.js',
+      anchor: "  if (rotating) return { repaired: false, reason: 'rotating' };",
+      replacement: "  if (false) return { repaired: false, reason: 'rotating' }; // 变异：不判轮转中",
+      testFile: 'audit104-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // F-01 的启动半边：`.then()` 不判 r.ok =「等解锁尝试完成」，锁定态照跑清扫。
+      name: 'R104-07a · F-01 · 首次清扫不判 unlock 成功（锁定态照跑 prune）',
+      file: 'server/index.js',
+      anchor: '  if (!r || !r.ok) return;\n  try { pruneSessions(); } catch (e) { /* 清扫失败不影响启动 */ }',
+      replacement: '  if (false) return; // 变异：不判 r.ok\n  try { pruneSessions(); } catch (e) { /* 清扫失败不影响启动 */ }',
+      testFile: 'audit104-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 启动期订单清扫不判锁定态 ⇒ loadFailed 被置成进程级永久（收入流水从此不落盘）。
+      name: 'R104-07b · F-01 · 启动期订单清扫不判锁定态（loadFailed 进程级永久）',
+      file: 'server/index.js',
+      anchor: '  const swept = configStore.isLocked()\n    ? { swept: 0, skipped: true }\n    : paymentOrders.sweepStalePending();',
+      replacement: '  const swept = paymentOrders.sweepStalePending(); // 变异：锁定态照跑',
+      testFile: 'audit104-regressions.test.js',
       minFail: 1,
     },
   ];

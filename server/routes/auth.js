@@ -42,10 +42,21 @@ const router = express.Router();
 /**
  * R94（审核 M03-04）：本站允许的域名集合 —— 供人机验证核对服务商应答里的 `hostname`。
  *
- * 取两处并集：本次请求的 `Host`（用户实际访问的域名）与 `SITE_DOMAIN`（部署脚本写入的
- * 对外域名）。两者都属 `security.isOwnSiteHost()` 认的「本站」，故任一命中即放行；
- * 而一枚在**别的域名**上解出的 token 两处都不匹配 —— 那正是要拦下的情况
- * （同一枚 sitekey 被多个站点共用是服务商官方支持的常见做法）。
+ * R104（F-03）：**请求 `Host` 不再无条件采信**。
+ *
+ * 允许集只能由**服务端权威来源**构造：本机 `HOST`、`SITE_DOMAIN`（部署脚本写入），
+ * 以及配置里的主 / 备域名 —— 也就是 `security.isOwnSiteHost()` 认的那一份。
+ * 旧实现在注释里说「两者都属 isOwnSiteHost() 认的本站」，实现却直接把
+ * `req.headers.host` 塞进允许集：任何人发一个 `Host: evil.com` 就把它自己
+ * 加进白名单，于是「在 evil.com 上解出的 token」也能过 —— R94 那层 hostname
+ * 核对被整条架空（`security.js:446` 早已声明「请求头不是安全判据」）。
+ *
+ * 保留「请求 Host 参与」这一能力，但必须先过 `isOwnSiteHost()`：它拿配置比对，
+ * 不把传入值当额外白名单（`extra` 留空 —— 否则又是自我认证）。
+ *
+ * ⚠️ 允许集为空时 `captcha.js` 的 `hostnameAllowed()` 按既有契约放行
+ * （「没有可比对的本站域名」不等于「任何域名都是本站」）。这一条刻意不改：
+ * 默认部署（`SITE_DOMAIN` 由部署脚本写入）下它不会为空。
  */
 function captchaHosts(req) {
   const out = [];
@@ -53,7 +64,8 @@ function captchaHosts(req) {
     const s = security.normalizeHost(v);
     if (s && out.indexOf(s) < 0) out.push(s);
   };
-  add(req && req.headers && req.headers.host);
+  const reqHost = req && req.headers && req.headers.host;
+  if (reqHost && security.isOwnSiteHost(reqHost)) add(reqHost);
   add(security.SITE_DOMAIN);
   return out;
 }

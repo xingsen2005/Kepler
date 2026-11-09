@@ -69,6 +69,8 @@ function load() {
     }
     throw new Error('内容结构不是预期的 { bans: [] }');
   } catch (e) {
+    // R104（F-01）：锁定态借出空表但不缓存、不置 loadFailed（否则解锁后封禁表恒空）
+    if (secureStore.isLockedError(e)) return { bans: [] };
     loadFailed = true;
     console.error('[restore-guard] 读取订单取回封禁失败，已锁定写入：', (e && e.stack) || e);
   }

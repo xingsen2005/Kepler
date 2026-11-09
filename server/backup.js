@@ -730,8 +730,28 @@ async function apply(data) {
    * 「导入成功」的响应会先于磁盘写入发出：此时进程若被容器重启 / OOM 杀掉，
    * 界面已经告诉管理员「导入完成」，磁盘上却还是旧配置（或写到一半）。
    * 导入是一次**整体覆盖**，它必须是「要么全都在盘上、要么明确报错」。
+   *
+   * R104（F-05）：**await 不等于知道写成功**。
+   *
+   * `config-store` 的写队列用 `.catch()` 把写盘异常吞成 `lastWriteError`，队列本身
+   * 永远 resolve（那是对的：改成 reject 会让 fire-and-forget 的调用点炸出
+   * `unhandledRejection`）。所以在**这个**关键调用点必须比对前后值 —— 项目里
+   * `key-rotate.js:503-512` 已是这个范式，导入是第二个「全量覆盖」语义的调用点。
+   *
+   * 只判「`lastWriteError` 非空」会误报：更早一次无关的失败会一直留在里面。
+   * 比对**前后引用**才能定位「本次导入有没有写下去」。
    */
+  const beforeWrite = configStore.getLastWriteError();
   await configStore.flush();
+  const afterWrite = configStore.getLastWriteError();
+  if (afterWrite && afterWrite !== beforeWrite) {
+    const err = new Error(
+      `配置导入失败：写入磁盘时出错（${(afterWrite && afterWrite.message) || afterWrite}）。`
+      + '为避免「界面显示导入完成、重启后配置回到导入前」，本次导入已按失败处理，请检查磁盘空间 / 权限后重试。'
+    );
+    err.status = 500;
+    throw err;
+  }
   const sum = summarize(collect());
   // R94（审核 M04-04）：把「因绑定用户在目标实例不存在而未导入」的 WebDAV 账户
   // 如实回报，避免它们静默消失（也就不会有人误以为它们被导入了）。

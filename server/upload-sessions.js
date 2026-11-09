@@ -48,6 +48,17 @@ function ensure() {
     if (raw && typeof raw === 'object') sessions = raw;
     else sessions = {};
   } catch (e) {
+    /**
+     * R104（F-01）：锁定态**不是**损坏，绝不能把空表钉进缓存。
+     *
+     * 旧实现只写了「secure-store 已锁定该文件写入」，那是错的：锁定态根本不进
+     * `corruptFiles`，所以解锁后第一次 `persistNow()` 就会把这份空表写盘 ——
+     * 会话里的分片 IV/TAG/盐全丢，已上传分片永久不可解且持续计费。
+     *
+     * 这里只**借出**一份空对象给调用方（读路径要能安全返回「现在什么也看不到」），
+     * 但不赋值给 `sessions`：解锁后的下一次读会重新落到磁盘上。
+     */
+    if (secureStore.isLockedError(e)) return {};
     // SEC-09：损坏时告警（secure-store 已锁定写入，磁盘文件不会被空集覆盖）
     console.error('[upload-sessions] 上传会话文件损坏，已降级为空集并锁定写入：', e.message);
     sessions = {};
@@ -66,6 +77,14 @@ function persist() {
 /** 立即落盘（去抖窗口之外调用；异步，不阻塞事件循环） */
 function persistNow() {
   try {
+    /**
+     * R104（F-01）：**从未成功读过盘就不许写**。
+     *
+     * 锁定态下 `ensure()` 只借出一份临时空对象、`sessions` 仍是 null。此时若照旧
+     * `writeJsonAsync(FILE, sessions)`，序列化的是 `null` —— 解锁后这条队列一执行，
+     * 磁盘上那份会话表就变成密文里的一个 `null`，谁都读不回来。
+     */
+    if (!sessions) return;
     /**
      * R10-01：这里曾误留一行 `if (cleaned && !fs.existsSync(DATA_DIR)) return;`，
      * 而 `cleaned` **只声明在**下面的 `persistNowSync()` 里 —— 本函数读取未声明
