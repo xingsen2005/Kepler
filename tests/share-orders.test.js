@@ -11,6 +11,9 @@
  *     允许复制，并告知「订单号是售后和取回下载权限的唯一凭证」。
  *  前提：所有取回功能只在订单状态为「支付成功」时成立。
  *
+ * ⚠️ R105 修订：需求里的「13 位毫秒时间戳」后来由用户本人撤回 —— 那一段会暴露
+ * 精确下单时间，已改为**等长的随机混淆段**（见 `R105-01`）。长度与字符集不变。
+ *
  * ## 分层（每条都指向**实际被执行的那一层**）
  *
  *  ① 纯函数层 —— `server/order-no.js`：长度 / 结构 / 区分大小写 / 非顺序 / 确定性派生
@@ -141,15 +144,18 @@ const setCookieOf = (r) => [].concat(r.headers['set-cookie'] || []).join('\n');
  * ① 纯函数层：订单号本身
  * ================================================================== */
 
-test('R64-01 · 订单号为 36 位：13 位毫秒时间戳 + 9 位链接 UID + 9 位用户 UID + 5 位随机串', () => {
+test('R64-01 · 订单号为 36 位：13 位混淆段 + 9 位链接 UID + 9 位用户 UID + 5 位随机串', () => {
   const a = orderNo.compose({ linkId: 'link-A', userId: 'user-A' });
   assertEqual(a.no.length, 36, `订单号应为 36 位，实际 ${a.no.length}`);
   assert(orderNo.isOrderNo(a.no), `订单号应能通过格式校验：${a.no}`);
 
   const p = orderNo.parse(a.no);
   assert(p.ok, '应能解析');
-  assertMatch(a.no.slice(0, 13), /^\d{13}$/, '首段必须是 13 位毫秒时间戳');
-  assert(Math.abs(p.ts - Date.now()) < 120000, '时间戳应贴近当前时刻（毫秒级）');
+  /**
+   * R105：首段已从「13 位毫秒时间戳」改为随机混淆段。这里**不能**再断言
+   * `/^\d{13}$/` —— 那正是被本次修改反转的旧契约（`R105-01a` 把它退回去时必须变红）。
+   */
+  assertEqual(p.mask.length, 13, '混淆段应为 13 位');
   assertEqual(p.linkUid.length, 9, '链接 UID 应为 9 位');
   assertEqual(p.userUid.length, 9, '用户 UID 应为 9 位');
   assertEqual(p.rand.length, 5, '随机串应为 5 位');
@@ -165,6 +171,64 @@ test('R64-01 · 订单号为 36 位：13 位毫秒时间戳 + 9 位链接 UID + 
   assert(!orderNo.isOrderNo(a.no.slice(0, 35) + '-'), '含连字符不是订单号（订单号内不出现分隔符）');
 });
 
+/**
+ * R105-01 · 订单号不得暴露精确下单时间（用户主动提出：前 13 位是时间戳）。
+ *
+ * 判据必须落在**能判定「读不出时间」**这一层，而不是「首段含字母」——
+ * 后者太弱：一个以 `1` 开头的随机串照样可能被误读成时间戳，反过来一段
+ * 时间戳只要开头是 `1`（任何 2023 年之后的毫秒值）也含数字。
+ *
+ * 三条一起成立才算混淆：
+ *  ① 首段**不是** 13 位全数字（旧实现的形状，一眼可读成时间戳）；
+ *  ② 把首段当十进制数解释时，它**不落在**「当前时刻 ± 3 年」这个区间内
+ *     （这是最容易被读出来的用法：`new Date(Number(前13位))`）；
+ *  ③ 同一毫秒内连续生成的两个号，首段**不相同**（时间戳会完全相同）。
+ */
+test('R105-01 · 订单号前 13 位不得暴露下单时间（随机混淆，且不可当时间戳解读）', () => {
+  const samples = [];
+  for (let i = 0; i < 300; i++) samples.push(orderNo.compose({ linkId: 'link-T', userId: 'user-T' }).no);
+
+  const now = Date.now();
+  const threeYears = 3 * 365 * 24 * 3600 * 1000;
+  const seenMask = new Set();
+
+  for (const no of samples) {
+    const head = no.slice(0, 13);
+    assert(!/^\d{13}$/.test(head),
+      `首段不得是 13 位纯数字（否则可被直接读成毫秒时间戳）：${no}`);
+    const asTs = Number(head);
+    // 只有全数字时才可能被当成时间戳；上一条已排除，这里再兜一次「数字开头的误读」
+    assert(!(Number.isFinite(asTs) && Math.abs(asTs - now) < threeYears),
+      `把首段当时间戳解读时不得落在当前时刻 ±3 年内：${no}`);
+    seenMask.add(head);
+  }
+
+  assertEqual(seenMask.size, samples.length,
+    `同一批生成的订单号首段必须互不相同（时间戳会大量重复）：${samples.length} 个号只出现 ${seenMask.size} 种首段`);
+});
+
+/**
+ * R105-02 · 格式判据必须接受新形态，同时**仍然拒绝**非法输入（两个方向都要钉）。
+ *
+ * 这条是「改判据」最容易翻车的地方：把 `/^\d{13}/` 换成「随便什么都行」能让新号通过，
+ * 但 16 位老 id、含连字符、超长串也会一起通过 —— 恢复购买页的形状校验会形同虚设。
+ */
+test('R105-02 · 新形态订单号通过校验，而非法形态仍被拒（判据没有一并放宽）', () => {
+  const v = orderNo.compose({ linkId: 'link-V', userId: 'user-V' }).no;
+  assertMatch(v, /^[0-9A-Za-z]{36}$/, '订单号必须是 36 位纯字母数字');
+  assert(orderNo.isOrderNo(v), '新生成的订单号必须通过格式校验');
+  // 历史订单号（R105 之前生成，首段是时间戳）必须继续有效 —— 否则老用户取不回购买
+  assert(orderNo.isOrderNo('1750000000000ABCDEFGHIJKLMNOPQR12345'),
+    'R105 之前的历史订单号仍须通过校验（首段为时间戳的形态）');
+
+  assert(!orderNo.isOrderNo(''), '空串不是订单号');
+  assert(!orderNo.isOrderNo('abc'), '短串不是订单号');
+  assert(!orderNo.isOrderNo(v.slice(0, 35) + '-'), '含连字符不是订单号');
+  assert(!orderNo.isOrderNo(v + 'A'), '超长不是订单号');
+  // 老记录 id（24 位 base64url，可能含 - 与 _）不是订单号 —— 它走的是 findByOrderNo 的原始精确匹配
+  assert(!orderNo.isOrderNo('AbC_-dEfGhIjKlMnOpQrStUv'), '24 位 base64url 记录 id 不是订单号');
+});
+
 test('R64-02 · 订单号区分大小写、非顺序：同链接同账号每次不同，且大小写与数字都出现', () => {
   const seen = new Set();
   let upper = 0;
@@ -174,13 +238,27 @@ test('R64-02 · 订单号区分大小写、非顺序：同链接同账号每次�
     const no = orderNo.compose({ linkId: 'link-B', userId: 'user-B' }).no;
     assert(!seen.has(no), `订单号必须唯一，重复出现：${no}`);
     seen.add(no);
-    if (/[A-Z]/.test(no.slice(13))) upper += 1;
-    if (/[a-z]/.test(no.slice(13))) lower += 1;
-    if (/\d/.test(no.slice(13))) digit += 1;
+    /**
+     * R105：这里原先对 `no.slice(13)` 计数（跳过首段）—— 因为当时首段是纯数字，
+     * 算进去会让「大写 / 小写」永远差一档。现在首段也是随机 base62，**整串**都该
+     * 参与分布判据：跳过它等于对 13/36 的字符不作要求。
+     */
+    if (/[A-Z]/.test(no)) upper += 1;
+    if (/[a-z]/.test(no)) lower += 1;
+    if (/\d/.test(no)) digit += 1;
   }
   assertEqual(seen.size, 200, '200 次生成必须全部唯一');
   assert(upper > 190 && lower > 190 && digit > 190,
     `顺序号或单字符集不满足需求：大写 ${upper}/200、小写 ${lower}/200、数字 ${digit}/200`);
+
+  /**
+   * R105 追加：格式判据要求「纯字母数字」，所以订单号里**不得**出现 `-` / `_`
+   * （老记录 id 是 base64url，含这两个字符 —— 若订单号也允许，银联 / 微信的
+   * 参数校验与 `normalize()` 的连字符剥离会互相打架）。整串扫一遍。
+   */
+  for (const o of seen) {
+    assertMatch(o, /^[0-9A-Za-z]{36}$/, `订单号必须是 36 位纯字母数字：${o}`);
+  }
 
   // 游客（无 userId）的账号段必须按单随机，而不是固定空值
   const g1 = orderNo.compose({ linkId: 'link-B' });

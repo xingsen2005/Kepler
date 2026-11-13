@@ -49,7 +49,7 @@ const qrcode = require('./qrcode');
 const couponStore = require('./coupon-store');
 // R62：分享页也要能认出「已登录的人」—— 只有这样「限特定用户」与「每人一次」才成立
 const authSession = require('./auth-session');
-// R64：订单号编解码（36 位「时间戳 + 链接 UID + 用户 UID + 随机串」的唯一实现点）
+// R64：订单号编解码（36 位「混淆段 + 链接 UID + 用户 UID + 随机串」的唯一实现点）
 const orderNo = require('./order-no');
 // R64：免费下载记录 —— 「查看历史订单」里「免费下载的文件」的唯一来源（只记首次）
 const downloadLog = require('./download-log');

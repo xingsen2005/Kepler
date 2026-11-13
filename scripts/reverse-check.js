@@ -9188,13 +9188,45 @@ const CASES = [
        *
        * 后果：16 位的老订单 id、甚至任意一串都能通过 `isOrderNo()`，「36 位」这条
        * 用户需求失去约束 —— 而界面上看不出任何异常（订单号照样生成、照样能取回）。
+       *
+       * ⚠️ R105 重锚：判据里那截 `/^[1-9]\d{12}[0-9A-Za-z]{23}$/` 已随「首段改随机
+       * 混淆段」替换为纯长度 + 字符集。本条要守的语义没变（**长度 36 位这条约束
+       * 必须存在**），故 anchor 跟到**新判据的同一行**上，`minFail` 不动。
        */
       name: 'R64-01a · 订单号格式判据退化成「字母数字即可」（36 位约束失效）',
       file: 'server/order-no.js',
-      anchor: '  return v.length === ORDER_NO_LEN && /^[1-9]\\d{12}[0-9A-Za-z]{23}$/.test(v);',
+      anchor: '  return v.length === ORDER_NO_LEN && /^[0-9A-Za-z]+$/.test(v);',
       replacement: '  return /^[0-9A-Za-z_-]+$/.test(v);',
       testFile: 'share-orders.test.js',
       minFail: 2,
+    },
+    {
+      /*
+       * R105-01a：首段退回「13 位毫秒时间戳」（用户本次要求修掉的那件事）。
+       *
+       * 后果：任何人拿到订单号就能读出精确到毫秒的下单时间 —— 而订单号是要交给用户
+       * 保存、在客服对话里粘贴、被截图转发的凭据。`R105-01` 的三条判据会同时红。
+       */
+      name: 'R105-01a · 订单号首段退回毫秒时间戳（暴露精确下单时间）',
+      file: 'server/order-no.js',
+      anchor: 'function maskSegment() {\n  return randomId(TS_LEN);\n}',
+      replacement: "function maskSegment() {\n  return String(Date.now()).padStart(TS_LEN, '0').slice(-TS_LEN);\n}",
+      testFile: 'share-orders.test.js',
+      minFail: 1,
+    },
+    {
+      /*
+       * R105-02a：格式判据退回到「要求首段长得像时间戳」。
+       *
+       * 与 R64-01a 方向相反、后果更隐蔽：新生成的订单号会**全部**被判为非法，
+       * 「恢复购买」对每一笔新订单都回「订单号格式不正确」—— 而生成侧一切正常。
+       */
+      name: 'R105-02a · 格式判据仍要求首段是 13 位时间戳（新订单号全部被判非法）',
+      file: 'server/order-no.js',
+      anchor: '  return v.length === ORDER_NO_LEN && /^[0-9A-Za-z]+$/.test(v);',
+      replacement: '  return v.length === ORDER_NO_LEN && /^[1-9]\\d{12}[0-9A-Za-z]{23}$/.test(v);',
+      testFile: 'share-orders.test.js',
+      minFail: 1,
     },
     {
       /*
