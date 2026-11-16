@@ -43,13 +43,12 @@ const vm = require('vm');
 const fs = require('fs');
 const crypto = require('crypto');
 const test = require('node:test');
-const { assert, assertEqual, ROOT, makeTempDir, request } = require('./helpers.js');
+const { assert, assertEqual, ROOT, makeTempDir, request, startShareApp } = require('./helpers.js');
 
 const tmp = makeTempDir('r80-');
 process.env.S3_DATA_DIR = tmp.dir;
 
 const SERVER = (...p) => path.join(ROOT, 'server', ...p);
-const express = require(path.join(ROOT, 'node_modules', 'express'));
 
 /* ---------------------------------------------------------------- *
  * 密钥素材（R80 不测密钥，但付费流程需要一对真钥匙才能走到 302）
@@ -108,26 +107,15 @@ statsStore.track = () => {};
 const shareStore = require(SERVER('share-store.js'));
 const paymentOrders = require(SERVER('payment-orders.js'));
 const paymentGateway = require(SERVER('payment-gateway.js'));
-const shareRoutes = require(SERVER('share-routes.js'));
 
 paymentGateway.queryCharge = async () => ({ paid: false, state: 'pending', tradeNo: '', failReason: '' });
 
 /* ---------------------------------------------------------------- *
  * HTTP 夹具
  * ---------------------------------------------------------------- */
+/** 分享路由的最小应用 —— 形态与中间件顺序见 `helpers.startShareApp` */
 async function serve() {
-  const app = express();
-  app.use(express.urlencoded({ extended: false }));
-  app.use(express.json());
-  app.use('/', shareRoutes);
-  const server = await new Promise((resolve) => {
-    const s = http.createServer(app);
-    s.listen(0, '127.0.0.1', () => resolve(s));
-  });
-  return {
-    port: server.address().port,
-    close: () => new Promise((r) => server.close(r)),
-  };
+  return startShareApp();
 }
 
 let seq = 0;

@@ -35,13 +35,12 @@
 const path = require('path');
 const http = require('http');
 const test = require('node:test');
-const { assert, assertEqual, ROOT, makeTempDir } = require('./helpers.js');
+const { assert, assertEqual, ROOT, makeTempDir, startShareApp } = require('./helpers.js');
 
 const tmp = makeTempDir('r95-');
 process.env.S3_DATA_DIR = tmp.dir;
 
 const SERVER = (...p) => path.join(ROOT, 'server', ...p);
-const express = require(path.join(ROOT, 'node_modules', 'express'));
 
 /* ---------------------------------------------------------------- *
  * 打桩：真实路由 + 真实 store，只替换外部依赖
@@ -103,7 +102,6 @@ const shareStore = require(SERVER('share-store.js'));
 const paymentOrders = require(SERVER('payment-orders.js'));
 const couponStore = require(SERVER('coupon-store.js'));
 const paymentGateway = require(SERVER('payment-gateway.js'));
-const shareRoutes = require(SERVER('share-routes.js'));
 
 paymentGateway.closeCharge = async () => ({ ok: true, state: 'closed' });
 
@@ -118,14 +116,9 @@ paymentGateway.queryCharge = async () => ({ paid: false, state: 'pending', trade
 /* ---------------------------------------------------------------- *
  * HTTP 夹具
  * ---------------------------------------------------------------- */
+/** 分享路由的最小应用 —— 形态与中间件顺序见 `helpers.startShareApp` */
 async function serve() {
-  const app = express();
-  app.use(express.urlencoded({ extended: false }));
-  app.use(express.json());
-  app.use('/', shareRoutes);
-  const s = http.createServer(app);
-  await new Promise((r) => s.listen(0, '127.0.0.1', r));
-  return { port: s.address().port, close: () => new Promise((r) => s.close(r)) };
+  return startShareApp();
 }
 
 function call(port, method, urlPath, opts) {

@@ -9,7 +9,6 @@
  */
 const { spawnSync } = require('child_process');
 const path = require('path');
-const fs = require('fs');
 
 const ROOT = path.join(__dirname, '..');
 
@@ -43,5 +42,3 @@ const r = spawnSync(process.platform === 'win32' ? 'npx.cmd' : 'npx',
   ['--no-install'].concat(args),
   { cwd: ROOT, stdio: 'inherit', shell: process.platform === 'win32' });
 process.exit(r.status === null ? 1 : r.status);
-
-void fs;

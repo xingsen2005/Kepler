@@ -8,7 +8,7 @@ const crypto = require('crypto');
 const roles = require('../roles');
 // R101（F-01）：判断「该实例是否已启用信封加密」—— 根用户改密的闸门要用
 const keyring = require('../keyring');
-const { providers, security, configStore, statsStore, encStore, s3, gitignore } = require('./_context');
+const { providers, security, configStore, statsStore, s3, gitignore } = require('./_context');
 /**
  * R25：`gitignore` 必须在**模块作用域**可见 —— `cachedGitignoreMatcher()` 里用了
  * `gitignore.createMatcher()`，而此前唯一一处 `require('../gitignore')` 是

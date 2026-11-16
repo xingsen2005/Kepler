@@ -60,7 +60,7 @@ const fs = require('fs');
 const crypto = require('crypto');
 const test = require('node:test');
 const { execFileSync } = require('child_process');
-const { assert, assertEqual, ROOT, makeTempDir, request } = require('./helpers.js');
+const { assert, assertEqual, ROOT, makeTempDir, request, startShareApp } = require('./helpers.js');
 
 const tmp = makeTempDir('r82-');
 process.env.S3_DATA_DIR = tmp.dir;
@@ -111,7 +111,6 @@ const shareStore = require(SERVER('share-store.js'));
 const paymentOrders = require(SERVER('payment-orders.js'));
 const couponStore = require(SERVER('coupon-store.js'));
 const paymentGateway = require(SERVER('payment-gateway.js'));
-const shareRoutes = require(SERVER('share-routes.js'));
 
 /**
  * R90（PAY-F1）：换渠道 / 换券时会**先在网关侧关单**再建新单。
@@ -131,14 +130,9 @@ paymentGateway.createCharge = async (platform, cfg, opts) => {
 /* ---------------------------------------------------------------- *
  * HTTP 夹具
  * ---------------------------------------------------------------- */
+/** 分享路由的最小应用 —— 形态与中间件顺序见 `helpers.startShareApp` */
 async function serve() {
-  const app = express();
-  app.use(express.urlencoded({ extended: false }));
-  app.use(express.json());
-  app.use('/', shareRoutes);
-  const s = http.createServer(app);
-  await new Promise((r) => s.listen(0, '127.0.0.1', r));
-  return { port: s.address().port, close: () => new Promise((r) => s.close(r)) };
+  return startShareApp();
 }
 
 /** 表单形态的 POST（浏览器点「立即支付」就是这个样子） */

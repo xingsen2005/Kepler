@@ -60,26 +60,15 @@ export function isStandalone() {
 }
 
 /**
- * 浏览器是否支持「由网页触发安装」。
- *
- * 只是能力探测，不代表现在真的能装（能不能装由 `canInstall()` 决定）。
- * Safari / Firefox 都不支持 `beforeinstallprompt`，它们各自有「添加到主屏幕」菜单，
- * 我们无法从页面触发，也不该假装可以。
- */
-export function installSupported() {
-  return typeof window !== 'undefined' && 'onbeforeinstallprompt' in window;
-}
-
-/**
  * 当前是否可以点「安装到桌面」。
  *
- * 三个条件缺一不可：
- *  ① 浏览器支持网页触发安装；
- *  ② 我们**确实收到过** `beforeinstallprompt`（拿到了凭据）；
- *  ③ 当前不在独立窗口里（没装过）。
+ * 判据只有两个，缺一不可：
+ *  ① 我们**确实收到过** `beforeinstallprompt`（拿到了凭据）；
+ *  ② 当前不在独立窗口里（没装过）。
  *
- * ⚠️ ② 才是真判据。`installSupported()` 为真时浏览器仍可能因为「已安装」「不满足
- * 可安装性（缺 SW / 缺图标 / 非安全上下文）」而不发事件 —— 那时点按钮只会静默失败。
+ * ⚠️ ① 才是真判据：只做「浏览器是否支持由网页触发安装」的能力探测是不够的 ——
+ * 支持不等于能装，已安装 / 缺 SW / 缺图标 / 非安全上下文时浏览器都不会发事件，
+ * 那时点按钮只会静默失败。所以宁可等事件真的到达。
  */
 export function canInstall() {
   return Boolean(deferredPrompt) && !isStandalone();

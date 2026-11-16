@@ -44,7 +44,7 @@ export function cardAnchorTitle(card) {
  *
  * @returns {number} 计算出的目标 scrollTop
  */
-export function scrollToCard(sec, bar, card) {
+function scrollToCard(sec, bar, card) {
   const cr = card.getBoundingClientRect();
   const sr = sec.getBoundingClientRect();
   const barH = bar && !bar.hidden ? bar.offsetHeight : 0;

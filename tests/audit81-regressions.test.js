@@ -44,13 +44,12 @@ const vm = require('vm');
 const fs = require('fs');
 const crypto = require('crypto');
 const test = require('node:test');
-const { assert, assertEqual, ROOT, makeTempDir, request } = require('./helpers.js');
+const { assert, assertEqual, ROOT, makeTempDir, request, startShareApp } = require('./helpers.js');
 
 const tmp = makeTempDir('r81-');
 process.env.S3_DATA_DIR = tmp.dir;
 
 const SERVER = (...p) => path.join(ROOT, 'server', ...p);
-const express = require(path.join(ROOT, 'node_modules', 'express'));
 
 const KEY_PAIR = crypto.generateKeyPairSync('rsa', { modulusLength: 2048 });
 const PKCS8_PEM = KEY_PAIR.privateKey.export({ type: 'pkcs8', format: 'pem' }).trim();
@@ -89,7 +88,6 @@ statsStore.track = () => {};
 const shareStore = require(SERVER('share-store.js'));
 const paymentOrders = require(SERVER('payment-orders.js'));
 const paymentGateway = require(SERVER('payment-gateway.js'));
-const shareRoutes = require(SERVER('share-routes.js'));
 
 /* ================================================================== *
  * A. 出站超时必须覆盖「响应体」
@@ -391,14 +389,9 @@ test('R81-08 · 探针说「下单失败」/已支付 / 拿不到答案时，三
  * C. `?probe=1` 必须是只读的（不烧网关查单配额）
  * ================================================================== */
 
+/** 分享路由的最小应用 —— 形态与中间件顺序见 `helpers.startShareApp` */
 async function serve() {
-  const app = express();
-  app.use(express.urlencoded({ extended: false }));
-  app.use(express.json());
-  app.use('/', shareRoutes);
-  const s = http.createServer(app);
-  await new Promise((r) => s.listen(0, '127.0.0.1', r));
-  return { port: s.address().port, close: () => new Promise((r) => s.close(r)) };
+  return startShareApp();
 }
 
 let seq = 0;

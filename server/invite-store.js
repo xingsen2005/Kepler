@@ -62,9 +62,6 @@ const INVITE_FAIL_TEXT = {
   disabled: '该邀请码已被停用，请联系管理员',
 };
 
-/** 邀请码状态：active | expired | used_up | disabled（顺序即判定优先级） */
-const INVITE_STATUS = ['active', 'expired', 'used_up', 'disabled'];
-
 let cache = null;
 
 function ensureDataDir() {
@@ -474,5 +471,5 @@ function exportText(opts) {
 module.exports = {
   list, get, findByCode, generate, update, bulkUpdate, remove,
   consume, rollback, exportText, view, status,
-  INVITE_FAIL_TEXT, INVITE_STATUS,
+  INVITE_FAIL_TEXT,
 };

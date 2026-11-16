@@ -1,6 +1,6 @@
 /** 资源管理器核心 —— 目录列表 / 分页 / 多视图 / 排序 / 多选 / 右键菜单 / 拖拽 / 搜索 */
 import { API } from './api.js';
-import { escapeHtml, fmtSize, fmtTime, toast, confirmDialog, openModal, iconHtml, propertyBodyHtml, TYPE_LABEL, FILE_TYPES, isStaffRole } from './util.js';
+import { escapeHtml, fmtSize, fmtTime, toast, openModal, iconHtml, propertyBodyHtml, TYPE_LABEL, FILE_TYPES, isStaffRole } from './util.js';
 import { App } from './main.js';
 import { uploadMgr } from './upload.js';
 import { ops } from './ops.js';

@@ -1421,15 +1421,6 @@ function setActiveCredential(id) {
   return true;
 }
 
-function updateCredentialRemark(id, remark) {
-  const cfg = requireStore();
-  const c = cfg.credentials.find((x) => x.id === id);
-  if (!c) return false;
-  c.remark = String(remark || '');
-  persist(cfg);
-  return true;
-}
-
 /** 更新密钥（服务商 / 端点 / 备注 / 可见性 / 启用状态）——停用时自动设为不可见 */
 function updateCredential(id, patch) {
   const cfg = requireStore();
@@ -1965,13 +1956,6 @@ function resetMasterKeyCache() {
   masterKeyCache = null;
   cached = null;
   cachedAt = 0;
-}
-
-/* ============================ 服务商 ============================ */
-
-/** 返回全部服务商元数据（供前端呈现厂商选择器与文案） */
-function listProviders() {
-  return providers.list();
 }
 
 /* ============================ 用户偏好 ============================ */
@@ -3712,8 +3696,7 @@ module.exports = {
   // R94（审核 M04-02）：`defaultConfig` 是对外**唯一**的「以默认配置起步」入口；
   // `DEFAULT_CONFIG` 只保留为冻结只读快照（向后兼容 + 供护栏断言模板未被污染）。
   defaultConfig, DEFAULT_CONFIG, DEFAULT_QUOTA, normalizeQuotaBytes,
-  listCredentials, listCredentialsFor, addCredential, removeCredential, setActiveCredential, updateCredentialRemark, updateCredential, setCredentialsVisibility,
-  listProviders,
+  listCredentials, listCredentialsFor, addCredential, removeCredential, setActiveCredential, updateCredential, setCredentialsVisibility,
   listBuckets, listBucketsFor, addBucket, updateBucket, removeBucket, setActiveBucket, setBucketsVisibility, bucketBlockOverseas, credentialIdForBucket,
   getPrefs, setPrefs,
   getUploadExcludes, setUploadExcludes,

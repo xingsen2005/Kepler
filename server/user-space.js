@@ -57,12 +57,6 @@ function rootForUserId(userId) {
   return PREFIX + id + '/';
 }
 
-/** 这一段是否属于「存量区」（仅管理层可见） */
-function isLegacy(key) {
-  return String(key == null ? '' : key) === LEGACY_PREFIX.replace(/\/$/, '')
-    || String(key == null ? '' : key).indexOf(LEGACY_PREFIX) === 0;
-}
-
 /**
  * 相对 key → 绝对 key。
  *
@@ -112,15 +106,8 @@ function assertOwned(root, abs, label) {
   throw e;
 }
 
-/** 列表批量版：任一越界即整体拒绝（不做「跳过越界的那些」—— 那等于静默漏删/漏移） */
-function assertAllOwned(root, list, label) {
-  const arr = Array.isArray(list) ? list : [];
-  for (const k of arr) assertOwned(root, k, label);
-  return arr;
-}
-
 module.exports = {
   PREFIX, LEGACY_PREFIX, USER_ID_RE,
-  rootForUserId, isLegacy,
-  toAbs, toRel, isInside, assertOwned, assertAllOwned,
+  rootForUserId,
+  toAbs, toRel, isInside, assertOwned,
 };

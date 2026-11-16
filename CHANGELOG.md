@@ -5,7 +5,7 @@
 > 本文件是**事后重建**的，不是随每次发版逐条维护的发布记录。项目虽托管在 GitHub（`origin` 可用、有提交历史），但提交历史**未按发布切分** —— 提交信息多为「bug fix」这类无信息量占位，也没有留存任何发布记录文档，因此：
 >
 > - **不给出任何发布日期**。版本标题写「日期未归档」，而不是填一个看起来合理的日期；
-> - 版本号的唯一事实源是 `package.json` 的 `version` 字段（当前 `2.1.5`）；
+> - 版本号的唯一事实源是 `package.json` 的 `version` 字段（当前 `2.1.6`）；
 
 ## 仓库整理 · 客户端二进制移出仓库，改由 Releases 分发
 
@@ -28,6 +28,127 @@
 
 - **没有改写历史**。`git filter-repo` / BFG 能把 160MB 从历史里彻底抹掉、让 clone 真正变小，但那要 `push --force` 重写 `main`，所有已有克隆全部失效，而且这个仓库的提交历史本身没有按发布切分（见本文件开头）。收益（一次性的体积）与代价（破坏性、不可逆）不成比例。真要清理，应单独决策、单独备份。
 - **没有让客户端版本号跟服务端同步**。两者发布节奏不同，硬绑只会制造「服务端 2.1.0 就该配客户端 2.1.0」的假承诺。Release 标题注明该构建**实际内置**的版本。
+
+---
+
+## [2.1.6] - 日期未归档
+
+**本轮只删不加：把「零调用方」的东西清掉，并把一份被抄了十几遍的测试样板收成一份。**
+判据不是「看起来没用」，而是**引用计数** —— 逐个符号先在「生产源码 / 测试 / 脚本」三域
+分别统计调用方（比较前先把注释抹成等长空白，否则一段注释就能把死代码「救活」），
+确认零调用方才动手。
+
+清完的量：**19 个**符号整段删除（连定义一起）、**3 个**只摘掉 `export`（实现仍在本模块内
+被调用）、外加 `restore-guard` 的 **3 个**纯别名 —— 合计 25 条目从各模块的导出清单里消失；
+另有 13 组死 CSS、6 处未使用的 `import`、1 张孤儿图标、1 个误提交的工具日志目录，
+以及 12 份逐字重复的测试启动样板被收进公共工具层。
+
+### 为什么「注释说它给测试用」不算数
+
+删掉的符号里有几个的原注释明确写着「供测试 / 调试验证」，但把 `tests/` 全量展开后
+grep，一个调用点都没有 —— **注释里的承诺已经过期，而导出清单还在替它作证**。所以判据
+只能落在「有没有人调用」，不能落在「注释怎么说」。
+
+同理，`server/restore-guard.js` 曾把内部常量以**别名**再导出一次（`BAN_MS` / `IDLE_MS` /
+`MAX_BANS`），三个名字在全项目零引用 —— 那是一层纯别名，删掉后模块对外只说真名
+（`RESTORE_BAN_MS` / `RESTORE_FAIL_IDLE_MS` / `MAX_BANS` 仍在模块内正常使用）。
+
+### 删掉的死代码（19 个，零调用方）
+
+| 符号 | 位置 |
+| --- | --- |
+| `listProviders`、`updateCredentialRemark` | `server/config-store.js` |
+| `decodeRsaPrivate`、`decodeRsaPublic` | `server/pem-key.js` |
+| `classifyLinks` | `server/agreement-text.js` |
+| `metaCountForBucket` | `server/enc-store.js` |
+| `isLegacy`、`assertAllOwned` | `server/user-space.js` |
+| `paidCountForLink` | `server/payment-orders.js` |
+| `viewItems` | `server/share-store.js` |
+| `INVITE_STATUS` | `server/invite-store.js` |
+| `matchTokens` | `server/gitignore.js` |
+| `normalizeRanges`（`buildIntervals` 的语义别名） | `server/ip-guard.js` |
+| `normalizeNoticePage`、`COUPON_MAX_USES_MAX` | `server/limits.js` |
+| `PROBE_STATES` | `server/payment-gateway.js` |
+| `defaults` | `server/payment-providers.js` |
+| `hasToken` | `public/js/enc.js` |
+| `installSupported` | `public/js/pwa.js` |
+
+三处注释原本指向这些已删符号，一并按**代码实际行为**重写，避免注释继续承诺一个不存在的
+实现：`payment-providers.js` 三处「`defaults()` / `applySave()` 会补齐默认值」改为只提
+`applySave()` 的 `backfillDefault`（补齐确实发生在那里，`defaults()` 从未参与）；
+`payment-gateway.js` 的 R92 导出说明不再提 `PROBE_STATES`；`pwa.js` 的 `canInstall()`
+保留「能力探测不算数、必须等事件真的到达」这条理由，但不再指向被删掉的探测函数。
+
+### 只去掉导出、保留实现（3 个）
+
+`loopbackExemptBanner`（`public/js/ipmgr.js`）、`fromMBps`（`public/js/speedlimit.js`）、
+`scrollToCard`（`public/js/anchornav.js`）都在模块内部有真实调用，只是没人从外面 import。
+`export` 去掉即可，实现一行没动。
+
+### 死 CSS：13 组选择器 + 1 个变量（34 行）
+
+`public/css/style.css` 里这些选择器在 HTML 与 JS 里都找不到引用，且不是模板拼接产生的
+（已对 `cred-all-*` / `user-all-*` / `bucket-all-*` / `link-all-*` / `invite-all-*` /
+`coupon-all-*` 这 6 个动态前缀做过豁免）：
+
+- `.cred-list` / `.cred-row` 及其 6 个子规则 —— 凭据列表改版为 `lk-table` 表格后的遗留；
+- `.ipguard-china-row` / `.ipguard-china-text`（含暗色覆盖层的 2 条）；
+- `.fade-l`、`.tree-node`、`.help-toc`、`.about-sub`、`.hide-sm`；
+- 死变量 `--tb-h`（工具栏高度）：35 个 `:root` 变量里唯一一个从未被 `var()` 读取的。
+
+⚠️ `.ipguard-china-*` 这一组只删 **CSS**：它对应的「中国 IP 白名单」卡片早已从界面移除
+（功能改为按桶的 `blockOverseasIP`），但 `server/ip-guard.js` 里那段 `chinaMode` →
+`blockOverseasIP` 的**历史配置迁移**必须留着 —— 老实例升级上来时，正是它把全局开关
+展开成「当时存在的每个桶都开启」，删了会让已付费用户的海外屏蔽静默失效。
+
+### 其余小清理
+
+| 项 | 处理 |
+| --- | --- |
+| `public/js/explorer.js` 的 `confirmDialog` | 未使用，从 import 里去掉 |
+| `public/js/ops.js` 的 `fmtSize` | 同上 |
+| `server/fs-gateway.js` 的 `translateError` | 解构后未使用 |
+| `server/routes/buckets.js` 的 `badRequest`、`requireConfig` | 同上 |
+| `server/routes/_shared.js` 的 `encStore` | 同上 |
+| `scripts/lint.js` 的 `fs` + `void fs;` | 为绕过「未使用」告警而写的空引用，连 `require` 一起删 |
+| `public/icons/favicon-32.png` | 全项目零引用（页面 favicon 是内联 data URI、manifest 也没列它），删除 |
+| `.dsh-acl-recovery/` | 本机 ACL 修复工具的运行记录（含绝对路径），与项目无关：`git rm --cached` 并加入 `.gitignore`，文件仍留在工作区 |
+
+### 测试样板：12 份 `serve()` 收成一份
+
+分享相关的回归用例（换券 / 换渠道 / 恢复购买 / 口令 …）需要的是**同一个形态**：
+`urlencoded` → `json` → `shareRoutes` 挂在 `/`，监听 `127.0.0.1` 的随机端口。
+这段「组装 app + 建 server + `listen(0)` + 把 `close` 包成 Promise」此前被逐字抄进
+**12 个文件**，现已收进 `tests/helpers.js` 的 `startShareApp()`，各处只留一个委托。
+
+这不是纯粹的洁癖：抄的份数一多，`close` 就容易有人写成同步返回 —— 用例结束时句柄不
+释放，表现为「跑全量时莫名卡住，单跑那个文件永远正常」。**同一个形态只写一份。**
+
+### 刻意**没有**动的（差异是真实的，合并只会变差）
+
+- **另外 10 种 `serve()` 变体各保留独立实现**。它们分别要注入假身份（`role: 'admin'`）、
+  挂错误处理器、换挂载点、或直接接任意 router —— 用一个巨型选项对象吞掉这些差异，
+  可读性比重复更糟。
+- **4 份测试里的 `stripComments()` 不合并**。它们看着同构，语义却不同：有的把块注释
+  折叠成一个空格（会**改变长度**），有的抹成等长空白。后者是 `indexOf` 定位类断言的前提，
+  合并成一份必然让其中一侧的判据悄悄失效。
+- **git 历史里的 160MB 客户端二进制不动**（见本文件「仓库整理」一节：收益只对全新克隆
+  有效，代价是重写 `main`）。
+- **`public/icons/icon.svg` 保留**：它不进 manifest、不被页面引用，但 `audit70` 拿它
+  逐像素核对圆角与配色，是那张图标的**设计母版**。
+
+### 验证
+
+| 项 | 清理前 | 清理后 |
+| --- | --- | --- |
+| 全量用例 | 1745（pass 1744 / fail 0 / skip 1） | **逐项相同** |
+| `npm run lint` | 0 errors / 49 warnings | 0 errors / **43 warnings** |
+| `docs-sync` | 22 条全绿 | 22 条全绿（判据未改） |
+| `invariants` | 52 条全绿 | 52 条全绿（1110 条反向对照 anchor 全部仍唯一命中） |
+
+CSS 与测试样板的改动都落在**不改变行为**的位置，所以这次没有任何新增护栏 —— 但删完
+仍单独跑了一次反向变异（`--only=R13-01`）确认「测试隔离默认安全」那条对照**依然
+`fail=1`**：`tests/helpers.js` 被改过，必须证明它的护栏没有跟着一起变软。
 
 ---
 

@@ -171,21 +171,6 @@ function classify(raw) {
   return null;
 }
 
-/** 解析并确认为 RSA 私钥（支付宝 / 微信都用 RSA 签名，EC / Ed25519 一律不适用） */
-function decodeRsaPrivate(raw) {
-  const d = decodeKey('private', raw);
-  if (!d || d.type !== 'rsa') return null;
-  return d.key;
-}
-
-/** 解析并确认为 RSA 公钥（`classify()` 已保证它不是私钥材料） */
-function decodeRsaPublic(raw) {
-  const c = classify(raw);
-  if (!c || c.kind !== 'public' || c.type !== 'rsa') return null;
-  const d = decodeKey('public', raw);
-  return d ? d.key : null;
-}
-
 /** 导出为 PEM（私钥固定 PKCS#8、公钥固定 SPKI）；失败返回 '' */
 function exportPem(kind, key) {
   if (!key) return '';
@@ -265,8 +250,6 @@ module.exports = {
   split,
   decodeKey,
   classify,
-  decodeRsaPrivate,
-  decodeRsaPublic,
   exportPem,
   normalizePrivateKey,
   normalizePublicKey,

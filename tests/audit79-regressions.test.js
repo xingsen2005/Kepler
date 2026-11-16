@@ -40,7 +40,7 @@ const path = require('path');
 const http = require('http');
 const crypto = require('crypto');
 const test = require('node:test');
-const { assert, assertEqual, ROOT, makeTempDir, request } = require('./helpers.js');
+const { assert, assertEqual, ROOT, makeTempDir, request, startShareApp } = require('./helpers.js');
 
 const tmp = makeTempDir('r79-');
 process.env.S3_DATA_DIR = tmp.dir;
@@ -91,7 +91,6 @@ const shareStore = require(SERVER('share-store.js'));
 const paymentOrders = require(SERVER('payment-orders.js'));
 const paymentGateway = require(SERVER('payment-gateway.js'));
 const paymentProviders = require(SERVER('payment-providers.js'));
-const shareRoutes = require(SERVER('share-routes.js'));
 
 /**
  * 网关查单的可控桩：默认「还没付」。
@@ -111,19 +110,9 @@ function resetGateway() {
 /* ---------------------------------------------------------------- *
  * HTTP 夹具：一个只挂分享路由的本地服务
  * ---------------------------------------------------------------- */
+/** 分享路由的最小应用 —— 形态与中间件顺序见 `helpers.startShareApp` */
 async function serve() {
-  const app = express();
-  app.use(express.urlencoded({ extended: false }));
-  app.use(express.json());
-  app.use('/', shareRoutes);
-  const server = await new Promise((resolve) => {
-    const s = http.createServer(app);
-    s.listen(0, '127.0.0.1', () => resolve(s));
-  });
-  return {
-    port: server.address().port,
-    close: () => new Promise((r) => server.close(r)),
-  };
+  return startShareApp();
 }
 
 let seq = 0;

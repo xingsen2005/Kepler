@@ -7,9 +7,9 @@
  */
 // R7-03：shareStore 一并从 _context 取（删对象/删桶都要同步标记分享链接）
 const { express, providers, configStore, statsStore, encStore, ipGuard, shareStore } = require('./_context');
-const { getClient, p, translateError, listAll, badRequest } = require('../s3');
+const { getClient, p, translateError, listAll } = require('../s3');
 const {
-  requireAdmin, roleOf, bucketsFor, requireConfig, requireLocalBucket,
+  requireAdmin, roleOf, bucketsFor, requireLocalBucket,
   bucketClient, requireNameConfirm, bucketStat, listFragments, listFragmentsNoCache, mapLimit,
   assertCredentialQuota, errorBody,
 } = require('./_shared');

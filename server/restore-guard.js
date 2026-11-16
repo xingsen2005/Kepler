@@ -22,7 +22,7 @@
  *   一个仍在 24 小时内的封禁，等于「重启即解封」，是绕过它的最省事办法。
  * - **连击计数**只在内存里：它的语义是「**连续**输错」，而一次重启本身就打断了这个
  *   连续性；把它落盘反而会让「重启前的两次手误」继续算在新一轮头上。
- *   另有 `IDLE_MS`（24 小时无新失败）自动归零，避免长期使用中零散手误攒成封禁。
+ *   另有 `RESTORE_FAIL_IDLE_MS`（24 小时无新失败）自动归零，避免长期使用中零散手误攒成封禁。
  *
  * ## 与限流器的分工
  *
@@ -234,8 +234,5 @@ function unban(ip) {
 }
 
 module.exports = {
-  BAN_MS: RESTORE_BAN_MS,
-  IDLE_MS: RESTORE_FAIL_IDLE_MS,
-  MAX_BANS,
   isBanned, noteFail, noteSuccess, listBans, unban, flush,
 };

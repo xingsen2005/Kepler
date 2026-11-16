@@ -195,12 +195,13 @@ const PLATFORMS = {
        * 付款那一刻才炸」的坑。用单选把这个歧义彻底消掉。
        *
        * 默认 `page`（网站应用）**是刻意的**：R93 之前保存的配置里没有这个键，
-       * `defaults()` / `applySave()` 会把它补成 `page`，于是老配置的行为
+       * `applySave()` 会把它补成 `page`，于是老配置的行为
        * **一字不变**——不会因为升级就从「可用」变成「未配置完整」而让付费链接失效。
        *
        * `required: false` 也是为了这一条：若设成必填，`isConfigured()` 会在老配置上
        * 判 false（键不存在），`availableChannels()` 随即把支付宝移出可用渠道。
-       * 取值完整性由下面 `mode` 的枚举校验保证（空值走 `defaults` 补齐）。
+       * 取值完整性由下面 `mode` 的枚举校验保证（空值由 `applySave()` 的
+       * `backfillDefault` 补齐）。
        */
       {
         key: 'mode', official: 'product', label: '接入的产品', input: 'select', required: false, default: 'page',
@@ -594,7 +595,7 @@ function publicView(platformId, stored) {
      * 起因是支付宝的 `mode`：R93 之前保存的配置里没有这个键，若原样下发空串，
      * 前端 `<select>` 一个选项都命不中 `selected`，界面显示成**空白下拉框** ——
      * 用户会以为配置坏了。回填后显示为「支付宝（网站应用）」，与后端
-     * `defaults()` / `applySave()` 的实际取值一致。
+     * `applySave()` 的实际取值一致。
      */
     const v = stored0 || (f.backfillDefault && !f.secret && f.default !== undefined ? String(f.default) : '');
     if (f.secret) {
@@ -659,15 +660,6 @@ function isConfigured(platformId, stored) {
   return p.fields.filter((f) => f.required).every((f) => Boolean(asValue(s[f.key])));
 }
 
-/** 按平台取默认值（新建表单时预填） */
-function defaults(platformId) {
-  const p = platform(platformId);
-  if (!p) return {};
-  const d = {};
-  for (const f of p.fields) if (f.default !== undefined) d[f.key] = f.default;
-  return d;
-}
-
 module.exports = {
   VALIDATORS,
   registerValidator,
@@ -683,5 +675,4 @@ module.exports = {
   publicView,
   applySave,
   isConfigured,
-  defaults,
 };

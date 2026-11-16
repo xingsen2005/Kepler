@@ -1678,7 +1678,6 @@ async function closeCharge(platform, cfg, order) {
  * 只能由入网材料确定。自检能**证伪**（选错会验签失败），不能**证成**。
  */
 const PROBE_ORDER_NO = 'SELFTESTPROBE000000000000000000';
-const PROBE_STATES = ['ok', 'auth', 'net', 'config'];
 
 function probePass(message, detail) {
   return { ok: true, state: 'ok', message, detail: detail || '' };
@@ -1844,7 +1843,7 @@ module.exports = {
   // R90（PAY-F1）：网关侧关单 —— 换渠道 / 换券时必须先关掉被放弃的那笔，
   // 否则旧收银台仍可付款，同一件商品会被付两次
   closeCharge,
-  // R92：凭据自检（只读）。`PROBE_ORDER_NO` / `PROBE_STATES` 导出是为了让行为测试
-  // 能直接断言「用的是必然不存在的假单号」「四档状态齐全」，而不是去匹配日志文案。
-  probeCharge, PROBE_ORDER_NO, PROBE_STATES,
+  // R92：凭据自检（只读）。`PROBE_ORDER_NO` 导出是为了让行为测试能直接断言
+  // 「用的是必然不存在的假单号」，而不是去匹配日志文案。
+  probeCharge, PROBE_ORDER_NO,
 };

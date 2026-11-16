@@ -307,7 +307,7 @@ test('R40 · 主题：CSS 的明暗两套变量必须一一对应，且暗色块
 
   // 几何与字体不需要换主题；**颜色**槽位一个都不能漏，漏掉的那个面在暗色下仍是亮色，
   // 而它在界面上往往就是一块刺眼的白（输入框 / 对话框 / 提示块）。
-  const GEOMETRY = new Set(['--radius', '--tb-h', '--sb-h', '--font']);
+  const GEOMETRY = new Set(['--radius', '--sb-h', '--font']);
   const missing = Object.keys(light).filter((k) => !GEOMETRY.has(k) && !(k in dark));
   assertEqual(missing.length, 0,
     `暗色块未覆盖这些颜色变量（它们在暗色下仍会用亮色值）：${missing.join(', ')}`);

@@ -55,7 +55,7 @@ function isAdmin() {
  * @param {string} at   最近一次豁免生效的时刻（ISO 字符串，可为空）
  * @returns {string} 空串表示正常
  */
-export function loopbackExemptBanner(flag, at) {
+function loopbackExemptBanner(flag, at) {
   if (!flag) return '';
   const when = at ? `<br>最近一次豁免生效：${escapeHtml(fmtTime(at))}。` : '';
   return '<div role="alert" style="margin:0 0 10px;padding:10px 12px;border-left:4px solid #b45309;'

@@ -25,9 +25,8 @@
  *  ④ 存储层   —— `download-log`：同一文件只记首次、不同文件各一条
  */
 const path = require('path');
-const http = require('http');
 const test = require('node:test');
-const { assert, assertEqual, assertMatch, ROOT, makeTempDir, request } = require('./helpers.js');
+const { assert, assertEqual, assertMatch, ROOT, makeTempDir, request, startShareApp } = require('./helpers.js');
 
 /**
  * ⚠️ 所有 store 都支持 `S3_DATA_DIR`，必须**先设环境变量再 require**，
@@ -37,7 +36,6 @@ const tmp = makeTempDir('r64-');
 process.env.S3_DATA_DIR = tmp.dir;
 
 const SERVER = (...p) => path.join(ROOT, 'server', ...p);
-const express = require(path.join(ROOT, 'node_modules', 'express'));
 
 /* ---- 打桩：云端客户端（callback 风格，与 s3.p 的约定一致） ---- */
 let cloud = null;
@@ -88,22 +86,10 @@ const authSession = require(SERVER('auth-session.js'));
 const security = require(SERVER('security.js'));
 const orderNo = require(SERVER('order-no.js'));
 const restoreGuard = require(SERVER('restore-guard.js'));
-const shareRoutes = require(SERVER('share-routes.js'));
 
-/** 起一个只挂分享路由的本地服务 */
+/** 分享路由的最小应用 —— 形态与中间件顺序见 `helpers.startShareApp` */
 async function serve() {
-  const app = express();
-  app.use(express.urlencoded({ extended: false }));
-  app.use(express.json());
-  app.use('/', shareRoutes);
-  const server = await new Promise((resolve) => {
-    const s = http.createServer(app);
-    s.listen(0, '127.0.0.1', () => resolve(s));
-  });
-  return {
-    port: server.address().port,
-    close: () => new Promise((r) => server.close(r)),
-  };
+  return startShareApp();
 }
 
 let seq = 0;

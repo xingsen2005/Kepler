@@ -188,13 +188,6 @@ function analyze(toks) {
   };
 }
 
-/**
- * 兼容入口：编译单个模式并直接对 text 求值（供测试/调试使用）。
- */
-function matchTokens(toks, text) {
-  return matchSteps(mergeSteps(toks), text);
-}
-
 /* ------------------------------ 规则解析 ------------------------------ */
 
 /** 结构性上限：防止用超大输入拖垮解析（匹配本身已是线性，这里只防解析与内存放大） */
@@ -333,6 +326,6 @@ function createMatcher(text) {
 }
 
 module.exports = {
-  createMatcher, parseLine, matchTokens, compile, mergeSteps, matchSteps, analyze,
+  createMatcher, parseLine, compile, mergeSteps, matchSteps, analyze,
   MAX_TEXT, MAX_RULES, MAX_LINE, MAX_PATH, MAX_DEPTH,
 };

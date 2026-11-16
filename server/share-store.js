@@ -268,20 +268,6 @@ function itemPaths(items) {
   return map;
 }
 
-/**
- * 安全的条目视图（原样返回 key，供分享页拼相对路径与下载校验用）
- *
- * ⚠️ 这里返回的是**原始 key**，不是展示名 —— 需要展示名请用 {@link itemPaths}。
- */
-function viewItems(l) {
-  return itemList(l).map((it) => ({
-    key: it.key,
-    name: itemName(it.key),
-    size: it.size,
-    dir: it.dir,
-  }));
-}
-
 function itemStats(items) {
   let totalSize = 0;
   let dirCount = 0;
@@ -831,7 +817,7 @@ module.exports = {
   flush: () => writer.flush(),
   markMissing, clearMissing, markMissingByKeys, markMissingByBucket,
   // R51：多文件 / 文件夹分享
-  SNAPSHOT_MAX, itemList, itemName, itemStats, viewItems, normalizeItems, displayName,
+  SNAPSHOT_MAX, itemList, itemName, itemStats, normalizeItems, displayName,
   // R52-05：展示路径（抹掉「分享根之上」的祖先）—— 列表行与归档条目名的唯一实现点
   maskPrefix, maskedPath, itemPaths,
 };

@@ -24,9 +24,6 @@ export function reset() {
   tokenExp = 0;
 }
 
-/** 当前是否持有有效令牌（仅供测试与诊断，不用于鉴权判定） */
-export function hasToken() { return unlocked(); }
-
 /** 确保已通过加密访问密码验证（未设密码 / 已持有效令牌时直接通过） */
 export async function ensureUnlocked() {
   const enc = App.state.enc;

@@ -1253,7 +1253,7 @@ module.exports = {
   speedLimitFor, RULE_KINDS, normalizeKind,
   isChinaIP, isPrivateIP, isPrivateIPv6, parseTarget, parseIpInfo,
   ipv4ToInt, ipv6ToBytes, ipv6ToString, canonicalIpLiteral, cidrContains, cidrContainsV6, cidrMatch,
-  buildIntervals, normalizeRanges,     // FUN-08：可在测试中直接验证归一化性质
+  buildIntervals,                      // FUN-08：可在测试中直接验证归一化性质
   flushHits, // R78：命中计数的落盘动作（定时器只是它的调用者），供测试直接驱动
   ALLOWED_METHODS,
 };
@@ -1268,6 +1268,3 @@ function __setChinaIntervalsForTest(segs) {
   chinaLoaded = true;
 }
 module.exports.__setChinaIntervalsForTest = __setChinaIntervalsForTest;
-
-/** 统一称呼：`normalizeRanges` 是 `buildIntervals` 的语义别名（对外强调归一化意图） */
-function normalizeRanges(cidrs) { return buildIntervals(cidrs); }

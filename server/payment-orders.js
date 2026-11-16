@@ -702,11 +702,6 @@ function claimForLink(no, linkId, opts) {
   };
 }
 
-/** 某链接已支付订单数（供管理端展示收入概况） */
-function paidCountForLink(linkId) {
-  return listForLink(linkId).filter((o) => o.status === 'paid').length;
-}
-
 /* ============================ 状态流转 ============================ */
 
 /**
@@ -954,7 +949,7 @@ function view(o) {
 
 module.exports = {
   MAX_ORDERS_PER_LINK, MAX_ORDERS_TOTAL, PAYMENT_WRITE_DEBOUNCE_MS,
-  create, get, findByTradeNo, listForLink, listAll, paidCountForLink,
+  create, get, findByTradeNo, listForLink, listAll,
   // R64：订单号取回 —— 按用户可见订单号查找 / 按账号归集 / 「恢复购买」的唯一判定点
   findByOrderNo, listForUser, claimForLink,
   pruneGlobal, // R8-25：导出以供测试直接驱动跨链接裁剪

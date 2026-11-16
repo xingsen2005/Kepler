@@ -383,11 +383,6 @@ const NOTICE_TEXT_MAX = 300;
  */
 const AGREEMENT_BODY_MAX = 20000;
 
-/** 归一化页面名：非法一律回到 `''`（调用方据此判断「不认识这一页」） */
-function normalizeNoticePage(v) {
-  return NOTICE_PAGES.includes(v) ? v : '';
-}
-
 /**
  * 校验接口入参里的**提示文案**（单行）。
  *
@@ -723,12 +718,6 @@ const COUPON_CODE_RE = new RegExp(`^[${COUPON_CODE_ALPHABET}]{${COUPON_CODE_LEN}
 const COUPON_BATCH_MAX = 200;
 const COUPON_NOTE_MAX = INVITE_NOTE_MAX;
 
-/**
- * 单张券可领取/使用的总次数上限。`0` = 不限制（与邀请码同一语义：
- * **0 不是「一次都不能用」**，而是「不限」）。
- */
-const COUPON_MAX_USES_MAX = INVITE_MAX_USES_MAX;
-
 /** 优惠券的**适用范围**类型 —— 也是需求原文里的「类型限制」三档 */
 const COUPON_TYPES = ['any', 'links', 'users'];
 
@@ -865,7 +854,7 @@ function parseCouponMinSpendInput(v) {
 
 /**
  * 券的「总使用次数」校验：**复用**邀请码的同一实现（`0` = 不限制、负数必须拒绝、
- * 上限同为 `COUPON_MAX_USES_MAX`）。理由同 `normalizeCouponCode`：同一判据不写两份。
+ * 上限同为 `INVITE_MAX_USES_MAX`）。理由同 `normalizeCouponCode`：同一判据不写两份。
  */
 const parseCouponMaxUsesInput = parseInviteMaxUsesInput;
 
@@ -978,7 +967,7 @@ module.exports = {
   DEFAULT_ROLES, DEFAULT_ROLE_FALLBACK, normalizeDefaultRole,
   // R68：协议提示（三个页面）与协议正文
   NOTICE_PAGES, NOTICE_PAGE_LABEL, NOTICE_TEXT_MAX, AGREEMENT_BODY_MAX,
-  normalizeNoticePage, parseNoticeTextInput, parseAgreementBodyInput,
+  parseNoticeTextInput, parseAgreementBodyInput,
   // R54②：邮箱与验证码
   EMAIL_MAX, EMAIL_CODE_LEN, EMAIL_CODE_TTL_MS, EMAIL_CODE_MAX_ATTEMPTS, EMAIL_CODE_RESEND_MS,
   normalizeEmail, parseEmailInput,
@@ -989,7 +978,7 @@ module.exports = {
   parseInviteMaxUsesInput, parseInviteExpiresInput, parseInviteNoteInput,
   // R62：优惠券
   COUPON_CODE_ALPHABET, COUPON_CODE_LEN, COUPON_CODE_RE,
-  COUPON_BATCH_MAX, COUPON_NOTE_MAX, COUPON_MAX_USES_MAX, COUPON_TYPES,
+  COUPON_BATCH_MAX, COUPON_NOTE_MAX, COUPON_TYPES,
   COUPON_MAX_TARGETS, COUPON_AMOUNT_MIN_FEN, COUPON_AMOUNT_MAX_FEN, COUPON_USES_MAX,
   COUPON_ORDER_IDX_MAX,
   COUPON_MIN_SPEND_MAX_FEN, parseCouponMinSpendInput,

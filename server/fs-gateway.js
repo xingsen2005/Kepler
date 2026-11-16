@@ -21,7 +21,7 @@ const configStore = require('./config-store');
 const encStore = require('./enc-store');
 const statsStore = require('./stats-store');
 const shareStore = require('./share-store'); // R7-03：删对象必须同步标记分享链接
-const { getClient, p, translateError, listAllInfo, listAllExact, LIMITS, normalizeKey, copySource, uploaderMeta, readUploader } = require('./s3');
+const { getClient, p, listAllInfo, listAllExact, LIMITS, normalizeKey, copySource, uploaderMeta, readUploader } = require('./s3');
 const { deleteMultipleConfirmed } = require('./s3'); // R10-03：批量删除的白名单判据（共用）
 const providers = require('./providers');
 

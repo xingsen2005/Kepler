@@ -841,12 +841,6 @@ function findOrphanMeta(bucket, cloudKeys) {
   return { orphans, total };
 }
 
-/** 统计某桶的加密元数据条数（不含为其他桶） */
-function metaCountForBucket(bucket) {
-  const prefix = `${bucket}|`;
-  return Object.keys(loadMeta().files).filter((mk) => mk.startsWith(prefix)).length;
-}
-
 /* ============================ 异或密钥流（magic 模式） ============================ */
 
 /**
@@ -1630,7 +1624,7 @@ module.exports = {
   // R99：完整性巡检要枚举「本系统加密过哪些对象 / 哪些桶」——只读，不触发任何写入
   metaBuckets, metaEntriesFor,
   renameMeta, migratePrefix, copyMeta, removeBucketMeta, encryptedSetFor,
-  findOrphanMeta, metaCountForBucket,
+  findOrphanMeta,
   encryptBuffer, encryptPart, buildFinalMeta, decryptTransform,
   // R48：多线程入口 —— 与同步版同一实现，只是 CPU 密集那一步交给工作线程池。
   // 路由层用它们；同步版保留给单元测试与「池不可用」的兜底路径。

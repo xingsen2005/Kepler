@@ -247,29 +247,10 @@ function renderNotice(text, page, available) {
   return { html: out, used };
 }
 
-/**
- * 仅供测试与调用方核对：一段文案里出现了哪些 `<a>`（按顺序），以及各自被归到哪一份协议。
- *
- * 存在的理由：上面那套「显式属性优先、否则按顺序」的规则很容易在改动中走样，
- * 而它的表现是「链接指向了错的协议」—— 在界面上看不出来。有了这个纯函数，
- * 护栏可以直接断言分类结果，不必去解析渲染出来的 HTML。
- */
-function classifyLinks(text) {
-  const src = String(text == null ? '' : text);
-  const out = [];
-  ANCHOR_RE.lastIndex = 0;
-  let m;
-  while ((m = ANCHOR_RE.exec(src)) !== null) {
-    out.push({ index: out.length + 1, doc: docOf(m[0], out.length + 1), label: m[1] });
-  }
-  return out;
-}
-
 module.exports = {
   escapeHtml,
   renderMarkdown,
   renderNotice,
-  classifyLinks,
   noticeText,
   DEFAULT_NOTICES,
   DOC_LABELS,

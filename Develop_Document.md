@@ -6,7 +6,7 @@
 
 以上。
 
-1. **适用版本**：v2.1.5（取自 `package.json` 的 `version`，由 `tests/docs-sync.test.js` 护栏校验）  
+1. **适用版本**：v2.1.6（取自 `package.json` 的 `version`，由 `tests/docs-sync.test.js` 护栏校验）  
 2. **渲染前提与目录兜底**：本文标题为手写 HTML（`<h1 id="develop_document-sectionN">`），目录依赖这些 `id`。若目标渲染器清洗原始 HTML 并剥离 `id`，**目录链接会失效，但目录本身仍然可用**，请按下述方式定位：
    - 目录条目本身是一份完整的章节清单，条目文字与正文标题严格一致（由 `docs-sync` 双向断言保证），按标题文字在页面内搜索即可跳到对应章节；
    - 章节编号 `develop_document-sectionN` 从 1 起**连续递增**（同样由护栏断言），因此「第 N 章」的表述在标题被剥离后仍可换算；

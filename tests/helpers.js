@@ -383,6 +383,44 @@ function packageSource(entryRel, pkgRel) {
   return parts.map((p) => fs.readFileSync(p, 'utf8')).join('\n');
 }
 
+/* ============================ 起服务：分享路由的最小应用 ============================ */
+
+/**
+ * 分享路由的最小应用：`urlencoded + json + shareRoutes` 挂在 `/`，监听 `127.0.0.1`
+ * 的**随机端口**，返回 `{ port, close }`。
+ *
+ * 为什么收在这里：分享相关的回归用例（换券 / 换渠道 / 恢复购买 / 口令 …）需要的是
+ * **同一个形态** —— 只要 HTTP 入口能走到 `share-routes` 就够了。此前这段「组装 app +
+ * 建 server + listen(0) + 把 close 包成 Promise」被逐字抄进十余个文件，抄的份数一多，
+ * `close` 就容易有人写成同步返回：用例结束时句柄不释放，跑全量时表现为「莫名卡住」，
+ * 而单跑那一个文件永远正常。**同一个形态只写一份**，其余文件调用本函数。
+ *
+ * ⚠️ 中间件顺序是这个形态的一部分（`urlencoded` → `json` → 路由），不要调换：
+ * 分享下单接口收的是表单，路由里的 `req.body` 依赖它们。
+ *
+ * 需要挂别的东西（自定义身份中间件 / 错误处理器 / 别的 router）时**不要**往这里加
+ * 选项开关 —— 那些差异是真实存在的，各写各的比塞进一个巨型选项对象更可读。
+ *
+ * @returns {Promise<{port: number, close: () => Promise<void>}>}
+ */
+async function startShareApp() {
+  // 延迟 require：helpers 被全部 107 个测试文件引入，顶层不加载 express 可省一点启动开销
+  const express = require(path.join(ROOT, 'node_modules', 'express'));
+  const app = express();
+  app.use(express.urlencoded({ extended: false }));
+  app.use(express.json());
+  app.use('/', require(path.join(ROOT, 'server', 'share-routes')));
+
+  const server = await new Promise((resolve) => {
+    const s = http.createServer(app);
+    s.listen(0, '127.0.0.1', () => resolve(s));
+  });
+  return {
+    port: server.address().port,
+    close: () => new Promise((r) => server.close(r)),
+  };
+}
+
 module.exports = {
   ROOT,
   assert, assertEqual, assertMatch, assertReject,
@@ -395,4 +433,6 @@ module.exports = {
   ensureTestTls,
   // R67：「读整个模块源码」的静态断言必须覆盖拆出去的包目录（详见函数上方的说明）
   packageSource,
+  // 分享路由的最小应用（十余个回归文件的同一形态，见函数上方的说明）
+  startShareApp,
 };

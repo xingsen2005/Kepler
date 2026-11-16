@@ -1,6 +1,6 @@
 /** 文件操作 —— 新建 / 重命名 / 移动 / 删除 / 下载 / 复制链接 */
 import { API } from './api.js';
-import { toast, confirmDialog, promptDialog, openModal, escapeHtml, fmtSize, fmtTime, isStaffRole, randomSharePassword } from './util.js';
+import { toast, confirmDialog, promptDialog, openModal, escapeHtml, fmtTime, isStaffRole, randomSharePassword } from './util.js';
 import { App } from './main.js';
 import { openDownload } from './enc.js';
 // R37：文件分享的「下载限速」与「链接管理」是**同一份字段**（同一条分享记录上的

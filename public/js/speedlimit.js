@@ -39,7 +39,7 @@ export function toMBps(bytesPerSec) {
 }
 
 /** MB/s → 字节/秒整数 */
-export function fromMBps(mbps) {
+function fromMBps(mbps) {
   const n = Number(mbps);
   if (!Number.isFinite(n) || n <= 0) return 0;
   return Math.floor(n * MB);
