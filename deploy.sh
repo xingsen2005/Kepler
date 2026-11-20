@@ -15,7 +15,9 @@
 #   1) 自动识别包管理器并安装 git、curl、ca-certificates、tar 等基础工具
 #   2) 自动拉取 https://github.com/xingsen2005/Kepler.git 源码
 #   3) 安装运行时（Node.js ≥ 18）与依赖（npm 生产依赖）
-#   4) 安装并配置 Nginx 反向代理
+#   4) 安装并配置 Nginx 反向代理（要求 Nginx ≥ 1.31.9 主线 / ≥ 1.30.7 稳定分支 ——
+#      2026-11-18 的 NGINX2Root 漏洞组影响 1.9.5~1.31.8；发行版仓库给的版本低于这条底线，
+#      脚本会当场中断并给出换官方 mainline 源的命令）
 #   5) 生成 .env 环境变量文件并注册进程守护
 #   6) HTTPS：自动向 ACME 证书颁发机构（CA）签发（默认 Let's Encrypt，可换 ZeroSSL / LiteSSL；
 #      失败即中断并提示改用自备证书）
@@ -110,6 +112,20 @@ readonly LEGACY_DEFAULT_REPO_URLS=(
 # WebDAV 独立 HTTPS 端口：应用侧同名环境变量，这里作为唯一事实来源，
 # .env 与 Nginx 上游都用它 —— 两边写死两份 8443 迟早会漂移成「界面有地址、反代不通」。
 WEBDAV_PORT="${WEBDAV_PORT:-8443}"
+
+# Nginx 版本安全底线。
+#
+# 2026-11-18 nginx 官方修复了一组被合称为「NGINX2Root」的漏洞。本脚本配出来的
+# 反向代理正是直接暴露在公网的那一层，所以底线钉在修复版本上：
+#   · CVE-2026-123007  HTTP/2 发送窗口整数下溢 → 堆越界写（无需认证，可 RCE）
+#   · CVE-2026-123633 / CVE-2026-123634  worker 进程 use-after-free
+#   · CVE-2026-121810 / CVE-2026-113425
+# 官方给的是**两条平行分支**的修复版本：主线 1.31.9、稳定 1.30.7。
+# ⇒ 判据不能写成单一的大小比较。1.30.7 < 1.31.9，但它**是安全的**；
+#   只写 `>= 1.31.9` 会把官方标注的安全版本判成不安全（false positive），
+#   而只写 `>= 1.30.7` 又会把 1.31.0~1.31.8 这些**仍受影响**的主线版本放过去。
+readonly NGINX_MIN_VERSION="1.31.9"   # 主线分支底线
+readonly NGINX_MIN_STABLE="1.30.7"    # 稳定分支底线（与主线平行，不可互比）
 
 STEP_NO=0
 VERBOSE="${VERBOSE:-0}"
@@ -1046,7 +1062,9 @@ on_pkg_failure() {
         add_hint "  1) 启用 EPEL：$(epel_rpm_cmd)"
         add_hint "  2) 刷新索引：${PM} makecache"
         add_hint "  3) 查正确包名：${PM} search ${pkg_list%% *}"
-        add_hint "  4) nginx 还可走模块：${PM} module list nginx && ${PM} module enable -y nginx:1.24" ;;
+        add_hint "  4) nginx 还可走模块：${PM} module list nginx && ${PM} module enable -y nginx:1.24"
+        add_hint "     注意：模块流最高只到 1.24，低于 ${NGINX_MIN_VERSION} 安全底线，装完仍会被版本检查拦下 ——"
+        add_hint "     要真正跑起来请换官方 mainline 源：https://nginx.org/en/linux_packages.html" ;;
       apk)
         add_hint "  1) 刷新索引：apk update（确认 /etc/apk/repositories 已启用社区源）" ;;
       zypper)
@@ -2265,6 +2283,87 @@ WEBDAV_PUBLIC_URL=${webdav_public}
 # ------------------------------------------------------------------------------
 # 7. Nginx
 # ------------------------------------------------------------------------------
+# 三段式版本比较：$1 >= $2 时返回 0。
+#
+# 不用 `sort -V`：BusyBox 与部分老 coreutils 对它支持不一致（有的不支持、有的按
+# 字典序），而这一步在部署主路径上 —— 判错的后果是「把仍有漏洞的 nginx 放过去」，
+# 比多写十行代码贵得多。非数字字符一律丢弃，缺段按 0 补齐（`1.31` 等价 `1.31.0`）。
+#
+# ⚠️ `read` 在输入为空时返回非 0，`set -e` 下会把整个脚本带走 ⇒ 必须 `|| true`。
+version_ge() {
+  local -a a b
+  local s1="${1//[^0-9.]/}" s2="${2//[^0-9.]/}"
+  local i x y
+  IFS='.' read -r -a a <<< "$s1" || true
+  IFS='.' read -r -a b <<< "$s2" || true
+  for i in 0 1 2; do
+    x="${a[i]:-0}"; y="${b[i]:-0}"
+    x="${x:-0}";   y="${y:-0}"
+    if (( 10#$x > 10#$y )); then return 0; fi
+    if (( 10#$x < 10#$y )); then return 1; fi
+  done
+  return 0
+}
+
+# 取当前 PATH 里那份 nginx 的版本号（如 `1.31.9`）；取不到时输出空串。
+nginx_version_of() {
+  local out
+  out="$(nginx -v 2>&1 || true)"
+  printf '%s\n' "$out" | sed -n 's|.*nginx/\([0-9][0-9.]*\).*|\1|p' | head -n 1 || true
+}
+
+# 判定 nginx 是否达到安全底线；不达标直接中断部署。
+#
+# 为什么中断而不是只 warn：这层是公网入口，版本过低等于脚本亲手把一个可 RCE 的
+# 组件留在门口。只警告的话，用户看到的是一条淹没在几十行输出里的黄字，而部署
+# 照常「成功」—— 那等于把安全责任悄悄转嫁给没看日志的人。
+#
+# 逃生口两条，都必须由用户**显式**选择（与 `KEPLER_ALLOW_UNVERIFIED_NODE` 同一套路）：
+#   ① 升级到修复版本；② `KEPLER_ALLOW_OLD_NGINX=1` 自行担保；③ `--skip-nginx` 自建反代。
+require_secure_nginx() {
+  local label="${1:-}"
+  local v
+  v="$(nginx_version_of)"
+  if [[ -z "$v" ]]; then
+    # 解析不到 ≠ 版本低：OpenResty / Tengine / 面板定制版的 `nginx -v` 格式各异，
+    # 它们的修复节奏由各自的厂商决定，脚本无从判断。这里放行但必须留下痕迹。
+    warn "${label}Nginx 版本无法识别（nginx -v 输出里没有可解析的版本号），跳过安全底线检查。"
+    warn "  若这是 OpenResty / Tengine / 面板自带版本，请自行确认它已包含 2026-11-18 的修复。"
+    return 0
+  fi
+  if version_ge "$v" "$NGINX_MIN_VERSION"; then
+    ok "${label}Nginx ${v}：已达安全底线（主线 ≥ ${NGINX_MIN_VERSION}）"
+    return 0
+  fi
+  if version_ge "$v" "$NGINX_MIN_STABLE" && ! version_ge "$v" "1.31.0"; then
+    ok "${label}Nginx ${v}：已达安全底线（稳定分支 ≥ ${NGINX_MIN_STABLE}）"
+    return 0
+  fi
+  if [[ "${KEPLER_ALLOW_OLD_NGINX:-0}" == "1" ]]; then
+    warn "${label}Nginx ${v} 低于安全底线（主线 ${NGINX_MIN_VERSION} / 稳定 ${NGINX_MIN_STABLE}）。"
+    warn "  已按 KEPLER_ALLOW_OLD_NGINX=1 继续部署 —— 该版本仍受 CVE-2026-123007 等漏洞影响，风险由你自行承担。"
+    return 0
+  fi
+  HINTS=()
+  add_hint "当前 Nginx ${v} 受 CVE-2026-123007 / -123633 / -123634 / -121810 / -113425 影响"
+  add_hint "（HTTP/2 发送窗口整数下溢可导致堆越界写，无需认证即可 RCE）。"
+  add_hint "修复版本：主线 ${NGINX_MIN_VERSION}、稳定 ${NGINX_MIN_STABLE}。三种做法任选："
+  add_hint ""
+  add_hint "  ① 换官方 mainline 源升级（推荐）。Debian/Ubuntu 示例，代号按自己系统替换："
+  add_hint "     curl -fsSL https://nginx.org/keys/nginx_signing.key | gpg --dearmor -o /usr/share/keyrings/nginx-archive-keyring.gpg"
+  add_hint "     echo \"deb [signed-by=/usr/share/keyrings/nginx-archive-keyring.gpg] http://nginx.org/packages/mainline/debian \$VERSION_CODENAME nginx\" > /etc/apt/sources.list.d/nginx.list"
+  add_hint "     apt-get update && apt-get install -y --only-upgrade nginx"
+  add_hint "     RHEL/CentOS 走 rpm 源：https://nginx.org/en/linux_packages.html"
+  add_hint "  ② 自行编译安装 ≥ ${NGINX_MIN_VERSION}（装进 PATH 或 /usr/local/nginx/sbin/nginx，脚本会自动发现）"
+  add_hint "  ③ 自己维护反代，让脚本不碰 Nginx：$(rerun_cmd --skip-nginx)"
+  add_hint ""
+  add_hint "  ⚠️ 发行版仓库里的 nginx 全部低于底线（Debian 12 = 1.22、Ubuntu 24.04 = 1.24、"
+  add_hint "     RHEL 9 = 1.20），包管理器默认装不出安全版本 —— 这就是必须换官方源的原因。"
+  add_hint "  确认风险并愿意自行担保时，可显式放行："
+  add_hint "     KEPLER_ALLOW_OLD_NGINX=1 $(rerun_cmd)"
+  die_with_hint "Nginx 版本低于安全底线" "${HINTS[@]}"
+}
+
 # 找「不是系统包装的 nginx」：宝塔/AMH/编译版/官方二进制常常不在 PATH 里。
 # 找到就把所在目录临时加进 PATH，后续 nginx / nginx -t / nginx -s reload 都能用对这一份。
 locate_nginx() {
@@ -2297,7 +2396,9 @@ install_nginx() {
   fi
   if ! have nginx; then locate_nginx; fi
   if have nginx; then
-    ok "Nginx 已安装：$(nginx -v 2>&1 | sed 's/.*nginx\///' || true)"
+    # 用户机器上已有的那份（可能是面板/编译版）也要过版本底线：
+    # 「以前就装好了」并不等于「它是安全的」，而这层恰恰是公网入口。
+    require_secure_nginx "已装 "
   else
     info "安装 Nginx…"
     # 这里用 pkg_run_pm（失败只给退出码、不中断）而不是 pkg_install：
@@ -2332,7 +2433,8 @@ install_nginx() {
           add_hint "  apt-get update && apt-get install -y nginx" ;;
         dnf|yum)
           add_hint "  1) 启用 EPEL：$(epel_rpm_cmd)"
-          add_hint "  2) 或启用官方模块：${PM} module reset -y nginx && ${PM} module enable -y nginx:1.24 && $(pm_install_cmd) nginx"
+          add_hint "  2) 或换官方 mainline 源安装（发行版仓库与模块流最高只到 1.24，低于安全底线）："
+          add_hint "     https://nginx.org/en/linux_packages.html"
           add_hint "  3) 确认源里有包：${PM} search nginx ; ${PM} module list nginx" ;;
         apk)
           add_hint "  apk update && apk add nginx（确认 /etc/apk/repositories 已启用社区源）" ;;
@@ -2363,6 +2465,10 @@ install_nginx() {
       die_with_hint "Nginx 安装失败" "${HINTS[@]}"
     fi
     ok "Nginx 安装完成"
+    # 包管理器装出来的是发行版版本（Debian 12 = 1.22、Ubuntu 24.04 = 1.24、
+    # RHEL 9 = 1.20），必然低于安全底线 —— 在这里当场拦下，而不是等反代配好、
+    # 站点已经在公网上跑起来才发现装的是个可 RCE 的版本。
+    require_secure_nginx "新装的 "
   fi
   mkdir -p "$WEBROOT/.well-known/acme-challenge"
   nginx_detect_layout || true

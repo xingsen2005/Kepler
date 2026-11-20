@@ -13426,6 +13426,43 @@ const CASES = [
       testFile: 'audit104-regressions.test.js',
       minFail: 1,
     },
+    {
+      // 「版本号按字符串比大小」是 `sort -V` 不可用时最容易滑向的兜底写法，
+      // 而它会把 1.9.5 判成比 1.31.9 新 —— 1.9.5 恰好是这批漏洞的影响下界。
+      name: 'R107-01a · Nginx 版本改字符串比较（1.9.5 被判成高于 1.31.9）',
+      file: 'deploy.sh',
+      anchor: '    if (( 10#$x > 10#$y )); then return 0; fi\n    if (( 10#$x < 10#$y )); then return 1; fi',
+      replacement: '    if [[ "$x" > "$y" ]]; then return 0; fi\n    if [[ "$x" < "$y" ]]; then return 1; fi',
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
+    {
+      // 只判主线 ⇒ 官方标注安全的稳定分支 1.30.7 被拒（false positive，用户白升一轮）。
+      name: 'R107-02a · 只判主线底线（稳定分支 1.30.7 被误判为不安全）',
+      file: 'deploy.sh',
+      anchor: '  if version_ge "$v" "$NGINX_MIN_STABLE" && ! version_ge "$v" "1.31.0"; then\n    ok "${label}Nginx ${v}：已达安全底线（稳定分支 ≥ ${NGINX_MIN_STABLE}）"\n    return 0\n  fi\n',
+      replacement: '',
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
+    {
+      // 「只警告不中断」= 部署照常成功、漏洞照旧留在公网入口上，且那行黄字会被淹没。
+      name: 'R107-03a · 版本过低只警告不中断（受影响的 nginx 照常上线）',
+      file: 'deploy.sh',
+      anchor: '  die_with_hint "Nginx 版本低于安全底线" "${HINTS[@]}"',
+      replacement: '  warn "Nginx 版本低于安全底线（变异：不中断）"',
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
+    {
+      // 只查「新装完成」那条 ⇒ 机器上已有的旧 nginx（面板/编译版最常见）完全不过闸。
+      name: 'R107-04a · 只对新装路径做底线检查（已装的那份不过闸）',
+      file: 'deploy.sh',
+      anchor: '    require_secure_nginx "已装 "',
+      replacement: '    ok "Nginx 已安装（变异：不检查版本）"',
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
   ];
 
 module.exports = { runCase, CASES, parseArgs };

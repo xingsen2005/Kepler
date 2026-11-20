@@ -2866,3 +2866,118 @@ printf 'END\\n'
   assert.strictEqual(val('SRC_KEEP'), '1',
     '源码目录（可能是用户自己的仓库）里的 client/ 一个字节都不能动 —— 那是要提交的代码');
 });
+
+/**
+ * Nginx 版本安全底线（2026-11-18 的 NGINX2Root 漏洞组）。
+ *
+ * 判据的关键不在「比较两个版本号」，而在**两条平行分支**：官方同时给了主线
+ * 1.31.9 与稳定 1.30.7，而 1.30.7 < 1.31.9。于是两种典型错法都会出事：
+ *   · 只判 `>= 1.31.9` ⇒ 官方标注安全的 1.30.7 被拒（false positive，用户白升一轮）；
+ *   · 只判 `>= 1.30.7` ⇒ 1.31.0~1.31.8 这些**仍受影响**的主线版本被放过去。
+ * 另有第三种错法更隐蔽：拿字符串比大小（`sort -V` 不可用时的常见兜底），
+ * 于是 `1.9.5 > 1.31.9` —— 而 1.9.5 恰好是这批漏洞的**影响下界**。
+ */
+test('deploy.sh：Nginx 版本比较必须是数字比较（字符串比较会把 1.9.5 判成比 1.31.9 高）', async () => {
+  const r = await spawnBashSnippet(`
+set -Eeuo pipefail
+source ./deploy.sh
+trap - ERR
+ge() { if version_ge "$1" "$2"; then printf '1\\n'; else printf '0\\n'; fi; }
+printf 'SAME=%s\\n'    "$(ge 1.31.9 1.31.9)"
+printf 'PATCH=%s\\n'   "$(ge 1.31.10 1.31.9)"
+printf 'OLD=%s\\n'     "$(ge 1.31.8 1.31.9)"
+printf 'ANCIENT=%s\\n' "$(ge 1.9.5 1.31.9)"
+printf 'SHORT=%s\\n'   "$(ge 1.31 1.31.0)"
+printf 'MAIN=%s\\n'    "$NGINX_MIN_VERSION"
+printf 'STABLE=%s\\n'  "$NGINX_MIN_STABLE"
+`);
+  assert(!r.unavailable, `无法运行 bash 片段（版本判据不能跳过）：${r.unavailable}`);
+  const val = (k) => {
+    const mm = new RegExp('^' + k + '=(.*)$', 'm').exec(r.out);
+    assert(mm, `片段未产出 ${k}：${r.out}${r.err}`);
+    return mm[1];
+  };
+  assert.strictEqual(val('MAIN'), '1.31.9', '主线底线必须是 1.31.9（CVE-2026-123007 的修复版本）');
+  assert.strictEqual(val('STABLE'), '1.30.7', '稳定分支底线必须单独记 1.30.7，不能与主线互比');
+  assert.strictEqual(val('SAME'), '1');
+  assert.strictEqual(val('OLD'), '0', '1.31.8 在影响范围内，必须判为低于底线');
+  assert.strictEqual(val('PATCH'), '1',
+    '1.31.10 必须大于 1.31.9 —— 按字符串比会得出相反结论（".1" < ".9"），后续版本会被永久误拒');
+  assert.strictEqual(val('ANCIENT'), '0',
+    '1.9.5 是这批漏洞的影响下界，字符串比较会把它判成「比 1.31.9 新」而直接放行');
+  assert.strictEqual(val('SHORT'), '1', '缺段要按 0 补齐（1.31 等价 1.31.0），否则短写版本会被误判');
+});
+
+test('deploy.sh：低于 Nginx 安全底线必须中断，两种安全档与显式放行开关都要成立', async () => {
+  const src = readDeploy();
+  // 接线：已装的那份、以及包管理器刚装出来的那份，**都要**过底线检查。
+  // 只查「出现过一次」不够 —— 漏掉任一处，那条路径就等于没有保护。
+  const body = codeOnly(fnBody(src, 'install_nginx'));
+  const calls = (body.match(/require_secure_nginx/g) || []).length;
+  assert.strictEqual(calls, 2,
+    `install_nginx 必须对「已装」与「新装完成」两条路径都做底线检查（当前 ${calls} 处）：`
+    + '只查一处时，另一条路径仍会把受影响的 nginx 放上线');
+
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'kepler-ngx-'));
+  try {
+    // 每档一个独立目录，各放一个只会打印版本号的桩，避免互相干扰。
+    // ⚠️ 交给 bash 的路径必须是 POSIX 形式（`/c/...`）：`C:/...` 放进 PATH 后，
+    // 盘符里的冒号会被当成 PATH 分隔符，于是桩永远找不到 —— 那时 nginx -v 输出为空、
+    // 走「版本无法识别」分支放行，用例会以「本该阻断却放行」的形式静默变绿。
+    const toPosix = (p) => p.replace(/\\/g, '/').replace(/^([A-Za-z]):/, (_, d) => '/' + d.toLowerCase());
+    const dirOf = (v) => {
+      const abs = path.join(tmp, v);
+      fs.mkdirSync(abs, { recursive: true });
+      fs.writeFileSync(path.join(abs, 'nginx'),
+        `#!/bin/sh\necho "nginx version: nginx/${v}" >&2\n`, { mode: 0o755 });
+      return toPosix(abs);
+    };
+    const dirs = {
+      main: dirOf('1.31.9'),
+      stable: dirOf('1.30.7'),
+      gap: dirOf('1.31.8'),
+      ancient: dirOf('1.9.5'),
+    };
+
+    const r = await spawnBashSnippet(`
+set -Eeuo pipefail
+source ./deploy.sh
+trap - ERR
+probe() {
+  local tag="$1" dir="$2" allow="\${3:-0}" rc=0 out=""
+  out="$(PATH="$dir:$PATH" KEPLER_ALLOW_OLD_NGINX="$allow" \\
+    bash -c 'source ./deploy.sh; trap - ERR; require_secure_nginx "T "' 2>&1)" || rc=$?
+  printf '%s_RC=%s\\n' "$tag" "$rc"
+  case "$out" in *CVE-2026-123007*) printf '%s_CVE=1\\n' "$tag" ;; *) printf '%s_CVE=0\\n' "$tag" ;; esac
+  case "$out" in *--skip-nginx*)     printf '%s_SKIP=1\\n' "$tag" ;; *) printf '%s_SKIP=0\\n' "$tag" ;; esac
+  case "$out" in *KEPLER_ALLOW_OLD_NGINX=1*) printf '%s_ALLOWHINT=1\\n' "$tag" ;; *) printf '%s_ALLOWHINT=0\\n' "$tag" ;; esac
+}
+probe MAIN    "${dirs.main}"    0
+probe STABLE  "${dirs.stable}"  0
+probe GAP     "${dirs.gap}"     0
+probe ANCIENT "${dirs.ancient}" 0
+probe RELAXED "${dirs.gap}"     1
+`);
+    assert(!r.unavailable, `无法运行 bash 片段（底线阻断不能跳过）：${r.unavailable}`);
+    const val = (k) => {
+      const mm = new RegExp('^' + k + '=(.*)$', 'm').exec(r.out);
+      assert(mm, `片段未产出 ${k}：${r.out}${r.err}`);
+      return mm[1];
+    };
+    assert.strictEqual(val('MAIN_RC'), '0', '1.31.9 是主线修复版本，必须放行');
+    assert.strictEqual(val('STABLE_RC'), '0',
+      '1.30.7 虽小于 1.31.9，但它是官方标注的稳定分支修复版本 —— 判成不安全就是假阳性');
+    assert.strictEqual(val('GAP_RC'), '1',
+      '1.31.8 仍受影响，必须中断部署（放行等于脚本亲手留着公网入口的漏洞）');
+    assert.strictEqual(val('ANCIENT_RC'), '1', '1.9.5 必须中断');
+    assert.strictEqual(val('GAP_CVE'), '1', '阻断提示要点名 CVE，否则用户不知道该不该当回事');
+    assert.strictEqual(val('GAP_SKIP'), '1', '必须给出 --skip-nginx 这条逃生口');
+    assert.strictEqual(val('GAP_ALLOWHINT'), '1',
+      '必须给出显式放行开关的具体写法：只提示「可以自行担保」而不给命令，等于没有出口');
+    assert.strictEqual(val('RELAXED_RC'), '0',
+      'KEPLER_ALLOW_OLD_NGINX=1 必须真的能放行（否则用户除 --skip-nginx 外无路可走）');
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+

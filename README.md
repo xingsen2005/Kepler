@@ -89,6 +89,7 @@ curl -fLo /tmp/kepler-deploy.sh https://raw.githubusercontent.com/xingsen2005/Ke
 ---
 
 - Node.js ≥ 24.22.1（24.22.1 是 CVE-2026-111497（Brotli 解码器越界写，可 RCE）的最低修复版，Node 20.x 及更早已 EOL 不再有修复；S3 适配器依赖内置 `fetch`，热重载依赖 `--watch`）
+- Nginx ≥ 1.31.9（主线）或 ≥ 1.30.7（稳定分支）—— 2026-11-18 披露的 NGINX2Root 漏洞组（CVE-2026-123007 / -123633 / -123634 / -121810 / -113425）影响 1.9.5 ~ 1.31.8，其中 HTTP/2 发送窗口整数下溢可致堆越界写、无需认证即可 RCE。`deploy.sh` 会在配置反代前校验版本，低于底线直接中断；发行版仓库里的版本（Debian 12 = 1.22、Ubuntu 24.04 = 1.24、RHEL 9 = 1.20）均不满足，需换用官方 mainline 源
 - 仅一个运行时依赖：`express`
 - 测试与 lint 不引入运行时依赖：测试使用 Node 内置 `node:test`；ESLint 为可选开发依赖
 
