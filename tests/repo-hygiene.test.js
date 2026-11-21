@@ -22,6 +22,9 @@
 const fs = require('node:fs');
 const path = require('node:path');
 const http = require('node:http');
+const net = require('node:net');
+const os = require('node:os');
+const { spawn } = require('node:child_process');
 const test = require('node:test');
 
 const { assert, assertEqual, assertMatch, request, ROOT } = require('./helpers');
@@ -261,3 +264,112 @@ test('R67-03 · 入口文件只做生命周期：不得再注册任何路由', (
   assert(appRoutes.length >= 5,
     `app.js 应至少有 5 处路由注册（当前 ${appRoutes.length}）—— 为 0 说明路由已不在它手里`);
 });
+
+/* ==================================================================== */
+/* R108 · 请求体解析面：匿名未知路径不得先缓冲                             */
+/* ==================================================================== */
+
+/**
+ * **为什么要一条行为断言，而不是「源码里有没有那个正则」**：
+ *
+ * `express.json()` 的语义是「先把整个 body 读进内存，再 next()」。它一旦被挂成
+ * 应用级中间件，`POST /随便什么` 只要带 `Content-Type: application/json`，就会在
+ * 判定 404 **之前**完整缓冲一遍（上限 2MB）—— 不需要命中任何路由、不需要任何凭据。
+ * 这是纯内存放大面：N 个并发即 2N MB 常驻。
+ *
+ * 判据必须落在**实际被执行的那一层**：源码里写着「按前缀收窄」不代表运行时真的收窄了
+ * （例如中间件顺序变了、或者另一条挂在 `/` 上的路由又补了一份全局解析器）。
+ * 因此这里起**真实入口**发真请求，用状态码区分两种世界：
+ *
+ *   · 仍被应用级解析器吃掉 ⇒ body 超 2MB ⇒ **413**
+ *   · 压根没读 body        ⇒ 走到 404 兜底 ⇒ **404**
+ *
+ * 另外两条正向对照防止「把解析器删了」也能通过：`/api` 与 `/s` 必须仍然解析 JSON。
+ */
+
+function freePort() {
+  return new Promise((resolve, reject) => {
+    const srv = net.createServer();
+    srv.once('error', reject);
+    srv.listen(0, '127.0.0.1', () => {
+      const { port } = srv.address();
+      srv.close(() => resolve(port));
+    });
+  });
+}
+
+function postRaw(port, pathname, body, contentType) {
+  return new Promise((resolve, reject) => {
+    const req = http.request({
+      host: '127.0.0.1',
+      port,
+      path: pathname,
+      method: 'POST',
+      headers: {
+        'Content-Type': contentType,
+        'X-Requested-With': 'XMLHttpRequest',
+        'Content-Length': Buffer.byteLength(body),
+      },
+    }, (res) => {
+      res.resume();
+      res.on('end', () => resolve(res.statusCode));
+    });
+    req.on('error', reject);
+    req.end(body);
+  });
+}
+
+async function waitForApp(port, child) {
+  for (let i = 0; i < 120; i += 1) {
+    if (child.exitCode !== null) return false;
+    const ok = await new Promise((resolve) => {
+      const req = http.request({ host: '127.0.0.1', port, path: '/api/health', timeout: 500 }, () => resolve(true));
+      req.on('error', () => resolve(false));
+      req.on('timeout', () => { req.destroy(); resolve(false); });
+      req.end();
+    });
+    if (ok) return true;
+    await new Promise((r) => { setTimeout(r, 100); });
+  }
+  return false;
+}
+
+test('R108-01 · 匿名未知路径不得缓冲请求体（未命中路由前不解析 JSON）', { timeout: 60000 }, async () => {
+  const dataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'kepler-body-'));
+  const port = await freePort();
+  const child = spawn(process.execPath, ['server/index.js'], {
+    cwd: ROOT,
+    env: {
+      ...process.env,
+      S3_DATA_DIR: dataDir,
+      PORT: String(port),
+      HOST: '127.0.0.1',
+    },
+    stdio: ['ignore', 'ignore', 'ignore'],
+  });
+
+  try {
+    const up = await waitForApp(port, child);
+    assert(up, '前置：真实入口应能在回环上监听（独立数据目录）');
+
+    /* ① 3MB > 2MB 上限：若 body 被缓冲，body-parser 会先回 413 */
+    const huge = JSON.stringify({ pad: 'x'.repeat(3 * 1024 * 1024) });
+    assertEqual(await postRaw(port, '/totally-unknown-path', huge, 'application/json'), 404,
+      '匿名未知路径不得先读请求体：超 2MB 仍应落到 404（413 说明解析器又在全路径生效了）');
+
+    /* ② 正向对照：/api 仍要解析 JSON（口令错 ⇒ 401，而不是 415/400 解析失败） */
+    assertEqual(
+      await postRaw(port, '/api/auth/login', JSON.stringify({ username: 'admin', password: 'x' }), 'application/json'),
+      401,
+      '/api 下的 JSON 必须照旧解析：登录用错口令应回 401，不是解析失败',
+    );
+
+    /* ③ 正向对照：/s 仍要解析 JSON（坏 JSON ⇒ 400 entity.parse.failed，而不是被跳过） */
+    assertEqual(await postRaw(port, '/s/abcdef', '{bad json', 'application/json'), 400,
+      '/s 下的 JSON 必须照旧解析：坏 JSON 应回 400（若被跳过会变成 404 页面）');
+  } finally {
+    child.kill('SIGKILL');
+    try { fs.rmSync(dataDir, { recursive: true, force: true }); } catch (e) { /* 尽力而为 */ }
+  }
+});
+

@@ -7,6 +7,57 @@
 > - **不给出任何发布日期**。版本标题写「日期未归档」，而不是填一个看起来合理的日期；
 > - 版本号的唯一事实源是 `package.json` 的 `version` 字段（当前 `2.1.7`）；
 
+## 安全加固 · 请求体解析面收窄 + 反代配置补两处默认关闭项
+
+> **不占用版本号**：没有新增功能与接口，`package.json` 仍为 `2.1.7`；改的是「谁能把字节灌进内存」与「对外回报多少信息」。
+
+### ① `body-parser` 1.20.8 → 1.20.9（`CVE-2026-111181` / `GHSA-27r3-jxmh-p828`）
+
+官方公告的定性是：带 `Content-Encoding` 的请求体被管道接进解压流，**读取完成后既不解除管道、也不挂 `error` 监听**，于是压缩帧之后的尾随字节打进「已经收工」的解码器，`Z_DATA_ERROR` 无人接管 → `uncaughtException` → 进程终止。CVSS 7.5（`AV:N/AC:L/PR:N/UI:N/A:H`），受影响区间 `< 1.20.9`。
+
+`express@4.22.3` 依赖 `body-parser ~1.20.5`，实装为 1.20.8 ⇒ 命中。1.20.9 的修法（上游 `1260c38`）在 `getBody` 成功之后补了四件事：`req.unpipe(stream)` / `stream.on('error', noop)` / `destroy(stream, true)` / `req.resume()`。
+
+**复现记录（形态极易搞错，本项目踩了两次）**：最初的尝试是「gzip 帧 + 直接补 `0x58` 垃圾、一次写完」，在 v22.22.2 与 v24.22.3 上各跑 6 档延迟（5 / 20 / 50 / 100 / 200 / 400ms）**全部只回 400、进程存活**，一度据此以为机理不成立。真正能打崩的形态有两条硬要求：
+
+1. **压缩帧后面必须再补一个 `0x00` 填充字节**再发送 —— 少了它，`gunzip` 立刻报 `incorrect header check`，被 `raw-body` 兜成 400、进程不死；
+2. **尾随字节要分两次写** —— 先写「帧 + 填充」，隔 5ms 再写 1024 字节 `0x58`；一次写完同样只回 400。
+
+按这个形态、把 `body-parser` 临时降到 1.20.8、请求打到真实入口的 `/api/auth/login`：stderr 打出 `Error: incorrect header check`（`errno: -3`、`code: 'Z_DATA_ERROR'`）与「进程处于未定义状态，准备退出以避免故障放大」，客户端收到 `ECONNRESET`，**子进程 exit code=1**。同一形态在 1.20.9 上返回 200、进程存活。
+
+机理与观察自洽：`raw-body` 的 `onEnd` 挂在可读侧 `end` 上，解析一完成 `cleanup()` 就 `removeListener('error')`；帧被消费完之后才到达的尾随字节让 `zlib` 在**无人监听**的情况下 `emit('error')`，直接变成未捕获异常。1.20.9 补的那四件事正是堵这个窗口。（`0x00` 填充为何是必需的一环，本项目没有逐字节追到底；但结论已由「同形态下 1.20.8 崩 / 1.20.9 不崩」的对照钉住，不需要靠推理。）
+
+**结论**：升级后 `npm audit` 归零（含 CI 的 `npm audit --omit=dev --audit-level=high` 这一步）。
+
+> 只有受控复现、没有线上证据 ⇒ 不要据此声称「本服务曾被单个请求打崩过」。后续若要重做这条，必须用「帧 + `0x00` + 分两次写」的形态：用「一次写完」的形态必然只回 400，很容易得出「漏洞不存在」的错误结论。
+
+### ② 请求体解析面收窄到 `/api` 与 `/s`
+
+`express.json()` 的语义是「先把整个 body 读进内存，再 `next()`」。它原先挂成**应用级**中间件，于是 `POST /随便什么` 只要带 `Content-Type: application/json`，就会在判定 404 **之前**完整缓冲一遍（上限 2MB）—— 不需要命中任何路由、不需要任何凭据，N 个并发即 2N MB 常驻。实测（起真实入口）：`POST /totally-unknown` + 3MB JSON 原先回 **413**（说明 body 被读并被上限拒绝），小 JSON 才回 404。
+
+改动两处，缺一不可：
+
+- `server/index.js`：`app.use(express.json(...))` → 由 `JSON_BODY_PATH_RE = /^\/(?:api|s)(?:\/|$)/` 门控的 `JSON_BODY_PARSER`。仍在 `ipGuard` / `/api` 鉴权之后、仍在应用级 `express.raw` 之后（R27-22 与 FUN-01 的顺序约束一条不破；`/pay/notify/*` 依旧由前面那条 256KB 解析器先行处理）。
+- `server/share-routes.js`：本路由挂在 `/` 上，原先那句裸的 `router.use(express.urlencoded/json)` 等价于**对全站任意路径生效**——只改 `index.js` 的话，未知路径仍会被它缓冲 256KB。现改为按 `/s` 与 `/pay/notify` 前缀门控。
+
+收窄后：`POST /totally-unknown` + 3MB → **404**（body 压根没读），`/api/auth/login` 仍正常解析（错口令 401），`/s/:id` 坏 JSON 仍回 400，`/pay/notify/*` 的表单与 JSON 仍可解析。
+
+**护栏 `R108-01`**（`tests/repo-hygiene.test.js`）：真起入口、真发 3MB，判「404 而不是 413」，另带两条正向对照（`/api` 401、`/s` 400）防止「把解析器整个删掉」也能通过。**已按项目规矩做撤销验证**：把 `index.js` 退回应用级解析器 → 该条立刻变红（实际 413），还原后转绿。
+
+### ③ Nginx：`server_tokens off` + `client_max_body_size 0 → 128m`
+
+- **`server_tokens off`**：`deploy.sh` 生成的 HTTP / HTTPS 两个 `server{}` 都补上。此前响应头 `Server: nginx/1.x.y` 与 4xx/5xx 页脚会交出精确版本 —— 应用侧 `app.disable('x-powered-by')` 早就做对了同一件事，Nginx 这层是唯一漏口。版本号对运维毫无用处（`nginx -v` 随时能看），对扫描器却是「该挑哪个 CVE」的索引。
+- **`client_max_body_size 0 → 128m`**：`0` 是「不限制」。取 128m 而不是更小，是因为它必须**不小于应用自己的天花板**，否则会砍掉合法请求：
+  - 单片上传 `express.raw` = 64MB（大文件由前端分片，单请求永远不超过它）；
+  - WebDAV PUT 在 `server/fs-gateway.js` 里按 `MAX_WRITE_BUFFER = 128MB` 全量缓冲，超限本来就由应用回 413；
+  - HTTP 块（未启用 TLS 时直接反代）原先**根本没写**这条，落回 Nginx 默认的 1m —— 那会让非 TLS 部署的单片上传全部 413，本次一并补齐。
+  - 只限制**单个请求体**，不限制文件总大小（分片上传的总量由配额与桶策略管）。
+
+### ④ 明确**没有**改的两处（以及为什么）
+
+- **systemd 的 `Restart=always` / `RestartSec=5`**：它们是「挂了就拉起来」的正常配置。若为了防「崩溃循环」加上 `StartLimitBurst`，崩溃循环会从「一直重启」变成「彻底 failed、不再自愈」，对可用性反而更差；真正该修的是崩溃的**成因**（见 ①）。
+- **反代的 `limit_req` / `limit_conn`**：全站限流目前由应用内 `ip-guard.js` 承担（按 IP、按端点各有预算）。在反代再加一层需要按部署规模调速率与突发值，调错会误伤分片上传与大批量下载；单实例部署下现有闸门够用，留作将来横向扩展时的排期项。
+
+
 ## 仓库整理 · 客户端二进制移出仓库，改由 Releases 分发
 
 > **不占用版本号**：这一条没有任何服务端代码变更，`package.json` 仍为 `2.1.0`。改的是「二进制放在哪里」。

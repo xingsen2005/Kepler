@@ -2659,6 +2659,12 @@ ${proxy_snippet}
     listen ${HTTP_PORT};
     server_name __DOMAIN__;
 
+    # 不主动回报精确版本：4xx/5xx 页脚与 Server 响应头都只留 \"nginx\"。
+    # 版本号对运维没有用处（本机 nginx -v 随时能看），对扫描器却是「该挑哪个 CVE」的索引。
+    server_tokens off;
+    # 与「应用自己的请求体天花板」对齐，见下方 TLS server 块的同名说明。
+    client_max_body_size 128m;
+
 ${acme_block}
 
     # 未启用 HTTPS 时直接提供反代；启用后改为 301 跳转
@@ -2713,6 +2719,9 @@ server {
     ${h2}
     server_name __DOMAIN__;
 
+    # 不主动回报精确版本（同 HTTP 块）：错误页脚与 Server 头只留 \"nginx\"。
+    server_tokens off;
+
     ssl_certificate     ${cert_fullchain};
     ssl_certificate_key ${cert_key};
     ssl_protocols       TLSv1.2 TLSv1.3;
@@ -2724,8 +2733,15 @@ server {
 ${hsts_header}
     add_header X-Content-Type-Options nosniff always;
 
-    # 上传大文件：交由应用自身分片，此处不做体积限制
-    client_max_body_size 0;
+    # 请求体上限**与「应用自己的天花板」对齐**，而不是 0（不限制）：
+    #   · 单片上传的 express.raw 是 64MB（server/routes/fs.js），大文件由前端分片，
+    #     所以「单请求」永远不需要超过 64MB；
+    #   · WebDAV PUT 在 server/fs-gateway.js 里按 MAX_WRITE_BUFFER = 128MB 全量缓冲，
+    #     超限本身就会被应用以 413 拒绝 —— 边缘取 128m 不会放宽、也不会砍掉任何合法请求；
+    #   · 更小的请求体（JSON / 表单）另有更紧的应用侧闸门，这里只是兜底线。
+    # 好处是明显超限的请求在边缘就被打回，不必先建到应用的连接、再把字节灌进去等它读完。
+    # 注意：这只限制**单个请求体**，不限制文件总大小（分片上传的总量由配额与桶策略管）。
+    client_max_body_size 128m;
     # 反代超时放宽，避免大文件列举/打包下载被中途掐断
     keepalive_timeout 65s;
 

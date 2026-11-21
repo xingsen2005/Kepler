@@ -13463,6 +13463,24 @@ const CASES = [
       testFile: 'deploy-script.test.js',
       minFail: 1,
     },
+    {
+      // 入口的 JSON 解析器退回**应用级** ⇒ 匿名未知路径也先缓冲 2MB（3MB 直接 413 而不是 404）。
+      name: 'R108-01a · 入口 JSON 解析器退回应用级（匿名未知路径重新缓冲请求体）',
+      file: 'server/index.js',
+      anchor: "const JSON_BODY_PARSER = express.json({ limit: '2mb' });\nconst JSON_BODY_PATH_RE = /^\\/(?:api|s)(?:\\/|$)/;\napp.use((req, res, next) => {\n  if (!JSON_BODY_PATH_RE.test(String(req.path || ''))) return next();\n  return JSON_BODY_PARSER(req, res, next);\n});",
+      replacement: "app.use(express.json({ limit: '2mb' }));",
+      testFile: 'repo-hygiene.test.js',
+      minFail: 1,
+    },
+    {
+      // 分享路由挂在 `/` 上，裸 `router.use(parser)` 等价于全站解析 ⇒ 未知路径又被缓冲 256KB。
+      name: 'R108-01b · 分享路由的解析器不限前缀（未知路径重新被缓冲）',
+      file: 'server/share-routes.js',
+      anchor: "router.use((req, res, next) => {\n  if (!BODY_PATH_RE.test(String(req.path || ''))) return next();\n  return BODY_URLENCODED(req, res, () => BODY_JSON(req, res, next));\n});",
+      replacement: "router.use(express.urlencoded({ extended: false }));\nrouter.use(express.json({ limit: '256kb' }));",
+      testFile: 'repo-hygiene.test.js',
+      minFail: 1,
+    },
   ];
 
 module.exports = { runCase, CASES, parseArgs };

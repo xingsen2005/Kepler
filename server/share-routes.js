@@ -72,13 +72,25 @@ const { asyncHandler } = require('./routes/_shared'); // R17-04：async 抛错�
 const agreementView = require('./agreement-view');
 
 const router = express.Router();
-router.use(express.urlencoded({ extended: false }));
-// 异步通知是 JSON（微信 / PayPal），支付宝则是表单；两者都要能解析
-// ⚠️ 审计 I-4：JSON 这张上限**已经不吃这套了** —— 全局解析器在 `index.js` 里更早执行，
-// 会先把 body 读完并置 `req._body`，本行只对「显式跳过全局解析」的路径生效。
-// 真正生效的 256KB 判据在 `index.js` 的 `NOTIFY_BODY_LIMIT_PARSER`（按 `/pay/notify/` 前置挂载）。
-// 留着这一行是为了 cover 直接 import 本路由（不经 index.js）的测试与脚本。
-router.use(express.json({ limit: '256kb' }));
+
+/**
+ * 本路由挂在 `/` 上（`app.use('/', shareRoutes)`），因此**裸挂 `router.use(parser)`
+ * 会对全站任意路径生效** —— 包括 `POST /拼错的地址` 这种根本没有对应路由的请求。
+ * `express.json()` 的语义是「先把 body 读进内存再 next()」，于是未认证的未知路径
+ * 也会先被缓冲一遍（256KB）才落到 404，纯属浪费的内存放大面。
+ *
+ * 真正需要请求体的只有两类路径，所以解析器按前缀收窄：
+ *  · `/s/*`         —— 分享页的口令 / 券码 / 下单 / 下载（表单与 JSON 都有）
+ *  · `/pay/notify/*` —— 网关回调（微信 / PayPal 是 JSON，支付宝是表单）
+ * 其余路径不再读 body；未读的 body 由 Node 在响应结束时丢弃。
+ */
+const BODY_PATH_RE = /^\/(?:s|pay\/notify)(?:\/|$)/;
+const BODY_URLENCODED = express.urlencoded({ extended: false });
+const BODY_JSON = express.json({ limit: '256kb' });
+router.use((req, res, next) => {
+  if (!BODY_PATH_RE.test(String(req.path || ''))) return next();
+  return BODY_URLENCODED(req, res, () => BODY_JSON(req, res, next));
+});
 
 /**
  * SEC-04：`/s/*` 的非安全方法同源校验。

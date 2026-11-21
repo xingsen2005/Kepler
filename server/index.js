@@ -339,7 +339,30 @@ app.use((req, res, next) => {
   return NOTIFY_BODY_LIMIT_PARSER(req, res, next);
 });
 
-app.use(express.json({ limit: '2mb' }));
+/**
+ * JSON 请求体**只在这两个前缀下解析**，而不是对全部路径生效。
+ *
+ * `express.json()` 是「先把整个请求体读进内存，再调用 next()」的语义。若把它挂成
+ * 应用级中间件，那么 `POST /随便什么` 只要带 `Content-Type: application/json`，
+ * 请求体就会在被判定为 404 **之前**完整缓冲一遍（上限 2MB）—— 一个完全匿名、
+ * 不需要命中任何路由、也不需要任何凭据的内存放大器：N 个并发即 2N MB 常驻。
+ *
+ * 真正消费 JSON 的只有两处：`/api/*`（登录、批量改名、备份导入等）与 `/s/*`
+ * （分享页的口令 / 券码 / 下单）。`/pay/notify/*` 由上面那条 256KB 解析器先行
+ * 处理（已置 `req._body`），不依赖这里。其余路径（含拼错的 API 路径、扫描器
+ * 乱打的上传端点）一律不再读请求体，直接落到 404 —— 未读的 body 由 Node 在
+ * 响应结束时自行丢弃，不占应用内存。
+ *
+ * 顺序不变：仍在 `ipGuard.middleware` 与 `/api` 鉴权块之后（R27-22 的
+ * 「不为未认证请求缓冲」），也仍在应用级 `express.raw` 之后（FUN-01：`.json`
+ * 上传必须由 raw 吃下，不能被 json 解析器抢先置 `req._body`）。
+ */
+const JSON_BODY_PARSER = express.json({ limit: '2mb' });
+const JSON_BODY_PATH_RE = /^\/(?:api|s)(?:\/|$)/;
+app.use((req, res, next) => {
+  if (!JSON_BODY_PATH_RE.test(String(req.path || ''))) return next();
+  return JSON_BODY_PARSER(req, res, next);
+});
 
 // API
 app.use('/api', routes);
