@@ -93,6 +93,10 @@ readonly LOCK_FILE="/var/lock/${SERVICE_NAME}-deploy.lock"
 readonly STATE_DIR="/etc/${SERVICE_NAME}"
 readonly STATE_FILE="${STATE_DIR}/deploy.conf"
 readonly GLOBAL_COMMAND="/usr/local/bin/${SERVICE_NAME}"
+# 续期定时任务的落点。刻意**不是 readonly**：生产恒为这两个系统路径，而护栏需要把它们
+# 指到临时目录才能真跑一遍「写了没有 / 重跑会不会重写 / 写失败会不会谎报成功」。
+CRON_D_DIR="/etc/cron.d"
+CRONTAB_FILE="/etc/crontab"
 readonly DEFAULT_REPO_URL="https://github.com/xingsen2005/Kepler.git"
 # 国内镜像（Gitee）。GitHub 在国内服务器上经常拉不通（连接超时 / TLS 被重置），
 # 故克隆失败时自动改用同仓库的 Gitee 镜像重试一次 —— 内容与 GitHub 同步。
@@ -226,39 +230,143 @@ run_soft() {
 have() { command -v "$1" >/dev/null 2>&1; }
 
 # 版本比较：version_ge 20.19.0 18 → 0（真）。纯 bash 实现，不依赖 sort -V
+#
+# **全脚本只有这一份实现**。不允许再出现同名的第二份：bash 后定义覆盖先定义，
+# 于是「改定义处」看起来生效、实际完全没跑（实测：把这一份改成 return 1 之后，
+# 另一份仍让 version_ge 1.31.10 1.31.9 返回真）。要改比较语义，就改这里。
+#
+# 不用 `sort -V`：BusyBox 与部分老 coreutils 对它的支持不一致（有的不支持、有的按
+# 字典序），而这一步在部署主路径上 —— 判错的后果是「把仍有漏洞的 nginx 放过去」。
+#
+# 每段**必须是纯数字**，否则按 `0` 处理（缺段同样按 0，`1.31` 等价 `1.31.0`）。
+# 这条方向是刻意的：`1.31.9-rc1`、`1.30.7-stable` 这类带后缀的版本，剥掉非数字字符
+# 会被读成「1.31.9 / 1.30.7 达标」；按 0 处理则判成「不达标」，也就是**不把不认识的
+# 版本当安全版本**。所有调用点传进来的都是已经清洗过的版本号（`nginx_version_of` 用
+# sed 取数字段、node 用 `sed 's/^v//'`），不依赖这里做清洗。
 version_ge() {
   local a="$1" b="$2" i x y
   local -a A B
-  IFS='.' read -r -a A <<<"$a"
-  IFS='.' read -r -a B <<<"$b"
+  IFS='.' read -r -a A <<<"$a" || true
+  IFS='.' read -r -a B <<<"$b" || true
   for i in 0 1 2; do
     x="${A[i]:-0}"; y="${B[i]:-0}"
     [[ "$x" =~ ^[0-9]+$ ]] || x=0
     [[ "$y" =~ ^[0-9]+$ ]] || y=0
-    ((10#$x > 10#$y)) && return 0
-    ((10#$x < 10#$y)) && return 1
+    if (( 10#$x > 10#$y )); then return 0; fi
+    if (( 10#$x < 10#$y )); then return 1; fi
   done
   return 0
 }
 
 # 写文件（内容相同则跳过，已存在且不同则先备份）——保证幂等
+#
+# 「内容相同」的判据必须**同时看字节数与剥尾换行后的文本**：
+# `$(cat f)` 会剥掉**全部**末尾换行（实测「文件是 A\n\n、新内容是 A」判为相同），
+# 只比文本会让该写的尾部空行永远写不进去；而只比字节数又会被任意尾随空白骗成「变了」。
+# 两个条件一起看，才是「一模一样」。
 write_file() {
   local path="$1" content="$2" mode="${3:-0644}"
   local dir; dir="$(dirname "$path")"
   mkdir -p "$dir"
-  if [[ -f "$path" ]] && [[ "$(cat "$path")" == "$content" ]]; then
-    info "配置未变化，跳过写入：$path"
-    chmod "$mode" "$path"
-    return 0
+  if [[ -f "$path" ]]; then
+    local now_sz new_sz
+    now_sz="$(wc -c <"$path" | tr -d ' ' || true)"
+    new_sz="$(printf '%s\n' "$content" | wc -c | tr -d ' ' || true)"
+    if [[ -n "$now_sz" && "$now_sz" == "$new_sz" ]] && [[ "$(cat "$path")" == "$content" ]]; then
+      info "配置未变化，跳过写入：$path"
+      chmod "$mode" "$path"
+      return 0
+    fi
   fi
   if [[ -f "$path" ]]; then
-    local bak="${path}.bak.$(date +%Y%m%d%H%M%S)"
-    cp -a "$path" "$bak"
-    info "已备份旧配置 → $bak"
+    # 备份名必须**唯一**，且旧备份要有上限：
+    #  · 秒级时间戳在同一次部署里连改两次会撞名（第二份把第一份覆盖掉，实测）；
+    #  · 只写不删则每改一次配置就永久多一个 .bak，安装目录里能攒出上百个。
+    # 所以用 mktemp 拿唯一名，并只保留最近 5 份。
+    local bak=""
+    bak="$(mktemp "${path}.bak.XXXXXXXX" 2>/dev/null || true)"
+    if [[ -n "$bak" ]]; then
+      cp -a "$path" "$bak"
+      local olds="" old="" kept=0
+      olds="$(ls -1dt "${path}".bak.* 2>/dev/null || true)"
+      while IFS= read -r old; do
+        [[ -n "$old" ]] || continue
+        kept=$((kept + 1))
+        if ((kept > 5)); then rm -f -- "$old" || true; fi
+      done <<<"$olds"
+      info "已备份旧配置 → $bak"
+    else
+      warn "无法创建备份文件（${path}.bak.*），本次直接写入"
+    fi
   fi
   printf '%s\n' "$content" > "$path"
   chmod "$mode" "$path"
   ok "已写入：$path"
+}
+
+# 绝对路径归一：解析 `//`、`.` 与 `..`，返回不带尾斜杠的绝对路径。
+#
+# 为什么必须归一后再判断：脚本里所有「危险路径」判据（拒绝根目录 / 系统目录 / 家目录）
+# 都是**字面串**比对，而 `/usr/../etc`、`/usr/local/` 与它们要拦的目标只差几个字符 ——
+# `rm -rf` 与 `chown -R` 却会真的把 `..` 解析掉。判据的对象必须与执行的对象是同一个字符串。
+normalize_path() {
+  local p="$1" seg rest cur=""
+  [[ "$p" == /* ]] || return 1
+  rest="${p#/}"
+  while [[ -n "$rest" ]]; do
+    if [[ "$rest" == */* ]]; then seg="${rest%%/*}"; rest="${rest#*/}"; else seg="$rest"; rest=""; fi
+    case "$seg" in
+      ''|.) ;;
+      ..) cur="${cur%/*}" ;;
+      *) cur="${cur}/${seg}" ;;
+    esac
+  done
+  printf '%s' "${cur:-/}"
+  return 0
+}
+
+# 判定一个路径能不能「递归改归属 / 递归删除」。
+# 成功：把**归一后**的路径放进 PATH_SAFE_NORM（调用方要用它去执行动作），返回 0；
+# 失败：把原因放进 PATH_SAFE_REASON，返回 1。
+#
+# 允许系统目录**之下**的路径（/opt/kepler、/var/lib/kepler、/home/<用户>/kepler —— 都是
+# 真实会用的安装/数据目录），拒绝四类：根目录、系统目录本身、家目录本身、个人目录之下。
+# 边界与旧实现一致，区别只在于判断之前先归一 —— 旧的字面串比对能被 `..` 与尾斜杠绕过
+# （实测 `/tmp/xxx/a/../b` 会被真的删掉，而 `/usr/local/` 不等于字面量 `/usr/local`）。
+path_is_safe() {
+  local raw="$1" norm=""
+  PATH_SAFE_REASON=""
+  PATH_SAFE_NORM=""
+  if [[ -z "$raw" ]]; then PATH_SAFE_REASON="路径为空"; return 1; fi
+  if [[ "$raw" != /* ]]; then PATH_SAFE_REASON="不是绝对路径"; return 1; fi
+  norm="$(normalize_path "$raw")"
+  case "$norm" in
+    /) PATH_SAFE_REASON="是根目录"; return 1 ;;
+    /bin|/boot|/dev|/etc|/home|/lib|/lib64|/opt|/proc|/root|/run|/sbin|/srv|/sys|/tmp|/usr|/usr/local|/var)
+      PATH_SAFE_REASON="是系统目录（${norm}）"; return 1 ;;
+  esac
+  if [[ "$norm" =~ ^/(home|Users)/[^/]+$ ]]; then
+    PATH_SAFE_REASON="是家目录本身（${norm}）"
+    return 1
+  fi
+  if [[ "$norm" =~ /(Desktop|Downloads|Documents)(/|$) ]]; then
+    PATH_SAFE_REASON="位于个人目录之下（${norm}）"
+    return 1
+  fi
+  if [[ ${#norm} -lt 8 ]]; then PATH_SAFE_REASON="路径过短（${norm}）"; return 1; fi
+  PATH_SAFE_NORM="$norm"
+  return 0
+}
+
+# 把值转义成可安全放进 `${var//占位符/替换值}` 的替换串。
+#
+# bash 5.2 起 `patsub_replacement` 默认开启：替换串里的 `&` 代表「被匹配到的那段文本」，
+# 于是 `SUB_PATH=/a&b` 会把占位符本身写进生成物（实测产出 `/a__SUB_PATH__b`）。
+# 凡是「把用户提供的值填进模板」的地方都必须先过这里，转义只写一次。
+escape_repl() {
+  local s="${1//&/\\&}"
+  printf '%s' "$s"
+  return 0
 }
 
 # ------------------------------------------------------------------------------
@@ -664,6 +772,24 @@ fi
 # ------------------------------------------------------------------------------
 # 2. 前置检查：root、锁、必要命令、操作系统与包管理器
 # ------------------------------------------------------------------------------
+
+# 单实例锁里记录的进程是否**确实还在跑部署**。
+#
+# 判据分两层：先 `kill -0` 看进程在不在，再（Linux 上）读 /proc/<pid>/cmdline 确认
+# 那确实是 deploy.sh —— 否则「pid 被系统复用给了别的进程」会让陈旧锁永远清不掉，
+# 表现与「另一个部署正在运行」完全一样，而且提示还让人去删锁文件。
+# 没有 /proc 的环境（如 Git Bash）退化为只看存活：宁可多拦一次，也不要并发跑两份部署。
+lock_is_live() {
+  local pid="$1" cmd=""
+  [[ "$pid" =~ ^[0-9]+$ ]] || return 1
+  kill -0 "$pid" 2>/dev/null || return 1
+  if [[ -r "/proc/${pid}/cmdline" ]]; then
+    cmd="$(tr -d '\0' <"/proc/${pid}/cmdline" 2>/dev/null || true)"
+    [[ "$cmd" == *deploy.sh* ]] || return 1
+  fi
+  return 0
+}
+
 detect_env() {
   [[ "$(id -u)" -eq 0 ]] || die "请以 root 身份运行：sudo bash ${SCRIPT_NAME} --domain <域名>"
 
@@ -680,7 +806,21 @@ detect_env() {
   if [[ "${KEPLER_LOCK_HELD:-}" == "$LOCK_FILE" ]]; then
     info "沿用父进程持有的部署锁：${LOCK_FILE}"
   elif ! (set -o noclobber; printf '%s\n' "$$" > "$LOCK_FILE") 2>/dev/null; then
-    die "检测到另一个部署进程正在运行（锁文件 ${LOCK_FILE}）。若确认已退出，请删除该锁文件后重试。"
+    # 锁已存在：必须先分辨「真的还有人在跑」与「上一次留下的陈旧锁」。
+    #
+    # 为什么会有陈旧锁：exec 交接（重装 / 版本对齐）之前要 `trap - EXIT`，而 exec
+    # **失败**时进程直接退出、EXIT trap 也不会执行（实测 rc=127，连
+    # `exec … || { 清理; }` 的兜底分支都不会跑）—— 锁就永久留在磁盘上。
+    # 没有这一步的话，此后每一次部署都停在「另一个部署进程正在运行」，
+    # 而真正的原因（上一次交接失败）早已无人知晓，只能靠人工删文件。
+    local lock_pid="" 
+    lock_pid="$(<"$LOCK_FILE")" 2>/dev/null || lock_pid=""
+    lock_pid="${lock_pid//[^0-9]/}"
+    if lock_is_live "$lock_pid"; then
+      die "检测到另一个部署进程正在运行（pid ${lock_pid}，锁文件 ${LOCK_FILE}）。若确认已退出，请删除该锁文件后重试。"
+    fi
+    warn "接管陈旧锁：${LOCK_FILE}（上次记录的进程 ${lock_pid:-未知} 已不存在）"
+    printf '%s\n' "$$" > "$LOCK_FILE" || die "无法写入锁文件：${LOCK_FILE}"
   fi
   trap 'rm -f "$LOCK_FILE"' EXIT
 
@@ -1300,9 +1440,24 @@ collect_config() {
   MODE="${MODE,,}"
   [[ "$MODE" == "systemd" || "$MODE" == "docker" || "$MODE" == "compose" ]] || die "MODE 只支持 systemd 或 docker，当前：$MODE"
   [[ "$MODE" == "compose" ]] && MODE="docker"
-  [[ "$INSTALL_DIR" == /* ]] || die "安装目录必须是绝对路径：${INSTALL_DIR}"
-  [[ -z "$DATA_DIR" || "$DATA_DIR" == /* ]] || die "数据目录必须是绝对路径：${DATA_DIR}"
+  # 目录必须「绝对、且可以安全地递归改归属 / 递归删除」——判据与卸载时共用一个实现
+  # （path_is_safe），避免两处各写一份然后漂移。这里同时把值换成**归一后**的路径：
+  # 后续 `chown -R` / `rm -rf` 用的就是它，判据与执行对象因此是同一个字符串。
+  # 拦的是：根目录（`/` 能通过 `== /*`）、系统目录本身（/etc、/usr…）、家目录本身。
+  path_is_safe "$INSTALL_DIR" || die "安装目录不可用：${PATH_SAFE_REASON}。当前：${INSTALL_DIR}"
+  INSTALL_DIR="$PATH_SAFE_NORM"
+  if [[ -n "$DATA_DIR" ]]; then
+    path_is_safe "$DATA_DIR" || die "数据目录不可用：${PATH_SAFE_REASON}。当前：${DATA_DIR}"
+    DATA_DIR="$PATH_SAFE_NORM"
+  fi
   [[ -n "$REPO_URL" ]] || die "源码仓库地址不能为空。"
+  # 仓库地址会被拼进 `git clone` 的命令行。以 `-` 开头的值会被 git 当成**选项**，
+  # 其中 `--upload-pack=<命令>` 会让 git 执行那个命令（实测命中）——`--` 已经挡在
+  # clone 那一侧，这里再把入口收窄一次：只拒绝 `-` 开头，不限制协议（内网 GitLab、
+  # 本地路径镜像都是合法用法）。
+  case "$REPO_URL" in
+    -*) die "源码仓库地址不能以 - 开头（会被 git 当成命令行选项）：${REPO_URL}" ;;
+  esac
   for p in "$APP_PORT" "$HTTP_PORT" "$HTTPS_PORT"; do
     [[ "$p" =~ ^[0-9]+$ ]] && ((p >= 1 && p <= 65535)) || die "端口不合法：$p"
   done
@@ -1921,14 +2076,17 @@ prepare_source() {
     warn "  镜像由人工同步，可能不是最新版；网络恢复后重装即可回到官方源。"
   fi
   local cloned=0
-  if run git clone --depth 1 "$clone_url" "${tmp}/src"; then
+  # `--` 不能省：仓库地址来自 `--repo` / 环境变量 / .deploy.conf，以 `-` 开头的值会被
+  # git 当成**选项**，`--upload-pack=<命令>` 能让它以 root 执行任意命令（实测命中）。
+  # 加了 `--` 之后同样的值变成「仓库名不存在」，只是普通的克隆失败。
+  if run git clone --depth 1 -- "$clone_url" "${tmp}/src"; then
     cloned=1
   elif [[ "$clone_url" == "$DEFAULT_REPO_URL" ]]; then
     # 探测只看引用（ls-remote 不下载对象），克隆要真下对象 —— 半通 / 限速时
     # 仍可能失败，所以保留旧逻辑那层兜底：官方失败后再用镜像试一次。
     warn "从默认仓库拉取失败，改用国内镜像（Gitee）重试：${MIRROR_REPO_URL}"
     rm -rf "${tmp}/src"
-    if run git clone --depth 1 "$MIRROR_REPO_URL" "${tmp}/src"; then
+    if run git clone --depth 1 -- "$MIRROR_REPO_URL" "${tmp}/src"; then
       clone_url="$MIRROR_REPO_URL"
       cloned=1
     else
@@ -1983,7 +2141,7 @@ install_app() {
     # tar 管道复制：每次覆盖同名文件，保持幂等（重复执行即升级）
     # ⚠️ 排除项是**唯一实现点**：这里漏一个，`client/` 就会在「本地源码目录」形态下
     # 整棵树被同步进安装目录（那条路径上 prepare_source 一个字节都没删过任何东西）。
-    if ! run bash -c "cd '$SRC_DIR' && tar --exclude=./data --exclude=./node_modules --exclude=./.git --exclude=./.deploy.conf --exclude=./client -cf - . | tar -xf - -C '$INSTALL_DIR'"; then
+    if ! run bash -c 'cd "$1" || exit 1; tar --exclude=./data --exclude=./node_modules --exclude=./.git --exclude=./.deploy.conf --exclude=./client -cf - . | tar -xf - -C "$2"' _ "$SRC_DIR" "$INSTALL_DIR"; then
       warn "tar 同步失败（可能是 busybox tar 不支持 --exclude），改用逐项复制…"
       for item in package.json package-lock.json server public scripts Dockerfile; do
         [[ -e "${SRC_DIR}/${item}" ]] || continue
@@ -2026,16 +2184,16 @@ npm_install_deps() {
   info "安装生产依赖（npm ci --omit=dev）…"
   local rc=0
   mark_log
-  run bash -c "cd '$INSTALL_DIR' && npm ci --omit=dev --no-audit --no-fund $(npm_registry_args)" || rc=$?
+  run bash -c 'cd "$1" || exit 1; shift; npm ci --omit=dev --no-audit --no-fund "$@"' _ "$INSTALL_DIR" $(npm_registry_args) || rc=$?
   if ((rc != 0)); then
     warn "npm ci 失败（可能缺 package-lock.json 或网络受限），改用 npm install 重试…"
     rc=0
-    run bash -c "cd '$INSTALL_DIR' && npm install --omit=dev --no-audit --no-fund $(npm_registry_args)" || rc=$?
+    run bash -c 'cd "$1" || exit 1; shift; npm install --omit=dev --no-audit --no-fund "$@"' _ "$INSTALL_DIR" $(npm_registry_args) || rc=$?
   fi
   if ((rc != 0)) && [[ "$MIRROR" != "cn" ]]; then
     warn "默认 registry 安装失败，改用国内镜像重试…"
     rc=0
-    run bash -c "cd '$INSTALL_DIR' && npm install --omit=dev --no-audit --no-fund --registry=https://registry.npmmirror.com" || rc=$?
+    run bash -c 'cd "$1" || exit 1; shift; npm install --omit=dev --no-audit --no-fund --registry=https://registry.npmmirror.com "$@"' _ "$INSTALL_DIR" || rc=$?
   fi
   if ((rc != 0)); then
     HINTS=()
@@ -2283,27 +2441,9 @@ WEBDAV_PUBLIC_URL=${webdav_public}
 # ------------------------------------------------------------------------------
 # 7. Nginx
 # ------------------------------------------------------------------------------
-# 三段式版本比较：$1 >= $2 时返回 0。
-#
-# 不用 `sort -V`：BusyBox 与部分老 coreutils 对它支持不一致（有的不支持、有的按
-# 字典序），而这一步在部署主路径上 —— 判错的后果是「把仍有漏洞的 nginx 放过去」，
-# 比多写十行代码贵得多。非数字字符一律丢弃，缺段按 0 补齐（`1.31` 等价 `1.31.0`）。
-#
-# ⚠️ `read` 在输入为空时返回非 0，`set -e` 下会把整个脚本带走 ⇒ 必须 `|| true`。
-version_ge() {
-  local -a a b
-  local s1="${1//[^0-9.]/}" s2="${2//[^0-9.]/}"
-  local i x y
-  IFS='.' read -r -a a <<< "$s1" || true
-  IFS='.' read -r -a b <<< "$s2" || true
-  for i in 0 1 2; do
-    x="${a[i]:-0}"; y="${b[i]:-0}"
-    x="${x:-0}";   y="${y:-0}"
-    if (( 10#$x > 10#$y )); then return 0; fi
-    if (( 10#$x < 10#$y )); then return 1; fi
-  done
-  return 0
-}
+# 三段式版本比较已收敛到文件前部的唯一实现（见 `version_ge`）。
+# 这里**不要**再定义一份同名函数：bash 的后定义会覆盖先定义，改哪一处都只有一处生效，
+# 而另一处看起来照样"改过了"—— 那种状态比没有函数更难查。
 
 # 取当前 PATH 里那份 nginx 的版本号（如 `1.31.9`）；取不到时输出空串。
 nginx_version_of() {
@@ -2584,6 +2724,26 @@ nginx_http2_directive() {
   if [[ -n "$v" ]] && version_ge "$v" "1.25.1"; then printf 'http2 on;'; else printf ''; fi
 }
 
+# 启用站点：把 sites-enabled 里的软链指到刚写好的站点配置。
+#
+# 判据不能只看 `-e`：`-e` 会跟随链接，**悬空**软链（目标被删 / 被搬走）时为假，
+# 于是「这里什么都没有」成立、接着 `ln -s` 因文件已存在而失败 —— 返回码不判的话，
+# 日志照样打印「已启用站点」，而 Nginx 永远不会加载这份配置（配置写对了也没用）。
+ensure_site_link() {
+  local conf="$1" link="$2"
+  [[ -n "$link" ]] || return 0
+  if [[ -e "$link" || -L "$link" ]]; then
+    if [[ -L "$link" ]]; then
+      rm -f -- "$link" || die "无法删除旧的站点软链：${link}（可手工 rm -f 后重跑）"
+    else
+      die "站点配置位置被一个普通文件占用：${link}（请先手工移走，它不是本脚本生成的软链）"
+    fi
+  fi
+  ln -s "$conf" "$link" || die "无法创建站点软链：${link} → ${conf}"
+  ok "已启用站点：${link}"
+  return 0
+}
+
 write_nginx_conf() {
   local with_tls="$1" cert_fullchain="$2" cert_key="$3"
   # HTTP/2 写法随版本不同：≥1.25.1 用独立指令，旧版本写在 listen 行内
@@ -2753,18 +2913,18 @@ ${root_loc}
 }"
   fi
 
-  content="${content//__HTTP_LOCATION__/$http_location}"
+  # 替换值必须过 escape_repl：bash 5.2 起 `${v//占位符/替换值}` 里的 `&` 会被当成
+  # 「被匹配到的那段文本」，于是 SUB_PATH=/a&b 会把占位符**本身**写进配置
+  # （实测产出 `/a__SUB_PATH__b`）——生成物就此损坏，而且不报任何错。
+  content="${content//__HTTP_LOCATION__/$(escape_repl "$http_location")}"
   local ext_port=""; [[ "$HTTPS_PORT" == "443" ]] || ext_port=":${HTTPS_PORT}"
-  content="${content//__DOMAIN__/$DOMAIN}"
-  content="${content//__APP_PORT__/$APP_PORT}"
-  content="${content//__EXT_PORT__/$ext_port}"
-  content="${content//__SUB_PATH__/$SUB_PATH}"
+  content="${content//__DOMAIN__/$(escape_repl "$DOMAIN")}"
+  content="${content//__APP_PORT__/$(escape_repl "$APP_PORT")}"
+  content="${content//__EXT_PORT__/$(escape_repl "$ext_port")}"
+  content="${content//__SUB_PATH__/$(escape_repl "$SUB_PATH")}"
 
   write_file "$NGINX_CONF" "$content" 0644
-  if [[ -n "$NGINX_LINK" && ! -e "$NGINX_LINK" ]]; then
-    ln -s "$NGINX_CONF" "$NGINX_LINK"
-    ok "已启用站点：${NGINX_LINK}"
-  fi
+  ensure_site_link "$NGINX_CONF" "$NGINX_LINK"
 }
 
 nginx_is_running() {
@@ -2899,6 +3059,32 @@ TLS_DIR="/etc/${SERVICE_NAME}/ssl"
 ACME_CERT_DIR="${TLS_DIR}/acme"     # acme.sh 签发的证书安装到固定路径（与 --tls file 的自备证书分开存，便于切换）
 CERT_FULLCHAIN="${CERT_FULLCHAIN:-}"
 CERT_KEY="${CERT_KEY:-}"
+
+# 证书目录/私钥必须让**应用账号**读得到。
+#
+# 内置 HTTPS（3443）与 WebDAV（8443）都在应用进程里读同一份私钥（server/tls-cert.js），
+# 而 systemd 单元是 `User=<应用账号>`、容器里是 uid/gid 1000。只 `chmod 0600` 而不动属主
+# 等于「只有 root 能读」：部署一路绿灯（root 跑的 openssl 校验当然通过），可这两项功能
+# 一个都起不来，应用日志里只剩一行 EACCES。所以按「root:<应用组> 0640」落盘，目录同步收紧。
+#
+# `tls_perm_cmd` 生成同一组动作的**单行命令**，供 acme.sh 的 --reloadcmd 复用：
+# 续期时 acme.sh 会以 root 重写 privkey.pem，权限回到它自己的默认值，不重新落一次，
+# 「续期成功后功能又起不来」会照样出现 —— 而那次不会再有人盯着部署日志看。
+# 用 printf %q 引用每个值，路径里有空格或引号也不会被拆开。
+tls_perm_cmd() {
+  local dir="$1" key="$2" grp="$RUN_USER"
+  if [[ "$MODE" == "docker" ]]; then grp="1000"; fi
+  printf 'chgrp %q %q 2>/dev/null || true; chmod 0750 %q 2>/dev/null || true; chown %q %q 2>/dev/null || true; chmod 0640 %q 2>/dev/null || true' \
+    "$grp" "$dir" "$dir" "root:${grp}" "$key" "$key"
+}
+
+tls_key_allow_app() {
+  local dir="$1" key="$2" grp="$RUN_USER"
+  if [[ "$MODE" == "docker" ]]; then grp="1000"; fi
+  bash -c "$(tls_perm_cmd "$dir" "$key")" || true
+  info "私钥权限已按 root:${grp} 0640 落好（应用以 ${grp} 身份读它）"
+  return 0
+}
 
 # 重装/重跑时「证书还够新，不必再申请」的天数阈值。
 # 分工：**续期归 acme.sh 的每日 cron**（它在到期前 60 天自己续），本脚本只负责「首次签发」
@@ -3160,7 +3346,8 @@ use_provided_cert() {
     add_hint "  暂时没有证书、只想先把站点跑起来（仅 HTTP，不建议用于公网）：$(rerun_cmd --tls none)"
     die_with_hint "自备证书不可用（缺失，或内容是空白的 / 与私钥不配对）" "${HINTS[@]}"
   fi
-  chmod 0600 "$key"; chmod 0644 "$crt"
+  chmod 0644 "$crt"
+  tls_key_allow_app "$TLS_DIR" "$key"
   CERT_FULLCHAIN="$crt"; CERT_KEY="$key"
   # 刻意**不**在这里判有效期：证书何时到期、怎么续期是运维自己（或其 CA 客户端）的事，
   # 本脚本不越权去动别人的证书文件 —— 这也是与 ACME 模式最大的区别。
@@ -3337,7 +3524,7 @@ acme_install_cert() {
   local args=(--install-cert --home "$ACME_HOME" -d "$DOMAIN"
               --key-file "${dir}/privkey.pem"
               --fullchain-file "${dir}/fullchain.pem"
-              --reloadcmd "$(nginx_reload_cmd)")
+              --reloadcmd "$(nginx_reload_cmd); $(tls_perm_cmd "$dir" "${dir}/privkey.pem")")
   # 成功判据是「证书文件是否落盘」，不是 run 的返回码：acme.sh 的 --install-cert 会先把
   # key/fullchain 写进指定路径，**之后**才跑 --reloadcmd；若 reload 命令失败（宝塔/自编译
   # nginx 下 systemctl reload 报 "is not active"），acme.sh 返回非零并打 "Reload error"，
@@ -3346,8 +3533,8 @@ acme_install_cert() {
   if ! run "$(acme_bin)" "${args[@]}" </dev/null; then
     warn "acme.sh --install-cert 返回非零（多半是 --reloadcmd 那步失败）；证书可能已落盘，继续核对文件。"
   fi
-  chmod 0600 "${dir}/privkey.pem" 2>/dev/null || true
   chmod 0644 "${dir}/fullchain.pem" 2>/dev/null || true
+  tls_key_allow_app "$dir" "${dir}/privkey.pem"
   if [[ ! -s "${dir}/privkey.pem" || ! -s "${dir}/fullchain.pem" ]]; then
     warn "证书文件未正确落盘：${dir}/privkey.pem 或 fullchain.pem 缺失/为空。"
     return 1
@@ -3422,15 +3609,48 @@ install_acme_sh() {
   fi
   mv -f "$tmp" "$(acme_bin)"
   chmod 0700 "$(acme_bin)"
-  # 续期定时任务：官方 --install 会写 root 的 crontab，这里改成 cron.d（与 certbot 同一风格），
-  # 幂等：已存在同样的行就不重写。
-  local cron="/etc/cron.d/${SERVICE_NAME}-acme"
-  if ! grep -q 'acme\.sh --cron' /etc/crontab /etc/cron.d 2>/dev/null; then
-    printf '17 3 * * * root %s --cron --home %s >/dev/null 2>&1\n' "$(acme_bin)" "$ACME_HOME" > "$cron"
-    chmod 0644 "$cron"
-    ok "已添加 acme.sh 每日续期任务：${cron}"
-  fi
   ok "acme.sh 已就位（${src}）：$(acme_bin)"
+  return 0
+}
+
+# 续期定时任务：与「装 acme.sh」**解耦**。
+#
+# 为什么要拆开：install_acme_sh 开头有 `[[ -s "$(acme_bin)" ]] && return 0` 的早退，
+# 而卸载只删 /etc/cron.d 里的任务、**不删 acme.sh 本体**（它带着 CA 账户与私钥，
+# 卸载不该动用户的 ACME 身份）。两件事连在一起的结果是：卸载后重装，安装逻辑在
+# 第一行就早退，续期任务**永远不会再被创建** —— 证书 90 天后静默过期，而摘要里
+# 仍然写着「acme.sh 自动续期」。所以这里做成「每次签发都核对一次」，是修复性对账，
+# 不是幂等重写。
+#
+# 幂等判据必须区分文件与目录：`grep -q PATTERN /etc/crontab /etc/cron.d` 里第二个是
+# **目录**，grep 会以退出码 2 报错（实测），`if !` 于是恒为真 —— 注释里承诺的
+# 「已存在就不重写」从来没生效过。故 /etc/cron.d 一侧必须带 -r。
+ensure_acme_cron() {
+  local cron="${CRON_D_DIR}/${SERVICE_NAME}-acme"
+  local bin=""
+  bin="$(acme_bin)"
+  if [[ ! -s "$bin" ]]; then
+    warn "acme.sh 不在 ${bin}，无法安装续期任务"
+    return 1
+  fi
+  if grep -q -e '--cron --home' "${CRONTAB_FILE}" 2>/dev/null; then
+    info "已存在 acme.sh 每日续期任务（${CRONTAB_FILE}），跳过安装"
+    return 0
+  fi
+  if grep -rq -e '--cron --home' "${CRON_D_DIR}" 2>/dev/null; then
+    info "已存在 acme.sh 每日续期任务（${CRON_D_DIR}），跳过安装"
+    return 0
+  fi
+  # 路径进 crontab 必须加引号：cron 按空白切字段，安装目录带空格就会把参数切碎。
+  # 这里用双引号而不用 shell 式的 %q：crontab 不是 shell，`%` 在那里另有含义（分隔命令），
+  # 而单引号不被 cron 解析。
+  # 每一步都要判返回值：此函数在 `ensure_acme_cron || warn` 这种上下文里被调用时，
+  # 函数体内的 errexit 是**挂起**的（`||` 右侧不触发 set -e），写失败也不会中止 ——
+  # 不显式判，就会在「任务没写成」的情况下照样打印成功。
+  printf '17 3 * * * root "%s" --cron --home "%s" >/dev/null 2>&1\n' "$bin" "$ACME_HOME" > "$cron" \
+    || { warn "无法写入续期任务：${cron}"; return 1; }
+  chmod 0644 "$cron" || { warn "无法设置续期任务权限：${cron}"; return 1; }
+  ok "已添加 acme.sh 每日续期任务：${cron}"
   return 0
 }
 
@@ -3602,6 +3822,11 @@ setup_tls() {
         fi
       fi ;;
   esac
+  # ACME 两种落法（复用已装证书 / 本次新签发）都要核对一次续期任务：
+  # 复用分支根本不会走安装逻辑，而装了 acme.sh 的机器重装时安装逻辑又会早退。
+  case "$TLS_MODE" in
+    auto|acme) ensure_acme_cron || warn "续期任务未安装成功：证书到期后不会自动续期，请按上面的提示手工添加" ;;
+  esac
   write_nginx_conf 1 "$CERT_FULLCHAIN" "$CERT_KEY"
   nginx_apply
   # 收尾自检：把「实际对外提供的那份证书」打出来并与本地文件比对指纹。
@@ -3679,6 +3904,11 @@ setup_systemd_service() {
     "  · 或自己用 pm2/supervisor 守护，让脚本跳过这步：$(rerun_cmd --skip-service)" \
     "  · 服务启动命令：cd ${INSTALL_DIR} && ${NODE_BIN} server/index.js"
   check_port_free
+  # 两条目录都过了 collect_config 的 path_is_safe，这里再断言一次：
+  # 下面这条 `chown -R` 是**递归**的，一旦 $DATA_DIR 真的是 `/`，后果不可逆
+  # （全盘属主改成应用账号 + `chmod 0750 /`）。宁可在这里停下，也不要带着 `|| true` 跑完。
+  path_is_safe "$INSTALL_DIR" || die "安装目录不可用（${PATH_SAFE_REASON}）：${INSTALL_DIR}"
+  path_is_safe "$DATA_DIR" || die "数据目录不可用（${PATH_SAFE_REASON}）：${DATA_DIR}"
   chown -R "${RUN_USER}:${RUN_USER}" "$INSTALL_DIR" "$DATA_DIR" 2>/dev/null || true
   # R94（审核 M13-04）：**以 root 身份被执行的东西不能归应用账号所有**。
   #
@@ -3697,6 +3927,15 @@ setup_systemd_service() {
   if [[ -f "${INSTALL_DIR}/deploy.sh" ]]; then
     chown root:root "${INSTALL_DIR}/deploy.sh" 2>/dev/null || true
     chmod 0755 "${INSTALL_DIR}/deploy.sh" 2>/dev/null || true
+  fi
+  # 上面那条 `chown -R` 连 `.env` 一起交给了应用账号，而 gen_env_file 特意把它设成
+  # `root:<运行用户> 0640`（应用只读、root 可改）。不收回来的话，应用就能改写自己的
+  # 启动参数 —— 例如放宽 TRUST_PROXY_FROM、把 HOST 改回 0.0.0.0 —— 下次重启即生效，
+  # 正是可信代理白名单要防的那件事。所以这里的范围必须按注释承诺的来：目录 + deploy.sh
+  # **加上 .env**，其余文件（node_modules / 静态资源）仍归应用。
+  if [[ -f "${INSTALL_DIR}/.env" ]]; then
+    chown "root:${RUN_USER}" "${INSTALL_DIR}/.env" 2>/dev/null || true
+    chmod 0640 "${INSTALL_DIR}/.env" 2>/dev/null || true
   fi
   chmod 0750 "$DATA_DIR" || true
 
@@ -3873,7 +4112,7 @@ setup_docker_service() {
   ensure_docker
 
   info "构建镜像并启动容器（首次稍慢）…"
-  if ! run bash -c "cd '$INSTALL_DIR' && docker compose up -d --build"; then
+  if ! run bash -c 'cd "$1" || exit 1; shift; docker compose up -d --build "$@"' _ "$INSTALL_DIR"; then
     service_failure_hints docker
     die_with_hint "容器启动失败" "${HINTS[@]}"
   fi
@@ -4090,7 +4329,9 @@ if [[ "$(id -u)" -ne 0 ]]; then
   exit 1
 fi
 exec bash "$TARGET" "$@"'
-  content="${content/__TARGET__/$target}"
+  # 同 write_nginx_conf：替换值里的 `&` 会被当成"被匹配到的文本"，路径含 & 时
+  # 生成出来的 /usr/local/bin/kepler 里就是字面量 __TARGET__，命令全废。
+  content="${content/__TARGET__/$(escape_repl "$target")}"
   write_file "$GLOBAL_COMMAND" "$content" 0755
   ok "已注册全局管理命令：${GLOBAL_COMMAND}（终端输入 kepler 使用）"
 }
@@ -4099,7 +4340,7 @@ managed_service_stop() {
   [[ "$SKIP_SERVICE" != "1" ]] || die "当前部署未由脚本管理进程，无法自动停服。"
   if [[ "$MODE" == "docker" ]]; then
     have docker || die "未找到 docker，无法维护容器服务。"
-    run bash -c "cd '$INSTALL_DIR' && docker compose down"
+    run bash -c 'cd "$1" || exit 1; shift; docker compose down "$@"' _ "$INSTALL_DIR"
   else
     [[ "$INIT_SYSTEM" == "systemd" ]] || die "当前环境不可用 systemd。"
     run systemctl stop "$SERVICE_NAME"
@@ -4108,7 +4349,7 @@ managed_service_stop() {
 
 managed_service_start() {
   if [[ "$MODE" == "docker" ]]; then
-    run bash -c "cd '$INSTALL_DIR' && docker compose up -d --no-build"
+    run bash -c 'cd "$1" || exit 1; shift; docker compose up -d --no-build "$@"' _ "$INSTALL_DIR"
   else
     run systemctl start "$SERVICE_NAME"
   fi
@@ -4226,7 +4467,7 @@ apply_port_change() {
 
   if [[ "$SKIP_SERVICE" != "1" ]]; then
     if [[ "$MODE" == "docker" ]]; then
-      run bash -c "cd '$INSTALL_DIR' && docker compose up -d --no-build --force-recreate"
+      run bash -c 'cd "$1" || exit 1; shift; docker compose up -d --no-build --force-recreate "$@"' _ "$INSTALL_DIR"
     else
       run systemctl restart "$SERVICE_NAME"
     fi
@@ -4329,33 +4570,33 @@ manage_action() {
 # 13. 卸载
 # ------------------------------------------------------------------------------
 safe_remove_tree() {
-  local path="$1" label="$2"
-  [[ -n "$path" && "$path" == /* && "$path" != / ]] || [[ "$path" =~ ^[A-Za-z]:[\\/][^\\/] ]] \
-    || die "拒绝删除无效${label}路径（必须是非根的绝对路径）：${path}"
-  case "$path" in
-    /|/bin|/boot|/dev|/etc|/home|/lib|/lib64|/opt|/proc|/root|/run|/sbin|/srv|/sys|/tmp|/usr|/usr/local|/var)
-      die "安全保护：拒绝递归删除系统目录（${label}）：${path}" ;;
-  esac
-  # 家目录本身（/home/<用户>、/Users/<用户>）与个人目录下的任何路径都不动。
-  # 这里刻意不用 /home/* 这类通配：case 的 * 会跨 "/" 匹配，会把
-  # /home/deploy/kepler 这种正常安装目录一起拦掉，导致卸载永远失败。
-  if [[ "$path" =~ ^/(home|Users)/[^/]+/?$ || "$path" =~ /(Desktop|Downloads|Documents)(/|$) ]]; then
-    die "安全保护：拒绝递归删除家目录或个人目录下的${label}路径 ${path}，请人工核对后处理。"
+  local path="$1" label="$2" norm=""
+  # 判据只有一处实现（path_is_safe）：根目录、系统目录本身、家目录本身、个人目录之下
+  # 一律拒绝，其余放行。**必须先把路径归一再看**，否则 `case` 的字面串比对会被
+  # `..` 与尾斜杠绕过（`/usr/../etc` 与 `/usr/local/` 都不等于要拦的那几个字面量，
+  # 而 rm 会真的把 `..` 解析掉、把尾斜杠忽略掉）。
+  #
+  # 唯一例外是 Windows 盘符路径（`C:/…`）：它只会在开发机上出现（Git Bash 里跑卸载），
+  # 归一函数只认 POSIX 绝对路径，故单独放行 —— 它不可能命中上面那几个 POSIX 系统目录。
+  if [[ "$path" =~ ^[A-Za-z]:[\\/][^\\/] ]]; then
+    norm="$path"
+  else
+    path_is_safe "$path" || die "安全保护：拒绝递归删除${label}（${PATH_SAFE_REASON}）：${path}"
+    norm="$PATH_SAFE_NORM"
   fi
-  [[ ${#path} -ge 8 ]] || die "安全保护：${label}路径过短，拒绝删除：${path}"
   # 先尝试系统 rm；某些环境（如 Git Bash / MSYS2）会拒绝带盘符前缀的路径，
   # 此时退回到 Node 的递归删除（跨平台语义一致，同样只针对上面校验过的绝对路径）。
-  if rm -rf -- "$path" 2>/dev/null; then
-    ok "已清理${label}：${path}"
+  if rm -rf -- "$norm" 2>/dev/null; then
+    ok "已清理${label}：${norm}"
     return 0
   fi
   local node_bin="${NODE_BIN:-}"
   [[ -n "$node_bin" && -x "$node_bin" ]] || node_bin="$(command -v node || true)"
-  if [[ -n "$node_bin" ]] && rm_target="$path" "$node_bin" -e 'require("fs").rmSync(process.env.rm_target, { recursive: true, force: true })' >/dev/null 2>&1; then
-    ok "已清理${label}：${path}"
+  if [[ -n "$node_bin" ]] && rm_target="$norm" "$node_bin" -e 'require("fs").rmSync(process.env.rm_target, { recursive: true, force: true })' >/dev/null 2>&1; then
+    ok "已清理${label}：${norm}"
     return 0
   fi
-  die "清理${label}失败：${path}（可手工执行：rm -rf ${path}）"
+  die "清理${label}失败：${norm}（可手工执行：rm -rf ${norm}）"
 }
 
 do_uninstall() {
@@ -4380,7 +4621,7 @@ do_uninstall() {
     run_soft systemctl disable "${SERVICE_NAME}-docker"
   fi
   if have docker && [[ -f "${INSTALL_DIR}/docker-compose.yml" ]]; then
-    run_soft bash -c "cd '${INSTALL_DIR}' && docker compose down --remove-orphans --rmi local"
+    run_soft bash -c 'cd "$1" || exit 1; shift; docker compose down --remove-orphans --rmi local "$@"' _ "$INSTALL_DIR"
   fi
   rm -f "/etc/systemd/system/${SERVICE_NAME}.service" "/etc/systemd/system/${SERVICE_NAME}-docker.service"
   [[ "$INIT_SYSTEM" == "systemd" ]] && run_soft systemctl daemon-reload

@@ -467,12 +467,26 @@ test('deploy.sh：可选依赖安装失败只能降级，不得中断部署', ()
 });
 
 test('deploy.sh：卸载白名单不得误伤正常安装目录', () => {
-  const body = codeOnly(fnBody(readDeploy(), 'safe_remove_tree'));
-  assert(!/\/home\/\*|\/root\/\*/.test(body),
+  // 判据从 safe_remove_tree 迁移到 path_is_safe：保护逻辑收敛成唯一实现（卸载与
+  // collect_config 共用），如果继续只查 safe_remove_tree 的函数体，就变成「查一个
+  // 已经不在这里的判断」—— 名字还在、判据落空，正是最典型的假绿。
+  const guard = codeOnly(fnBody(readDeploy(), 'path_is_safe'));
+  assert(!/\/home\/\*|\/root\/\*/.test(guard),
     '不得使用 /home/* 这类通配：case 的 * 会跨 "/" 匹配，把 /home/<用户>/kepler 正常安装目录一起拦掉，卸载永远失败');
-  assert(/\(Desktop\|Downloads\|Documents\)/.test(body),
+  assert(/\(Desktop\|Downloads\|Documents\)/.test(guard),
     '个人目录要按路径组件精确匹配（Desktop/Downloads/Documents）');
-  assert(/拒绝递归删除系统目录|\/usr\/local/.test(body), '系统目录白名单必须显式列出并拒绝');
+  assert(/拒绝递归删除系统目录|\/usr\/local/.test(guard), '系统目录白名单必须显式列出并拒绝');
+  assert(/\^\/\(home\|Users\)\/\[\^\/\]\+\$/.test(guard),
+    '家目录本身（/home/<用户>）必须被拦，但它在系统目录白名单里匹配不到（前缀不同），只能靠这条正则');
+
+  // 唯一实现点：卸载必须复用 path_is_safe，且**先归一**再判 —— 归一之前判断等于没判
+  const rm = codeOnly(fnBody(readDeploy(), 'safe_remove_tree'));
+  assert(/path_is_safe "\$path"/.test(rm),
+    'safe_remove_tree 必须复用 path_is_safe（否则两处判断迟早漂移成两种行为）');
+  assert(!/case "\$path" in/.test(rm),
+    '不得再在 safe_remove_tree 里保留一份字面串黑名单：那正是被 `..` / 尾斜杠绕过的那一份');
+  assert(/rm -rf -- "\$norm"/.test(rm),
+    '删除的必须是**归一后**的路径（与判据同一个字符串），否则判 /usr/../etc 而删 /etc');
 });
 
 /**
@@ -1138,7 +1152,23 @@ test('deploy.sh：非 LE 的 CA 必须走 acme.sh，且真的带上 --server / E
   assert(/--install-cert/.test(inst) && /--key-file/.test(inst)
     && /--fullchain-file/.test(inst) && /--reloadcmd/.test(inst),
     '--install-cert 要指定 key-file / fullchain-file / reloadcmd（续期后自动生效）');
-  assert(/chmod 0600/.test(inst), '私钥落盘后必须收紧到 0600');
+  // 判据从「chmod 0600」改成「让应用读得到」：只 0600 而不改属主 = 只有 root 能读，
+  // 而读私钥的正是应用进程（systemd 是 User=<应用账号>、容器里是 uid 1000）。
+  // 于是部署全绿、内置 HTTPS 与 WebDAV 一个都起不来，日志里只剩一行 EACCES。
+  assert(/tls_key_allow_app "\$dir" "\$\{dir\}\/privkey\.pem"/.test(inst),
+    '私钥落盘后必须交给 tls_key_allow_app 按「root:<应用组> 0640」落权限（否则应用读不到，功能静默不启动）');
+  const grant = codeOnly(fnBody(src, 'tls_key_allow_app'));
+  assert(/tls_perm_cmd "\$dir" "\$key"/.test(grant),
+    'tls_key_allow_app 必须复用 tls_perm_cmd（一份实现、两处执行：部署时 + acme 续期时）');
+  const perm = codeOnly(fnBody(src, 'tls_perm_cmd'));
+  assert(/chmod 0750/.test(perm) && /chmod 0640/.test(perm),
+    '应用侧必须能读：私钥 0640、证书目录 0750（0755 会让无关账户也能遍历）');
+  assert(/chgrp/.test(perm) && /chown/.test(perm),
+    '必须同时改属组与属主：只 chmod 0600 而不动属主 = 只有 root 能读，应用读不到私钥');
+  assert(/MODE" == "docker"/.test(perm) && /1000/.test(perm),
+    'docker 模式要按 gid 1000 授权：容器里是镜像自带的 node 用户，宿主组名映射不进去');
+  assert(/\$\(tls_perm_cmd "\$dir"/.test(inst),
+    '--reloadcmd 必须带上 tls_perm_cmd：否则续期成功后「功能又起不来」会再出现一次，而那时没人看日志');
 
   // 反面：certbot 通道不得承载非 LE 的 CA
   const cb = codeOnly(fnBody(src, 'issue_via_certbot'));
@@ -1305,8 +1335,14 @@ test('deploy.sh：acme.sh 的安装必须「先落盘校验再安装」，且带
   assert(/head -c 2/.test(body),
     '落盘后必须查首行 shebang（拦「镜像返回了错误页」）：curl -f 拦不住所有非脚本内容');
   assert(/bash -n/.test(body), '必须 bash -n 拦「是脚本但被截断」—— 与 reinstall_now 的双检同一条纪律');
-  assert(/--cron --home/.test(body),
-    '不跑官方 --install（它会写 root 的 crontab），续期任务自己落 /etc/cron.d，必须带 --cron --home');
+
+  // 续期任务已从 install_acme_sh 拆到 ensure_acme_cron：判据跟着实现走。
+  // 留在原处只会得到「查一个已经不在这里的写法」—— 名字还在、判据落空（假绿）。
+  const cron = codeOnly(fnBody(readDeploy(), 'ensure_acme_cron'));
+  assert(/--cron --home/.test(cron),
+    '续期任务必须带 --cron --home（不跑官方 --install：它会写 root 的 crontab）');
+  assert(!/--cron/.test(body),
+    'install_acme_sh 不得再自己写续期任务：它开头的 -s 早退会让「卸载后重装」永远走不到这段');
 });
 
 test('deploy.sh：acme.sh 下载必须「国内镜像优先」，GitHub 官方源仅作兜底', async () => {
@@ -2598,8 +2634,10 @@ test('deploy.sh：先探 GitHub 连通性、不通才转 Gitee 镜像（且不�
   const body = codeOnly(fnBody(src, 'prepare_source'));
   assert(/clone_url="\$\(choose_clone_url\)"/.test(body),
     'prepare_source 必须先用 choose_clone_url 定地址（探测结果要真的被用上）');
-  assert(/git clone --depth 1 "\$clone_url"/.test(body),
-    '首次克隆必须用探测选出的 $clone_url —— 直接用 $REPO_URL 等于「先探后选」白做');
+  assert(/git clone --depth 1 -- "\$clone_url"/.test(body),
+    '首次克隆必须用探测选出的 $clone_url —— 直接用 $REPO_URL 等于「先探后选」白做；'
+    + '且必须带 `--` 选项终止符：仓库地址来自 --repo / .deploy.conf，'
+    + '以 `-` 开头的值会被 git 当成选项（`--upload-pack=<命令>` 会执行它，已实测）');
   assert(!/git clone --depth 1 "\$REPO_URL"/.test(body),
     '不得再出现「直接克隆 $REPO_URL」那一行：它就是用户报的那个问题的原始形态');
 
@@ -2610,8 +2648,8 @@ test('deploy.sh：先探 GitHub 连通性、不通才转 Gitee 镜像（且不�
    * 重跑」满足，于是「自动重试被删掉」也照样全绿（实测：只把 `if` 改成 `if false`
    * 时 `fail=0`，正是「护栏比名字弱」的标本）。这里要求的是**执行的那一行**。
    */
-  assert(/git clone --depth 1 "\$MIRROR_REPO_URL"/.test(body),
-    '官方失败后必须**真的执行** `git clone --depth 1 "$MIRROR_REPO_URL"` 重试：'
+  assert(/git clone --depth 1 -- "\$MIRROR_REPO_URL"/.test(body),
+    '官方失败后必须**真的执行** `git clone --depth 1 -- "$MIRROR_REPO_URL"` 重试：'
     + '探测只看引用、克隆要下对象，半通 / 限速时仍可能失败（只断言常量名会被提示行满足 ⇒ 假绿）');
   assert(/elif \[\[ "\$clone_url" == "\$DEFAULT_REPO_URL" \]\]/.test(body),
     '镜像兜底必须以「本次试的正是默认地址」为前置：显式 --repo 打不通就直接如实报错，不擅自换源');
@@ -2981,3 +3019,323 @@ probe RELAXED "${dirs.gap}"     1
   }
 });
 
+
+/* ================================================================== *
+ * R109 · 部署脚本专项复核（每条修复各一条判据）
+ * ================================================================== */
+
+/**
+ * 这一批的共同点：缺陷都**不会让部署报错**，只会让某个功能静静地不工作，
+ * 或者让一次「看起来正常」的操作落到不该落的地方。所以每条都尽量落在
+ * 「真跑一遍看结果」上，而不是「源码里有这句话」——后者在这个脚本里已经被
+ * 证明过很多次是假绿的来源（函数定义两份、注释写得比代码全）。
+ */
+
+test('deploy.sh：危险路径判据必须先归一（`..` / 尾斜杠不能绕过），且只有一份实现', async () => {
+  const src = readDeploy();
+  // 归一与判定都在 path_is_safe 里；safe_remove_tree 不得再留一份字面串黑名单
+  const guard = codeOnly(fnBody(src, 'path_is_safe'));
+  assert(/normalize_path "\$raw"/.test(guard),
+    'path_is_safe 必须先归一：拿 `/usr/../etc` 与字面量 `/etc` 比，永远比不出东西来');
+
+  const r = await spawnBashSnippet(`
+set -Eeuo pipefail
+source ./deploy.sh
+trap - ERR
+echo "N1=$(normalize_path '/usr/../etc/')"
+echo "N2=$(normalize_path '//a//b/./c/../d')"
+echo "N3=$(normalize_path '/a/b/../..')"
+for p in / /usr/local/ /usr/../etc /home/deploy /home/deploy/kepler /opt/kepler /var/lib/kepler /tmp/xx/yy/zz; do
+  if path_is_safe "$p"; then printf 'OK=%s\\n' "$p"; else printf 'NO=%s\\n' "$p"; fi
+done
+`);
+  assert(!r.unavailable, `无法运行 bash 片段：${r.unavailable}`);
+  const line = (k) => {
+    const m = new RegExp(`^${k}=(.*)$`, 'm').exec(r.out);
+    assert(m, `片段未产出 ${k}：${r.out}${r.err}`);
+    return m[1].trim();
+  };
+  assert.strictEqual(line('N1'), '/etc', '`/usr/../etc/` 归一后必须等于 /etc（尾斜杠与 .. 都被解析）');
+  assert.strictEqual(line('N2'), '/a/b/d', '重复斜杠 / `.` / `..` 都要按 POSIX 语义解析');
+  assert.strictEqual(line('N3'), '/', '走到根就停在根（不能吐出 `/..` 这种东西）');
+
+  const ok = r.out.split('\n').filter((l) => l.startsWith('OK=')).map((l) => l.slice(3)).sort();
+  const no = r.out.split('\n').filter((l) => l.startsWith('NO=')).map((l) => l.slice(3)).sort();
+  assert.deepStrictEqual(no, ['/', '/home/deploy', '/usr/../etc', '/usr/local/'],
+    '根目录、家目录本身、以及归一后命中系统目录的写法都必须拒绝（`/usr/../etc` 与 `/usr/local/` 正是旧实现放过去的两条）');
+  assert.deepStrictEqual(ok, ['/home/deploy/kepler', '/opt/kepler', '/tmp/xx/yy/zz', '/var/lib/kepler'],
+    '系统目录之下的真实安装/数据目录必须放行，否则卸载永远失败');
+});
+
+test('deploy.sh：配置备份必须唯一且有上限，内容比对要连字节数一起比', async () => {
+  const r = await spawnBashSnippet(`
+set -Eeuo pipefail
+source ./deploy.sh
+trap - ERR
+T="$(mktemp -d)"; TP="$(cygpath -u "$T" 2>/dev/null || printf '%s' "$T")"
+trap 'rm -rf "$T"' EXIT
+f="$TP/nginx.conf"
+# ① 连续改 4 次：「写了几次就有几份」—— 名字必须每次都唯一
+# 判据取 4 而不是 2：只判「≥2」时，秒级时间戳命名只要**跨过一个秒边界**就会凑出 2 份，
+# 于是「同一秒内撞名」这个真缺陷被时钟的偶然性放过去（实测正是 fail=0）。上限是 5，4 次还没触发淘汰。
+printf 'a\\n' > "$f"
+for v in b c d e; do write_file "$f" "$v" >/dev/null 2>&1; done
+echo "BAKS1=$(ls -1 "$TP"/nginx.conf.bak.* 2>/dev/null | wc -l || true)"
+# ② 连改 9 次后总量必须有上限（保留最近 5 份），不能无限堆积
+for i in 1 2 3 4 5 6 7 8 9; do write_file "$f" "v$i" >/dev/null 2>&1; done
+echo "BAKS2=$(ls -1 "$TP"/nginx.conf.bak.* 2>/dev/null | wc -l || true)"
+# ③ 尾部空行：文件是 A\\n\\n、新内容是 A —— 字节数不同就必须重写
+printf 'A\\n\\n' > "$f"
+write_file "$f" 'A' >/dev/null 2>&1
+echo "SIZE=$(wc -c <"$f" | tr -d ' ')"
+# ④ 内容真的一样时必须跳过（幂等，不产生新备份）
+before="$(ls -1 "$TP"/nginx.conf.bak.* 2>/dev/null | wc -l || true)"
+write_file "$f" 'A' >/dev/null 2>&1
+after="$(ls -1 "$TP"/nginx.conf.bak.* 2>/dev/null | wc -l || true)"
+echo "IDEMP=$((after - before))"
+`);
+  assert(!r.unavailable, `无法运行 bash 片段：${r.unavailable}`);
+  const val = (k) => {
+    const m = new RegExp(`^${k}=(.*)$`, 'm').exec(r.out);
+    assert(m, `片段未产出 ${k}：${r.out}${r.err}`);
+    return m[1].trim();
+  };
+  assert.strictEqual(val('BAKS1'), '4',
+    '每改一次必须留一份**不同名**的备份：秒级时间戳命名会让同一秒内的后一份覆盖前一份（实测）');
+  assert.strictEqual(val('BAKS2'), '5',
+    '备份总量必须有上限（保留最近 5 份）：只写不删会在安装目录里攒出上百个');
+  assert.strictEqual(val('SIZE'), '2',
+    '`$(cat f)` 会剥掉全部尾部换行，A\\n\\n 与 A 被判成相同 ⇒ 该重写的不重写；必须连字节数一起比');
+  assert.strictEqual(val('IDEMP'), '0', '内容一致时必须跳过写入（幂等不能被这次修改弄丢）');
+});
+
+test('deploy.sh：单实例锁要能分辨「陈旧锁」与「另一个部署正在跑」', async () => {
+  const r = await spawnBashSnippet(`
+set -Eeuo pipefail
+source ./deploy.sh
+trap - ERR
+lock_is_live 999999 && echo "DEAD=live" || echo "DEAD=stale"
+lock_is_live "abc" && echo "GARBAGE=live" || echo "GARBAGE=stale"
+lock_is_live "" && echo "EMPTY=live" || echo "EMPTY=stale"
+# pid 复用：起一个与部署无关的进程，把它的 pid 当成锁里记录的那个
+sleep 30 >/dev/null 2>&1 & sp=$!
+if lock_is_live "$sp"; then echo "REUSED=live"; else echo "REUSED=stale"; fi
+kill "$sp" 2>/dev/null || true
+if [[ -r "/proc/$$/cmdline" ]]; then echo "PROC=yes"; else echo "PROC=no"; fi
+`);
+  assert(!r.unavailable, `无法运行 bash 片段：${r.unavailable}`);
+  const val = (k) => {
+    const m = new RegExp(`^${k}=(.*)$`, 'm').exec(r.out);
+    assert(m, `片段未产出 ${k}：${r.out}${r.err}`);
+    return m[1].trim();
+  };
+  assert.strictEqual(val('DEAD'), 'stale', 'pid 已不存在 ⇒ 陈旧锁，必须接管，否则此后每次部署都停在「另一个进程在跑」');
+  assert.strictEqual(val('GARBAGE'), 'stale', '锁内容不是数字（历史/损坏）⇒ 按陈旧锁处理，不能永久阻塞');
+  assert.strictEqual(val('EMPTY'), 'stale', '空锁文件同理');
+  if (val('PROC') === 'yes') {
+    assert.strictEqual(val('REUSED'), 'stale',
+      'pid 被复用给了别的进程时必须识别出来（读 /proc/<pid>/cmdline）：否则陈旧锁永远清不掉，而提示还让人去删文件');
+  }
+});
+
+test('deploy.sh：续期任务要能对账（重装路径会早退），写失败不得谎报成功', async () => {
+  const r = await spawnBashSnippet(`
+set -Eeuo pipefail
+source ./deploy.sh
+trap - ERR
+T="$(mktemp -d)"; TP="$(cygpath -u "$T" 2>/dev/null || printf '%s' "$T")"
+trap 'rm -rf "$T"' EXIT
+mkdir -p "$TP/cron.d" "$TP/acme"
+printf '#!/bin/sh\\nVER=3.0.0\\n' > "$TP/acme/acme.sh"
+ACME_HOME="$TP/acme"; CRON_D_DIR="$TP/cron.d"; CRONTAB_FILE="$TP/crontab"
+if ensure_acme_cron >/dev/null 2>&1; then echo "FIRST=ok"; else echo "FIRST=fail"; fi
+sed 's/^/LINE=/' "$TP/cron.d/kepler-acme" 2>/dev/null || true
+out2="$(ensure_acme_cron 2>&1)" || true
+case "$out2" in *跳过安装*) echo "SECOND=skip" ;; *) echo "SECOND=rewrite" ;; esac
+CRON_D_DIR="$TP/no-such-dir"
+out="$(ensure_acme_cron 2>&1)" || rc=$?
+echo "FAILRC=\${rc:-0}"
+case "$out" in *已添加*) echo "LIED=1" ;; *) echo "LIED=0" ;; esac
+`);
+  assert(!r.unavailable, `无法运行 bash 片段：${r.unavailable}`);
+  const val = (k) => {
+    const m = new RegExp(`^${k}=(.*)$`, 'm').exec(r.out);
+    assert(m, `片段未产出 ${k}：${r.out}${r.err}`);
+    return m[1].trim();
+  };
+  assert.strictEqual(val('FIRST'), 'ok', '第一次必须真的把任务写出来');
+  const line = (/^LINE=(.*)$/m.exec(r.out) || [])[1] || '';
+  assert(/--cron --home/.test(line), `续期任务必须带 --cron --home，实际：${line}`);
+  assert(/"\/.*\/acme"/.test(line), `cron 里的路径必须加引号（cron 按空白切字段），实际：${line}`);
+  assert.strictEqual(val('SECOND'), 'skip',
+    '/etc/cron.d 是**目录**，判据必须带 -r 才进得去（实测 grep 对目录返回 2）；否则每次都重写 —— 旧实现里这条幂等从未生效');
+  assert.strictEqual(val('FAILRC'), '1', '目录不可写时必须返回非 0（不能像旧实现那样在 errexit 挂起的上下文里继续往下跑）');
+  assert.strictEqual(val('LIED'), '0', '写失败时绝不能打印「已添加」：那正是「任务不存在」与「任务已存在」打出同一行日志的来源');
+});
+
+test('deploy.sh：私钥要按「root:<应用组> 0640」落权限（否则内置 HTTPS / WebDAV 静默不启动）', async () => {
+  const r = await spawnBashSnippet(`
+set -Eeuo pipefail
+source ./deploy.sh
+trap - ERR
+T="$(mktemp -d)"; TP="$(cygpath -u "$T" 2>/dev/null || printf '%s' "$T")"
+trap 'rm -rf "$T"' EXIT
+mkdir -p "$TP/bin" "$TP/ssl"
+printf 'KEY\\n' > "$TP/ssl/privkey.pem"
+# 假命令记录「真的被执行了什么」——只查字符串出现过，等于没查（注释里也能出现）
+mk_rec() {
+  { printf '#!/bin/sh\\n'
+    printf 'printf "%%s %%s\\\\n" %s "$*" >> "$CALLS_LOG"\\n' "$1"
+  } > "$TP/bin/$1"
+  chmod +x "$TP/bin/$1"
+}
+mk_rec chmod; mk_rec chgrp; mk_rec chown
+export CALLS_LOG="$TP/calls"
+PATH="$TP/bin:$PATH"
+tls_key_allow_app "$TP/ssl" "$TP/ssl/privkey.pem" >/dev/null 2>&1
+echo "--- systemd"
+cat "$CALLS_LOG" 2>/dev/null || true
+: > "$CALLS_LOG"
+MODE=docker tls_key_allow_app "$TP/ssl" "$TP/ssl/privkey.pem" >/dev/null 2>&1
+echo "--- docker"
+cat "$CALLS_LOG" 2>/dev/null || true
+`);
+  assert(!r.unavailable, `无法运行 bash 片段：${r.unavailable}`);
+  const [systemdPart, dockerPart] = r.out.split('--- docker');
+  const sys = systemdPart.split('--- systemd')[1] || '';
+  assert(/chmod 0750 .*ssl/.test(sys), `证书目录必须 0750（0755 让无关账户也能遍历），实际：${sys}`);
+  assert(/chgrp kepler .*ssl/.test(sys), `证书目录必须交给应用组，实际：${sys}`);
+  assert(/chown root:kepler .*privkey\.pem/.test(sys),
+    `私钥属主必须是 root:<应用组>（只 chmod 不改属主 = 只有 root 能读，应用读不到），实际：${sys}`);
+  assert(/chmod 0640 .*privkey\.pem/.test(sys), `私钥必须 0640（root 可写 + 应用组可读），实际：${sys}`);
+  assert(/chown root:1000 .*privkey\.pem/.test(dockerPart || ''),
+    'docker 模式要按 gid 1000 授权：容器里是镜像自带的 node 用户，宿主组名映射不进去');
+  assert(!/0600/.test(sys), '不得再退回 0600：那正是「部署全绿、功能不启动」的成因');
+});
+
+test('deploy.sh：模板替换值里的 & 不得被 bash 二次展开', async () => {
+  const src = readDeploy();
+  // 每个替换点都要过 escape_repl —— 少一处就等于漏一个「生成物损坏但不报错」
+  const uses = (src.match(/\/\$\(escape_repl "/g) || []).length;
+  assert(uses >= 6, `模板替换必须逐处转义（write_nginx_conf 五处 + 全局命令一处），实际 ${uses} 处`);
+  assert(!/content="\$\{content\/\/__\w+__\/\$\w+"\}/.test(src),
+    '不得再有「替换值直接是裸变量」的写法：值里的 & 会被当成「被匹配到的文本」');
+
+  const r = await spawnBashSnippet(`
+set -Eeuo pipefail
+source ./deploy.sh
+trap - ERR
+v='__SUB_PATH__'
+echo "OUT=\${v//__SUB_PATH__/$(escape_repl '/a&b')}"
+v2='__TARGET__'
+echo "OUT2=\${v2/__TARGET__/$(escape_repl '/opt/a&b')}"
+`);
+  assert(!r.unavailable, `无法运行 bash 片段：${r.unavailable}`);
+  assert(/^OUT=\/a&b$/m.test(r.out.trim().split('\n')[0]),
+    `替换值里的 & 必须原样落进生成物，实际输出：${JSON.stringify(r.out)}`);
+  assert(/^OUT2=\/opt\/a&b$/m.test(r.out), `单斜杠替换同理，实际输出：${JSON.stringify(r.out)}`);
+});
+
+test('deploy.sh：站点启用要能修复悬空软链，且不覆盖普通文件', async () => {
+  const r = await spawnBashSnippet(`
+set -Eeuo pipefail
+source ./deploy.sh
+trap - ERR
+T="$(mktemp -d)"; TP="$(cygpath -u "$T" 2>/dev/null || printf '%s' "$T")"
+trap 'rm -rf "$T"' EXIT
+printf 'server{}\\n' > "$TP/kepler.conf"
+mkdir -p "$TP/sites"
+# 悬空软链这一半在 Windows（Git Bash）上做不出来：MSYS 创建"目标不存在"的软链需要
+# 特权，实测 EPERM。做不出来就如实标 SYMLINK=no 让断言跳过，而不是把环境限制写成"通过"。
+if ln -s "$TP/gone/old.conf" "$TP/sites/kepler.conf" 2>/dev/null && [[ -L "$TP/sites/kepler.conf" ]]; then
+  echo "SYMLINK=yes"
+  if ensure_site_link "$TP/kepler.conf" "$TP/sites/kepler.conf" >/dev/null 2>&1; then echo "RC1=0"; else echo "RC1=1"; fi
+  echo "TARGET=$(readlink "$TP/sites/kepler.conf" 2>/dev/null || echo none)"
+else
+  echo "SYMLINK=no"
+fi
+# 普通文件占位：必须拒绝（run 在子 shell 里，die 的 exit 只终止它）
+rm -f "$TP/sites/kepler.conf"; printf 'user-file\\n' > "$TP/sites/kepler.conf"
+( ensure_site_link "$TP/kepler.conf" "$TP/sites/kepler.conf" >/dev/null 2>&1 ) && echo "RC2=0" || echo "RC2=1"
+echo "KEPT=$(cat "$TP/sites/kepler.conf")"
+`);
+  assert(!r.unavailable, `无法运行 bash 片段：${r.unavailable}`);
+  const val = (k) => {
+    const m = new RegExp(`^${k}=(.*)$`, 'm').exec(r.out);
+    assert(m, `片段未产出 ${k}：${r.out}${r.err}`);
+    return m[1].trim();
+  };
+  if (/^SYMLINK=yes$/m.test(r.out)) {
+    assert.strictEqual(val('RC1'), '0', '悬空软链必须被重建（`[[ -e ]]` 对它为假，旧写法会再 ln 一次然后失败）');
+    assert(/kepler\.conf$/.test(val('TARGET')) && !/gone/.test(val('TARGET')),
+      `重建后必须指向新配置，实际：${val('TARGET')}`);
+  }
+  assert.strictEqual(val('RC2'), '1', '位置被普通文件占用时必须拒绝，不能靠 ln -sf 覆盖用户的文件');
+  assert.strictEqual(val('KEPT'), 'user-file', '拒绝时那个普通文件必须原样留下');
+});
+
+test('deploy.sh：version_ge 只能有一份实现，且不把带后缀的版本判成达标', async () => {
+  const src = readDeploy();
+  const defs = (src.match(/^version_ge\(\) \{/gm) || []).length;
+  assert.strictEqual(defs, 1,
+    `version_ge 必须只有一份定义，实际 ${defs} 份：后定义会覆盖先定义，改哪一处都只有一处生效（实测改第一处完全无效）`);
+
+  const r = await spawnBashSnippet(`
+set -Eeuo pipefail
+source ./deploy.sh
+trap - ERR
+version_ge 1.31.10 1.31.9   && echo "A=ge" || echo "A=lt"
+version_ge 1.9.5 1.31.9     && echo "B=ge" || echo "B=lt"
+version_ge 1.31.9-rc1 1.31.9 && echo "C=ge" || echo "C=lt"
+version_ge 1.31 1.31.0      && echo "D=ge" || echo "D=lt"
+`);
+  assert(!r.unavailable, `无法运行 bash 片段：${r.unavailable}`);
+  const val = (k) => {
+    const m = new RegExp(`^${k}=(.*)$`, 'm').exec(r.out);
+    assert(m, `片段未产出 ${k}：${r.out}${r.err}`);
+    return m[1].trim();
+  };
+  assert.strictEqual(val('A'), 'ge', '1.31.10 必须高于 1.31.9（数字比较，不是字符串比较）');
+  assert.strictEqual(val('B'), 'lt', '1.9.5 必须低于 1.31.9（字符串比较会判反，而 1.9.5 恰是受影响下界）');
+  assert.strictEqual(val('C'), 'lt',
+    '带后缀的版本不得被判成达标：剥掉非数字字符会把 1.31.9-rc1 读成 1.31.9，于是「不认识的版本」被当安全版本放行');
+  assert.strictEqual(val('D'), 'ge', '缺段按 0 补齐：1.31 等于 1.31.0');
+});
+
+test('deploy.sh：仓库地址与安装路径不得拼进 shell 字符串（选项注入 / 引号中断）', () => {
+  const src = readDeploy();
+  const ps = codeOnly(fnBody(src, 'prepare_source'));
+  assert.strictEqual((ps.match(/git clone --depth 1 -- /g) || []).length, 2,
+    '两处 clone（首克隆 + 镜像兜底）都必须带 `--`：缺了它，以 - 开头的仓库地址会变成 git 的选项');
+  assert(!/git clone --depth 1 "/.test(ps),
+    '不得再有「clone 后面直接跟地址」的写法：`--upload-pack=<命令>` 会以 root 执行（实测）');
+
+  const cfg = codeOnly(fnBody(src, 'collect_config'));
+  assert(/case "\$REPO_URL" in/.test(cfg) && /-\*\) die/.test(cfg),
+    '入口也要收窄：仓库地址以 - 开头必须当场拒绝（`--` 只是第二道闸）');
+  assert(/path_is_safe "\$INSTALL_DIR"/.test(cfg) && /path_is_safe "\$DATA_DIR"/.test(cfg),
+    '安装目录与数据目录必须过 path_is_safe：`/` 能通过 `== /*`，而后面是递归 chown');
+
+  // 安装路径不得再用单引号拼进 `bash -c`（路径里一个 ' 就把命令截断）
+  assert(!/bash -c "cd '/.test(src), '不得再用 `bash -c "cd \'$DIR\'"` 拼路径：引号会中断整条命令');
+  const viaArgs = (src.match(/bash -c 'cd "\$1"/g) || []).length;
+  assert(viaArgs >= 9, `九处调用（tar / npm×3 / compose×5）都要改成位置参数传值，实际 ${viaArgs} 处`);
+});
+
+test('deploy.sh：chown -R 之后必须把 .env 的归属收回 root:<应用组>', () => {
+  const body = codeOnly(fnBody(readDeploy(), 'setup_systemd_service'));
+  // 这两处查的是**源码里的字面量**：用正则而不是单引号串，`${...}` 才不会触发
+  // `no-template-curly-in-string`（那是「这里是不是漏了插值」的提醒，此处不是）
+  const iRecursive = body.search(/chown -R "\$\{RUN_USER\}:\$\{RUN_USER\}"/);
+  const iEnv = body.search(/chown "root:\$\{RUN_USER\}" "\$\{INSTALL_DIR\}\/\.env"/);
+  assert(iRecursive !== -1, '前置：setup_systemd_service 里应有一条递归 chown');
+  assert(iEnv !== -1,
+    '.env 必须被收回 root:<应用组>：`chown -R` 会把它一起交给应用账号，而 gen_env_file 特意设成 0640');
+  assert(iEnv > iRecursive, '收回动作必须排在 `chown -R` **之后**，否则被覆盖回去');
+  assert(/chmod 0640 "\$\{INSTALL_DIR\}\/\.env"/.test(body), '.env 的权限也要一起收回 0640');
+
+  // 递归 chown 之前必须再断言一次目录（collect_config 校验过，但这是不可逆动作前最后一道）
+  const iGuard = body.indexOf('path_is_safe "$DATA_DIR"');
+  assert(iGuard !== -1 && iGuard < iRecursive,
+    '递归 chown 之前必须断言 $DATA_DIR / $INSTALL_DIR 仍安全（`/` 的后果不可逆）');
+});

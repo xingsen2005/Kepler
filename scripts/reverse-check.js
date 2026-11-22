@@ -1821,7 +1821,7 @@ const CASES = [
        * `MIRROR_REPO_URL` 出现**两处** —— 自动重试那一行、以及失败提示里
        * 「手动用镜像重跑」那一行。只撤前者时，`/MIRROR_REPO_URL/` 仍被后者满足 ⇒
        * 第一版 `fail=0`（实测）。且判据也必须落在**执行的那一行**
-       * （`git clone --depth 1 "$MIRROR_REPO_URL"`），而不是「这个词出现过」。
+       * （`git clone --depth 1 -- "$MIRROR_REPO_URL"`），而不是「这个词出现过」。
        * 两步同撤 + 判据收紧后 `fail=1`。
        *
        * ⚠️ R63 把这段镜像兜底从「顶层 if」挪进了 `elif [[ "$clone_url" == ... ]]`
@@ -1833,7 +1833,7 @@ const CASES = [
       file: 'deploy.sh',
       mutations: [
         {
-          anchor: '    if run git clone --depth 1 "$MIRROR_REPO_URL" "${tmp}/src"; then',
+          anchor: '    if run git clone --depth 1 -- "$MIRROR_REPO_URL" "${tmp}/src"; then',
           replacement: '    if false; then',
         },
         {
@@ -9102,8 +9102,8 @@ const CASES = [
        */
       name: 'R63-01a · 克隆直接用 $REPO_URL（探测算了却没接上，行为退回修复前）',
       file: 'deploy.sh',
-      anchor: '  if run git clone --depth 1 "$clone_url" "${tmp}/src"; then',
-      replacement: '  if run git clone --depth 1 "$REPO_URL" "${tmp}/src"; then',
+      anchor: '  if run git clone --depth 1 -- "$clone_url" "${tmp}/src"; then',
+      replacement: '  if run git clone --depth 1 -- "$REPO_URL" "${tmp}/src"; then',
       testFile: 'deploy-script.test.js',
       minFail: 1,
     },
@@ -13479,6 +13479,152 @@ const CASES = [
       anchor: "router.use((req, res, next) => {\n  if (!BODY_PATH_RE.test(String(req.path || ''))) return next();\n  return BODY_URLENCODED(req, res, () => BODY_JSON(req, res, next));\n});",
       replacement: "router.use(express.urlencoded({ extended: false }));\nrouter.use(express.json({ limit: '256kb' }));",
       testFile: 'repo-hygiene.test.js',
+      minFail: 1,
+    },
+    /* ---------------- R109：部署脚本专项复核 ---------------- */
+    {
+      // 判据与执行对象必须是同一个字符串：不归一的话 `case` 的字面串比对会被
+      // `/usr/../etc` 与 `/usr/local/` 绕过，而 rm 会真的解析 `..`。
+      name: 'R109-01a · 危险路径不归一（`..` 与尾斜杠重新绕过系统目录黑名单）',
+      file: 'deploy.sh',
+      anchor: '  norm="$(normalize_path "$raw")"',
+      replacement: '  norm="$raw"',
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
+    {
+      // 秒级时间戳命名：同一轮部署里连改两次会撞名，第二份覆盖第一份。
+      name: 'R109-02a · 配置备份退回秒级时间戳（同一秒的第二份备份覆盖第一份）',
+      file: 'deploy.sh',
+      anchor: '    bak="$(mktemp "${path}.bak.XXXXXXXX" 2>/dev/null || true)"',
+      replacement: '    bak="${path}.bak.$(date +%Y%m%d%H%M%S)"',
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
+    {
+      // `$(cat f)` 剥掉全部尾部换行 ⇒ 「文件 A\n\n、新内容 A」被判成没变化。
+      name: 'R109-02b · 内容比对只看剥尾换行后的文本（尾部空行永远写不进去）',
+      file: 'deploy.sh',
+      anchor: '    if [[ -n "$now_sz" && "$now_sz" == "$new_sz" ]] && [[ "$(cat "$path")" == "$content" ]]; then',
+      replacement: '    if [[ "$(cat "$path")" == "$content" ]]; then',
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
+    {
+      // 锁里的 pid 已不存在还当成「另一个部署在跑」⇒ 一次 exec 失败之后每次部署都被挡。
+      name: 'R109-03a · 单实例锁不判进程存活（陈日锁变永久锁，只能人工删文件）',
+      file: 'deploy.sh',
+      anchor: '  kill -0 "$pid" 2>/dev/null || return 1',
+      replacement: '  return 0',
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
+    {
+      // grep 的第二个参数是**目录**，不带 -r 返回 2 ⇒ `if !` 恒真，幂等从未生效。
+      name: 'R109-04a · 续期任务的幂等判据对目录用 grep -q（每次都重写，判据等于没跑）',
+      file: 'deploy.sh',
+      anchor: "  if grep -rq -e '--cron --home' \"${CRON_D_DIR}\" 2>/dev/null; then",
+      replacement: "  if grep -q -e '--cron --home' \"${CRON_D_DIR}\" 2>/dev/null; then",
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
+    {
+      // 写失败被 `|| true` 吞掉 ⇒ 日志说「已添加」，而任务根本不存在。
+      // ⚠️ 必须把**两道**判据一起去掉：只去掉 printf 那一道时，紧随其后的 `chmod 0644` 会因为
+      // 文件压根没生成而失败，被它自己的 `|| { … return 1; }` 接住 ⇒ 行为与修复后**完全一样**、
+      // 反向对照 fail=0（实测）。这不是护栏弱，是**变异不等价于旧实现**。
+      name: 'R109-04b · 续期任务写入失败不报错（任务不存在却打印「已添加」）',
+      file: 'deploy.sh',
+      mutations: [
+        {
+          anchor: "  printf '17 3 * * * root \"%s\" --cron --home \"%s\" >/dev/null 2>&1\\n' \"$bin\" \"$ACME_HOME\" > \"$cron\" \\\n    || { warn \"无法写入续期任务：${cron}\"; return 1; }",
+          replacement: "  printf '17 3 * * * root \"%s\" --cron --home \"%s\" >/dev/null 2>&1\\n' \"$bin\" \"$ACME_HOME\" > \"$cron\" 2>/dev/null || true",
+        },
+        {
+          anchor: '  chmod 0644 "$cron" || { warn "无法设置续期任务权限：${cron}"; return 1; }',
+          replacement: '  chmod 0644 "$cron" 2>/dev/null || true',
+        },
+      ],
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
+    {
+      // 只 chmod 0600 而不动属主 ⇒ 只有 root 能读，应用进程读不到私钥：
+      // 内置 HTTPS 与 WebDAV 静默不启动，而部署全绿。
+      name: 'R109-05a · 私钥退回 0600 且不改属组（应用读不到 ⇒ 两项功能静默不启动）',
+      file: 'deploy.sh',
+      anchor: "; chmod 0640 %q 2>/dev/null || true' \\",
+      replacement: "; chmod 0600 %q 2>/dev/null || true' \\",
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
+    {
+      // bash 5.2+ 的 `${v//pat/repl}` 会把 repl 里的 & 当成"被匹配到的文本"：
+      // SUB_PATH=/a&b 时生成物里留下字面量占位符。
+      name: 'R109-06a · 替换值不转义 &（含 & 的路径把占位符本身写进生成物）',
+      file: 'deploy.sh',
+      anchor: '  local s="${1//&/\\\\&}"',
+      replacement: '  local s="$1"',
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
+    {
+      // 普通文件占位时直接覆盖 ⇒ 用户的文件被删掉（ln -s 失败时无声无息）。
+      name: 'R109-07a · 站点位置被普通文件占用时直接覆盖（删掉用户的文件）',
+      file: 'deploy.sh',
+      anchor: '      die "站点配置位置被一个普通文件占用：${link}（请先手工移走，它不是本脚本生成的软链）"',
+      replacement: '      rm -f -- "$link"',
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
+    {
+      // 剥掉非数字字符 ⇒ `1.31.9-rc1` 被读成 `1.31.9`，于是「不认识的版本」被判达标。
+      name: 'R109-08a · 版本号剥掉非数字字符（带后缀的版本被判成安全版本）',
+      file: 'deploy.sh',
+      anchor: '    [[ "$x" =~ ^[0-9]+$ ]] || x=0',
+      replacement: '    x="${x//[^0-9]/}"; x="${x:-0}"',
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
+    {
+      // 缺 `--` ⇒ 以 - 开头的仓库地址变成 git 的选项，`--upload-pack=<命令>` 会被执行。
+      // ⚠️ 加上 `--` 的那一轮**顺带老化了另外两条 anchor**：`R59-03a`（镜像重试那一行）与
+      // `R63-01a`（克隆用 `$clone_url` 那一行）原本钉的是不带 `--` 的写法 —— 改完立刻被
+      // invariants 的「anchor 必须命中」抓到（2 条失效）。两处已跟着重锚，`R63-01a` 的
+      // replacement 也补上了 `--`，免得它同时表达两件事（换变量 + 去掉 `--`）而分不清红在哪。
+      name: 'R109-09a · git clone 去掉 --（仓库地址变成 git 选项，可执行任意命令）',
+      file: 'deploy.sh',
+      anchor: '  if run git clone --depth 1 -- "$clone_url" "${tmp}/src"; then',
+      replacement: '  if run git clone --depth 1 "$clone_url" "${tmp}/src"; then',
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
+    {
+      // `chown -R` 会把 .env 一起交给应用账号 ⇒ 应用能改写自己的启动参数
+      // （放宽 TRUST_PROXY_FROM、把 HOST 改回 0.0.0.0），下次重启生效。
+      name: 'R109-10a · .env 归属不收回到 root（应用可改写可信代理 / 监听地址）',
+      file: 'deploy.sh',
+      anchor: "  if [[ -f \"${INSTALL_DIR}/.env\" ]]; then\n    chown \"root:${RUN_USER}\" \"${INSTALL_DIR}/.env\" 2>/dev/null || true\n    chmod 0640 \"${INSTALL_DIR}/.env\" 2>/dev/null || true\n  fi",
+      replacement: '',
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
+    {
+      // 卸载的删除保护退回字面串 case ⇒ `/usr/../etc` 与 `/usr/local/` 重新被放行。
+      name: 'R109-11a · 卸载不经 path_is_safe（回到字面串黑名单，`..` 重新可绕过）',
+      file: 'deploy.sh',
+      anchor: '    path_is_safe "$path" || die "安全保护：拒绝递归删除${label}（${PATH_SAFE_REASON}）：${path}"',
+      replacement: '    norm="$path"',
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
+    {
+      // 单引号拼接安装路径：路径里一个 ' 就把命令截断（报错还指向引号，不指向路径）。
+      name: 'R109-12a · 安装路径拼回 `bash -c "cd \'$DIR\'"`（路径含引号即语法中断）',
+      file: 'deploy.sh',
+      anchor: "  run bash -c 'cd \"$1\" || exit 1; shift; npm ci --omit=dev --no-audit --no-fund \"$@\"' _ \"$INSTALL_DIR\" $(npm_registry_args) || rc=$?",
+      replacement: "  run bash -c \"cd '$INSTALL_DIR' && npm ci --omit=dev --no-audit --no-fund $(npm_registry_args)\" || rc=$?",
+      testFile: 'deploy-script.test.js',
       minFail: 1,
     },
   ];
