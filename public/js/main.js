@@ -350,6 +350,9 @@ async function bootstrapApp() {
     filetype.init();
     uploadMgr.init();
     dashboard.init();
+    // 后台静默总闸：必须在各轮询启动（本函数末尾那几行）之前绑好，
+    // 否则「首屏就在后台打开」的那一次会把 pageHidden 留在初值 false 上
+    bindVisibilityGate();
     help.init();
     settings.init();
     App._bootstrapped = true;
@@ -2311,6 +2314,60 @@ export async function refreshMiniStats() {
   }
 }
 
+/* ------------------------------ 后台静默 ------------------------------ */
+
+/**
+ * 页面是否可见 —— 全站轮询的**唯一**暂停门（R111）。
+ *
+ * ## 为什么要有它
+ *
+ * 一个登录着管理员的标签页被切到后台之后，这些定时器原本照跑不误：
+ * `speed`（2 秒，每 30 分钟 900 次）、`summary`（60 秒）、仪表盘（30 秒）、
+ * 桶统计（5 秒~5 分）、自动刷新（用户设的间隔）。合起来在**看不到任何画面**的
+ * 情况下持续打服务端与对象存储（桶统计会真的列举云端）—— 移动端是电量，
+ * 桌面端是风扇与月度流量，服务端那边是一整片无人看的日志。
+ *
+ * 浏览器对后台标签页的 `setInterval` 有节流（多数实现压到 1 次/分钟），但那只是
+ * **变慢**，不是停止；而且各家的节流策略不一致，不能当作依赖。
+ *
+ * ## 判据为什么取 `document.hidden`，而不是「自家定时器自己算」
+ *
+ * 一个模块自己判断「我在不在前台」是不可能的 —— 只有 document 知道。因此做成
+ * 全局单点：`App.state.pageHidden` 由 `visibilitychange` 维护，所有 tick 只读它。
+ * 这样「暂停」这件事只有一份实现，新增轮询时不需要再想一遍。
+ *
+ * ## 恢复时必须**立刻补一次**
+ *
+ * 只做「隐藏时不发」而不做「可见时补」，用户切回来的第一眼看到的是几分钟前的
+ * 数字，且没有任何「正在更新」的提示 —— 表现为「这个页面卡住了」。所以
+ * `resumeAllPolling()` 在可见的那一瞬把所有轮询各触发一次。
+ */
+function bindVisibilityGate() {
+  const apply = () => {
+    App.state.pageHidden = Boolean(document.hidden);
+    if (!App.state.pageHidden) resumeAllPolling();
+  };
+  App.state.pageHidden = Boolean(document.hidden);
+  document.addEventListener('visibilitychange', apply);
+}
+
+/**
+ * 页面重新可见时把所有轮询立刻补一轮。
+ *
+ * 这里刻意**只补一轮、不重建定时器**：定时器本来就没被清掉（它们的 tick 只是
+ * 提前 return），重建会引入「谁负责恢复」的额外状态 —— 而那份状态一旦漏一处，
+ * 结果就是某个轮询永久停摆（比后台多跑几次糟得多）。
+ */
+function resumeAllPolling() {
+  if (!App.state.user) return; // 登录页 / 已登出：没有任何轮询可恢复
+  refreshMiniStats();
+  refreshSpeed();
+  startAutoRefresh(); // 内部先 clearInterval 再按当前设置重建，天然幂等
+  if (App.state.mainView === 'dashboard') dashboard.refresh();
+  if (App.state.mainView === 'bucketmgr') bucketmgr.refresh();
+}
+
+
 /** R7-09：统计摘要定时器 —— 句柄保存 + 先停后启，登出时由 forceLogout 停止 */
 function startStatsTimer() {
   stopStatsTimer();
@@ -2320,7 +2377,10 @@ function startStatsTimer() {
    * 注定 403 的请求 —— 请求频率本身也是一种噪音与日志污染。
    */
   if (!isStaffRole(App.state.user && App.state.user.role)) return;
-  App._statsTimer = setInterval(refreshMiniStats, 60000);
+  App._statsTimer = setInterval(() => {
+    if (App.state.pageHidden) return; // 后台标签页：不发、不渲染，切回来由 resumeAllPolling 补
+    refreshMiniStats();
+  }, 60000);
 }
 function stopStatsTimer() {
   if (App._statsTimer) { clearInterval(App._statsTimer); App._statsTimer = null; }
@@ -2335,6 +2395,27 @@ function stopStatsTimer() {
  * 同时在元素不存在（未登录 / 已登出）时**停止轮询**，而不是"请求照发、只在渲染时 return"。
  */
 let speedTimer = null;
+
+/**
+ * 拉一次实时速度并写回状态栏。
+ *
+ * 从 `startSpeedPolling` 里抽出来，是为了让「切回前台立刻补一次」
+ * （`resumeAllPolling`）能复用同一段实现 —— 否则那一段会在两处各写一遍，
+ * 而「停轮询的判据」正是这类重复里最容易分叉的东西（一处判 401、一处漏）。
+ */
+async function refreshSpeed() {
+  const el = () => document.getElementById('status-traffic');
+  if (!el()) { stopSpeedPolling(); return; } // 状态栏不在 → 已登出，立即停
+  try {
+    const s = await API.speed();
+    if (!el()) { stopSpeedPolling(); return; }
+    el().textContent = `↑${fmtSize(s.up || 0)}/s ↓${fmtSize(s.down || 0)}/s`;
+  } catch (e) {
+    // 401（未登录）说明会话已失效，继续轮询没有意义
+    if (e && (e.status === 401 || e.status === 403)) stopSpeedPolling();
+  }
+}
+
 function startSpeedPolling() {
   stopSpeedPolling();
   const el = () => document.getElementById('status-traffic');
@@ -2350,17 +2431,7 @@ function startSpeedPolling() {
   const node = el();
   if (node) node.hidden = !staff;
   if (!staff) return;
-  async function tick() {
-    if (!el()) { stopSpeedPolling(); return; } // 状态栏不在 → 已登出，立即停
-    try {
-      const s = await API.speed();
-      if (!el()) { stopSpeedPolling(); return; }
-      el().textContent = `↑${fmtSize(s.up || 0)}/s ↓${fmtSize(s.down || 0)}/s`;
-    } catch (e) {
-      // 401（未登录）说明会话已失效，继续轮询没有意义
-      if (e && (e.status === 401 || e.status === 403)) stopSpeedPolling();
-    }
-  }
+  const tick = () => { if (App.state.pageHidden) return; refreshSpeed(); };
   tick();
   speedTimer = setInterval(tick, 2000);
 }
@@ -2391,6 +2462,7 @@ function startAutoRefresh() {
   clearInterval(refreshTimer);
   if (App.state.autoRefresh > 0) {
     refreshTimer = setInterval(() => {
+      if (App.state.pageHidden) return; // 后台标签页：不列举、不渲染
       if (document.getElementById('explorer').hidden) return; // 仪表盘打开时不刷新文件列表
       if (uploadMgr.hasActive()) return; // 有上传任务时暂停自动刷新，避免干扰
       explorer.refresh({ silent: true });
@@ -2398,6 +2470,7 @@ function startAutoRefresh() {
     }, App.state.autoRefresh * 1000);
   }
 }
+
 
 /* ------------------------------ 键盘快捷键 ------------------------------ */
 

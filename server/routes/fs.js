@@ -1369,6 +1369,20 @@ router.get('/fs/thumb', async (req, res) => {
     const url = await new Promise((resolve, reject) => {
       client.getObjectUrl({ Bucket: cfg.bucket, Region: cfg.region, Key: key, Sign: true, Expires: 3600 }, (err, data) => (err ? reject(err) : resolve(data.Url)));
     });
+    /**
+     * 302 本身默认**不可缓存**（RFC 9111 里 302 属「不明确可缓存」），于是同一张
+     * 缩略图每进一次目录、每换一次排序 / 类型筛选（都会重建 `innerHTML`）就要重新
+     * 打一次 `/fs/thumb` —— 一次列表刷新 200 张图就是 200 次签名请求。
+     *
+     * 给跳转本身加缓存：TTL 必须**严格小于**预签名有效期（上面 `Expires: 3600`），
+     * 否则缓存里会留下一条指向已过期 URL 的 302，表现为缩略图随机性整片加载失败、
+     * 且刷新也未必立刻恢复。这里取 5 分钟 —— 与下面两个占位 SVG 分支的 `max-age`
+     * 同值，同一个路由只有一个口径；同时把「同名对象被覆盖后看到旧图」的窗口
+     * 收敛在 5 分钟内。
+     *
+     * `private` 是必需的：预签名 URL 本身就是凭据，不允许任何共享缓存留存。
+     */
+    res.setHeader('Cache-Control', 'private, max-age=300');
     res.redirect(302, url);
   } catch (e) {
     const err = e.status ? e : translateError(e);

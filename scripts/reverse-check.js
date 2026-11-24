@@ -13627,6 +13627,89 @@ const CASES = [
       testFile: 'deploy-script.test.js',
       minFail: 1,
     },
+    /* ---------------------------------------------------------------- *
+     * R111 · 社区性能建议里被采纳的五处
+     *
+     * 这五处**都不改变可观测行为**（画出来还是同样的东西，只是不再白算一遍），
+     * 所以没有任何既有行为用例会替它们变红 —— 每处都必须有自己的对照，
+     * 否则「优化过了」就只是一句话。
+     * ---------------------------------------------------------------- */
+    {
+      // 判据是"短路排在 sort 之前"，故把短路整条去掉 ≡ 旧实现（每帧白排一遍全表）。
+      name: 'R111-01a · 排序去重被去掉（每次重绘都白排一遍全表）',
+      file: 'public/js/explorer.js',
+      anchor: '  if (sortSig && sortSig.items === state.items && sortSig.key === key && sortSig.dir === dir) return;',
+      replacement: '',
+      testFile: 'audit44-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 委托了、但用冒泡阶段接：`load` / `error` **不冒泡**，缩略图永不淡入、坏图也永不清除，
+      // 而且不报任何错 —— 这正是"看起来做了委托"的假绿形态。
+      name: 'R111-02a · 缩略图委托退回冒泡阶段（load/error 不冒泡 ⇒ 缩略图永不淡入）',
+      file: 'public/js/explorer.js',
+      anchor: "  els.area.addEventListener('load', (e) => {\n    const img = e.target;\n    if (img && img.dataset && img.dataset.thumb !== undefined) img.classList.add('loaded');\n  }, true);",
+      replacement: "  els.area.addEventListener('load', (e) => {\n    const img = e.target;\n    if (img && img.dataset && img.dataset.thumb !== undefined) img.classList.add('loaded');\n  });",
+      testFile: 'audit44-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 少比一个维度：滚动后仍按旧屏幕位置命中 ⇒ 长目录上框到幽灵行（几乎必然发生）。
+      name: 'R111-03a · 矩形签名漏掉 scrollTop/scrollLeft（滚动后框到幽灵行）',
+      file: 'public/js/explorer.js',
+      anchor: "  const sig = els.area.clientWidth + 'x' + els.area.clientHeight + '@' + els.area.scrollTop + ',' + els.area.scrollLeft;",
+      replacement: "  const sig = els.area.clientWidth + 'x' + els.area.clientHeight;",
+      testFile: 'audit44-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 只去掉其中一路的门（统计摘要）：判据必须能定位到"具体哪一个 tick 没被挡"。
+      name: 'R111-04a · 统计摘要 tick 去掉后台门（看不到画面时仍每 60 秒打一次）',
+      file: 'public/js/main.js',
+      // anchor 不能带行尾注释：invariants 的 anchor 校验跑在「注释抹成等长空格」之上，
+      // 带注释的字面量在剥完注释后必然对不上（= 等于没登记）。这里截到 `return;` 为止。
+      anchor: '  App._statsTimer = setInterval(() => {\n    if (App.state.pageHidden) return;',
+      replacement: '  App._statsTimer = setInterval(() => {',
+      testFile: 'audit7-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 暂停做了、恢复漏一路：切回前台后速度那一格永远停在几分钟前，且没有"正在更新"的提示。
+      name: 'R111-05a · 切回前台漏补实时速度（状态栏停在几分钟前的数字）',
+      file: 'public/js/main.js',
+      anchor: '  refreshMiniStats();\n  refreshSpeed();',
+      replacement: '  refreshMiniStats();',
+      testFile: 'audit7-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // `if (true)` ≡ 旧实现（每轮都重画环图 + 整块重写 4 行图例）。
+      name: 'R111-06a · 仪表盘存储用量退回"每轮都重绘"（数据没变也重建 canvas 与图例）',
+      file: 'public/js/dashboard.js',
+      anchor: '    if (sig !== storageSig) {',
+      replacement: '    if (true) {',
+      testFile: 'audit7-regressions.test.js',
+      minFail: 1,
+    },
+    {
+      // 去掉缓存头 ≡ 旧实现：同一张缩略图每重建一次列表就要重新签一次名。
+      name: 'R111-07a · 缩略图 302 不带 Cache-Control（每重建一次列表就重签一次名）',
+      file: 'server/routes/fs.js',
+      anchor: "    res.setHeader('Cache-Control', 'private, max-age=300');\n    res.redirect(302, url);",
+      replacement: '    res.redirect(302, url);',
+      testFile: 'list-cache.test.js',
+      minFail: 1,
+    },
+    {
+      // 缓存 TTL 超过预签名有效期：缓存里会留下指向**已过期** URL 的 302，
+      // 缩略图随机整片加载失败，且刷新也未必立刻恢复。
+      name: 'R111-08a · 302 的 TTL 超过预签名有效期（缓存里留下指向过期 URL 的跳转）',
+      file: 'server/routes/fs.js',
+      anchor: "    res.setHeader('Cache-Control', 'private, max-age=300');\n    res.redirect(302, url);",
+      replacement: "    res.setHeader('Cache-Control', 'private, max-age=7200');\n    res.redirect(302, url);",
+      testFile: 'list-cache.test.js',
+      minFail: 1,
+    },
   ];
 
 module.exports = { runCase, CASES, parseArgs };

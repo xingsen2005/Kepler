@@ -76,29 +76,14 @@ export const explorer = {
       if (els.area.scrollTop + els.area.clientHeight > els.area.scrollHeight - 420) this.loadMore();
     });
 
-    // 拖拽上传 / 内部移动
-    els.area.addEventListener('dragover', (e) => {
-      if ([...e.dataTransfer.types].includes('Files')) {
-        e.preventDefault();
-        els.area.classList.add('dropping');
-      } else if ([...e.dataTransfer.types].includes('application/x-s3-keys')) {
-        e.preventDefault();
-      }
-    });
-    els.area.addEventListener('dragleave', (e) => { if (e.target === els.area) els.area.classList.remove('dropping'); });
-    els.area.addEventListener('drop', async (e) => {
-      e.preventDefault();
-      els.area.classList.remove('dropping');
-      if ([...e.dataTransfer.types].includes('application/x-s3-keys')) {
-        // 内部拖拽 → 移动到空白区域 = 当前目录
-        return;
-      }
-      const files = await filesFromDataTransfer(e.dataTransfer);
-      if (files.length) uploadMgr.enqueue(files.map((f) => f.file), App.state.prefix, files.some((f) => f.path));
-    });
+    // 文件区的全部行级交互（单击 / 多选 / 双击 / 右键 / 拖拽 / 缩略图 / 表头排序）
+    bindAreaEvents();
 
-    // 空白区域按下：左键 = 开始框选（R50），右键 = 交给下面的 contextmenu 处理
+    // 按下：行内交给委托分支（单击 / Ctrl 点 / Shift 连选 / 右键选批），
+    // 空白处左键才开始框选（R50）
     els.area.addEventListener('mousedown', (e) => {
+      const row = e.target.closest('[data-key]');
+      if (row) { onRowMouseDown(e, row); return; }
       if (e.button !== 0) return;
       if (e.target.closest('.grid-item') || e.target.closest('tr[data-key]') || e.target.closest('thead')) return;
       // 点在 #file-area 自己的滚动条上时，target 就是这个元素本身，与「点在空白处」
@@ -106,12 +91,6 @@ export const explorer = {
       if (e.offsetX > els.area.clientWidth || e.offsetY > els.area.clientHeight) return;
       beginMarquee(e);
     });
-    els.area.addEventListener('contextmenu', (e) => {
-      if (e.target.closest('.grid-item') || e.target.closest('tr[data-key]')) return;
-      e.preventDefault();
-      showContextMenu(e.clientX, e.clientY, null);
-    });
-
     document.addEventListener('mousedown', (e) => {
       if (!e.target.closest('#ctx-menu')) document.getElementById('ctx-menu').hidden = true;
     });
@@ -307,6 +286,7 @@ export const explorer = {
     els.area.className = 'view-' + view;
     updateLoadMore();
     state.visible = visibleItems();
+    rectCache = null; // 行要被重建：矩形快照作废（见 rowRects()）
     if (listChangedCb) listChangedCb();
     if (!state.items.length) {
       els.area.innerHTML = '';
@@ -425,8 +405,29 @@ function mergePage(items, r) {
   return out;
 }
 
+/**
+ * 上一次排序的「输入签名」—— 数组**引用** + 排序键 + 方向。
+ *
+ * 为什么需要它：`render()` 每次调用都先 `sortItems()`，而 `render` 的触发面很宽
+ * （筛选类型、改选中集后 `syncSelectionUi` 之外的路径、视图切换、窗口尺寸变化、
+ * 状态栏更新……），排序键却极少数情况下才变。`localeCompare(…, 'zh-CN')` 走 ICU
+ * collation，比普通比较贵一个量级；无限滚动攒到几千项后，每次重绘都白排一遍
+ * 全表，而这正是「切个类型/点个空白都发涩」的来源之一。
+ *
+ * 判据只用**引用相等**，不用内容比较：`state.items` 只在三处被整体替换 ——
+ * `refresh()` 的 `mergePage([], r)`、`loadMore()` 的 `mergePage(state.items, r)`、
+ * `search()` 的 `state.searchMatches`（都是新数组），因此「引用没变」严格等价于
+ * 「自上次排序以来列表内容没变」。反过来，任何一次内容变化都会换掉引用，
+ * 签名必然失效 —— 不存在「漏排」的缝隙。
+ *
+ * ⚠️ 不能改成「判断长度」或「判断首尾项」：重命名（size/name 变、条数不变）
+ * 就会漏排，而那正是本项目最爱出现的一类假绿。
+ */
+let sortSig = null;
+
 function sortItems() {
   const { key, dir } = App.state.sort;
+  if (sortSig && sortSig.items === state.items && sortSig.key === key && sortSig.dir === dir) return;
   const mul = dir === 'desc' ? -1 : 1;
   state.items.sort((a, b) => {
     if (a.isFolder !== b.isFolder) return a.isFolder ? -1 : 1; // 文件夹始终在前
@@ -437,6 +438,7 @@ function sortItems() {
     else if (key === 'type') cmp = String(a.type).localeCompare(String(b.type));
     return cmp * mul || a.name.localeCompare(b.name, 'zh-CN');
   });
+  sortSig = { items: state.items, key, dir };
 }
 
 function preserveSelection() {
@@ -477,7 +479,6 @@ function renderList() {
       <thead><tr>${cols.map(colHtml).join('')}</tr></thead>
       <tbody>${rows}</tbody>
     </table>`;
-  bindRowEvents();
 }
 
 /** 类型文案 —— 分类表只有一份（`util.js` 的 `TYPE_LABEL`），这里只是取值 */
@@ -494,92 +495,167 @@ function renderGrid(view) {
       ${thumb}<div class="nm">${escapeHtml(item.name || item.key)}${item.encrypted ? LOCK : ''}</div></div>`;
   }).join('');
   els.area.innerHTML = `<div class="grid-wrap">${items}</div>`;
-  bindRowEvents();
 }
 
-function bindRowEvents() {
-  // 缩略图：加载完成淡入、失败则从 DOM 移除（回退到类型图标）
-  //
-  // SEC-06：这两行为**原来用内联的 onload/onerror 属性**实现，那是全项目唯一的
-  // `script-src 'unsafe-inline'` 需求来源 —— 一旦 CSP 里保留 unsafe-inline，
-  // 任何一处 XSS 注入都能直接升级为脚本执行。改为 addEventListener 后
-  // 即可彻底移除 unsafe-inline。
-  // 注意：图片可能在绑定前就已 load 完成，故需补查 `complete` 状态处理竞态。
-  els.area.querySelectorAll('img[data-thumb]').forEach((img) => {
-    if (img.dataset.thumbBound === '1') return;
-    img.dataset.thumbBound = '1';
-    img.addEventListener('load', () => img.classList.add('loaded'), { once: true });
-    img.addEventListener('error', () => img.remove(), { once: true });
-    if (img.complete) {
-      // 绑定太晚：图片早已完成（缓存命中或极快响应）
-      if (img.naturalWidth > 0) img.classList.add('loaded');
-      else img.remove();
-    }
-  });
-  // 表头排序
-  els.area.querySelectorAll('th[data-sort]').forEach((th) => {
-    if (!th.dataset.sort) return;
-    th.onclick = () => {
-      const k = th.dataset.sort;
-      if (App.state.sort.key === k) App.state.sort.dir = App.state.sort.dir === 'asc' ? 'desc' : 'asc';
-      else App.state.sort = { key: k, dir: 'asc' };
-      if (window.__savePrefs) window.__savePrefs();
-      explorer.render();
-    };
+/**
+ * 文件区**全部**行级交互的唯一挂载点（事件委托）。
+ *
+ * ## 为什么不再逐行绑
+ *
+ * 旧实现是 `renderList()` / `renderGrid()` 写完 `innerHTML` 后调 `bindRowEvents()`
+ * 给**每一行**挂 8 个监听（mousedown / dblclick / contextmenu / dragstart，
+ * 宫格文件夹再加 dragover / dragleave / drop，另加每个缩略图 2 个）。200 行就是
+ * 1600 个监听器、200 张图又是 400 个；而这份开销**每渲染一次就重来一遍**
+ * （改排序、换类型筛选、切视图、翻页都算），旧的那批随着 `innerHTML` 覆盖一起
+ * 变成垃圾（监听器随元素回收，不泄漏，但分配与注册是实打实的）。
+ *
+ * 委托之后：监听器数量与行数**无关**，恒为本次绑定的 8 个（init 里一次），
+ * 行怎么重建都不影响；行上的 key / idx 从 `dataset` 现取，不存在"闭包里抓着上一批
+ * 行"的形态。
+ *
+ * ⚠️ `load` / `error` 两个事件**不冒泡**，只能用**捕获阶段**接（第三个参数 true）。
+ * 这也是旧实现只能逐张 `<img>` 绑的原因 —— 捕获让它们同样可以委托。
+ */
+function bindAreaEvents() {
+  // 双击：打开 / 预览
+  els.area.addEventListener('dblclick', (e) => {
+    const row = e.target.closest('[data-key]');
+    if (row) explorer.openItem(row.dataset.key);
   });
 
-  const rows = els.area.querySelectorAll('[data-key]');
-  rows.forEach((row) => {
+  // 右键：行上给「针对该项」的菜单，空白处给「针对当前目录」的菜单
+  els.area.addEventListener('contextmenu', (e) => {
+    e.preventDefault();
+    const row = e.target.closest('[data-key]');
+    showContextMenu(e.clientX, e.clientY, row ? row.dataset.key : null);
+  });
+
+  // 拖拽起点：多选时拖的是整批，单选时拖的是这一项
+  els.area.addEventListener('dragstart', (e) => {
+    const row = e.target.closest('[data-key]');
+    if (!row) return;
     const key = row.dataset.key;
-    const idx = Number(row.dataset.idx);
-    row.addEventListener('mousedown', (e) => {
-      if (e.button === 2) {
-        // 右键：若未选中则单选该项
-        if (!App.state.selection.has(key)) {
-          App.state.selection.clear();
-          App.state.selection.add(key);
-          syncSelectionUi();
-        }
-        return;
-      }
-      if (e.ctrlKey || e.metaKey) {
-        toggleSel(key);
-        state.anchorIndex = idx;
-      } else if (e.shiftKey && state.anchorIndex >= 0) {
-        const [a, b] = [Math.min(state.anchorIndex, idx), Math.max(state.anchorIndex, idx)];
-        if (!e.ctrlKey && !e.metaKey) App.state.selection.clear();
-        for (let i = a; i <= b; i++) App.state.selection.add(state.visible[i].key);
-      } else {
-        App.state.selection.clear();
-        App.state.selection.add(key);
-        state.anchorIndex = idx;
-      }
-      syncSelectionUi();
-    });
-    row.addEventListener('dblclick', () => explorer.openItem(key));
-    row.addEventListener('contextmenu', (e) => {
+    const keys = App.state.selection.has(key) ? [...App.state.selection] : [key];
+    e.dataTransfer.setData('application/x-s3-keys', JSON.stringify(keys));
+    e.dataTransfer.effectAllowed = 'move';
+  });
+
+  /**
+   * 拖拽经过 / 离开 / 放下，一个监听里同时承担三件事：
+   *  a) 从系统拖进文件 → 上传到当前目录（原 area 层行为）；
+   *  b) 内部拖动经过**宫格文件夹** → 高亮该文件夹（原行层行为）；
+   *  c) 内部拖动松手在宫格文件夹上 → 移进去（原行层行为）。
+   *
+   * ⚠️ 目标文件夹的判定仍走 `state.visible[idx]`（下标来自 `dataset.idx`），
+   * 与渲染同源 —— 这也是 audit44 那条「按下标取项必须用 state.visible」的护栏
+   * 想守住的东西：改成 `state.items[idx]` 在筛选态下就是拖错文件。
+   */
+  els.area.addEventListener('dragover', (e) => {
+    const types = [...e.dataTransfer.types];
+    const row = e.target.closest('[data-key]');
+    const idx = row ? Number(row.dataset.idx) : -1;
+    if (types.includes('application/x-s3-keys')) {
       e.preventDefault();
-      showContextMenu(e.clientX, e.clientY, key);
-    });
-    row.addEventListener('dragstart', (e) => {
-      const keys = App.state.selection.has(key) ? [...App.state.selection] : [key];
-      e.dataTransfer.setData('application/x-s3-keys', JSON.stringify(keys));
-      e.dataTransfer.effectAllowed = 'move';
-    });
-    if (row.classList.contains('grid-item') && state.visible[idx] && state.visible[idx].isFolder) {
-      row.addEventListener('dragover', (e) => {
-        if ([...e.dataTransfer.types].includes('application/x-s3-keys')) { e.preventDefault(); e.stopPropagation(); row.style.background = 'var(--selected)'; }
-      });
-      row.addEventListener('dragleave', () => { row.style.background = ''; });
-      row.addEventListener('drop', async (e) => {
-        e.preventDefault(); e.stopPropagation(); row.style.background = '';
-        const keys = JSON.parse(e.dataTransfer.getData('application/x-s3-keys') || '[]');
-        const target = state.visible[idx];
-        const toMove = keys.filter((k) => k !== target.key && !target.key.startsWith(k));
-        if (toMove.length) ops.moveKeysTo(toMove, target.key);
-      });
+      if (row && row.classList.contains('grid-item') && state.visible[idx] && state.visible[idx].isFolder) {
+        row.style.background = 'var(--selected)';
+      }
+      return;
+    }
+    if (types.includes('Files')) {
+      e.preventDefault();
+      els.area.classList.add('dropping');
     }
   });
+  els.area.addEventListener('dragleave', (e) => {
+    const row = e.target.closest('[data-key]');
+    if (row) row.style.background = '';
+    if (e.target === els.area) els.area.classList.remove('dropping');
+  });
+  els.area.addEventListener('drop', async (e) => {
+    e.preventDefault();
+    els.area.classList.remove('dropping');
+    const types = [...e.dataTransfer.types];
+    if (types.includes('application/x-s3-keys')) {
+      const row = e.target.closest('[data-key]');
+      // 松手在空白处 / 非宫格目标：语义是「移动到当前目录」，即什么都不做
+      if (!row || !row.classList.contains('grid-item')) return;
+      row.style.background = '';
+      const target = state.visible[Number(row.dataset.idx)];
+      if (!target || !target.isFolder) return;
+      const keys = JSON.parse(e.dataTransfer.getData('application/x-s3-keys') || '[]');
+      const toMove = keys.filter((k) => k !== target.key && !target.key.startsWith(k));
+      if (toMove.length) ops.moveKeysTo(toMove, target.key);
+      return;
+    }
+    const files = await filesFromDataTransfer(e.dataTransfer);
+    if (files.length) uploadMgr.enqueue(files.map((f) => f.file), App.state.prefix, files.some((f) => f.path));
+  });
+
+  /**
+   * 缩略图：加载完成淡入、失败则移除（回退到同类型图标）。
+   *
+   * SEC-06：这两行原本是**内联的 `onload` / `onerror` 属性**，是全项目唯一的
+   * `script-src 'unsafe-inline'` 需求来源 —— 一旦 CSP 保留 unsafe-inline，
+   * 任何一处 XSS 都能直接升级为脚本执行。委托版连 `unsafe-inline` 都不需要，
+   * 也不再往 `<img>` 上写任何属性。
+   *
+   * 顺带消掉了旧实现的一个竞态：旧代码「插完 DOM 再逐张查 `img.complete`」，
+   * 因为监听器总是在图片可能已经加载完之后才绑上；这里监听器在 `init()` 就位于
+   * 容器上、早于任何一张图的存在，`load` 不可能早于它。
+   */
+  els.area.addEventListener('load', (e) => {
+    const img = e.target;
+    if (img && img.dataset && img.dataset.thumb !== undefined) img.classList.add('loaded');
+  }, true);
+  els.area.addEventListener('error', (e) => {
+    const img = e.target;
+    if (img && img.dataset && img.dataset.thumb !== undefined) img.remove();
+  }, true);
+
+  // 表头排序：表头也是每次渲染重建的，同样走委托
+  els.area.addEventListener('click', (e) => {
+    const th = e.target.closest('th[data-sort]');
+    if (!th || !th.dataset.sort) return;
+    const k = th.dataset.sort;
+    if (App.state.sort.key === k) App.state.sort.dir = App.state.sort.dir === 'asc' ? 'desc' : 'asc';
+    else App.state.sort = { key: k, dir: 'asc' };
+    if (window.__savePrefs) window.__savePrefs();
+    explorer.render();
+  });
+}
+
+/**
+ * 行上的按下（单击 / Ctrl 点 / Shift 连选 / 右键）。
+ *
+ * 从委托的 `mousedown` 分支进来，`row` 是**当前**这一行的元素；key 与 idx 都从
+ * `dataset` 现取 —— 闭包形态（旧实现）在「列表被重建、而事件还给到旧行」时会
+ * 按上一批的下标去选，那是错位的来源。
+ */
+function onRowMouseDown(e, row) {
+  const key = row.dataset.key;
+  const idx = Number(row.dataset.idx);
+  if (e.button === 2) {
+    // 右键：若未选中则单选该项（已选中的保持整批，右键菜单会给出批量入口）
+    if (!App.state.selection.has(key)) {
+      App.state.selection.clear();
+      App.state.selection.add(key);
+      syncSelectionUi();
+    }
+    return;
+  }
+  if (e.ctrlKey || e.metaKey) {
+    toggleSel(key);
+    state.anchorIndex = idx;
+  } else if (e.shiftKey && state.anchorIndex >= 0) {
+    const [a, b] = [Math.min(state.anchorIndex, idx), Math.max(state.anchorIndex, idx)];
+    if (!e.ctrlKey && !e.metaKey) App.state.selection.clear();
+    for (let i = a; i <= b; i++) App.state.selection.add(state.visible[i].key);
+  } else {
+    App.state.selection.clear();
+    App.state.selection.add(key);
+    state.anchorIndex = idx;
+  }
+  syncSelectionUi();
 }
 
 function toggleSel(key) {
@@ -665,12 +741,51 @@ function marqueeMove(e) {
 }
 
 /**
+ * 行矩形快照 —— 一次框选会话只测一次布局。
+ *
+ * ## 为什么必须缓存
+ *
+ * `getBoundingClientRect()` 是**强制同步布局**：它要浏览器立刻把挂起的样式/布局
+ * 计算跑完才能回答。旧实现在每一次 `mousemove` 里对所有行各调一次，几千行的目录
+ * 就是「每帧几千次 forced reflow」—— 列表本身的绘制被挤压，观感是选框跟手
+ * 严重滞后，而 CPU 主要耗在布局重算上。拖动期间列表内容与滚动位置都不变
+ * （没有自动滚屏），所以测一遍就够，此后每帧只做纯数值的区间相交比较。
+ *
+ * ## 失效判据：**自带签名校验**，而不是挂监听
+ *
+ * 视口坐标只在三种情况下变：**滚动**（`scrollLeft` / `scrollTop`）、**容器尺寸变化**
+ * （宫格重新换行）、**列表重建**（筛选 / 排序 / 翻页）。
+ *
+ * 前两种直接体现在容器自身的属性上，所以每次取用时比一下 `clientWidth` /
+ * `scrollTop` 就够了 —— 不需要 `scroll` / `resize` 监听，也就不会出现「监听漏挂
+ * 一处 ⇒ 框到幽灵行」这种只能靠肉眼发现的形态。第三种由 `render()` 显式置空。
+ *
+ * ⚠️ 少比任何一个维度都会留缝隙：漏 `clientWidth` 则窗口变宽后宫格换行、命中错列；
+ * 漏 `scrollTop` 则滚动后仍按旧屏幕位置命中 —— 后者在长目录上几乎必然发生。
+ */
+let rectCache = null;
+
+function rowRects() {
+  const sig = els.area.clientWidth + 'x' + els.area.clientHeight + '@' + els.area.scrollTop + ',' + els.area.scrollLeft;
+  if (rectCache && rectCache.sig === sig) return rectCache.list;
+  const list = [];
+  els.area.querySelectorAll('[data-key]').forEach((node) => {
+    const r = node.getBoundingClientRect();
+    if (!r) return;
+    list.push({ key: node.dataset.key, left: r.left, right: r.right, top: r.top, bottom: r.bottom });
+  });
+  rectCache = { sig, list };
+  return list;
+}
+
+/**
  * 把与矩形**相交**的条目并入选中集。
  *
  * 命中判据取 `getBoundingClientRect()`（视口坐标）与选框矩形（也是视口坐标）相交，
- * 所以横向 / 纵向滚动都不需要额外换算 —— 选框在滚动后的列表上仍与看到的行对齐。
+ * 所以横向 / 纵向滚动都不需要额外换算 —— 选框在滚动后的列表上仍与看到的行对齐
+ * （滚动会让 `rowRects()` 的签名失配并重测，见上）。
  *
- * 遍历 `[data-key]` 而不是 `state.visible`：前者就是**当前渲染出来的**那一批
+ * 遍历渲染出来的行而不是 `state.visible`：前者就是**当前实际在 DOM 里的**那一批
  * （列表视图是 `<tr>`、宫格视图是 `.grid-item`），与渲染同源，不会出现
  * 「算出来的命中集里有看不见的项」。两种视图共用这一段，无需区分。
  */
@@ -678,11 +793,10 @@ function applyMarqueeSelection(rect) {
   const sel = App.state.selection;
   sel.clear();
   for (const k of marquee.base) sel.add(k);
-  els.area.querySelectorAll('[data-key]').forEach((node) => {
-    const r = node.getBoundingClientRect();
+  rowRects().forEach((r) => {
     if (!r || r.right < rect.left || r.left > rect.right) return;
     if (r.bottom < rect.top || r.top > rect.bottom) return;
-    sel.add(node.dataset.key);
+    sel.add(r.key);
   });
   syncSelectionUi();
 }
@@ -692,6 +806,7 @@ function endMarquee() {
   document.removeEventListener('mousemove', marqueeMove);
   document.removeEventListener('mouseup', endMarquee);
   document.removeEventListener('keydown', marqueeKey);
+  rectCache = null; // 一次会话结束：下一轮可能是另一个滚动位置
   if (!marquee) return;
   if (marquee.el) {
     marquee.el.remove();

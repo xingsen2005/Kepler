@@ -1036,6 +1036,264 @@ test('D3 · GET /users：普通用户只看到自己一条（scope=self），不
   }
 });
 
+/* ============================================================
+ * R111 · 后台标签页暂停轮询 / 仪表盘「数据没变就不重绘」
+ *
+ * ## 为什么要动这件事
+ *
+ * 全站有六路轮询：实时速度 2 秒、统计摘要 60 秒、仪表盘 30 秒、桶统计
+ * 5 秒~5 分（两处）、自动刷新（用户设的间隔）。它们原先**只受"页面还在不在"
+ * 约束，不受"看不看得见"约束** —— 标签页切到后台后仍在跑。浏览器对后台
+ * `setInterval` 有节流（多数压到 1 次/分钟），但那只是**变慢**，各家策略还不
+ * 一致，不能当作依赖；桶统计那一路更是会真的去列举云端对象。
+ *
+ * ## 判据为什么必须是"唯一的门"
+ *
+ * 一次修对不难，难的是**新增轮询时还记得**。所以这里不按文件逐个点名"要暂停"，
+ * 而是反过来：**这三个模块里的每一处 `setInterval` 都必须被门挡掉，唯一例外是
+ * 显式登记在案的纯 UI 计时器**。这样将来加第七路轮询忘了加门，会当场变红；
+ * 名单也必须真的命中（否则名单会腐烂成"全放过"）。
+ *
+ * ⚠️ 判据刻意**只覆盖 main / dashboard / bucketmgr**：`pay-poll.js` 与
+ * `profile.js` 里也有 `setInterval`，但它们各自是独立页面且自带恢复路径
+ * （`pay-poll` 在 `visibilitychange` 里 clear 后重建、`profile` 是 60 秒重发
+ * 倒计时），把它们纳入"必须读共享门"的口径只会逼出错误的实现。
+ * `pay-poll` 那条**已经**自建了暂停/恢复，属于同一需求在另一页面上的独立实现。
+ * ========================================================== */
+
+/** 把注释抹成**等长空格**（保留换行）—— 偏移不变，才能靠偏移切出 tick 正文 */
+function maskComments(src) {
+  let out = '';
+  let i = 0;
+  while (i < src.length) {
+    const c = src[i];
+    const n = src[i + 1];
+    if (c === '/' && n === '/') {
+      while (i < src.length && src[i] !== '\n') { out += ' '; i += 1; }
+      continue;
+    }
+    if (c === '/' && n === '*') {
+      out += '  ';
+      i += 2;
+      while (i < src.length && !(src[i] === '*' && src[i + 1] === '/')) {
+        out += src[i] === '\n' ? '\n' : ' ';
+        i += 1;
+      }
+      if (i < src.length) { out += '  '; i += 2; }
+      continue;
+    }
+    if (c === '"' || c === "'" || c === '`') {
+      const q = c;
+      out += c;
+      i += 1;
+      while (i < src.length) {
+        if (src[i] === '\\') { out += src[i] + (src[i + 1] || ''); i += 2; continue; }
+        out += src[i];
+        if (src[i] === q) { i += 1; break; }
+        i += 1;
+      }
+      continue;
+    }
+    out += c;
+    i += 1;
+  }
+  return out;
+}
+
+/** 从 start 开始切出**第一个实参**（按 ()[]{} 配平，遇到 depth 0 的 `,` 停） */
+function sliceFirstArg(src, start) {
+  let depth = 0;
+  for (let i = start; i < src.length; i += 1) {
+    const c = src[i];
+    if (c === '(' || c === '[' || c === '{') depth += 1;
+    else if (c === ')' || c === ']' || c === '}') {
+      if (depth === 0) return src.slice(start, i);
+      depth -= 1;
+    } else if (c === ',' && depth === 0) return src.slice(start, i);
+  }
+  return src.slice(start);
+}
+
+const escName = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+
+/**
+ * 把 `setInterval(<第一实参>, …)` 的 tick **正文**取出来。
+ *
+ * 两种形态都要能取到，否则判据会漏掉一半：
+ *  · 内联 `setInterval(() => { … })` —— 正文就是第一实参；
+ *  · 具名 `setInterval(tick, 2000)` —— 必须顺着名字找到 `const tick = …` / `function tick(`。
+ *    只查第一实参的话，"把门写进 tick 里"这种最自然的写法恰好会被漏检。
+ */
+function resolveTickBody(src, raw) {
+  const t = raw.trim();
+  if (!/^[A-Za-z_$][\w$]*(?:\.[A-Za-z_$][\w$]*)*$/.test(t)) return t; // 内联箭头 / 函数表达式
+  const name = t.split('.').pop();
+  const decl = new RegExp(`(?:const|let|var)\\s+${escName(name)}\\s*=\\s*`).exec(src);
+  if (decl) {
+    const from = decl.index + decl[0].length;
+    let depth = 0;
+    for (let i = from; i < src.length; i += 1) {
+      const c = src[i];
+      if (c === '(' || c === '[' || c === '{') depth += 1;
+      else if (c === ')' || c === ']' || c === '}') depth -= 1;
+      else if (c === ';' && depth === 0) return src.slice(from, i);
+    }
+    return src.slice(from);
+  }
+  const fn = new RegExp(`function\\s+${escName(name)}\\s*\\(`).exec(src);
+  if (fn) {
+    const from = src.indexOf('{', fn.index);
+    const to = src.indexOf('\n}', from);
+    if (from > 0) return src.slice(from, to < 0 ? undefined : to);
+  }
+  return t;
+}
+
+/** 列出源码里每一处 setInterval：{ handle, body }（注释里的不算） */
+function intervalSites(src) {
+  const masked = maskComments(src);
+  const out = [];
+  const re = /setInterval\s*\(/g;
+  let m;
+  while ((m = re.exec(masked))) {
+    const before = masked.slice(Math.max(0, m.index - 80), m.index);
+    const hm = /([A-Za-z_$][\w$.]*)\s*=\s*$/.exec(before);
+    const body = resolveTickBody(masked, sliceFirstArg(masked, m.index + m[0].length));
+    out.push({ handle: hm ? hm[1] : '', body });
+  }
+  return out;
+}
+
+test('R111-01 · 定时器分析器自测：内联 / 具名两种 tick 都能取到正文，注释不算', () => {
+  const inline = intervalSites("x = setInterval(() => {\n  API.speed();\n}, 2000);");
+  assertEqual(inline.length, 1, '应识别出一处 setInterval');
+  assert(/API\.speed/.test(inline[0].body), '内联箭头函数的正文必须被取出');
+  assertEqual(inline[0].handle, 'x', '句柄名应从 `x =` 现取');
+
+  const named = intervalSites('const tick = () => { API.order(); };\nt = setInterval(tick, 2000);');
+  assert(/API\.order/.test(named[0].body),
+    '具名 tick 必须顺着名字解析到定义 —— 取不到的话「把门写进 tick 里」会被判据静默跳过');
+
+  const fnForm = intervalSites('function tick() { if (1) return; }\nt = setInterval(tick, 1);');
+  assert(/if \(1\) return;/.test(fnForm[0].body), 'function 声明形态也必须能解析');
+
+  const commented = intervalSites('// setInterval(() => { API.x(); }, 1);\n/* setInterval(f, 1) */\nx = 1;');
+  assertEqual(commented.length, 0, '注释里的 setInterval 不算（否则光靠写注释就能让判据失明）');
+});
+
+test('R111-02 · 三个轮询模块里每一处 setInterval 都必须被后台门挡掉（例外须逐个登记）', () => {
+  /**
+   * 显式例外：验证码重发倒计时。
+   * 纯 UI 递减（`resendLeft -= 1` + 改按钮文案），不发请求；暂停它只会让
+   * 「60 秒后可重发」停在半路 —— 那是一个用户看得见的错误。
+   */
+  const ALLOW = { resendTimer: '验证码重发倒计时（纯 UI 递减，不发请求）' };
+  const files = ['main.js', 'dashboard.js', 'bucketmgr.js'];
+  const unguarded = [];
+  const usedAllow = [];
+  let total = 0;
+
+  for (const f of files) {
+    const src = fs.readFileSync(path.join(JS_DIR, f), 'utf8');
+    for (const site of intervalSites(src)) {
+      total += 1;
+      if (Object.prototype.hasOwnProperty.call(ALLOW, site.handle)) { usedAllow.push(site.handle); continue; }
+      if (!/App\.state\.pageHidden/.test(site.body)) unguarded.push(`${f}:${site.handle || '(内联)'}`);
+    }
+  }
+
+  assertEqual(unguarded.join(', '), '',
+    'R111：每个 tick 的第一句都必须是 `if (App.state.pageHidden) return;`。'
+    + '判据落在 tick 正文而不是"文件里出现过 pageHidden" —— 后者在只改了一处时同样成立；'
+    + '后台标签页不是"慢一点"，而是整站在无人看的时候持续打服务端与对象存储（桶统计会真列举云端）');
+  assertEqual(total, 7,
+    '自检：main / dashboard / bucketmgr 里现有 7 处 setInterval（6 处受门控 + 1 处纯 UI 倒计时）。'
+    + '数量变了说明有人新增或删除了轮询 —— 请回来看一眼新加的那处是不是被门挡住了，'
+    + '再把这个数字改掉；否则新轮询会悄悄从判据的视野里溜走');
+  assertEqual(usedAllow.join(','), 'resendTimer',
+    '例外名单必须真的命中：名单一条都用不上时，它已经腐烂成"什么都没豁免"的噪音，'
+    + '而下一个人会照着它继续往里加；一条都没豁免才是危险形态（说明有人把倒计时也暂停了）');
+});
+
+test('R111-03 · 「后台暂停」只允许一份判据：只有 main.js 写 pageHidden，读它的文件不得自挂监听', () => {
+  const files = fs.readdirSync(JS_DIR).filter((f) => f.endsWith('.js'));
+  const writers = [];
+  const selfListeners = [];
+  for (const f of files) {
+    const code = maskComments(fs.readFileSync(path.join(JS_DIR, f), 'utf8'));
+    if (/App\.state\.pageHidden\s*=/.test(code)) writers.push(f);
+    // 同一页面里既读共享门、又自挂一份 visibilitychange = 两套判据，必有一套漏
+    if (/App\.state\.pageHidden/.test(code) && /addEventListener\('visibilitychange'/.test(code)) {
+      selfListeners.push(f);
+    }
+  }
+  assertEqual(writers.join(','), 'main.js',
+    '`App.state.pageHidden` 的写入口只允许 bindVisibilityGate 一处（判据全站唯一）。'
+    + '一个模块自己判断"我在不在前台"是不可能的 —— 只有 document 知道');
+  assertEqual(selfListeners.join(','), 'main.js',
+    '读了共享门的文件不得再自挂一份 visibilitychange 监听：dashboard 曾经自挂过一份，'
+    + '它用 logsShown 决定"要不要重启定时器"，而 main 的门只是提前 return —— '
+    + '两套判据里必然有一套漏，表现为切回前台后图表停在几分钟前');
+
+  // 写入口本身：两次赋值（初始化 + 变化时），且都在 bindVisibilityGate 里
+  const mainCode = maskComments(fs.readFileSync(path.join(JS_DIR, 'main.js'), 'utf8'));
+  const gate = /function bindVisibilityGate\(\)[\s\S]*?\n\}/.exec(mainCode);
+  assert(gate, '自检：应能定位到 bindVisibilityGate()');
+  assertEqual((gate[0].match(/App\.state\.pageHidden\s*=/g) || []).length, 2,
+    'bindVisibilityGate 里应有两次赋值：开局按当前 document.hidden 定初值（首屏就在后台打开时，'
+    + '不写初值会让第一次 tick 以为自己在前台），以及每次 visibilitychange 时更新');
+});
+
+test('R111-04 · 切回前台必须把每一路轮询各补一次（暂停了不补 = 「页面卡住了」）', () => {
+  const code = maskComments(fs.readFileSync(path.join(JS_DIR, 'main.js'), 'utf8'));
+  const body = /function resumeAllPolling\(\)[\s\S]*?\n\}/.exec(code);
+  assert(body, '自检：应能定位到 resumeAllPolling()');
+
+  for (const call of ['refreshMiniStats()', 'refreshSpeed()', 'startAutoRefresh()',
+    'dashboard.refresh()', 'bucketmgr.refresh()']) {
+    assert(body[0].includes(call),
+      `切回前台必须补一次 ${call} —— 只做"隐藏时不发"而不做"可见时补"，`
+      + '用户切回来第一眼看到的是几分钟前的数字，且没有任何"正在更新"的提示，表现就是"这页面卡住了"');
+  }
+
+  assert(/if \(!App\.state\.user\) return;/.test(body[0]),
+    '未登录时没有任何轮询可恢复：登录页 / 已登出状态下补一轮只会打出一串 401');
+
+  assert(!/setInterval|clearInterval/.test(body[0]),
+    '恢复只能是"补一轮"，不得在这里重建定时器 —— 定时器本来就没被清掉（tick 只是提前 return）。'
+    + '重建会引入"谁负责恢复"的额外状态，那份状态漏一处就是某路轮询永久停摆');
+});
+
+test('R111-05 · 仪表盘：参与绘制的数据没变就不重绘，且签名只在画完之后才记', () => {
+  const code = maskComments(fs.readFileSync(path.join(JS_DIR, 'dashboard.js'), 'utf8'));
+
+  const st = /async function loadStorage\(\)[\s\S]*?\n\}/.exec(code);
+  assert(st, '自检：应能定位到 loadStorage()');
+  const sb = st[0];
+  assert(/if \(sig !== storageSig\) \{/.test(sb),
+    '存储用量必须比对签名后才重绘：30 秒一轮的自动刷新里绝大多数轮次数字完全一样，'
+    + '而重画一次要走 canvas 的尺寸/清屏/圆弧路径 + 重建 4 行图例的整块 innerHTML');
+  const iDonut = sb.indexOf('drawDonut(');
+  const iRecStorage = sb.indexOf('storageSig = sig');
+  assert(iDonut > 0 && iRecStorage > iDonut,
+    '签名必须在**画完之后**才记：先记后画，一旦绘制途中抛错，这一组数据就再也不会重画（永远停在半屏）');
+  assert(sb.indexOf("document.getElementById('storage-note').innerHTML") > iRecStorage,
+    '「更新时间」那行必须在签名判断**之外**，每次都写 —— 它表达的是"这份数据什么时候取的"，'
+    + '数据没变时更需要它保持新鲜，否则用户看到半小时前的时间戳会以为页面挂了');
+
+  const sm = /async function loadSummary\(\)[\s\S]*?\n\}/.exec(code);
+  assert(sm, '自检：应能定位到 loadSummary()');
+  const sum = sm[0];
+  assert(/if \(sig === summarySig\) return;/.test(sum), '流量 / 请求 / 类型三张图同上，必须按签名短路');
+  const iGuard = sum.indexOf('if (sig === summarySig) return;');
+  const iFirstWrite = sum.search(/innerHTML\s*=|draw(?:GroupedBars|StackedBars|HBars)\(/);
+  assert(iGuard > 0 && iFirstWrite > iGuard,
+    '短路必须发生在**任何 DOM / canvas 写入之前**（写在后面 = 图都画完了才发现不用画）');
+  const iRecSum = sum.indexOf('summarySig = sig');
+  assert(iRecSum > iFirstWrite,
+    'summarySig 也必须三张图都画成功之后才记');
+});
+
 test.after(async () => {
   restoreConfig();
   try { encStore.updateSettings({ mode: 'none', password: '' }); } catch (e) { /* ignore */ }

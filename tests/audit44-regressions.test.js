@@ -601,3 +601,134 @@ test('R44 · 源码不变量：渲染 / 连选 / 拖拽落点 / 全选都只用 
     + '方法，不是模块内的自由标识符；漏了 `explorer.` 前缀会在运行期抛 ReferenceError，'
     + '而静态看代码完全正常');
 });
+
+/* ================================================================== *
+ * R111 · 渲染热路径（社区性能建议里被采纳的三条）
+ *
+ * 这三条改的是**最热的一段代码**：`render()` 的触发面极宽（改排序、换类型筛选、
+ * 切视图、翻页、窗口尺寸变化、状态栏更新都会走到），所以这里的任何一点浪费
+ * 都会被放大成"点一下要等一下"。而它们全都**不改变可观测行为**，因此没有任何
+ * 既有行为用例会变红 —— 只能靠结构判据守。
+ *
+ * ⚠️ 判据一律落在「**实际被执行的那一层**」：
+ *  · 排序去重看的是短路条件**排在 `state.items.sort(` 之前**（写在后面 = 永远
+ *    多排一遍还白记签名，而且"看起来加了缓存"）；
+ *  · 事件委托看的是 `addEventListener` 挂在 `els.area` 上、且行由 `closest` 现取
+ *    （挂在行上也算"有委托"是假绿）；
+ *  · 矩形缓存看的是**命中路径在 `getBoundingClientRect()` 之前**，以及签名里
+ *    真的含 `scrollTop`（少比一个维度 = 滚动后框到幽灵行）。
+ * ================================================================== */
+
+const readExplorer = () => readSrc('public', 'js', 'explorer.js')
+  .replace(/\/\*[\s\S]*?\*\//g, '').replace(/^\s*\/\/.*$/gm, '');
+
+/** 取某个顶格函数声明到下一个顶格 `}` 之间的正文（入参须已剥注释） */
+function r111Body(code, header) {
+  const i = code.indexOf(header);
+  if (i < 0) return '';
+  const j = code.indexOf('\n}', i);
+  return j < 0 ? code.slice(i) : code.slice(i, j);
+}
+
+/**
+ * 切出**某一个** `els.area.addEventListener('<ev>', …)` 的完整正文。
+ *
+ * ⚠️ 这里不能取「从起点往后 N 个字符」：紧接着的下一个监听器就挂在同一个容器上，
+ * 它完全可能落在这个窗口里 —— 于是「冒泡版 load」会借到 error 那条的 `}, true);`
+ * 而判绿（本轮实测踩到过：把 load 改成冒泡版，`fail=0`）。边界必须落在
+ * **下一个 `els.area.addEventListener(` 之前**。
+ */
+function r111Listener(code, ev) {
+  const i = code.indexOf(`els.area.addEventListener('${ev}', `);
+  if (i < 0) return '';
+  const next = code.indexOf('els.area.addEventListener(', i + 10);
+  return code.slice(i, next < 0 ? code.length : next);
+}
+
+test('R111 · sortItems() 的「输入没变就跳过」按数组引用判，且签名只在排完之后才记', () => {
+  const code = readExplorer();
+  const body = r111Body(code, 'function sortItems() {');
+  assert(body, '自检：应能定位到 sortItems() 的函数体');
+
+  assert(/if \(sortSig && sortSig\.items === state\.items && sortSig\.key === key && sortSig\.dir === dir\) return;/.test(body),
+    'sortItems() 必须在开头短路：列表引用 + 排序键 + 方向三者都没变就直接返回。'
+    + '`localeCompare(…, "zh-CN")` 走 ICU collation，无限滚动攒到几千项后每帧都白排一遍全表');
+
+  const iShort = body.indexOf('sortSig.items === state.items');
+  const iSort = body.indexOf('state.items.sort(');
+  assert(iShort > 0 && iSort > iShort,
+    '短路必须排在 state.items.sort( 之前 —— 写在排序之后等于"排完了再判断要不要排"，'
+    + '既没省下开销，还多记一次签名（看不出任何异常，只是慢）');
+
+  const iRec = body.indexOf('sortSig = { items: state.items, key, dir };');
+  assert(iRec > iSort,
+    '签名必须在排序**之后**才记：先记后排，排序过程一旦抛错（比较函数取不到 name），'
+    + '这一批数据就永远被当成"已排好"');
+
+  // 判据只能是引用相等：改成比长度 / 比首尾项都会在「重命名」（条数不变、内容变了）漏排
+  assert(!/\.length/.test(body),
+    'sortItems() 里不得用 length 参与判据 —— 重命名会让条数不变而内容改变，那是本项目最爱出现的假绿形态');
+  assert(!/searchMatches|\.name ===|items\[0\]/.test(body),
+    '签名不得掺入内容比较（首尾项 / 搜索集），"引用没变"才严格等价于"内容没变"');
+});
+
+test('R111 · 行事件必须委托到容器：bindRowEvents 已消失，行由 closest 现取', () => {
+  const code = readExplorer();
+
+  assert(!/bindRowEvents/.test(code),
+    '逐行绑定必须彻底移除：旧实现每次渲染给每行挂 8 个监听（200 行 = 1600 个），'
+    + '而这份开销每渲染一次就重来一遍。留着 bindRowEvents（哪怕只在别处调）'
+    + '就等于两套绑定并存，双击 / 右键会被调用两次');
+
+  for (const ev of ['dblclick', 'contextmenu', 'dragstart', 'dragover', 'dragleave', 'drop']) {
+    const seg = r111Listener(code, ev);
+    assert(seg, `${ev} 必须委托到 els.area（挂在行上不算委托）`);
+    assert(/closest\('\[data-key\]'\)/.test(seg),
+      `${ev} 的处理器必须用 e.target.closest('[data-key]') 现取行 —— `
+      + '闭包里抓着上一批行节点是最典型的"删了旧行、事件还打旧对象"来源');
+  }
+
+  // `load` / `error` **不冒泡**，只能用捕获阶段接；这也是旧实现只能逐张 <img> 绑的原因
+  for (const ev of ['load', 'error']) {
+    const seg = r111Listener(code, ev);
+    assert(seg, `${ev} 必须委托到 els.area`);
+    assert(/\}, true\);/.test(seg),
+      `${ev} 不冒泡，委托只能在**捕获阶段**（第三个参数 true）接到；`
+      + '写成冒泡版不会有任何报错，缩略图只是永远不淡入 / 坏图永远不清掉');
+    assert(/dataset\.thumb/.test(seg),
+      `${ev} 的处理器必须只认带 data-thumb 的 <img>（否则会误伤图标精灵与其它图片）`);
+  }
+
+  assert(/\bels\.area\.addEventListener\('mousedown'/.test(code),
+    'mousedown 也必须留在 area 上：它同时承担"按行选中"与"按空白开始框选"两种语义，'
+    + '分行绑定会让框选（空白拖拽）永远收不到起点');
+});
+
+test('R111 · 框选的行矩形带签名缓存，命中路径排在 getBoundingClientRect 之前', () => {
+  const code = readExplorer();
+  const body = r111Body(code, 'function rowRects() {');
+  assert(body, '自检：应能定位到 rowRects() 的函数体');
+
+  assert(/if \(rectCache && rectCache\.sig === sig\) return rectCache\.list;/.test(body),
+    'rowRects() 必须自带「签名相同就复用上次快照」的短路 —— '
+    + 'getBoundingClientRect() 是强制同步布局，mousemove 每帧对全表算一遍就是 O(n)/帧 的抖动来源');
+  assert(body.indexOf('rectCache.sig === sig') < body.indexOf('getBoundingClientRect()'),
+    '短路必须排在遍历之前（写在后面 = 照样每帧量一遍，缓存只是摆设）');
+
+  for (const dim of ['clientWidth', 'clientHeight', 'scrollTop', 'scrollLeft']) {
+    assert(new RegExp(dim).test(body),
+      `签名必须比 ${dim}：少比任何一个维度都会留缝隙`
+      + '（漏 scrollTop = 滚动后仍按旧屏幕位置命中，长目录上几乎必然发生；漏 clientWidth = 窗口变宽后宫格换行、命中错列）');
+  }
+
+  const marq = r111Body(code, 'function applyMarqueeSelection(rect) {');
+  assert(marq, '自检：应能定位到 applyMarqueeSelection() 的函数体');
+  assert(/rowRects\(\)\.forEach/.test(marq),
+    '框选循环必须走 rowRects() 的快照');
+  assert(!/getBoundingClientRect/.test(marq),
+    '框选循环里不得直接调 getBoundingClientRect() —— 那是"缓存加了但没用上"的形态');
+
+  assertEqual((code.match(/rectCache = null/g) || []).length, 3,
+    'rectCache 只允许三处出现：声明（let rectCache = null）、render() 置空（行被重建）、'
+    + 'endMarquee() 置空（一次框选结束，下一轮可能是另一个滚动位置）');
+});

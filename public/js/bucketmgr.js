@@ -53,6 +53,8 @@ function applyInterval(ms) {
   if (timer) { clearInterval(timer); timer = null; }
   if (ms > 0) {
     timer = setInterval(() => {
+      // 后台标签页不发请求 —— 桶统计会真的列举云端对象，是本站最贵的一类轮询
+      if (App.state.pageHidden) return;
       const sec = document.getElementById('bucketmgr');
       if (sec && !sec.hidden) refresh();
     }, ms);
@@ -75,6 +77,7 @@ export function refresh() {
   if (!box) return;
   if (!timer && refreshMs > 0) {
     timer = setInterval(() => {
+      if (App.state.pageHidden) return; // 同上
       const sec = document.getElementById('bucketmgr');
       if (sec && !sec.hidden) refresh();
     }, refreshMs);
