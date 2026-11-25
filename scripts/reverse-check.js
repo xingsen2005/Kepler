@@ -1812,33 +1812,22 @@ const CASES = [
     },
     {
       /*
-       * R59-03a：GitHub 拉不通时不再改用 Gitee 镜像 —— 退回「失败即 die」。
+       * R59-03a（R112 改写）：拉取失败时不再给出「换源重跑」的可复制命令。
        *
-       * 国内服务器拉 GitHub 常超时/TLS 被重置；镜像重试能省掉用户「手动换 --repo
-       * 再跑一遍」这一趟。
+       * 原始语义是「GitHub 拉不通时自动改用 Gitee 镜像重试」。R112 把被动规则整体
+       * 换成了「拉取前主动询问」，自动重试那一行随之删除 —— 但**失败出口**这一层
+       * 仍值得守：用户按提示选了一个源、结果拉不下来时，唯一能让他自己救回来的
+       * 就是那行带 `--repo <另一个源>` 的命令。删掉它，失败就只剩「检查网络」。
        *
-       * ⚠️ 必须两步一起撤**且缩进要跟着当前实现走**：`prepare_source` 里
-       * `MIRROR_REPO_URL` 出现**两处** —— 自动重试那一行、以及失败提示里
-       * 「手动用镜像重跑」那一行。只撤前者时，`/MIRROR_REPO_URL/` 仍被后者满足 ⇒
-       * 第一版 `fail=0`（实测）。且判据也必须落在**执行的那一行**
-       * （`git clone --depth 1 -- "$MIRROR_REPO_URL"`），而不是「这个词出现过」。
-       * 两步同撤 + 判据收紧后 `fail=1`。
-       *
-       * ⚠️ R63 把这段镜像兜底从「顶层 if」挪进了 `elif [[ "$clone_url" == ... ]]`
-       * 分支，缩进由 6 空格变 4 空格 —— 旧 anchor 因此**未命中**（invariants 立刻报
-       * 「1 条失效 anchor」）。这正是「改判据形态会老化别处 anchor」的标本：
-       * 挪动代码块时必须回头把台账里钉这段代码的条目一起重锚。
+       * ⚠️ 判据落在**执行的那两行 add_hint** 上（`--repo ${MIRROR_REPO_URL}` 也
+       * 会出现在别的提示里，只查「这个词出现过」是假绿的标本）。
        */
-      name: 'R59-03a · 克隆失败不再改用 Gitee 镜像重试（国内服务器拉 GitHub 失败即中断）',
+      name: 'R59-03a · 拉取失败不再给出换源重跑命令（用户选错源时无路可退）',
       file: 'deploy.sh',
       mutations: [
         {
-          anchor: '    if run git clone --depth 1 -- "$MIRROR_REPO_URL" "${tmp}/src"; then',
-          replacement: '    if false; then',
-        },
-        {
-          anchor: '      add_hint "     · 国内服务器推荐用 Gitee 镜像（脚本已自动试过，仍失败可手动重试）："\n      add_hint "       $(rerun_cmd --repo ${MIRROR_REPO_URL})"',
-          replacement: '      : # 镜像提示已移除',
+          anchor: '      add_hint "     · 本机访问 GitHub 不通时可改用 Gitee 镜像（内容由人工同步，可能略旧）："\n      add_hint "       $(rerun_cmd --repo ${MIRROR_REPO_URL})"',
+          replacement: '      : # 换源提示已移除',
         },
       ],
       testFile: 'deploy-script.test.js',
@@ -4854,10 +4843,13 @@ const CASES = [
     },
     {
       // 不带域名 → 第二趟会再问一次域名；非交互场景（管道 / CI）直接判失败。
+      // ⚠️ R112 在这段 exec 里加了一行 `KEPLER_REPO_URL="$REPO_URL" \`（用户本轮选定
+      // 的仓库地址必须带过去，否则第二趟回落成默认值、save_state 把 Gitee 写成 GitHub），
+      // 两条 anchor 因此一起重锚 —— 只到 `bash` 那一行的话，它们会因为中间多了一行而未命中。
       name: 'R39-01g · 交接时不带已解析的域名（第二趟重复提问 / 非交互直接失败）',
       file: 'deploy.sh',
-      anchor: 'KEPLER_SELF_HANDOFF=1 DOMAIN="$DOMAIN" \\\n      bash "$target" "${ORIGINAL_ARGV[@]}"',
-      replacement: 'KEPLER_SELF_HANDOFF=1 \\\n      bash "$target" "${ORIGINAL_ARGV[@]}"',
+      anchor: 'exec env KEPLER_LOCK_HELD="$LOCK_FILE" KEPLER_SELF_HANDOFF=1 DOMAIN="$DOMAIN" \\\n      KEPLER_REPO_URL="$REPO_URL" \\\n      bash "$target" "${ORIGINAL_ARGV[@]}"',
+      replacement: 'exec env KEPLER_LOCK_HELD="$LOCK_FILE" KEPLER_SELF_HANDOFF=1 \\\n      KEPLER_REPO_URL="$REPO_URL" \\\n      bash "$target" "${ORIGINAL_ARGV[@]}"',
       testFile: 'deploy-script.test.js',
       minFail: 1,
     },
@@ -4865,8 +4857,8 @@ const CASES = [
       // 不带锁 → 与 R39-01f 同后果的另一条实现路径：锁没交接，新进程自锁。
       name: 'R39-01h · 交接时不带单实例锁（新进程判「另一个部署进程正在运行」）',
       file: 'deploy.sh',
-      anchor: 'KEPLER_SELF_HANDOFF=1 DOMAIN="$DOMAIN" \\\n      bash "$target" "${ORIGINAL_ARGV[@]}"',
-      replacement: 'DOMAIN="$DOMAIN" \\\n      bash "$target" "${ORIGINAL_ARGV[@]}"',
+      anchor: 'exec env KEPLER_LOCK_HELD="$LOCK_FILE" KEPLER_SELF_HANDOFF=1 DOMAIN="$DOMAIN" \\\n      KEPLER_REPO_URL="$REPO_URL" \\\n      bash "$target" "${ORIGINAL_ARGV[@]}"',
+      replacement: 'exec env KEPLER_SELF_HANDOFF=1 DOMAIN="$DOMAIN" \\\n      KEPLER_REPO_URL="$REPO_URL" \\\n      bash "$target" "${ORIGINAL_ARGV[@]}"',
       testFile: 'deploy-script.test.js',
       minFail: 1,
     },
@@ -9094,61 +9086,17 @@ const CASES = [
        */
 
       /*
-       * R63-01a：克隆绕开 choose_clone_url，直接用 `$REPO_URL`。
+       * R63-01a：克隆绕开询问结果，直接用默认地址。
        *
-       * 后果：`repo_reachable` 照跑、日志照打印「探测不通，改用镜像」，**克隆却仍打
-       * 官方地址** —— 探测白做，用户还是等那一段没有结论的时间。这正是「信号算了
-       * 但没接上」的形态：源码里两个词都在，行为却回到修复前。
+       * R112 之后 `$REPO_URL` 就是「用户刚选的那个」（ask_repo_source 把选择写回
+       * 它），所以这里的坏法是把它换回 `$DEFAULT_REPO_URL`：日志照打「源码仓库：
+       * Gitee…」、询问照问，**克隆却仍打 GitHub** —— 用户在一台 GitHub 被墙的机器
+       * 上选 Gitee 也白选。这正是「问了但没接上」的形态：两个词都在，行为退回修复前。
        */
-      name: 'R63-01a · 克隆直接用 $REPO_URL（探测算了却没接上，行为退回修复前）',
+      name: 'R63-01a · 克隆绕开询问结果（选了 Gitee 却仍去拉 GitHub）',
       file: 'deploy.sh',
-      anchor: '  if run git clone --depth 1 -- "$clone_url" "${tmp}/src"; then',
-      replacement: '  if run git clone --depth 1 -- "$REPO_URL" "${tmp}/src"; then',
-      testFile: 'deploy-script.test.js',
-      minFail: 1,
-    },
-    {
-      /*
-       * R63-02a：连通性探针改用 `curl -sI https://github.com`。
-       *
-       * 这是最像「已经修好了」的坏法：探针确实存在、也确实有界超时，但判据落在
-       * **另一条路**上 —— 网页首页 200 不代表 git 克隆端点通（用户可能只给网页配了
-       * 代理），首页被墙也不代表 clone 不通。结论会与克隆实际结果相反。
-       */
-      name: 'R63-02a · 连通性探针改用 curl -I（网页首页 200 ≠ git 克隆端点通）',
-      file: 'deploy.sh',
-      anchor: '    GIT_TERMINAL_PROMPT=0 timeout "$REPO_PROBE_TIMEOUT" git ls-remote --heads "$url" >/dev/null 2>&1 || rc=$?',
-      replacement: '    GIT_TERMINAL_PROMPT=0 timeout "$REPO_PROBE_TIMEOUT" curl -sI "https://github.com" >/dev/null 2>&1 || rc=$?',
-      testFile: 'deploy-script.test.js',
-      minFail: 1,
-    },
-    {
-      /*
-       * R63-03a：探针不再用 `timeout` 兜底。
-       *
-       * GitHub 被黑洞时 TCP 根本连不上，而 **git 自己不设连接超时** ⇒ `ls-remote`
-       * 会一直挂着。没有 timeout 的探针不是「快一点的探针」，而是把原来那段
-       * 没有结论的等待**原封不动**搬到了探测里 —— 等于没修。
-       */
-      name: 'R63-03a · 探针不再用 timeout 兜底（被黑洞时一直挂着，等于没有探针）',
-      file: 'deploy.sh',
-      anchor: '    GIT_TERMINAL_PROMPT=0 timeout "$REPO_PROBE_TIMEOUT" git ls-remote --heads "$url" >/dev/null 2>&1 || rc=$?',
-      replacement: '    GIT_TERMINAL_PROMPT=0 git ls-remote --heads "$url" >/dev/null 2>&1 || rc=$?',
-      testFile: 'deploy-script.test.js',
-      minFail: 1,
-    },
-    {
-      /*
-       * R63-04a：`choose_clone_url` 里「显式 --repo 直接返回」那道短路被删掉。
-       *
-       * 后果：用户从**内网 GitLab / 自建 fork** 部署时，脚本先去探测那个地址（多余，
-       * 还可能卡 15s），探测不通就把官方 Gitee 镜像顶上去 —— 装出来的是别人的代码。
-       * 「纠正用户」比装不上更糟：它悄悄换了源码来源却不报错。
-       */
-      name: 'R63-04a · 显式 --repo 也被探测并替换（内网 / 自建 fork 被官方镜像顶掉）',
-      file: 'deploy.sh',
-      anchor: '  if [[ "$REPO_URL" != "$DEFAULT_REPO_URL" ]]; then\n    printf \'%s\' "$REPO_URL"\n    return 0\n  fi',
-      replacement: '',
+      anchor: '  if run git clone --depth 1 -- "$REPO_URL" "${tmp}/src"; then',
+      replacement: '  if run git clone --depth 1 -- "$DEFAULT_REPO_URL" "${tmp}/src"; then',
       testFile: 'deploy-script.test.js',
       minFail: 1,
     },
@@ -9156,13 +9104,14 @@ const CASES = [
       /*
        * R63-05a：走镜像分支不再调用 `warn_mirror_staleness`。
        *
-       * 这正是用户提这件事的**理由**：「gitee 极有可能不是最新版」。装一份落后于
-       * 官方的代码却不吭声，用户只能在「功能怎么没有」的工单里反推原因。
+       * 这正是用户提这件事的**理由**：「gitee 极有可能不是最新版」。R112 把「自动
+       * 换源」改成「用户自己选」，这条提示反而更重要了 —— 用户是**主动**选的镜像，
+       * 更不会怀疑它旧。装一份落后于官方的代码却不吭声，下一次工单就是「功能怎么没有」。
        * 提示里必须带实际 commit，否则「落后多少」无从谈起。
        */
-      name: 'R63-05a · 走镜像时不再提示「可能不是最新版」（用户不知道装的是旧代码）',
+      name: 'R63-05a · 走镜像时不再提示「可能不是最新版」（用户主动选的镜像更不会怀疑它旧）',
       file: 'deploy.sh',
-      anchor: '  if [[ "$clone_url" == "$MIRROR_REPO_URL" ]]; then\n    warn_mirror_staleness "$SRC_DIR"\n  fi',
+      anchor: '  if [[ "$REPO_URL" == "$MIRROR_REPO_URL" ]]; then\n    warn_mirror_staleness "$SRC_DIR"\n  fi',
       replacement: '  : # 镜像新鲜度提示已移除',
       testFile: 'deploy-script.test.js',
       minFail: 1,
@@ -9179,6 +9128,53 @@ const CASES = [
       file: 'deploy.sh',
       anchor: '    add_hint "  3) 检查网络（与克隆同一条路）：git ls-remote ${REPO_URL} ; echo \\$?"',
       replacement: '    add_hint "  3) 检查网络：curl -sI https://github.com -m 8 ; echo \\$?"',
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
+    /* ---------------------------------------------------------------- *
+     * R112 · 选源从「探测连通性、不通才转镜像」改为「拉取前主动询问」
+     *
+     * 被动规则的每一条判据都随代码一起删了（探针 / 选源函数 / 探针超时常量），
+     * 这里守的是**新契约的三个面**：默认项记得上次的选择、非交互一个字节都不读、
+     * 用户给过的地址不被改写。三条都能被 `deploy-script.test.js` 里那段**真跑 bash**
+     * 的片段抓到 —— 询问本身要 TTY，但它的判断逻辑不需要。
+     * ---------------------------------------------------------------- */
+    {
+      // 默认项不认识镜像 ⇒ 上次选了 Gitee 的机器，重装时按一次回车就换回官方源，
+      // 在 GitHub 被墙的机器上直接表现为「重装又卡住了」。
+      name: 'R112-01a · 默认项不再识别「上次选的是镜像」（重装按一次回车就换回官方源）',
+      file: 'deploy.sh',
+      anchor: '  if [[ "${1:-}" == "$MIRROR_REPO_URL" ]]; then printf \'2\'; else printf \'1\'; fi',
+      replacement: '  if [[ "${1:-}" == "$DEFAULT_REPO_URL" ]]; then printf \'2\'; else printf \'1\'; fi',
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
+    {
+      // 少一道「非 TTY」门 ⇒ `curl | bash` / CI 里那行 read 会去读管道：
+      // 读不到就挂在这儿，读得到就把管道里的内容当答案（实测：管道里的 "2" 会把源换掉）。
+      name: 'R112-02a · 非交互门被删（管道里的内容被当成用户的回答）',
+      file: 'deploy.sh',
+      anchor: '  if [[ "$ASSUME_YES" == "1" || ! -t 0 ]]; then\n    info "源码仓库（非交互，沿用上次选择）',
+      replacement: '  if [[ "$ASSUME_YES" == "1" ]]; then\n    info "源码仓库（非交互，沿用上次选择）',
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
+    {
+      // 「已指定」那条支路把地址换成默认值 ⇒ 内网 GitLab / 自建 fork 被悄悄装成别人的代码，
+      // 而且日志还说「已指定」—— 比装不上更糟。
+      name: 'R112-03a · 显式 --repo 被默认值顶掉（自建 fork 装成别人的代码）',
+      file: 'deploy.sh',
+      anchor: '    info "源码仓库（已指定，不再询问）：${REPO_URL}"',
+      replacement: '    REPO_URL="$DEFAULT_REPO_URL"',
+      testFile: 'deploy-script.test.js',
+      minFail: 1,
+    },
+    {
+      // 函数写好了、没人调用 ⇒ 行为与「没做这个需求」完全一样，但源码里 grep 得到 ask_repo_source。
+      name: 'R112-04a · 询问函数定义了却没人调用（行为与没做这个需求一样）',
+      file: 'deploy.sh',
+      anchor: '  ask_repo_source\n  info "未发现本地源码，从仓库拉取：${REPO_URL}"',
+      replacement: '  info "未发现本地源码，从仓库拉取：${REPO_URL}"',
       testFile: 'deploy-script.test.js',
       minFail: 1,
     },
@@ -13589,13 +13585,15 @@ const CASES = [
     {
       // 缺 `--` ⇒ 以 - 开头的仓库地址变成 git 的选项，`--upload-pack=<命令>` 会被执行。
       // ⚠️ 加上 `--` 的那一轮**顺带老化了另外两条 anchor**：`R59-03a`（镜像重试那一行）与
-      // `R63-01a`（克隆用 `$clone_url` 那一行）原本钉的是不带 `--` 的写法 —— 改完立刻被
-      // invariants 的「anchor 必须命中」抓到（2 条失效）。两处已跟着重锚，`R63-01a` 的
-      // replacement 也补上了 `--`，免得它同时表达两件事（换变量 + 去掉 `--`）而分不清红在哪。
+      // `R63-01a`（克隆那一行）原本钉的是不带 `--` 的写法 —— 改完立刻被 invariants 的
+      // 「anchor 必须命中」抓到（2 条失效）。两处已跟着重锚。
+      //
+      // ⚠️ R112 把 `$clone_url` 并进了 `$REPO_URL`（选源由询问决定，不再有第二个变量），
+      // 本条 anchor 随之更新；语义不变：**这一行必须带 `--`**。
       name: 'R109-09a · git clone 去掉 --（仓库地址变成 git 选项，可执行任意命令）',
       file: 'deploy.sh',
-      anchor: '  if run git clone --depth 1 -- "$clone_url" "${tmp}/src"; then',
-      replacement: '  if run git clone --depth 1 "$clone_url" "${tmp}/src"; then',
+      anchor: '  if run git clone --depth 1 -- "$REPO_URL" "${tmp}/src"; then',
+      replacement: '  if run git clone --depth 1 "$REPO_URL" "${tmp}/src"; then',
       testFile: 'deploy-script.test.js',
       minFail: 1,
     },

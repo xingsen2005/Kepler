@@ -2586,162 +2586,151 @@ test('deploy.sh：NodeSource 之外的 CentOS EOL 说明必须在【A】旁边�
     + '这正是用户第一条诉求：报错里给的方案在本机根本装不上');
 });
 
-test('deploy.sh：先探 GitHub 连通性、不通才转 Gitee 镜像（且不误伤用户显式 --repo）', async () => {
+test('deploy.sh：拉取前主动询问用哪个仓库，且不再探测连通性自动换源（R112）', async () => {
   const src = readDeploy();
   const m = /^readonly MIRROR_REPO_URL="([^"]+)"/m.exec(src);
   assert(m, '必须定义只读的 MIRROR_REPO_URL（Gitee 国内镜像地址）');
   assert(m[1] === 'https://gitee.com/xing_sen/kepler',
     `MIRROR_REPO_URL 必须是用户指定的 Gitee 地址，实际：${m[1]}`);
-  // 镜像地址不得等于默认地址，否则「重试」只是把同一个打不通的地址再试一遍。
   const def = /^readonly DEFAULT_REPO_URL="([^"]+)"/m.exec(src);
   assert(def && def[1] !== m[1], 'Gitee 镜像必须与默认的 GitHub 地址不同');
 
-  /* ── ① 契约：**先探后选**，不是「先撞一次再换」 ─────────────────────────
-   * 旧逻辑「先 clone 官方、失败了再换镜像」判据没错，但**信号来得太晚**：
-   * GitHub 被黑洞时 TCP 连不上，而 git 自己不设连接超时 ⇒ 用户盯着滚动的屏幕
-   * 等一个没有结论的等待。新契约是花几秒问一句「通不通」，再决定从哪儿 clone。 */
-  assert(hasFn(src, 'repo_reachable') && hasFn(src, 'choose_clone_url'),
-    '必须有 repo_reachable()（连通性判据）与 choose_clone_url()（选源唯一实现点）');
-  assert(hasFn(src, 'warn_mirror_staleness'),
-    '必须有 warn_mirror_staleness()：走镜像时如实告知「可能不是最新版」');
+  /* ── ① 被动规则必须**整条消失** ─────────────────────────────────────────
+   * 用户原话：「现在的检测连通性、GitHub 不通才改为 Gitee 的被动规则不再使用」。
+   * ⚠️ 三条负向断言都只能落在 codeOnly 上：注释里还写着「不再探测」这几个字，
+   * 直接对全文断言会被自己那句注释满足 ⇒ 假绿（本项目反复踩过的同一类坑）。 */
+  const code = codeOnly(src);
+  assert(!/repo_reachable/.test(code),
+    '连通性探针 repo_reachable 必须删掉：需求是「不再检测连通性」；留一个没人调用的探针，'
+    + '下一个人很容易把它接回去');
+  assert(!/choose_clone_url/.test(code),
+    '选源函数 choose_clone_url 必须删掉 —— 它存在的唯一理由就是「按探测结果选」');
+  assert(!/REPO_PROBE_TIMEOUT/.test(code),
+    '探针超时常量 REPO_PROBE_TIMEOUT 必须删掉：常量留着等于给探针留了个原地复活的插槽');
+  assert(!/git clone --depth 1 -- "\$MIRROR_REPO_URL"/.test(code),
+    '不得再「官方失败 → 自动用镜像重试」：取源已由用户选定，悄悄换源等于把用户的选择当建议');
 
-  /* ── ② 探针本身：`git ls-remote` + timeout + 关交互 ──────────────────────
-   * ⚠️ 判据必须落在**真正要执行的那件事**上。`curl -sI https://github.com`
-   * 是另一条路：网页首页 200 不代表 git 克隆端点通（也不代表不通），拿它当
-   * 判据会让「探测说通、克隆照样失败」。 */
-  const probe = codeOnly(fnBody(src, 'repo_reachable'));
-  assert(/git ls-remote/.test(probe),
-    '连通性判据必须是 git ls-remote（与 clone 同一条路）；curl 探网页是另一条路，不作数');
-  assert(!/curl/.test(probe),
-    '探针里不得出现 curl：网页首页与 git 克隆端点是两个服务，判据会落到错的那层');
-  assert(/timeout "\$REPO_PROBE_TIMEOUT"/.test(probe),
-    '必须用 timeout 有界兜底：被黑洞时连接会一直挂着，否则等于没有探针');
-  assert(/GIT_TERMINAL_PROMPT=0/.test(probe),
-    '必须关掉 git 的交互提示：私有仓库 / 缺凭据时它会停等输入，非交互脚本就此冻住');
-  const tmo = /^readonly REPO_PROBE_TIMEOUT=(\d+)/m.exec(src);
-  assert(tmo && Number(tmo[1]) > 0 && Number(tmo[1]) <= 30,
-    `REPO_PROBE_TIMEOUT 必须是有意义的小值（秒），实际：${tmo && tmo[1]}`);
+  /* ── ② 询问函数：三道门都必须在**读 stdin 之前** ────────────────────── */
+  assert(hasFn(src, 'ask_repo_source'),
+    '必须有一个具名函数负责「拉取前问一句用哪个仓库」（散在 prepare_source 里就没人守得住）');
+  const ask = codeOnly(fnBody(src, 'ask_repo_source'));
+  const iRead = ask.indexOf('read -r -p');
+  assert(iRead !== -1,
+    '询问必须真的 read：只打印一句「请选择」然后自己决定，是最像已实现、实际没实现的形态');
+  const iExplicit = ask.indexOf('"$REPO_EXPLICIT" == "1"');
+  assert(iExplicit !== -1 && iExplicit < iRead,
+    '用户已表过态（--repo / 环境变量 / 自我交接带过来）必须短路在**读 stdin 之前**：'
+    + '表过态还问一遍，等于把 --repo 降级成「建议」');
+  const iNonTty = ask.indexOf('! -t 0');
+  assert(iNonTty !== -1 && iNonTty < iRead,
+    '非交互（curl | bash、-y、--reinstall、CI）必须挡在读 stdin 之前：'
+    + '读不到会挂在这儿；能读到则是把管道里的内容当成用户的回答 —— 两种都比沿用已有值更糟');
+  assert(/ASSUME_YES/.test(ask.slice(0, iRead)),
+    '`--yes` / `--reinstall` 属于「不要问我」，必须与非 TTY 一起挡掉');
+  // 用正则字面量而不是 `includes('${...}')`：后者会触发 no-template-curly-in-string
+  // （那条规则提醒的是「这里是不是漏了反引号」—— 此处不是，但没必要为一个提示加豁免）。
+  assert(/\$\{DEFAULT_REPO_URL\}/.test(ask) && /\$\{MIRROR_REPO_URL\}/.test(ask),
+    '菜单里必须同时摆出 GitHub 与 Gitee 两个地址：只写一个，另一个就成了要翻文档才知道的隐藏选项');
+  assert(/repo_url_for_answer "\$ans"/.test(ask),
+    '输入必须经 repo_url_for_answer 翻译（认 1/2 也认 github/gitee），不能自己写 case 分支');
+  assert(/REPO_URL="\$chosen"/.test(ask),
+    '选定地址必须落回 REPO_URL：后面 clone 与所有提示读的都是它，少一处传参就多一条缝');
+  assert(/\[\[ -n "\$chosen" \]\] \|\| chosen="\$REPO_URL"/.test(ask),
+    '必须有「兜底沿用原地址」：一次读取失败（Ctrl+D / 输入流断开）不该把仓库地址置成空串');
 
-  /* ── ③ 选源：显式 --repo 必须**在探测之前**短路 ──────────────────────── */
-  const choose = codeOnly(fnBody(src, 'choose_clone_url'));
-  const iGuard = choose.indexOf('"$REPO_URL" != "$DEFAULT_REPO_URL"');
-  const iProbe = choose.indexOf('repo_reachable');
-  assert(iGuard !== -1 && iProbe !== -1 && iGuard < iProbe,
-    '用户显式 --repo 的地址必须**先返回、后探测**：那个地址是他的意图（内网 GitLab / 自建 fork），'
-    + '拿官方镜像把它顶掉属于「纠正用户」，比装不上更糟');
+  const mapper = codeOnly(fnBody(src, 'repo_url_for_answer'));
+  assert(/return 1/.test(mapper),
+    '认不出的输入必须返回非零（由调用方重问）：兜成默认值等于把误触当成选择');
+  const dflt = codeOnly(fnBody(src, 'default_repo_choice'));
+  assert(/MIRROR_REPO_URL/.test(dflt),
+    '默认项必须能识别「上次选的是镜像」：否则重装时回车一次就把源换回了官方');
 
-  /* ── ④ 接线：克隆必须用 choose_clone_url 的结果，而不是裸 $REPO_URL ───── */
-  const body = codeOnly(fnBody(src, 'prepare_source'));
-  assert(/clone_url="\$\(choose_clone_url\)"/.test(body),
-    'prepare_source 必须先用 choose_clone_url 定地址（探测结果要真的被用上）');
-  assert(/git clone --depth 1 -- "\$clone_url"/.test(body),
-    '首次克隆必须用探测选出的 $clone_url —— 直接用 $REPO_URL 等于「先探后选」白做；'
-    + '且必须带 `--` 选项终止符：仓库地址来自 --repo / .deploy.conf，'
-    + '以 `-` 开头的值会被 git 当成选项（`--upload-pack=<命令>` 会执行它，已实测）');
-  assert(!/git clone --depth 1 "\$REPO_URL"/.test(body),
-    '不得再出现「直接克隆 $REPO_URL」那一行：它就是用户报的那个问题的原始形态');
+  /* ── ③ 接线：询问排在 clone **之前** ─────────────────────────────────── */
+  const prep = codeOnly(fnBody(src, 'prepare_source'));
+  const iAsk = prep.indexOf('ask_repo_source');
+  const iClone = prep.indexOf('git clone --depth 1 -- "$REPO_URL"');
+  assert(iAsk !== -1, 'prepare_source 的克隆分支必须真的调用 ask_repo_source');
+  assert(iClone !== -1,
+    '克隆必须用 $REPO_URL（询问的结果就是它），并且必须带 `--` 选项终止符：'
+    + '仓库地址来自 --repo / .deploy.conf，以 `-` 开头的值会被 git 当成选项（已实测可执行命令）');
+  assert(iAsk > 0 && iAsk < iClone,
+    '询问必须排在 clone **之前**：问完再拉，"选了 Gitee 却仍去拉 GitHub" 才不可能出现');
+  assert(/warn_mirror_staleness/.test(prep),
+    '选镜像时必须调用 warn_mirror_staleness：镜像由人工同步，「可能不是最新版」不能不说');
 
-  /* ── ⑤ 兜底：探测通但克隆仍失败时，官方 → 镜像再试一次 ────────────────── */
-  /**
-   * ⚠️ 必须断言**镜像克隆真的被调用**（`git clone … "$MIRROR_REPO_URL"`），而不是
-   * 只查 `MIRROR_REPO_URL` 这个词出现过 —— 后者会被**失败提示**里那句「手动用镜像
-   * 重跑」满足，于是「自动重试被删掉」也照样全绿（实测：只把 `if` 改成 `if false`
-   * 时 `fail=0`，正是「护栏比名字弱」的标本）。这里要求的是**执行的那一行**。
-   */
-  assert(/git clone --depth 1 -- "\$MIRROR_REPO_URL"/.test(body),
-    '官方失败后必须**真的执行** `git clone --depth 1 -- "$MIRROR_REPO_URL"` 重试：'
-    + '探测只看引用、克隆要下对象，半通 / 限速时仍可能失败（只断言常量名会被提示行满足 ⇒ 假绿）');
-  assert(/elif \[\[ "\$clone_url" == "\$DEFAULT_REPO_URL" \]\]/.test(body),
-    '镜像兜底必须以「本次试的正是默认地址」为前置：显式 --repo 打不通就直接如实报错，不擅自换源');
-
-  /* ── ⑥ 走镜像时必须说清「可能不是最新版」+ 报出实际 commit ────────────── */
-  assert(/warn_mirror_staleness/.test(body),
-    'prepare_source 走镜像分支必须调用 warn_mirror_staleness：'
-    + '这正是用户提这件事的理由（Gitee 由人工同步，极可能落后），不能静悄悄地装一份旧代码');
-  const stale = codeOnly(fnBody(src, 'warn_mirror_staleness'));
-  assert(/log -1/.test(stale),
-    '提示里必须报出**实际拿到的 commit**：用户下次对比官方提交时才有确切参照物');
-  assert(/落后|最新版/.test(stale), '文案必须点破「可能落后于官方最新提交」');
-
-  /* ── ⑦ 失败出口：诊断命令也要与克隆同一条路 ───────────────────────────── */
-  assert(/git ls-remote/.test(body),
+  /* ── ④ 失败出口：两个方向都要给出可复制的换源命令 ───────────────────────
+   * 自动换源删掉之后，这行提示就成了「源选错（或临时抽风）」时唯一的自救路径：
+   * 只给一个方向，等于替用户假设「你一定是选错了那一头」。 */
+  assert(/--repo \$\{MIRROR_REPO_URL\}/.test(prep),
+    '选 GitHub 失败时必须给出「改用 Gitee 镜像」的可复制命令（`--repo <镜像地址>`）');
+  assert(/--repo \$\{DEFAULT_REPO_URL\}/.test(prep),
+    '选 Gitee 失败时必须给出「改回官方」的可复制命令 —— 镜像过期时这是唯一出路');
+  assert(/git ls-remote \$\{REPO_URL\}/.test(prep),
     '失败提示给的诊断命令必须是 git ls-remote（与 clone 同一条路）');
-  assert(!/curl -sI https:\/\/github\.com/.test(body),
+  assert(!prep.includes('curl -sI https://github.com'),
     '失败提示不得再让用户用 `curl -sI https://github.com` 自证：'
     + '那是另一条路，用户照它验证会得到与克隆相反的结论');
-  // 失败出口的提示里也要给出「手动换镜像」这一条，且带上可复制的重跑命令。
-  assert(/--repo \$\{MIRROR_REPO_URL\}/.test(body),
-    '失败提示里必须给出「手动用 Gitee 镜像重跑」的可复制命令 —— 自动重试也失败时这是最后一根稻草');
 
-  /* ── ⑧ 判据真跑：光看源码里有 `git ls-remote` 不代表它真被执行 ──────────
-   * 用 PATH 上的**假 git**（真可执行文件）给退出码 0 / 128，验证选源真的跟着变。
-   * ⚠️ 假体必须放 **POSIX 路径**：本机 `mktemp -d` 返回 `C:\...\Temp/tmp.X`，
-   * 塞进 PATH 后 MSYS 找不到它，`timeout` 会执行**真 git** —— 那时退出码看着
-   * 也对，其实是真网络在回答（本文件 R61 注释里记了这个坑）。
-   * ⚠️ 路径是**固定**的、且**不清理**：本机 `rm -f` 经沙箱包装层要 ~19s，
-   * 清理会把这条用例从 1s 拖到 20s（实测）；而每次开跑都 `: >` 重置，无需删。
-   * ⚠️ 计数只用内建命令（`while read` 循环，不 `wc`/`tr`）：本机每 exec 一个外部
-   * 进程约 0.5~1s，8 次 `wc \| tr` 就要 8s（实测 19.9s → 11.3s 的差就在这里）。 */
+  /* ── ⑤ 判据真跑：翻译表 / 默认项 / 三道门 ───────────────────────────────
+   * 询问本身要 TTY，CI 里造不出来；但真正的判断逻辑（输入→地址、默认项、三道短路）
+   * 都可以**真的执行** —— 只断言源码里有 `read` 是钉不住行为的。
+   * ⚠️ 这里刻意用 `<<<` 而不是 `$(printf '2\n' | ask_repo_source)`：后者跑在子 shell 里，
+   * REPO_URL 的改动带不回来，断言就成了「看输出猜状态」。 */
   const r = await spawnBashSnippet(`
 set -Eeuo pipefail
-FAKE_BIN="/tmp/fakegit-r61"
-mkdir -p "$FAKE_BIN"
-export FAKE_COUNT_FILE="$FAKE_BIN/count"
-: > "$FAKE_COUNT_FILE"
-cat > "$FAKE_BIN/git" <<'FAKE'
-#!/usr/bin/env bash
-case "$1" in
-  --version) echo "git version 2.40.0"; exit 0 ;;
-  ls-remote) echo x >> "\${FAKE_COUNT_FILE}"
-             [[ "\${FAKE_PROBE}" == "ok" ]] && exit 0
-             exit 128 ;;
-  *) exit 0 ;;
-esac
-FAKE
-chmod +x "$FAKE_BIN/git"
-export PATH="$FAKE_BIN:$PATH"
 source ./deploy.sh
 trap - ERR
 set +e
-# 探测次数用内建循环数行，不 fork wc/tr
-hc() { HC=0; while IFS= read -r _; do HC=$((HC + 1)); done < "$FAKE_COUNT_FILE"; }
-reset() { : > "$FAKE_COUNT_FILE"; }
+map() { local u; if u="$(repo_url_for_answer "$1")"; then printf 'MAP %s => %s\\n' "$1" "$u"; else printf 'MAP %s => <reject>\\n' "$1"; fi; }
+map 1; map 2; map github; map GiTeE; map 3
+if u="$(repo_url_for_answer "")"; then printf 'EMPTY=%s\\n' "$u"; else printf 'EMPTY=<reject>\\n'; fi
+printf 'DEF_GH=%s\\n' "$(default_repo_choice "$DEFAULT_REPO_URL")"
+printf 'DEF_GE=%s\\n' "$(default_repo_choice "$MIRROR_REPO_URL")"
+printf 'DEF_CUSTOM=%s\\n' "$(default_repo_choice "https://git.example.com/x/y.git")"
 
-# 自证：假体真的被 timeout 看到，否则下面全是假结论
-reset; export FAKE_PROBE=ok
-timeout 5 git ls-remote --heads https://example.invalid/x >/dev/null 2>&1
-hc; printf 'SELF=%s\\n' "$HC"
+# ① 非交互（stdin 不是终端）：一个字节都不读，地址保持不变
+REPO_EXPLICIT=0; ASSUME_YES=0; REPO_URL="$DEFAULT_REPO_URL"
+ask_repo_source <<< "2" >/dev/null 2>&1
+printf 'PIPE_URL=%s\\n' "$REPO_URL"
 
-reset; REPO_URL="$DEFAULT_REPO_URL"; export FAKE_PROBE=ok
-GOT="$(choose_clone_url)"; hc; printf 'UP=%s|%s\\n' "$GOT" "$HC"
+# ② 用户显式 --repo：不改写、不读取
+REPO_EXPLICIT=1; REPO_URL="https://git.example.com/team/kepler.git"
+ask_repo_source <<< "2" >/dev/null 2>&1
+printf 'EXPLICIT_URL=%s\\n' "$REPO_URL"
 
-reset; REPO_URL="$DEFAULT_REPO_URL"; export FAKE_PROBE=fail
-GOT="$(choose_clone_url)"; hc; printf 'DOWN=%s|%s\\n' "$GOT" "$HC"
-
-reset; REPO_URL="https://git.example.com/team/kepler.git"; export FAKE_PROBE=fail
-GOT="$(choose_clone_url)"; hc; printf 'FORK=%s|%s\\n' "$GOT" "$HC"
+# ③ --yes / --reinstall：同样不读，沿用已有值（管道里塞的是 1，若被读走就会变成 GitHub）
+REPO_EXPLICIT=0; ASSUME_YES=1; REPO_URL="$MIRROR_REPO_URL"
+ask_repo_source <<< "1" >/dev/null 2>&1
+printf 'YES_URL=%s\\n' "$REPO_URL"
 printf 'END\\n'
 `);
   assert(!r.unavailable, `无法运行 bash 片段（这条运行期判据不能跳过）：${r.unavailable}`);
-  const val = (k) => {
+  assert(r.code === 0, `片段异常退出（${r.code}）：${r.err}`);
+  const kv = (k) => {
     const mm = new RegExp('^' + k + '=(.*)$', 'm').exec(r.out);
     assert(mm, `片段未产出 ${k}：${r.out}${r.err}`);
-    const [got, probes] = mm[1].split('|');
-    return { got, probes: probes === undefined ? null : Number(probes) };
+    return mm[1];
   };
-  assert.strictEqual(val('SELF').got, '1',
-    '自证失败：假 git 未被调用（放错 PATH / 不是可执行文件），下面的结论都不成立');
-  assert.strictEqual(val('UP').got, def[1],
-    '探测通时必须选官方 GitHub —— 官方才是最新版，镜像只在连不通时兜底');
-  assert.strictEqual(val('UP').probes, 1, '选源只探测一次（每多重试一次就多等 15 秒）');
-  assert.strictEqual(val('DOWN').got, m[1],
-    '探测不通时必须改选 Gitee 镜像（这正是本次需求：连不通才转 gitee）');
-  assert.strictEqual(val('FORK').got, 'https://git.example.com/team/kepler.git',
-    '用户显式 --repo 的地址必须原样返回 —— 不能被官方镜像顶掉');
-  assert.strictEqual(val('FORK').probes, 0,
-    '显式 --repo 时**一次都不该探测**：那个地址通不通是用户的事，探测只用于「默认地址」的取舍');
-  // DOWN 本身就是「失败退出码被如实透传」的行为证据：若 repo_reachable 把失败吞成 0
-  // （`|| true` / `return 0`），DOWN 就会等于官方地址 —— 上面那条断言先红。
+  const mapped = (k) => {
+    const mm = new RegExp('^MAP ' + k + ' => (.*)$', 'm').exec(r.out);
+    assert(mm, `片段未产出 MAP ${k}：${r.out}${r.err}`);
+    return mm[1];
+  };
+  assert.strictEqual(mapped('1'), def[1], '1 必须指向官方 GitHub');
+  assert.strictEqual(mapped('2'), m[1], '2 必须指向 Gitee 镜像');
+  assert.strictEqual(mapped('github'), def[1], '文字答案 github 也认（用户不一定看编号）');
+  assert.strictEqual(mapped('GiTeE'), m[1], '名字必须大小写不敏感：Gitee / GITEE / gitee 都是同一个源');
+  assert.strictEqual(mapped('3'), '<reject>', '编号超范围必须拒绝，不能兜成默认值');
+  assert.strictEqual(kv('EMPTY'), '<reject>', '空输入由调用方回落默认项，翻译层自己不许兜底');
+  assert.strictEqual(kv('DEF_GH'), '1', '上次用的是官方（或没记录）时，默认项必须是 1');
+  assert.strictEqual(kv('DEF_GE'), '2', '上次选的是镜像时必须默认回 2 —— 否则重装按一次回车就换源了');
+  assert.strictEqual(kv('DEF_CUSTOM'), '1', '自建 fork 的地址不在两项之内，默认给官方（且不会覆盖它）');
+  assert.strictEqual(kv('PIPE_URL'), def[1],
+    '非交互时必须沿用已有地址：管道里的 "2" 被读走就说明「不读 stdin」那道门没生效');
+  assert.strictEqual(kv('EXPLICIT_URL'), 'https://git.example.com/team/kepler.git',
+    '显式 --repo 的地址必须原样保留（不能被默认值顶掉，也不能被提问改写）');
+  assert.strictEqual(kv('YES_URL'), m[1],
+    '--yes / --reinstall 时必须沿用已有值：管道里的 "1" 被读走就说明 ASSUME_YES 那道门没生效');
 });
 
 /* ================================================================== *
@@ -3305,8 +3294,11 @@ version_ge 1.31 1.31.0      && echo "D=ge" || echo "D=lt"
 test('deploy.sh：仓库地址与安装路径不得拼进 shell 字符串（选项注入 / 引号中断）', () => {
   const src = readDeploy();
   const ps = codeOnly(fnBody(src, 'prepare_source'));
-  assert.strictEqual((ps.match(/git clone --depth 1 -- /g) || []).length, 2,
-    '两处 clone（首克隆 + 镜像兜底）都必须带 `--`：缺了它，以 - 开头的仓库地址会变成 git 的选项');
+  // R112 之后 clone 只剩一处（「官方失败 → 自动换成镜像重试」已随被动规则一起删除）。
+  // 计数断言照旧保留：将来若又长出第二处 clone，它同样必须带 `--`，否则这里先红。
+  assert.strictEqual((ps.match(/git clone --depth 1 -- /g) || []).length, 1,
+    'clone 必须带 `--`（缺了它，以 - 开头的仓库地址会变成 git 的选项）；'
+    + '若新增了第二处 clone，请把它也写成带 `--` 的形状并同步这个计数');
   assert(!/git clone --depth 1 "/.test(ps),
     '不得再有「clone 后面直接跟地址」的写法：`--upload-pack=<命令>` 会以 root 执行（实测）');
 

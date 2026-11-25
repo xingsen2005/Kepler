@@ -13,7 +13,8 @@
 #
 # 脚本会依次完成：
 #   1) 自动识别包管理器并安装 git、curl、ca-certificates、tar 等基础工具
-#   2) 自动拉取 https://github.com/xingsen2005/Kepler.git 源码
+#   2) 拉取源码：拉取前先问一句用哪个仓库 —— GitHub（官方）或 Gitee（国内镜像），
+#      选定后再 clone（不再「探测连通性、不通才自动换源」）
 #   3) 安装运行时（Node.js ≥ 18）与依赖（npm 生产依赖）
 #   4) 安装并配置 Nginx 反向代理（要求 Nginx ≥ 1.31.9 主线 / ≥ 1.30.7 稳定分支 ——
 #      2026-11-18 的 NGINX2Root 漏洞组影响 1.9.5~1.31.8；发行版仓库给的版本低于这条底线，
@@ -53,7 +54,8 @@
 #                           或设环境变量 KEPLER_EAB_HMAC_KEY（同 uid 才能读 /proc/<pid>/environ）
 #   --email <邮箱>          ACME 账户注册 / 通知邮箱（默认 admin@<域名>）
 #   --path <路径>           服务路径前缀（默认 /，推荐根路径；子路径为尽力而为模式）
-#   --repo <git-url>        脚本独立运行时用于拉取源码的仓库地址
+#   --repo <git-url>        拉取源码的仓库地址（给了就不再询问；默认 GitHub，Gitee 镜像为
+#                           https://gitee.com/xing_sen/kepler）
 #   --node-version <版本>   指定 Node.js 版本（默认解析最新的 20.x LTS）
 #   --mirror <auto|cn|official> 下载镜像：cn 走 npmmirror 加速；auto 先走官方源，失败自动改走国内
 #   --staging               使用 Let's Encrypt 测试环境（仅在 CA 为 letsencrypt 时生效）
@@ -99,14 +101,9 @@ CRON_D_DIR="/etc/cron.d"
 CRONTAB_FILE="/etc/crontab"
 readonly DEFAULT_REPO_URL="https://github.com/xingsen2005/Kepler.git"
 # 国内镜像（Gitee）。GitHub 在国内服务器上经常拉不通（连接超时 / TLS 被重置），
-# 故克隆失败时自动改用同仓库的 Gitee 镜像重试一次 —— 内容与 GitHub 同步。
-# 只在「用户没显式指定 --repo」时启用（显式指定的地址是用户的意图，不该被替换）。
+# 故拉取源码**之前**由用户自己选一次用哪个仓库 —— 脚本既不探测连通性，也不在失败后
+# 自动换源（R112：被动规则改主动询问，见 §5 的 ask_repo_source）。
 readonly MIRROR_REPO_URL="https://gitee.com/xing_sen/kepler"
-# 仓库连通性探针的有界超时（秒）。
-# GitHub 在国内服务器上被黑洞时，TCP 根本连不上，而 **git 自己不设连接超时** ——
-# 旧写法「先 clone、失败了再换镜像」因此要等很久才给出结论（用户盯着滚动条怀疑卡死）。
-# 探针只做一次 ls-remote，秒级回答「通不通」。
-readonly REPO_PROBE_TIMEOUT=15
 # 历史默认仓库地址（账号/仓库迁移前的值）。老安装机的 ${STATE_FILE} 里仍留着它，
 # 而旧仓库现已不存在（git clone 会 404）。load_state 会把「恰好等于历史默认值」的
 # 地址翻译成当前默认值，避免重装时拉一个死仓库；用户自建 fork 的地址不在其列、原样保留。
@@ -544,6 +541,10 @@ CERT_KEY=""
 # 用于区分「用户就是要用 LE」与「状态文件里残留了上一轮的 letsencrypt」两种情况，
 # 后者要主动提醒换 CA（LE 在公共后缀域名上容易被 rateLimited 限流）。
 CA_EXPLICIT=0
+# 本轮仓库地址是不是**用户明确给的**（`--repo` / 环境变量 REPO_URL / 自我交接带过来的
+# 上一趟结论）。只有它为 0 才会在拉取前问一句「用 GitHub 还是 Gitee」——
+# 用户已经表过态就不该再问一遍，更不能拿默认值把他的地址顶掉。
+REPO_EXPLICIT=0
 
 usage() {
   local source="${BASH_SOURCE[0]:-$0}"
@@ -658,7 +659,11 @@ function apply_env_overrides() {
   if [[ -n "$ENV_TLS_MODE" ]]; then TLS_MODE="$ENV_TLS_MODE"; fi
   if [[ -n "$ENV_EMAIL" ]]; then EMAIL="$ENV_EMAIL"; fi
   if [[ -n "$ENV_SUB_PATH" ]]; then SUB_PATH="$ENV_SUB_PATH"; fi
-  if [[ -n "$ENV_REPO_URL" ]]; then REPO_URL="$ENV_REPO_URL"; fi
+  if [[ -n "$ENV_REPO_URL" ]]; then REPO_URL="$ENV_REPO_URL"; REPO_EXPLICIT=1; fi
+  # 自我交接带过来的地址（见 handoff_to_installed_script）：上一趟已经问过 / 收过
+  # `--repo`，第二趟不许再问 —— 而且必须**原样带过去**，否则 save_state 会把用户
+  # 刚选的 Gitee 写成默认的 GitHub，下次重装又悄悄换回官方源。
+  if [[ -n "${KEPLER_REPO_URL:-}" ]]; then REPO_URL="$KEPLER_REPO_URL"; REPO_EXPLICIT=1; fi
   if [[ -n "$ENV_NODE_VERSION" ]]; then NODE_VERSION="$ENV_NODE_VERSION"; fi
   if [[ -n "$ENV_MIRROR" ]]; then MIRROR="$ENV_MIRROR"; fi
   if [[ -n "$ENV_STAGING" ]]; then STAGING="$ENV_STAGING"; fi
@@ -730,7 +735,7 @@ parse_args() {
             if ca_is_valid "$2"; then CA_PROVIDER="$2"; TLS_MODE="acme"; CA_EXPLICIT=1; else TLS_MODE="$2"; fi ;;
           --email)        EMAIL="$2" ;;
           --path)         SUB_PATH="$2" ;;
-          --repo)         REPO_URL="$2" ;;
+          --repo)         REPO_URL="$2"; REPO_EXPLICIT=1 ;;
           --node-version) NODE_VERSION="$2" ;;
           --mirror)       MIRROR="$2" ;;
           --ca)           CA_PROVIDER="$2"; CA_EXPLICIT=1 ;;
@@ -1964,57 +1969,103 @@ preflight_network() {
 # 5. 部署源码
 # ------------------------------------------------------------------------------
 
-# 仓库连通性判据：`git ls-remote` 只取引用、不下载对象，是最便宜的真连通探针。
+# ---- 选源：拉取之前**问一次**（R112） -----------------------------------------
 #
-# ⚠️ 为什么不用 `curl -sI https://github.com`：那是**另一条路**。网页首页与 git
-# 克隆端点不是同一个服务（首页 200 不代表 clone 能成；首页被墙也不代表 clone 不通，
-# 用户可能已给 github.com 配好代理而未给网页配）。判据必须落在**真正要执行的那件事**上。
+# 旧规则是**被动**的：先拿 `git ls-remote` 探 GitHub 通不通，不通才自动转 Gitee
+# 镜像；克隆失败后还会再自动换一次。它解决的是「用户不知道还能换源」，代价却是
+# 每台机器都先撞一次探测、并且**装的是哪个源**由脚本替用户决定 —— 用户看到日志里
+# 「探测不通，改用镜像」时，既没法反对，也无从判断这是不是他想要的结果。
 #
-# ⚠️ 三个硬约束：
-#   ① `timeout` 兜底：被黑洞时连接会一直挂着，探针必须自己掐断（否则等于没有探针）；
-#   ② `GIT_TERMINAL_PROMPT=0`：私有仓库 / 缺凭据时 git 会停在输入提示上等用户敲，
-#      非交互脚本会就此冻住 —— 探针必须"失败得干脆"；
-#   ③ 输出丢 /dev/null：探针只回答「通不通」，不把 refs 灌进日志。
-repo_reachable() {
-  local url="$1" rc=0
-  if have timeout; then
-    GIT_TERMINAL_PROMPT=0 timeout "$REPO_PROBE_TIMEOUT" git ls-remote --heads "$url" >/dev/null 2>&1 || rc=$?
-  else
-    GIT_TERMINAL_PROMPT=0 git ls-remote --heads "$url" >/dev/null 2>&1 || rc=$?
-  fi
-  return "$rc"
+# 现在改为**主动询问**：拉取之前把两个地址摆出来，由用户选。好处是三重的 ——
+#   ① 不再有「先探测」这一段白等（连不通的机器上，探测本身就是那段没有结论的等待）；
+#   ② 装的是哪个源永远可解释（用户自己选的，日志里也写明）；
+#   ③ 不再有「自动换源」这种悄悄改变源码来源的动作，也就没有「内网 GitLab 被官方
+#      镜像顶掉」这一类需要靠门控去防的事故。
+#
+# 三个约束（每一条都对应一个真实场景）：
+#   · 用户已表过态（`--repo` / 环境变量 / 自我交接带过来）就**不再问**，也不改写；
+#   · 非交互（`curl | bash`、`-y`、`--reinstall`、CI）**一个字节都不读 stdin**：
+#     读不到会挂在这儿，能读到则是把管道里的内容当答案，两种都比默认值更糟；
+#   · 无论走哪条路，落定的地址都会被打出来 —— 用户下次翻日志要知道装的是哪个源。
+
+# 地址 → 人话。只用于提示，不参与任何判断。
+repo_label() {
+  case "${1:-}" in
+    "$DEFAULT_REPO_URL") printf 'GitHub（官方）' ;;
+    "$MIRROR_REPO_URL")  printf 'Gitee（国内镜像）' ;;
+    *)                   printf '自定义仓库' ;;
+  esac
 }
 
-# 决定「本次从哪个仓库拉源码」——**唯一实现点**，只输出地址、不打印日志
-# （打印留给调用方，避免 `$(...)` 把日志一起捕获）。
-#
-# 顺序就是需求本身：**先测 GitHub 通不通，不通才转 Gitee 镜像**。
-# 旧写法「先克隆 GitHub、失败了再换镜像」的判据没错，但**信号来得太晚**：
-# 被黑洞时 git 会挂很久，用户看到的是一段没有结论的等待，而不是一句"改用镜像"。
-#
-# ⚠️ 用户显式 `--repo` 时**既不探测也不替换**：那个地址就是他的意图（可能是内网
-# GitLab，也可能是自建 fork）。拿官方镜像把它顶掉属于"纠正用户"，比装不上更糟。
-choose_clone_url() {
-  if [[ "$REPO_URL" != "$DEFAULT_REPO_URL" ]]; then
-    printf '%s' "$REPO_URL"
+# 默认选项：沿用本轮已有的地址（来自 .deploy.conf 的上次选择）→ 否则官方。
+# 只输出 `1` / `2`，与菜单编号一一对应。
+default_repo_choice() {
+  if [[ "${1:-}" == "$MIRROR_REPO_URL" ]]; then printf '2'; else printf '1'; fi
+}
+
+# 把用户输入翻译成仓库地址：认编号（1/2）也认名字（github / gitee，大小写不敏感）。
+# 认不出来时返回非零 —— 由调用方重问，**绝不**在这里兜成默认值（那等于把误触当选择）。
+repo_url_for_answer() {
+  local a="${1:-}"
+  a="${a//[[:space:]]/}"
+  a="${a,,}"
+  case "$a" in
+    1|github|gh) printf '%s' "$DEFAULT_REPO_URL" ;;
+    2|gitee|ge)  printf '%s' "$MIRROR_REPO_URL" ;;
+    *) return 1 ;;
+  esac
+}
+
+# 拉取源码前的唯一选择点（`prepare_source` 的克隆分支里调用，一次部署只问一次）。
+# 只改 REPO_URL，不返回地址 —— 后续所有克隆与提示读的都是同一个 REPO_URL，
+# 少一个「传参传错了一处」的缝。
+ask_repo_source() {
+  if [[ "$REPO_EXPLICIT" == "1" ]]; then
+    info "源码仓库（已指定，不再询问）：${REPO_URL}"
     return 0
   fi
-  if repo_reachable "$REPO_URL"; then
-    printf '%s' "$REPO_URL"
+  local def_choice; def_choice="$(default_repo_choice "$REPO_URL")"
+  if [[ "$ASSUME_YES" == "1" || ! -t 0 ]]; then
+    info "源码仓库（非交互，沿用上次选择）：$(repo_label "$REPO_URL") ${REPO_URL}"
+    info "  要换源：--repo <地址>（Gitee 镜像：${MIRROR_REPO_URL}）"
+    return 0
+  fi
+
+  plain ""
+  plain "${C_BOLD}请选择本次拉取源码的仓库${C_RESET}（拉取之前确认一次，之后不再询问）"
+  plain "  1) GitHub（官方，最新提交）      ${DEFAULT_REPO_URL}"
+  plain "  2) Gitee（国内镜像，人工同步）   ${MIRROR_REPO_URL}"
+  plain "  ${C_DIM}国内服务器访问 GitHub 常超时；镜像可能落后于官方，但通常几十秒就能拉完。${C_RESET}"
+
+  local ans="" chosen="" tries=0
+  while ((tries < 5)); do
+    tries=$((tries + 1))
+    read -r -p "$(printf '%s选择 [%s]: %s' "$C_BOLD" "$def_choice" "$C_RESET")" ans \
+      || { warn "无法读取输入，沿用当前仓库：${REPO_URL}"; break; }
+    [[ -n "$ans" ]] || ans="$def_choice"
+    if chosen="$(repo_url_for_answer "$ans")"; then break; fi
+    chosen=""
+    warn "无法识别「${ans}」：请输入 1 或 2（直接回车用默认 ${def_choice}）"
+  done
+  # 兜底沿用原地址：宁可装原来那个源，也不要因为一次读取失败把地址置空
+  [[ -n "$chosen" ]] || chosen="$REPO_URL"
+  REPO_URL="$chosen"
+  if [[ "$REPO_URL" == "$MIRROR_REPO_URL" ]]; then
+    ok "源码仓库：$(repo_label "$REPO_URL") ${REPO_URL}（镜像可能落后于官方最新提交）"
   else
-    printf '%s' "$MIRROR_REPO_URL"
+    ok "源码仓库：$(repo_label "$REPO_URL") ${REPO_URL}"
   fi
   return 0
 }
 
-# 走镜像时**如实告知可能不是最新版** —— 两条成功路径（探针直接选镜像 / 官方克隆
-# 失败后重试成功）共用这一处文案，避免一条说、另一条静悄悄地不说。
+# 走镜像时**如实告知可能不是最新版**。取源已由用户选定，但「镜像由人工同步」这件事
+# 用户不一定知道 —— 装一份落后于官方的代码却不吭声，下一次工单会是「功能怎么没有」。
 # 同时把实际拿到的 commit 报出来：用户下次对比官方提交时有个确切参照物。
 warn_mirror_staleness() {
   local dir="$1" got=""
   got="$(git -C "$dir" log -1 --format='%h %cd' --date=short 2>/dev/null || true)"
   warn "本次源码取自 Gitee 镜像（commit ${got:-未知}）：镜像由人工同步，可能落后于官方最新提交。"
-  warn "  网络恢复后重装即可拿到官方最新版：$(rerun_cmd --repo "${DEFAULT_REPO_URL}" --reinstall)"
+  warn "  想拿官方最新版：$(rerun_cmd --repo "${DEFAULT_REPO_URL}" --reinstall)"
 }
 
 # 【R102】拉取阶段就排除客户端源码（`client/`）。
@@ -2062,36 +2113,20 @@ prepare_source() {
     fi
   fi
   local tmp; tmp="$(mktemp -d)"
-  # ── 先探后选 ──────────────────────────────────────────────────────────────
-  # 需求：**默认走官方（GitHub），连不通才转 Gitee 镜像**。
-  # 旧写法是「先 clone 官方、失败了再换镜像」—— 判据没错，但信号来得太晚：
-  # 被黑洞时 git 不设连接超时，要挂很久才吐结论。这里先花 ≤${REPO_PROBE_TIMEOUT}s
-  # 用 ls-remote 问一句「通不通」，再决定从哪儿 clone。
-  local clone_url=""
-  clone_url="$(choose_clone_url)"
-  if [[ "$clone_url" == "$REPO_URL" ]]; then
-    info "未发现本地源码，从仓库拉取：${clone_url}"
-  else
-    warn "GitHub 连接不通（${REPO_PROBE_TIMEOUT}s 内有界探测未通过），改用国内镜像（Gitee）：${clone_url}"
-    warn "  镜像由人工同步，可能不是最新版；网络恢复后重装即可回到官方源。"
-  fi
+  # ── 先问后拉（R112）──────────────────────────────────────────────────────
+  # 需求：**拉取之前主动问一次**用哪个仓库（GitHub / Gitee），不再「探测连通性、
+  # 不通才转镜像」的被动规则。三个理由写在 ask_repo_source 上方；这里只强调一处
+  # 位置约束 —— 它必须排在 `git clone` **之前**：问完再拉，"选了 gitee 却仍去拉
+  # GitHub" 这种把问题原样搬回来的形态才不可能出现。
+  # 只问一次：REPO_EXPLICIT 由 --repo / 环境变量 / 自我交接置位，用户表过态就不问。
+  ask_repo_source
+  info "未发现本地源码，从仓库拉取：${REPO_URL}"
   local cloned=0
   # `--` 不能省：仓库地址来自 `--repo` / 环境变量 / .deploy.conf，以 `-` 开头的值会被
   # git 当成**选项**，`--upload-pack=<命令>` 能让它以 root 执行任意命令（实测命中）。
   # 加了 `--` 之后同样的值变成「仓库名不存在」，只是普通的克隆失败。
-  if run git clone --depth 1 -- "$clone_url" "${tmp}/src"; then
+  if run git clone --depth 1 -- "$REPO_URL" "${tmp}/src"; then
     cloned=1
-  elif [[ "$clone_url" == "$DEFAULT_REPO_URL" ]]; then
-    # 探测只看引用（ls-remote 不下载对象），克隆要真下对象 —— 半通 / 限速时
-    # 仍可能失败，所以保留旧逻辑那层兜底：官方失败后再用镜像试一次。
-    warn "从默认仓库拉取失败，改用国内镜像（Gitee）重试：${MIRROR_REPO_URL}"
-    rm -rf "${tmp}/src"
-    if run git clone --depth 1 -- "$MIRROR_REPO_URL" "${tmp}/src"; then
-      clone_url="$MIRROR_REPO_URL"
-      cloned=1
-    else
-      warn "Gitee 镜像仍拉取失败。"
-    fi
   fi
   if ((cloned != 1)); then
     rm -rf "$tmp"
@@ -2100,9 +2135,13 @@ prepare_source() {
     while IFS= read -r l; do [[ -n "$l" ]] && add_hint "  日志 | ${l}"; done <<<"$(log_key_lines 5)"
     add_hint ""
     add_hint "  1) 换可访问的仓库：--repo <git 地址>"
+    # 两个方向都给可复制的命令：选 GitHub 的机器往往是「国内网络」，选 Gitee 的
+    # 往往是「镜像过期想回官方」。只给一个方向等于假设用户选错了源。
     if [[ "$REPO_URL" == "$DEFAULT_REPO_URL" ]]; then
-      add_hint "     · 国内服务器推荐用 Gitee 镜像（脚本已自动试过，仍失败可手动重试）："
+      add_hint "     · 本机访问 GitHub 不通时可改用 Gitee 镜像（内容由人工同步，可能略旧）："
       add_hint "       $(rerun_cmd --repo ${MIRROR_REPO_URL})"
+    else
+      add_hint "     · 也可改用官方仓库（最新提交）：$(rerun_cmd --repo ${DEFAULT_REPO_URL})"
     fi
     add_hint "  2) 或先把项目上传/解压到服务器，再在该目录内执行本脚本（脚本会自动识别同目录源码）"
     # 判据落在**真正要执行的那件事**上：`curl -sI https://github.com` 是另一条路
@@ -2113,14 +2152,11 @@ prepare_source() {
   SRC_DIR="${tmp}/src"
   SRC_TMP_DIR="$tmp"   # 复制完成后清理
   # 【R102】拿到源码树后第一件事：把客户端源码摘掉（详见 drop_client_from_clone）。
-  # 刻意放在这里、而不是分别塞进两个 clone 分支 —— 官方与镜像两条成功路径共用
-  # 同一处调用，少一个调用点就会出现「走镜像时装了 client、走官方时没装」这种
-  # 只在一半机器上复现的差异。
   drop_client_from_clone "$SRC_DIR"
   # 走镜像时说清「可能不是最新版」+ 实际拿到的 commit。
   # 放在这里而不是 install_app：此刻 ${SRC_DIR}/.git 还在（同步时会排除掉），
-  # 才能取到真实 commit；两条成功路径（探针直接选镜像 / 官方失败后兜底）共用这一处。
-  if [[ "$clone_url" == "$MIRROR_REPO_URL" ]]; then
+  # 才能取到真实 commit。
+  if [[ "$REPO_URL" == "$MIRROR_REPO_URL" ]]; then
     warn_mirror_staleness "$SRC_DIR"
   fi
 }
@@ -2304,13 +2340,17 @@ handoff_to_installed_script() {
   # 否则新进程一启动就会撞上自己留下的锁、直接判「另一个部署进程正在运行」。
   # 已解析好的域名也随环境带过去：否则第二趟会在终端里**再问一次**域名
   # （collect_config 只在 $DOMAIN 为空时提问），非交互场景下更是直接判失败。
+  # 本轮已确定的**仓库地址**同理：它可能是用户刚在「GitHub / Gitee」里选的，
+  # 第二趟若回落成默认值，save_state 就会把 Gitee 写成 GitHub（下次重装悄悄换源）。
   # 原始命令行一并原样转发（ORIGINAL_ARGV 在参数解析前就存好了），保住 --skip-* 等开关。
   trap - EXIT
   if ((${#ORIGINAL_ARGV[@]} > 0)); then
     exec env KEPLER_LOCK_HELD="$LOCK_FILE" KEPLER_SELF_HANDOFF=1 DOMAIN="$DOMAIN" \
+      KEPLER_REPO_URL="$REPO_URL" \
       bash "$target" "${ORIGINAL_ARGV[@]}"
   fi
   exec env KEPLER_LOCK_HELD="$LOCK_FILE" KEPLER_SELF_HANDOFF=1 DOMAIN="$DOMAIN" \
+    KEPLER_REPO_URL="$REPO_URL" \
     bash "$target"
 }
 
